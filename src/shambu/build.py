@@ -853,7 +853,10 @@ class Pipeline:
         if plan.map_applies:
             cmd.setting("filament_map_mode", "Manual").setting("filament_map", plan.filament_map)
         if len(plan.filaments) > 1:
-            cmd.setting("wipe_tower_x", WIPE_TOWER_XY[0]).setting("wipe_tower_y", WIPE_TOWER_XY[1])
+            # wipe_tower_x/y are per-plate vectors: a scalar moves the tower on plate 1 only, and every later plate keeps
+            # the CLI default (15, 220), inside the right nozzle's dead strip (exit -102) or under a part (exit -101)
+            n = len(plan.plates)
+            cmd.setting("wipe_tower_x", [WIPE_TOWER_XY[0]] * n).setting("wipe_tower_y", [WIPE_TOWER_XY[1]] * n)
         if do_slice:
             if "custom_gcodes" in paths:
                 cmd.option("load-custom-gcodes", str(paths["custom_gcodes"]))

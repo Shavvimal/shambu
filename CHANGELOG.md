@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-13
+
+### Fixed
+- The prime tower position is a per-plate vector in Studio (`wipe_tower_x`/`wipe_tower_y`, one value per plate). The
+  CLI passed one scalar, which moved the tower on plate 1 only; every later two-filament plate kept the CLI default
+  (15, 220), inside the right nozzle's dead strip, and the slicer refused the project (exit -102, or -101 with a part
+  in that corner). The build now repeats the position once per plate.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
