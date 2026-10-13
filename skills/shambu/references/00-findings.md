@@ -44,7 +44,10 @@ The CLI never resolves `inherits` or `include`. A half-resolved machine preset g
 ## 4. CLI flags
 
 Bool flags take no value (`--min-save 1` makes `1` an input file). `--min-save` strips all meshes. `--orient 1`
-overwrites every object's settings with the process preset. `--rotate*` turns every object at once. `--pipe` does
+overwrites every object's settings with the process preset, but only when `--load-settings` loaded one and only
+objects that carry per-object keys lose anything: an orient-only run on positional STLs (shambu's pass 1 for
+`"orientation": "auto"`) is safe, and the slicing run with the assemble list never passes `--orient`. Studio's
+printed best vector ends up pointing up, so `lay_on_face = -best` (live on five parts). `--rotate*` turns every object at once. `--pipe` does
 nothing on macOS. Actions run in argv order (`--no-check` before `--slice`). `--export-3mf` wants a bare name plus
 an existing `--outputdir` (reference 01 section 1).
 
@@ -63,6 +66,17 @@ colour and one map entry for two filaments (reference 01 section 2).
 `filament_extruder_variant` = "Bowden Standard" or slicing crashes. Thumbnails are optional. Every patch the tool
 makes survives a CLI load and re-export. The plate's `print_sequence` metadata beats the process key
 (reference 03, reference 08 section 2).
+
+`result.json`, which a slicing run writes into `--outputdir` next to the 3MF, carries per plate
+(`sliced_plates[]`) the seconds per feature in `feature_type_times` (every extrusion role plus `Travel`),
+`total_predication`, `main_predication` (total minus prepare, prime tower and flush), `filament_change_times`, and
+per filament `total_used_g` and `main_used_g`. `main_used_g` is model plus support, so `total_used_g - main_used_g` is
+the flush and prime-tower waste; nothing splits support from the model, which is why the G-code parser stays for
+support grams (BS.cpp:500-600, 7265-7330 at v02.08.02.61; PLAN-native-cli section 2.5). `filament_change_times`
+counts filament loads, not nozzle switches: it is 0 on a two-nozzle X2D plate (0 against 41 tool switches in the
+G-code, live), so the swap count comes from the parser's T lines and shambu keeps Studio's value only as
+`studio_filament_change_times`. Only the slicing path
+writes the file, and each run overwrites it, so `inspect` on a project built elsewhere falls back to the parser.
 
 ## 7. The Studio GUI
 

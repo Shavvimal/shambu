@@ -397,7 +397,10 @@ class Project:
         out["waste_g"] = round(out["tower_g"] + out["flush_g"], 2)
         return out
 
-    def summary(self) -> dict:
+    def summary(self, features: bool = False) -> dict:
+        """The project as a dict. `features=True` adds `slice.features` per sliced plate from feature_usage(), which
+        parses the whole plate G-code: ask for it only when support grams (or the G-code cross-check) are needed.
+        A slice run's result.json gives seconds per feature and tower plus flush grams without that parse."""
         ps = self.project_settings
         order = self.build_order()
         index_of = {oid: i + 1 for i, oid in enumerate(order)}
@@ -482,7 +485,7 @@ class Project:
         slices = self.slice_info()
         for plate_d in plates:
             plate_d["slice"] = slices.get(plate_d["id"])
-            if plate_d["slice"] is not None:
+            if features and plate_d["slice"] is not None:
                 plate_d["slice"]["features"] = self.feature_usage(plate_d["id"])
         return {
             "file": self.path,

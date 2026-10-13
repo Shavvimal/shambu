@@ -73,8 +73,14 @@ All notable changes to this project are documented here. The format follows
 - A bad spec (unknown recipe, bad JSON) in `check` or `build` gives one error document and exit 1, not 3. The
   message names `shambu recipes`, not `bambu recipes`.
 - `info` on a multi-object 3MF sums facets and parts and takes the union bbox; it reported only the last object.
+- Review fixes: same-stem members of a merged part get separate oriented copies, a filament group packs inside its nozzle's reach, a lone reversed-winding shell stays a body (flipped), `aux_x_limit` counts the brim margin, a short `at` or a structurally bad spec or variant gives exit 1 (the sweep records the variant as failed), failed plate checks show in the sweep problems, and a build stopped at the plan says nothing was exported.
 
 ### Changed
+- Build estimates, reports and the sweep read Studio's `result.json`: seconds per feature (`feature_times_s`; sweep
+  columns for support, prime tower, flush and travel), `main_prediction_s`, `studio_filament_change_times`, and per
+  filament `main_g` and `waste_g` (flush + tower). The G-code parser now runs only for support grams, for the
+  filament-change (tool-switch) count on a plate with more than one filament, for `inspect --json`, and when a run
+  left no `result.json`.
 - The skill explains orientation, supports and time hacks and runs the sweep loop to pick a configuration.
 - `data/` is gitignored for real CAD parts; `data/README.md` and CONTRIBUTING describe the manual real-CAD loop.
 - Reference 07: the prime-tower-with-by-object rule is compiled out in Studio (corrected).

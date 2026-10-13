@@ -90,6 +90,20 @@ z = 0 at x, y >= 0; the sub-parts of a merged object are turned in one shared fr
 and the file name carries a hash of the source path and the orientation so two parts with one stem, or rotations
 of 1.2 and 12 degrees, never share a file. The object keeps the original stem as its name.
 
+A part with `"orientation": "auto"` takes Studio's own auto-orient in two passes instead. Pass 1 is an orient-only
+run on the bare STL: `--load-settings "<machine.json>;<process.json>" --convert-unit --orient=1 --export-stls DIR
+--outputdir DIR <part>.stl`, in that argv order (transforms run in argv order, so the unit fix comes first). Studio
+writes `DIR/obj_1_<stem>.stl` with the turn baked in and prints its candidate table on stdout; shambu keeps its own
+`stands` check on that file. Pass 2 is the normal slicing run with the assemble list pointing at the exported file;
+it never passes `--orient`, so the config replacement (reference 01, finding 10) cannot happen. Studio's printed
+vector is the mesh direction that ends up pointing up, so the matching spec value is `lay_on_face = -best`. Live on
+bracket, carrier, jaw_posy, tag_bridge and bottle-funnel (Studio 02.08.02.61): Studio's export and shambu's copy
+with `lay_on_face = -best` gave the same contact, support shadow and height, and on all five shambu's own score
+ranked that face first too. Pass 1 takes 0.07 to 0.13 s per part. A merged part (`parts: [...]`) keeps shambu's own
+best candidate, because Studio turns each positional input on its own. `shambu orient --native` prints Studio's
+table; `shambu sweep --orientations PART --source studio` takes its candidates (negated, filtered by `stands`, top N by
+`unprintability`) and bakes each one with the code above.
+
 ### 1.4 Myths
 
 - "45 deg is a hard limit": no, it depends on nozzle, layer height, cooling and material.

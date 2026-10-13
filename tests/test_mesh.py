@@ -224,3 +224,25 @@ def test_split_bodies_drops_an_inward_shell():
     assert len(bodies) == 1 and len(bodies[0]) == 12 and M.volume(bodies[0]) == pytest.approx(1500)
     assert M.count_shells(facets) == 2 and M.cavities(facets) == 1
     assert M.cavities(box((0, 0, 0), (1, 1, 1))) == 0
+
+
+def test_split_bodies_keeps_a_standalone_reversed_shell():
+    """A closed cube with reversed winding and no enclosing body is a part, not a cavity: it comes back flipped."""
+    inside_out = [(a, c, b) for a, b, c in box((0, 0, 0), (10, 10, 10))]
+    bodies = M.split_bodies(inside_out)
+    assert len(bodies) == 1 and M.volume(bodies[0]) == pytest.approx(1000)
+    assert M.cavities(inside_out) == 0
+    # beside (not inside) an outward box: still two bodies, no cavity
+    facets = box((20, 0, 0), (30, 10, 10)) + inside_out
+    assert len(M.split_bodies(facets)) == 2 and M.cavities(facets) == 0
+
+
+def test_oriented_copies_same_stem_members_get_two_files(tmp_path):
+    """A merged object with body/part.stl and label/part.stl: two output files, each with its own mesh."""
+    (tmp_path / "body").mkdir()
+    (tmp_path / "label").mkdir()
+    a = M.write_stl(tmp_path / "body" / "part.stl", box((0, 0, 0), (10, 10, 10)))
+    b = M.write_stl(tmp_path / "label" / "part.stl", box((0, 0, 10), (4, 4, 11)))
+    ta, tb = M.oriented_copies([a, b], M.Orientation(rotate=(90, 0, 0)), tmp_path / "o")
+    assert ta != tb and ta.is_file() and tb.is_file()
+    assert M.volume(M.read_stl(ta)) == pytest.approx(1000) and M.volume(M.read_stl(tb)) == pytest.approx(16)

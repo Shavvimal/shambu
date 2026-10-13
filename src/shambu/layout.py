@@ -285,10 +285,11 @@ class ExtruderReach:
                         f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and spans x {mx0:.1f}..{mx1:.1f} "
                         f"with its brim and support margin ({p.margin:.1f} mm); that extruder reaches x {e['x'][0]:.1f}..{e['x'][1]:.1f}",
                     )
-                if e["index"] == 2 and ctx.aux_x_limit is not None and p.x1 > ctx.aux_x_limit:
+                if e["index"] == 2 and ctx.aux_x_limit is not None and mx1 > ctx.aux_x_limit:
                     yield Check(
                         False,
-                        f"{p.key} uses extruder 2 and ends at x {p.x1:.1f}; the configured aux_x_limit for the auxiliary nozzle is {ctx.aux_x_limit} mm",
+                        f"{p.key} uses extruder 2 and ends at x {mx1:.1f} with its brim and support margin ({p.margin:.1f} mm); "
+                        f"the configured aux_x_limit for the auxiliary nozzle is {ctx.aux_x_limit} mm",
                     )
 
 
@@ -312,7 +313,8 @@ class MeshSane:
                 yield Check(
                     False,
                     f"{p.key} is {p.info.size[0]:.3f} x {p.info.size[1]:.3f} x {p.info.size[2]:.3f} mm: probably a mesh in metres; "
-                    f"`shambu rotate FILE -o DIR --scale 1000` writes a mm copy",
+                    f'add "orientation": "auto" to the part (Studio converts the unit first) or run '
+                    f"`shambu rotate FILE -o DIR --convert-unit` for a mm copy",
                 )
             if p.info.parts > 1:
                 yield Check(True, f"{p.key}: the STL holds {p.info.parts} bodies; `shambu split` if they are separate parts")

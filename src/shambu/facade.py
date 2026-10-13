@@ -70,8 +70,9 @@ class Bambu:
             spec = load_spec(spec)
         return self.pipeline().build(spec, export=export, timeout=timeout, keep_going=keep_going, do_slice=do_slice)
 
-    def inspect(self, path: str | Path) -> dict:
-        return Project(str(path)).summary()
+    def inspect(self, path: str | Path, features: bool = True) -> dict:
+        """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature."""
+        return Project(str(path)).summary(features=features)
 
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)

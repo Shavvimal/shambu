@@ -317,6 +317,31 @@ def test_spec_missing_key_is_exit_1(capsys, tmp_path):
     assert code == 1 and "bad spec" in one_json(out)["error"]
 
 
+def test_spec_short_at_is_exit_1(capsys, tmp_path):
+    """`"at": [20]` raises IndexError in Spec.from_json: still one error document and exit 1."""
+    p = write_spec(tmp_path, plates=[{"name": "p", "parts": [{"path": "/a.stl", "at": [20]}]}])
+    code, out, err = run(capsys, "--json", "check", str(p))
+    assert code == 1 and err == ""
+    assert "bad spec (IndexError" in one_json(out)["error"]
+
+
+def test_sweep_bad_plates_before_the_run_is_exit_1(capsys, tmp_path):
+    """--by-object reads the plate list before any variant builds; a non-list there is one error document, exit 1."""
+    p = write_spec(tmp_path, plates=5)
+    code, out, err = run(capsys, "--json", "sweep", str(p), "--by-object", "--no-slice")
+    assert code == 1 and err == ""
+    assert "bad spec (TypeError" in one_json(out)["error"]
+
+
+def test_sweep_structurally_bad_spec_fails_each_variant(capsys, tmp_path):
+    """`"process": {}` fails Spec.from_json in every variant: the sweep records each as failed, prints one document."""
+    p = write_spec(tmp_path, process={})
+    code, out, _ = run(capsys, "--json", "sweep", str(p), "--by-object", "--no-slice")
+    j = one_json(out)
+    assert code == 1 and [r["name"] for r in j] == ["baseline", "by-object"]
+    assert all(r["ok"] is False and "bad spec for variant" in r["problems"][0] for r in j)
+
+
 def test_check_without_the_binary_stays_exit_3(capsys, tmp_path, monkeypatch):
     def missing(self):
         raise StudioError("Bambu Studio binary not found")

@@ -16,7 +16,8 @@ the answer off a table instead of guessing. A variant is a small JSON patch over
   "merge": {"bed_type": "Cool Plate"}             # RFC 7386 merge patch over the whole spec, applied last
 }
 
-`orientation_variants()` turns the best candidates of `mesh.candidates()` into variants for one part, and
+`orientation_variants()` turns the best candidates of `mesh.candidates()` (or, with `source="studio"`, of Studio's
+own auto-orient table) into variants for one part, and
 `by_object_variant()` flips every plate to print-by-object, so the two hacks the skill leans on most are one
 flag each on the command line.
 """
@@ -25,15 +26,20 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import mesh as M
 from .errors import BambuError, BuildError
 from .spec import Spec
+
+if TYPE_CHECKING:
+    from .studio import StudioCLI
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 BASELINE = "baseline"
@@ -61,10 +67,12 @@ def _part_key(p: dict) -> str:
 
 def _patch_part(part: dict, change: dict) -> dict:
     """`set` merges; every other key (including `recipes`) replaces, so a variant that adds a recipe must repeat the
-    part's existing ones."""
+    part's existing ones. A None value deletes the key (an orientation variant drops `"orientation": "auto"`)."""
     out = dict(part)
     for k, v in change.items():
-        if k == "set":
+        if v is None:
+            out.pop(k, None)
+        elif k == "set":
             out["set"] = {**out.get("set", {}), **v}
         else:
             out[k] = copy.deepcopy(v)
@@ -112,8 +120,23 @@ def apply_variant(spec_json: dict, variant: dict) -> dict:
     return d
 
 
-def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold_deg: float = M.DEFAULT_THRESHOLD) -> list[dict]:
-    """One variant per best orientation of the part (its first file), from `mesh.candidates()`."""
+SOURCES = ("own", "studio")
+
+
+def orientation_variants(
+    spec_json: dict,
+    part_key: str,
+    top: int = 4,
+    threshold_deg: float = M.DEFAULT_THRESHOLD,
+    source: str = "own",
+    studio: StudioCLI | None = None,
+) -> list[dict]:
+    """One variant per best orientation of the part (its first file). `source="own"`: `mesh.candidates()`, by
+    shambu's score. `source="studio"`: Studio's auto-orient table (`StudioCLI.orient()`), each vector negated into a
+    `lay_on_face`, kept when shambu's `stands` check passes, top `top` by Studio's unprintability; the variant still
+    bakes the turn with `mesh.oriented_copies()`. A variant drops a part's `"orientation": "auto"`."""
+    if source not in SOURCES:
+        raise BuildError(f"orientation source {source!r} not in {SOURCES}")
     path = None
     for pl in spec_json.get("plates", []):
         for p in pl.get("parts", []):
@@ -121,7 +144,10 @@ def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold
                 path = p.get("path") or (p.get("parts") or [{}])[0].get("path")
     if not path:
         raise BuildError(f"no part with key {part_key!r} in the spec")
-    cands = [c for c in M.candidates(M.read_stl(Path(path).expanduser()), threshold_deg) if c.metrics.stands][:top]
+    facets = M.read_stl(Path(path).expanduser())
+    if source == "studio":
+        return _studio_variants(part_key, Path(path).expanduser(), facets, top, threshold_deg, studio)
+    cands = [c for c in M.candidates(facets, threshold_deg) if c.metrics.stands][:top]
     if not cands:
         raise BuildError(
             f"{part_key}: no orientation puts a flat face on the bed (an organic part); orient it by hand or add a flat base in CAD"
@@ -132,8 +158,48 @@ def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold
         out.append(
             {
                 "name": f"{part_key}-{i}-{label}",
-                "parts": {part_key: {"lay_on_face": [round(v, 6) for v in c.normal], "rotate": [0, 0, 0]}},
+                "parts": {part_key: {"lay_on_face": [round(v, 6) for v in c.normal], "rotate": [0, 0, 0], "orientation": None}},
                 "orientation": c.to_json(),
+            }
+        )
+    return out
+
+
+def _studio_variants(
+    part_key: str, path: Path, facets: list[M.Facet], top: int, threshold_deg: float, studio: StudioCLI | None
+) -> list[dict]:
+    if studio is None:
+        from .studio import StudioCLI
+
+        studio = StudioCLI()
+    # No unit fix here: the variant bakes the turn into the ORIGINAL file, so the vectors must be in its frame
+    # (a direction does not change with a uniform scale anyway).
+    with tempfile.TemporaryDirectory(prefix="shambu-orient-") as tmp:
+        res = studio.orient([path], Path(tmp), convert_unit=False)
+    seen: list[M.Vec] = []
+    picked = []
+    for c in res.candidates:  # sorted by unprintability, best first
+        o = M.from_studio_vector(c.vector)
+        n = M.unit(o.lay_on_face)  # type: ignore[arg-type]
+        if any(M._dot(s, n) > math.cos(math.radians(1.0)) for s in seen):
+            continue
+        seen.append(n)
+        m = M.metrics(M.transform(facets, M.lay_on_face_matrix(n)), threshold_deg)
+        if m.stands:
+            picked.append((c, o, m))
+        if len(picked) >= top:
+            break
+    if not picked:
+        raise BuildError(
+            f"{part_key}: none of Studio's {len(res.candidates)} orientations puts a flat face on the bed; orient it by hand or add a flat base in CAD"
+        )
+    out = []
+    for i, (c, o, m) in enumerate(picked, 1):
+        out.append(
+            {
+                "name": f"{part_key}-{i}-studio-{o.tag()}"[:80],
+                "parts": {part_key: {"lay_on_face": [round(v, 6) for v in o.lay_on_face or ()], "rotate": [0, 0, 0], "orientation": None}},
+                "orientation": {"label": f"studio {i}", "source": "studio", **c.to_json(), **m.to_json()},
             }
         )
     return out
@@ -166,6 +232,13 @@ def check_names(variants: Sequence[dict], baseline: bool = True) -> None:
         seen.add(name)
 
 
+TIME_ROLES = ("Support", "Prime tower", "Flush", "Travel")  # result.json feature_type_times keys shown in the table
+
+
+def _round(v: float | None) -> float | None:
+    return None if v is None else round(v, 1)
+
+
 @dataclass
 class VariantResult:
     name: str
@@ -186,7 +259,49 @@ class VariantResult:
         return sum(float(p.get("weight_g") or 0) for p in self.plates)
 
     def feature_total(self, key: str) -> float:
+        """A total from the G-code parser's `features` (0 for a plate without them)."""
         return sum(float((p.get("features") or {}).get(key) or 0) for p in self.plates)
+
+    @property
+    def has_result(self) -> bool:
+        """Every plate carries result.json numbers (seconds per feature, tower plus flush grams)."""
+        return bool(self.plates) and all("feature_times_s" in p for p in self.plates)
+
+    def support_g(self) -> float | None:
+        """Support grams from the G-code parser; 0 on a plate where the slicer used no support; None when unknown."""
+        total = 0.0
+        for p in self.plates:
+            if p.get("features"):
+                total += float(p["features"].get("support_g") or 0)
+            elif p.get("support_used") != "false":
+                return None
+        return total
+
+    def waste_g(self) -> float | None:
+        """Prime tower plus flush grams: result.json (total minus main per filament), else the G-code parser."""
+        if self.has_result:
+            return sum(float(f.get("waste_g") or 0) for p in self.plates for f in p.get("filaments") or [])
+        return self.feature_total("waste_g") if any(p.get("features") for p in self.plates) else None
+
+    def filament_changes(self) -> int | None:
+        """Tool switches from the G-code parser (0 on a one-filament plate); None when a plate lacks the count.
+        Not result.json `filament_change_times`: it counts filament loads and gave 0 against 41 nozzle switches on an
+        X2D plate (live 2026-10-13), and the nozzle switch is the swap that print-by-object removes."""
+        total = 0
+        for p in self.plates:
+            if p.get("filament_changes") is not None:
+                total += int(p["filament_changes"])
+            elif p.get("features"):
+                total += int(p["features"].get("filament_changes") or 0)
+            else:
+                return None
+        return total
+
+    def feature_time(self, role: str) -> float | None:
+        """Seconds spent on one ExtrusionRole (or "Travel") over all plates, from result.json; None without it."""
+        if not self.has_result:
+            return None
+        return sum(float((p.get("feature_times_s") or {}).get(role) or 0) for p in self.plates)
 
     def to_json(self) -> dict:
         return {
@@ -196,9 +311,10 @@ class VariantResult:
             "sliced": self.sliced,
             "total_s": self.total_s,
             "total_g": round(self.total_g, 1),
-            "support_g": round(self.feature_total("support_g"), 1),
-            "waste_g": round(self.feature_total("waste_g"), 1),
-            "filament_changes": int(self.feature_total("filament_changes")),
+            "support_g": _round(self.support_g()),
+            "waste_g": _round(self.waste_g()),
+            "filament_changes": self.filament_changes(),
+            "feature_times_s": {k: round(v, 1) for k in TIME_ROLES if (v := self.feature_time(k)) is not None},
             "plates": self.plates,
             "problems": self.problems,
             "report": self.report,
@@ -216,17 +332,21 @@ def run(spec_json: dict, variants: Sequence[dict], build: Builder, *, do_slice: 
     out: list[VariantResult] = []
     for v in todo:
         try:
-            d = apply_variant(spec_json, v)
-            if "outdir" not in d:
-                raise BuildError("spec lacks 'outdir'")
-            d["outdir"] = str(Path(d["outdir"]).expanduser() / "sweep" / v["name"])
-            spec = Spec.from_json(d)
+            try:  # a structurally bad spec or variant (e.g. "process": {}) fails this variant, not the whole sweep
+                d = apply_variant(spec_json, v)
+                if "outdir" not in d:
+                    raise BuildError("spec lacks 'outdir'")
+                d["outdir"] = str(Path(d["outdir"]).expanduser() / "sweep" / v["name"])
+                spec = Spec.from_json(d)
+            except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
+                raise BuildError(f"bad spec for variant '{v['name']}' ({type(e).__name__}: {e})") from e
             r = build(spec, do_slice)
         except BambuError as e:  # a preset, mesh or Studio failure of ONE variant: record it, keep sweeping
             out.append(VariantResult(v["name"], False, "", do_slice, problems=[str(e)], orientation=v.get("orientation")))
             continue
         j = r.to_json()
         problems = list(j.get("problems") or []) + [f"verify: {x}" for x in (j.get("verify_problems") or [])]
+        problems += [f"check: {text}" for pl in j.get("plates") or [] for ok, text in pl.get("checks") or [] if not ok]
         if j.get("cli") and r.run is not None and not r.run.ok:
             problems.append(f"export failed: {r.run.summary()}")
         plates = [
@@ -236,6 +356,8 @@ def run(spec_json: dict, variants: Sequence[dict], build: Builder, *, do_slice: 
                 "weight_g": e.get("weight_g", 0.0),
                 "filaments": e.get("filaments", []),
                 "features": e.get("features"),
+                "support_used": e.get("support_used"),
+                **{k: e[k] for k in ("feature_times_s", "main_prediction_s", "filament_changes", "studio_filament_change_times") if k in e},
             }
             for e in j.get("estimates", [])
         ]
@@ -261,18 +383,28 @@ def table(results: Sequence[VariantResult]) -> list[str]:
     ok = sorted((r for r in results if r.ok and r.plates), key=lambda r: (r.total_s, r.total_g))
     rest = [r for r in results if not (r.ok and r.plates)]
     best = ok[0] if ok else None
+    mins = "".join(f" {h:>10}" for h in _TIME_HEADS)
     lines = [
-        f"{'variant':34s} {'time':>7} {'grams':>7} {'vs best':>8} {'support':>8} {'waste':>6} {'swaps':>5}  filament grams per slot / problems"
+        f"{'variant':34s} {'time':>7} {'grams':>7} {'vs best':>8} {'support':>8} {'waste':>6} {'swaps':>5}{mins}  filament grams per slot / problems"
     ]
     for r in ok:
         delta = f"+{_hms(60 * (_mins(r.total_s) - _mins(best.total_s)))}" if best and r is not best else ("best" if best else "")
         fil = ", ".join(f"{f['id']}:{f['used_g']:.0f}" for p in r.plates for f in p["filaments"])
-        feats = any(p.get("features") for p in r.plates)
-        sup = f"{r.feature_total('support_g'):8.1f}" if feats else f"{'-':>8}"
-        waste = f"{r.feature_total('waste_g'):6.1f}" if feats else f"{'-':>6}"
-        swaps = f"{int(r.feature_total('filament_changes')):5d}" if feats else f"{'-':>5}"
-        lines.append(f"{r.name:34s} {_hms(r.total_s):>7} {r.total_g:7.1f} {delta:>8} {sup} {waste} {swaps}  {fil}")
+        sup, waste, swaps = r.support_g(), r.waste_g(), r.filament_changes()
+        cells = f"{_cell(sup, 8)} {_cell(waste, 6)} {_cell(swaps, 5, '5d')}"
+        times = "".join(f" {_cell(None if (t := r.feature_time(k)) is None else t / 60, 10)}" for k in TIME_ROLES)
+        lines.append(f"{r.name:34s} {_hms(r.total_s):>7} {r.total_g:7.1f} {delta:>8} {cells}{times}  {fil}")
     for r in rest:
         why = r.problems[0] if r.problems else ("not sliced" if not r.plates else "failed")
-        lines.append(f"{r.name:34s} {'-':>7} {'-':>7} {'FAIL':>8} {'-':>8} {'-':>6} {'-':>5}  {why}")
+        dashes = "".join(f" {'-':>10}" for _ in TIME_ROLES)
+        lines.append(f"{r.name:34s} {'-':>7} {'-':>7} {'FAIL':>8} {'-':>8} {'-':>6} {'-':>5}{dashes}  {why}")
     return lines
+
+
+_TIME_HEADS = ("supp min", "tower min", "flush min", "travel min")  # TIME_ROLES in minutes, from result.json
+
+
+def _cell(v: float | None, width: int, fmt: str = "") -> str:
+    if v is None:
+        return f"{'-':>{width}}"
+    return f"{int(v):{fmt}}" if fmt else f"{v:{width}.1f}"

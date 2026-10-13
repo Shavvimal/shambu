@@ -139,6 +139,12 @@ def test_aux_x_limit():
     assert failures([part("a", filament=1, x0=220, y0=30)], aux_x_limit=235.5) == []
 
 
+def test_aux_x_limit_counts_the_brim_margin():
+    """The mesh ends at x 230 (under 235.5), but its 10 mm brim and support margin reaches x 240."""
+    t = failures([part("a", filament=2, x0=210, y0=30, margin=10)], aux_x_limit=235.5)
+    assert any("aux_x_limit" in x and "240.0" in x for x in t)
+
+
 def test_filament_map_redirects_reach():
     assert failures([part("a", filament=2, x0=5, y0=30)], filament_extruder={2: 1}) == []
 
@@ -173,7 +179,7 @@ def test_custom_rule_set():
 # ---------------------------------------------------------------------------- batch 1 (real-STL test findings)
 def test_mesh_in_metres_fails_the_check():
     t = failures([part("jaw", w=0.022, h=0.092, z=0.048, x0=30, y0=30)])
-    assert any("probably a mesh in metres" in x and "--scale 1000" in x for x in t)
+    assert any("probably a mesh in metres" in x and "--convert-unit" in x for x in t)
     assert not any("metres" in x for x in failures([part("a", w=0.5, h=20, z=10, x0=30, y0=30)]))  # one thin axis is fine
 
 

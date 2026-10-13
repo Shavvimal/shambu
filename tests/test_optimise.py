@@ -266,6 +266,21 @@ def test_sweep_failed_variant_sinks(tmp_path):
     assert S.table(res)[-1].startswith("bad") and "FAIL" in S.table(res)[-1]
 
 
+def test_sweep_bad_spec_fails_the_variant_not_the_sweep(tmp_path):
+    res = S.run({**BASE, "outdir": str(tmp_path), "process": {}}, [{"name": "v"}], lambda s, d: _Result(True, 10, 1.0))
+    assert [(r.name, r.ok) for r in res] == [("baseline", False), ("v", False)]
+    assert "bad spec for variant 'baseline' (KeyError" in res[0].problems[0]
+
+
+def test_sweep_failed_plate_check_is_a_problem(tmp_path):
+    """A placement failure has no plan problem and no estimate: the check text must reach the variant and the table."""
+    r = _Result(False, 0, 0.0)
+    r._j["plates"] = [{"name": "p", "checks": [[True, "a fits"], [False, "a and b overlap (footprints with brim margins)"]]}]
+    res = S.run({**BASE, "outdir": str(tmp_path)}, [], lambda s, d: r)
+    assert res[0].ok is False and res[0].problems == ["check: a and b overlap (footprints with brim margins)"]
+    assert "check: a and b overlap" in S.table(res)[-1] and "not sliced" not in S.table(res)[-1]
+
+
 # ---------------------------------------------------------------------------- CLI
 @pytest.fixture(autouse=True)
 def fake_app(monkeypatch, resolver):

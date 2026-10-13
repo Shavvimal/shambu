@@ -195,3 +195,24 @@ def test_verify_counts_a_group_as_one_object(tmp_path, stls, resolver):
     d = spec_dict(tmp_path, stls)
     d["plates"][0]["group_by_filament"] = False  # three objects expected, the file holds two
     assert "2 objects in file, expected 3" in pipe.verify(pipe.plan(Spec.from_json(d)), two)
+
+
+def test_a_filament_two_group_packs_inside_the_right_nozzle_reach(tmp_path, stls, resolver):
+    """Three 80 x 20 parts on filament 2 fit one 250 mm row of the whole bed, but the right nozzle reaches only
+    x 20.5..256: the cluster packs in two rows inside that reach, so the plate places it with no reach failure."""
+    d = spec_dict(tmp_path, stls, parts=[{"path": str(stls[n]), "filament": 2} for n in ("body", "base", "text")])
+    sizes = {f"{n}.stl": (80.0, 20.0, 10.0) for n in ("body", "base", "text")}
+    plan = Pipeline(FakeStudio(sizes=sizes), resolver).plan(Spec.from_json(d))
+    assert plan.ok, (plan.problems, fails(plan))
+    (g,) = plan.parts
+    assert g.grouped and len(g.members) == 3
+    assert g.placed.x0 >= 20.5 and g.placed.x1 <= 254.0
+    assert g.placed.info.size[0] < 250.0  # two rows, not one 250 mm row
+
+
+def test_a_group_that_cannot_fit_the_reach_prints_as_separate_objects(tmp_path, stls, resolver):
+    d = spec_dict(tmp_path, stls, parts=[{"path": str(stls[n]), "filament": 2} for n in ("body", "base")])
+    sizes = {"body.stl": (150.0, 150.0, 10.0), "base.stl": (150.0, 150.0, 10.0)}
+    plan = Pipeline(FakeStudio(sizes=sizes), resolver).plan(Spec.from_json(d))
+    assert not any(x.grouped for x in plan.parts) and len(plan.parts) == 2
+    assert any("group-f2 not merged" in w and "print as separate objects" in w for w in plan.warnings)

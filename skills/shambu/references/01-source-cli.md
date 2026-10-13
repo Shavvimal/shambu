@@ -83,7 +83,12 @@ marked **UNVERIFIED** are inferences that need a run to confirm.
 10. **`--orient 1` overwrites each object's config with the whole process preset**
     (`o->config.assign_config(load_process_config)`, `BS.cpp:5216`). This drops the
     per-object `extruder` and turns every process key into a per-object override.
-    Do not use `--orient 1` with `--load-settings`; orient meshes yourself.
+    The replacement happens only when `--load-settings` loaded a process (`BS.cpp:5215-5217`)
+    and only hurts objects that already carry per-object keys (assemble-list `print_params`,
+    `extruder`). So: never pass `--orient 1` on the slicing run with an assemble list. An
+    orient-only run on positional STLs is safe, even with `--load-settings` (it then uses the
+    process's `support_threshold_angle`). shambu runs it as pass 1 for `"orientation": "auto"`
+    (PLAN-native-cli section 2.1).
 
 ---
 
@@ -174,7 +179,7 @@ String, Strings (`;`-list), Ints (`,`-list). "A" = action, "T" = transform, "M" 
 | `--normative-check` | A | Bool | **true** | For 3MF input only: non-empty `post_process` → -19 (`BS.cpp:1950-1960`). Disable with `--normative-check=0`. |
 | `--pipe <name>` | A | String | "" | Linux only (finding 4). On macOS: no effect, but it is an action. |
 | `--arrange <n>` | T | Int | 0 | 0 → `need_arrange=false`; 1 → true; other → keep automatic (`BS.cpp:5060-5075`). Automatic = false for a Bambu 3MF, true for STL/OBJ input. **Ignored for assemble lists** (they use per-plate `need_arrange`). |
-| `--orient <n>` | T | Int | 0 | 1 → orient every object with `orientation::orient()`, after replacing the object config with the process preset (finding 10, `BS.cpp:4982-5011, 5207-5223`). 0 → no orient. |
+| `--orient <n>` | T | Int | 0 | 1 → orient every object with `orientation::orient()`, after replacing the object config with the process preset (finding 10, `BS.cpp:4982-5011, 5207-5223`). 0 → no orient. The config replacement happens only when `--load-settings` loaded a process (`BS.cpp:5215-5217`) and only hurts when objects already carry `print_params`. An orient-only run on positional STLs is safe (PLAN-native-cli section 2.1). The candidate table (vector, then `overhang, bottom, bothull, contour, A_laf, A_prj, unprintability`; sorted by the last) goes to stdout at any debug level; the printed vector ends up pointing up, so `lay_on_face = -best`. |
 | `--ensure-on-bed` | T | Bool | false | After transforms/arrange: `o->ensure_on_bed()` for all objects (`BS.cpp:6182-6188`). STL/OBJ *positional* inputs are always put on the bed at load (`BS.cpp:2124`); assemble-list objects are not. |
 | `--repetitions <n>` | T | Int | 1 | Duplicates the plate n-1 times with a binary search for the largest count that fits; needs `--slice <plate>` > 0 (`BS.cpp:4947-4968, 5232-5260, 5585-6165`). |
 | `--assemble` | T | Bool | false | Merges all loaded objects into one object "Assembly" (`BS.cpp:4925-4946`). Not with `--clone-objects`. |
@@ -765,7 +770,8 @@ On load, `bed_type` becomes plate `curr_bed_type`; `filament_map_mode="Auto"`
 ### 9.2 Avoid
 
 - `--min-save` (strips the model).
-- `--orient=1` with `--load-settings` (overwrites object configs).
+- `--orient=1` with `--load-settings` on a run with an assemble list (overwrites object configs). An orient-only
+  run on positional STLs is safe.
 - `--pipe` on macOS (no effect).
 - `--export-png` together with any other action.
 - Underscore option names, `--no-*` forms, and space-separated bool values.

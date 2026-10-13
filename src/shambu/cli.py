@@ -76,7 +76,10 @@ def usage(out: Output, msg: str) -> int:
     return 2
 
 
-METRES_WARNING = "the whole mesh is under 1 mm; it is probably in metres. `shambu rotate FILE -o DIR --scale 1000` writes a mm copy."
+METRES_WARNING = (
+    "the whole mesh is under 1 mm; it is probably in metres. `shambu rotate FILE -o DIR --convert-unit` writes a mm copy "
+    '(Studio\'s own unit fix), and "orientation": "auto" on a spec part converts it during the build.'
+)
 THRESHOLD_HELP = "overhang angle from vertical that needs support (default 60, Studio's own; 45 is the cautious rule)"
 
 
@@ -89,7 +92,7 @@ def load_spec_or_error(path: str, out: Output) -> Spec | int:
         return load_spec(path)
     except BuildError as e:
         msg = f"BuildError: {e}"
-    except (KeyError, TypeError, ValueError, AttributeError) as e:
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
         msg = f"BuildError: {path}: bad spec ({type(e).__name__}: {e})"
     out.emit({"error": msg}, [msg])
     return 1
@@ -256,10 +259,17 @@ class Orient(Command):
         p.add_argument("--top", type=int, default=12, help="largest flat faces to try, on top of as-is and the six axis faces (default 12)")
         p.add_argument("--write", metavar="DIR", help="write the best orientation as <DIR>/<stem>__<tag>.stl")
         p.add_argument("--pick", type=int, default=1, help="with --write: which row of the table to write (1 = best)")
+        p.add_argument(
+            "--native",
+            action="store_true",
+            help="print Studio's own auto-orient table (--orient 1) instead of shambu's; with --write, keep Studio's export in DIR",
+        )
 
     def run(self, a, app, out):
         from . import mesh as M
 
+        if a.native:
+            return self._native(a, app, out)
         facets = M.read_stl(a.file)
         if not facets:
             return usage(out, f"{a.file}: the STL has no facets")
@@ -283,6 +293,52 @@ class Orient(Command):
         out.emit(data, lines)
         return 0
 
+    @staticmethod
+    def _native(a, app, out) -> int:
+        import tempfile
+
+        src = Path(a.file)
+        if not src.is_file():
+            return usage(out, f"{a.file}: no such file")
+        st = app.studio_cli()
+        with tempfile.TemporaryDirectory(prefix="shambu-orient-") as tmp:
+            res = st.orient([src], Path(a.write) if a.write else Path(tmp))
+        best = res.best
+        cands = res.candidates
+        data: dict = {
+            "path": str(src),
+            "source": "studio",
+            "seconds": round(res.seconds, 2),
+            "best": best.to_json() if best else None,
+            "candidates": [c.to_json() for c in cands],
+        }
+        lines = [
+            f"{a.file}: Studio auto-orient, {len(cands)} candidates sorted by unprintability (lower is better); {res.seconds:.2f} s",
+            "",
+            f"{'#':>2} {'vector (up)':28s} {'overhang':>9} {'bottom':>8} {'bot_hull':>8} {'contour':>8} {'area_laf':>8} {'area_prj':>8} "
+            f"{'unprint':>9}  lay_on_face [nx, ny, nz]",
+        ]
+
+        def vec(v) -> str:
+            return "[" + ", ".join(f"{x:.4f}" for x in v) + "]"
+
+        for i, c in enumerate(cands, 1):
+            is_best = best is not None and all(abs(x - y) < 1e-3 for x, y in zip(c.vector, best.vector, strict=True))
+            lines.append(
+                f"{i:>2} {vec(c.vector):28s} {c.overhang:9.1f} {c.bottom:8.1f} {c.bottom_hull:8.1f} {c.contour:8.1f} {c.area_laf:8.1f} "
+                f"{c.area_projected:8.1f} {c.unprintability:9.1f}  {vec(c.lay_on_face)}" + ("  BEST" if is_best else "")
+            )
+        lines += [
+            "",
+            'spec: "orientation": "auto" lets Studio pick at build time; "lay_on_face": <a row\'s lay_on_face> fixes one row. '
+            "`shambu sweep --orientations <part> --source studio` slices the best few.",
+        ]
+        if a.write:
+            data["written"] = str(res.files[0])
+            lines.append(f"written: {res.files[0]} (Studio's best, unit converted)")
+        out.emit(data, lines)
+        return 0
+
 
 @command("rotate", "Write a rotated copy of an STL (lay a face on the bed and/or Euler angles), dropped onto z = 0")
 class Rotate(Command):
@@ -291,11 +347,17 @@ class Rotate(Command):
         p.add_argument("-o", "--outdir", required=True)
         p.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="outward normal of the face to put on the bed")
         p.add_argument("--rotate", metavar="X,Y,Z", help="degrees about X, then Y, then Z (applied after --lay-on-face)")
-        p.add_argument(
+        unit = p.add_mutually_exclusive_group()
+        unit.add_argument(
             "--scale",
             type=float,
             default=1.0,
             help="multiply every coordinate first, e.g. 1000 for a mesh in metres (alone: scale and drop)",
+        )
+        unit.add_argument(
+            "--convert-unit",
+            action="store_true",
+            help="let Studio detect metres or inches and convert to mm first (its --convert-unit); alone: convert and drop",
         )
 
     def run(self, a, app, out):
@@ -310,22 +372,37 @@ class Rotate(Command):
             o = M.Orientation.from_json(d)
         except (ValueError, BuildError) as e:
             return usage(out, f"bad --lay-on-face or --rotate: {e}")
-        if o.is_identity and a.scale == 1.0:
-            return usage(out, "nothing to do: give --lay-on-face, --rotate and/or --scale")
+        if o.is_identity and a.scale == 1.0 and not a.convert_unit:
+            return usage(out, "nothing to do: give --lay-on-face, --rotate, --scale or --convert-unit")
         if a.scale <= 0:
             return usage(out, "--scale must be positive")
         src = Path(a.file)
-        if a.scale != 1.0:  # a scaled copy first, so the oriented copy (and its hash) start from mm
+        note = ""
+        if a.convert_unit:  # Studio's unit fix first, so the oriented copy (and its hash) start from mm
+            import tempfile
+
+            if not src.is_file():
+                return usage(out, f"{a.file}: no such file")
+            before = M.bbox(M.read_stl(src))
+            with tempfile.TemporaryDirectory(prefix="shambu-unit-") as tmp:
+                converted = M.read_stl(app.studio_cli().normalise([src], Path(tmp))[0])
+            lo, hi = M.bbox(converted)
+            k = max(hi[i] - lo[i] for i in range(3)) / max(*(before[1][i] - before[0][i] for i in range(3)), 1e-12)
+            note = f"Studio scaled by {k:g}" if abs(k - 1) > 1e-6 else "Studio judged the file to be in mm already: unchanged"
+            converted = M.translate(converted, (-lo[0], -lo[1], -lo[2]))  # dropped onto z = 0 at x, y >= 0
+            src = M.write_stl(Path(a.outdir) / f"{src.stem}__mm.stl", converted, f"{src.stem} mm")
+        elif a.scale != 1.0:  # a scaled copy first, so the oriented copy (and its hash) start from mm
             scaled = M.scale(M.read_stl(src), a.scale)
             lo, _ = M.bbox(scaled)
             scaled = M.translate(scaled, (-lo[0], -lo[1], -lo[2]))  # dropped onto z = 0 at x, y >= 0, as an oriented copy is
             src = M.write_stl(Path(a.outdir) / f"{src.stem}__x{a.scale:g}.stl", scaled, f"{src.stem} x{a.scale:g}")
-        path = M.oriented_copy(src, o, a.outdir)  # the identity orientation (--scale alone) returns the scaled copy
+        path = M.oriented_copy(src, o, a.outdir)  # the identity orientation (--scale or --convert-unit alone) returns that copy
         m = M.metrics(M.read_stl(path))
         out.emit(
-            {"written": str(path), **m.to_json()},
+            {"written": str(path), **m.to_json(), **({"unit": note} if note else {})},
             [
                 f"written {path}: {m.size[0]:.1f} x {m.size[1]:.1f} x {m.size[2]:.1f} mm, contact {m.contact_mm2:.0f} mm2, support shadow {m.shadow_mm2:.0f} mm2"
+                + (f" ({note})" if note else "")
             ],
         )
         return 0
@@ -361,6 +438,12 @@ class Sweep(Command):
         p.add_argument("--variants", metavar="JSON", help="a JSON file: a list of variants (see `shambu spec` and sweep.py)")
         p.add_argument("--orientations", metavar="PART", action="append", default=[], help="try the best orientations of this part key")
         p.add_argument("--top", type=int, default=4, help="orientations per part for --orientations (default 4)")
+        p.add_argument(
+            "--source",
+            choices=("own", "studio"),
+            default="own",
+            help="candidates for --orientations: shambu's own score (default) or Studio's auto-orient table, ranked by unprintability",
+        )
         p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=THRESHOLD_HELP)
         p.add_argument("--by-object", action="store_true", help="add a variant with every plate on print_sequence 'by object'")
         p.add_argument("--no-slice", action="store_true", help="only plan and export; no time or filament numbers")
@@ -377,7 +460,9 @@ class Sweep(Command):
                 raise BuildError(f"{a.spec}: cannot read the spec: {e}") from e
             variants: list[dict] = S.load_variants(a.variants) if a.variants else []
             for key in a.orientations:
-                variants += S.orientation_variants(spec_json, key, a.top, a.threshold)
+                variants += S.orientation_variants(
+                    spec_json, key, a.top, a.threshold, source=a.source, studio=app.studio_cli() if a.source == "studio" else None
+                )
             if a.by_object:
                 variants.append(S.by_object_variant(spec_json))
             if not variants and a.no_baseline:
@@ -385,6 +470,10 @@ class Sweep(Command):
             S.check_names(variants, baseline=not a.no_baseline)
         except BuildError as e:
             out.emit({"error": f"BuildError: {e}"}, [f"BuildError: {e}"])
+            return 1
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:  # a structurally bad spec or variant
+            msg = f"BuildError: {a.spec}: bad spec ({type(e).__name__}: {e})"
+            out.emit({"error": msg}, [msg])
             return 1
         results = S.run(
             spec_json,
@@ -440,7 +529,7 @@ class Inspect(Command):
         p.add_argument("file")
 
     def run(self, a, app, out):
-        s = app.inspect(a.file)
+        s = app.inspect(a.file, features=out.as_json)  # only --json shows grams by feature, so only it parses the G-code
         lines = [
             f"{a.file}: {s['application']}, {'SLICED' if s['sliced'] else 'unsliced'}",
             f"printer {s['printer']}; process {s['process']}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']}); "

@@ -23,8 +23,10 @@ send a job. Request: $ARGUMENTS
 ## Workflow (copy this checklist into the reply)
 
 - [ ] 1. Spec: write `plate.json` (example below; the full shape: `shambu spec`; the settings bundles: `shambu recipes`).
-- [ ] 2. Orient: `shambu orient part.stl` for every part that does not already lie on an obvious flat face; put
-      the chosen `lay_on_face` in the spec. A mesh under 1 mm is in metres: `shambu rotate part.stl -o DIR --scale 1000`.
+- [ ] 2. Orient: for a single-file part that does not already lie on an obvious flat face, `"orientation": "auto"`
+      lets Studio's auto-orient turn it at build time (it also converts a mesh in metres). To choose by hand,
+      `shambu orient part.stl` (add `--native` for Studio's table) and put the chosen `lay_on_face` in the spec. A
+      mesh under 1 mm is in metres: `shambu rotate part.stl -o DIR --convert-unit`.
 - [ ] 3. Check: `shambu check plate.json` until every line reads OK (presets, measurements, placement, reach,
       by-object rules).
 - [ ] 4. Compare when the answer is not obvious: `shambu sweep plate.json --orientations PART --by-object`
@@ -55,8 +57,8 @@ by-layer layout still needs 60 mm between objects.
 ```
 
 A part is a `path` with `filament`, `count`, `recipes`, `set` (keys as strings), `height_ranges`, `at` [x, y],
-`lay_on_face` [nx, ny, nz] and `rotate` [x, y, z] degrees; or `parts` (several files merged into one object,
-turned together). Per plate: `pause_at_z`, `colour_changes`, `print_sequence`, `group_by_filament` (by object:
+`lay_on_face` [nx, ny, nz] and `rotate` [x, y, z] degrees, or `"orientation": "auto"` (not with either); or
+`parts` (several files merged into one object, turned together). Per plate: `pause_at_z`, `colour_changes`, `print_sequence`, `group_by_filament` (by object:
 same-filament parts with the same settings merge into one object, packed close inside, 60 mm between groups).
 `aux_x_limit: 235.5` applies the user's stricter reading of the right nozzle.
 
@@ -83,10 +85,11 @@ holds the same facts; quote it, do not paraphrase numbers.
 ```
 shambu doctor | info FILE... | presets list filament --contains PETG | recipes | spec
 shambu orient PART.stl [--threshold 60] [--top 12] [--write DIR]      # score orientations: contact, support shadow, height
-shambu rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] [--rotate x,y,z] [--scale 1000]
+shambu orient PART.stl --native [--write DIR]                         # Studio's auto-orient table, lay_on_face = -vector
+shambu rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] [--rotate x,y,z] [--scale 1000 | --convert-unit]
 shambu split PART.stl -o DIR                                           # one STL per body
 shambu check plate.json | build plate.json [--slice] [--open]
-shambu sweep plate.json [--orientations PART]... [--by-object] [--variants v.json] [--no-slice]
+shambu sweep plate.json [--orientations PART]... [--source own|studio] [--by-object] [--variants v.json] [--no-slice]
 shambu inspect project.3mf
 shambu patch project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 --print-sequence "1:by object"
 shambu printer status [--ip IP] | printer watch --every 300            # read-only
@@ -107,7 +110,7 @@ or verification failed, 2 usage, 3 environment.
 | PETG part with PLA loaded too (or the reverse) | `dual-material-interface`: the other material as interface only, map 1,2, supported features at x >= 20.5 |
 | Two filaments, several single-colour objects | `print_sequence` by object with `group_by_filament`; sweep `--by-object` to confirm (measured 1 h 24 to 40 min; merged groups 21 min against 29 min as separate objects and 42 min by layer on four cubes); it loses on many tiny parts; biggest-volume filament on the left nozzle |
 | Colour on a face | horizontal colour bands (Z) beat vertical ones (12 min vs 68 min for the same text); text face down as gaps in the first layers (`two-colour-first-layers`); no second filament loaded: `pause_at_z` |
-| Orientation unclear | `shambu orient`, then `sweep --orientations`; priority: load direction, then supports and finish, then time; largest flat face down otherwise; show faces up or on a side; bed-facing fillets are a CAD fix (chamfer). The score misreads bridges and favours standing a thin part: the sweep decides |
+| Orientation unclear | `"orientation": "auto"` for a quick answer (Studio's auto-orient, single-file parts); to compare, `sweep --orientations PART --source studio` (Studio's candidates) or the default `--source own`; priority: load direction, then supports and finish, then time; largest flat face down otherwise; show faces up or on a side; bed-facing fillets are a CAD fix (chamfer). Both scores misread bridges, and shambu's favours standing a thin part: the sweep decides |
 | Time matters | `coarse-fast` (0.28), `fast-infill`, Standard not High Quality (1666 s vs 1062 s for the same 0.16 layers on a cube), fewer top shells on hidden tops, colour changes near the bottom; a `height_ranges` entry with a coarser `layer_height` above the detail |
 | Top surface rough or a show face | `fine-0.16` only on the part that needs it (flat solid tops look worse and print slower); `top-concentric` on round tops; `iron-top` on one flat face; keep the X2D defaults (monotonic-line top, one wall on all top surfaces, 0.42 top line width) elsewhere |
 | Finish matters | `scarf-seam` on cylinders, `seam-back` on cornered parts, `show-walls`, `precise-fit` for fits, `fuzzy-skin` to hide lines; matte filament, polish or resin after (`references/09-user-notes.md`) |

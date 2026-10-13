@@ -23,8 +23,8 @@ from . import presets as P
 from . import recipes as R
 from .errors import BambuError, BuildError
 from .patches import AddCustomGcode, PatchSet, RenameObject, SetBedTypeEverywhere, SetFilamentColours, SetFilamentMap
-from .spec import FileRef, PartSpec, Spec
-from .studio import CliCommand, MeshInfo, RunResult, StudioCLI
+from .spec import FileRef, LayoutSpec, PartSpec, Spec
+from .studio import CliCommand, MeshInfo, OrientResult, RunResult, SlicedPlate, StudioCLI
 from .threemf import Project
 
 log = logging.getLogger(__name__)
@@ -127,6 +127,10 @@ class PlannedPart:
     # group's bbox start (x0, y0). Their `placed` holds bed coordinates once `place_members` ran.
     members: list[PlannedPart] = field(default_factory=list)
     offsets: list[tuple[float, float]] = field(default_factory=list)
+    # "orientation": "auto": Studio's pass-1 result (a single-file part), or the lay_on_face shambu's own scorer chose
+    # (a merged part, which must turn in one frame)
+    orient: OrientResult | None = None
+    auto_face: tuple[float, float, float] | None = None
 
     @property
     def assembled(self) -> bool:
@@ -184,6 +188,51 @@ class Plan:
         return [x for p in self.plates for x in p.parts]
 
 
+def used_filaments(slice_d: dict) -> int:
+    """Filaments with grams on a plate per slice_info.config."""
+    return sum(1 for f in slice_d.get("filaments") or [] if float(f.get("used_g") or 0) > 0)
+
+
+def _estimate(plate: dict, sp: SlicedPlate | None) -> dict:
+    e = {"plate": plate["id"], **plate["slice"]}
+    ft = e.get("features")
+    if ft:  # tool switches in the G-code: on a two-nozzle X2D a nozzle switch is the swap (result.json counts 0 there)
+        e["filament_changes"] = ft["filament_changes"]
+    elif used_filaments(e) <= 1:
+        e["filament_changes"] = 0
+    if sp is None:
+        return e
+    by_slot = {f.id: f for f in sp.filaments}
+    fils = []
+    for f in e.get("filaments") or []:
+        try:
+            rf = by_slot.get(int(f.get("id")))
+        except (TypeError, ValueError):
+            rf = None
+        if rf is not None:
+            f = {**f, "total_g": round(rf.total_g, 2), "main_g": round(rf.main_g, 2), "waste_g": round(rf.waste_g, 2)}
+        fils.append(f)
+    e["filaments"] = fils
+    e["feature_times_s"] = {k: round(v, 1) for k, v in sp.feature_times_s.items()}
+    e["main_prediction_s"] = int(sp.main_s)
+    e["studio_filament_change_times"] = sp.filament_change_times
+    return e
+
+
+def summarise(project: Path, run: RunResult | None) -> dict:
+    """Project.summary() plus the G-code parser only where it adds something: support grams on a plate whose slice
+    used support, the tool-switch count on a plate with more than one filament (one filament means 0 switches), and
+    every plate when the run left no result.json (the parser is then the only source of tower and flush grams)."""
+    pr = Project(str(project))
+    s = pr.summary()
+    have_result = bool(run and run.plates())
+    for p in s["plates"]:
+        sl = p.get("slice")
+        if sl is not None and (not have_result or sl.get("support_used") != "false" or used_filaments(sl) > 1):
+            sl["features"] = pr.feature_usage(p["id"])
+    return s
+
+
 @dataclass
 class BuildResult:
     plan: Plan
@@ -216,6 +265,15 @@ class BuildResult:
         w = (self.run.result or {}).get("warning_message") if self.run else None
         return [str(w)] if w else []
 
+    def estimates(self) -> list[dict]:
+        """Per sliced plate: slice_info.config (time, grams, filaments; `features` from the G-code parser when present),
+        merged with the run's result.json: `feature_times_s` (role -> seconds), `main_prediction_s` (without prepare,
+        tower and flush), `studio_filament_change_times` (filament loads, 0 on a two-nozzle plate), and per filament
+        `total_g`, `main_g` (model + support) and `waste_g` (flush + tower). The result.json keys are absent when the
+        run left no result.json. `filament_changes` is the parser's tool-switch count (0 on a one-filament plate)."""
+        by_id = {sp.id: sp for sp in (self.run.plates() if self.run else [])}
+        return [_estimate(p, by_id.get(p["id"])) for p in (self.summary or {}).get("plates", []) if p.get("slice")]
+
     def to_json(self) -> dict:
         problems = list(self.plan.problems) + ([self.export_problem()] if self.export_problem() else [])
         return {
@@ -224,7 +282,7 @@ class BuildResult:
             "ok": self.ok,
             "plan_ok": self.plan.ok,
             "sliced": self.sliced and self.exported,
-            "estimates": [{"plate": p["id"], **p["slice"]} for p in (self.summary or {}).get("plates", []) if p.get("slice")],
+            "estimates": self.estimates(),
             "problems": problems,
             "warnings": list(dict.fromkeys(self.plan.warnings + self.slicer_warnings())),
             "plates": [
@@ -298,7 +356,7 @@ class Pipeline:
                 if result.run.ok:
                     result.patches = self.patch(plan, result.project, do_slice)
                     result.verify_problems = self.verify(plan, result.project, do_slice)
-                    result.summary = Project(str(result.project)).summary()
+                    result.summary = summarise(result.project, result.run)
         result.report = self.report(result)
         result.report_path = plan.outdir / f"{spec.name}.report.md"
         result.report_path.write_text(result.report, encoding="utf-8")
@@ -362,12 +420,19 @@ class Pipeline:
         plates: list[PlannedPlate] = []
         used_keys: set[str] = set()
         k = 0  # assemble_index: unique across the project, as object names are global
+        # Native orientation (pass 1) loads the same machine and process JSON as the export (pass 2), so Studio's
+        # auto-orient uses the process's support_threshold_angle. write_inputs() writes the same files again later.
+        orient_settings = (
+            [P.write(machine, workdir / "machine.json"), P.write(process, workdir / "process.json")]
+            if any(ps.orientation.auto for pl in spec.plates for ps in pl.parts)
+            else None
+        )
         for pi, (pspec, seq) in enumerate(zip(spec.plates, sequences, strict=True), 1):
-            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir)
+            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir, orient_settings)
             by_object = seq == "by object"
             if pspec.group_by_filament:
                 if by_object:
-                    parts, notes = self._group_by_filament(parts, spec.layout.gap, bed, used_keys)
+                    parts, notes = self._group_by_filament(parts, spec.layout, bed, ctx, used_keys)
                     warnings += [f"plate {pi} '{pspec.name}': {n}" for n in notes]
                 else:
                     problems.append(
@@ -499,22 +564,47 @@ class Pipeline:
         n_filaments: int,
         used_keys: set[str],
         workdir: Path | None = None,
+        orient_settings: list[Path] | None = None,
     ) -> list[PlannedPart]:
         out: list[PlannedPart] = []
         for si, ps in enumerate(part_specs, 1):
             where = f"plate {plate_no} part {si}"
             files = [(f.path.expanduser().resolve(), f.filament, f.subtype) for f in ps.files()]
-            if not ps.orientation.is_identity and all(fp.is_file() for fp, _, _ in files):
+            o = ps.orientation
+            orient_res: OrientResult | None = None
+            auto_face: tuple[float, float, float] | None = None
+            if not o.is_identity and all(fp.is_file() for fp, _, _ in files):
                 # The CLI cannot turn one object (reference 01), so the orientation is baked into copies of the STLs,
                 # all in one shared frame so the sub-parts of a merged object keep their alignment.
+                odir = (workdir or files[0][0].parent) / "oriented"
+                srcs = [fp for fp, _, _ in files]
                 try:
-                    turned = M.oriented_copies([fp for fp, _, _ in files], ps.orientation, (workdir or files[0][0].parent) / "oriented")
+                    if o.auto and len(srcs) == 1:
+                        # Pass 1: Studio's auto-orient on the bare STL (--convert-unit first), exported with the turn
+                        # baked in. The export (pass 2) loads that file and never passes --orient.
+                        orient_res = self.studio.orient(
+                            srcs, odir / f"{srcs[0].stem}__auto-{M._orientation_hash(srcs, o)}", settings=orient_settings
+                        )
+                        turned = orient_res.files
+                    elif o.auto:
+                        # Studio turns every positional input on its own; a merged part must keep one frame, so it
+                        # takes shambu's own best candidate over all its files.
+                        facets = [f for p in srcs for f in M.read_stl(p)]
+                        cands = M.candidates(facets)
+                        auto_face = next((c for c in cands if c.metrics.stands), cands[0]).normal
+                        turned = M.oriented_copies(srcs, M.Orientation(lay_on_face=auto_face), odir)
+                    else:
+                        turned = M.oriented_copies(srcs, o, odir)
                     files = [(t, fil, sub) for t, (_, fil, sub) in zip(turned, files, strict=True)]
                     stands = M.metrics([f for t in turned for f in M.read_stl(t)]).stands
                     if not stands:
                         problems.append(
                             f"{where} ({ps.key()}): the orientation leaves no flat face on the bed (the part would stand on an edge); "
-                            f"pick a lay_on_face from `shambu orient`"
+                            + (
+                                "Studio's auto-orient found nothing better: add a flat base in CAD or pick a lay_on_face from `shambu orient`"
+                                if o.auto
+                                else "pick a lay_on_face from `shambu orient`"
+                            )
                         )
                 except BambuError as e:
                     problems.append(f"{where}: cannot orient {ps.key()}: {e}")
@@ -558,15 +648,19 @@ class Pipeline:
                 placed = L.Placed(key, body, main, margin=margin, also_filaments=frozenset(eff - {main}))
                 if ps.at is not None and copy == 0:
                     placed.x0, placed.y0, placed.fixed = float(ps.at[0]), float(ps.at[1]), True
-                out.append(PlannedPart(ps, key, files, ok_infos, placed))
+                out.append(PlannedPart(ps, key, files, ok_infos, placed, orient=orient_res, auto_face=auto_face))
         return out
 
     @staticmethod
-    def _group_by_filament(parts: list[PlannedPart], gap: float, bed: dict, used_keys: set[str]) -> tuple[list[PlannedPart], list[str]]:
+    def _group_by_filament(
+        parts: list[PlannedPart], layout: LayoutSpec, bed: dict, ctx: L.Context, used_keys: set[str]
+    ) -> tuple[list[PlannedPart], list[str]]:
         """Merge single-file parts without `at` that share the main filament, the settings and the height ranges into
         one object per cluster (print-by-object then prints the cluster together, by layer, with no nozzle change).
-        The members pack locally with `gap`; the cluster is one `Placed` (union bbox from (0, 0, 0)) for the plate
-        packer. A cluster of one stays as it is. Returns the new part list and notes for the warnings."""
+        The members pack locally with the layout gap inside the area every extruder of the cluster reaches, minus the
+        layout edges (and aux_x_limit for extruder 2), so the plate packer can place the cluster where those nozzles
+        reach; the cluster is one `Placed` (union bbox from (0, 0, 0)). A cluster of one stays as it is. Returns the
+        new part list and notes for the warnings."""
         clusters: dict[tuple, list[PlannedPart]] = {}
         order: list[PlannedPart | tuple] = []
         for p in parts:
@@ -598,11 +692,24 @@ class Pipeline:
             fil = members[0].placed.filament
             seen[fil] += 1
             base = f"group-f{fil}" if per_fil[fil] == 1 else f"group-f{fil}-{seen[fil]}"
-            local = L.ShelfPacker((0.0, bed["x"][1] - bed["x"][0]), (0.0, bed["y"][1] - bed["y"][0]), gap)
+            exts = [ctx.extruder_of(f) for f in sorted(members[0].placed.filaments)]
+            x_lo = max([bed["x"][0] + layout.edge] + [e["x"][0] for e in exts])
+            x_hi = min([bed["x"][1] - layout.edge] + [e["x"][1] for e in exts])
+            if ctx.aux_x_limit is not None and any(e["index"] == 2 for e in exts):
+                x_hi = min(x_hi, ctx.aux_x_limit)
+            y_lo = max([bed["y"][0] + layout.edge] + [e["y"][0] for e in exts])
+            y_hi = min([bed["y"][1] - layout.edge] + [e["y"][1] for e in exts])
+            local = L.ShelfPacker((0.0, x_hi - x_lo), (0.0, y_hi - y_lo), layout.gap)
+            why = f"its {len(members)} parts do not fit together in the reach of extruder(s) {sorted({e['index'] for e in exts})}"
             try:
-                fits, why = len(local.place([m.placed for m in members])) == 1, f"its {len(members)} parts do not fit one bed together"
+                fits = len(local.place([m.placed for m in members])) == 1
             except BambuError as e:
                 fits, why = False, str(e)
+            if fits:  # the cluster's rect grows by the largest member margin on every side: it must still fit
+                gm = max(m.placed.margin for m in members)
+                gw = max(m.placed.x1 for m in members) - min(m.placed.x0 for m in members) + 2 * gm
+                gh = max(m.placed.y1 for m in members) - min(m.placed.y0 for m in members) + 2 * gm
+                fits = gw <= x_hi - x_lo and gh <= y_hi - y_lo
             if not fits:
                 notes.append(f"{base} not merged: {why}; the parts print as separate objects")
                 out += members

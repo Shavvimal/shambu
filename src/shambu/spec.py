@@ -21,6 +21,8 @@ JSON shape:
                          "recipes": ["tall-outer-brim", "tree-supports"], "set": {"wall_loops": "8"},
                          "height_ranges": [{"min_z": 0, "max_z": 0.6, "set": {"extruder": "2"}}],
                          "lay_on_face": [0, 0, 1], "rotate": [0, 0, 45],   # optional: turn the STL before placing it
+                         # or "orientation": "auto": Studio's auto-orient picks the face (single-file parts; a merged
+                         # part uses shambu's own best candidate). Not together with lay_on_face or rotate.
                          "at": [10, 10]},
                         {"name": "label", "parts": [{"path": "/abs/label.stl", "filament": 1},
                                                     {"path": "/abs/text.stl", "filament": 2}]}],
@@ -319,6 +321,11 @@ class Spec:
                         errs.append(f"plate {pi} part {si}: subtype {f.subtype!r} not in {SUBTYPES}")
                 if part.count < 1:
                     errs.append(f"plate {pi} part {si}: count must be >= 1")
+                o = part.orientation
+                if o.auto and (o.lay_on_face is not None or any(abs(a) > 1e-9 for a in o.rotate)):
+                    errs.append(
+                        f"plate {pi} part {si}: orientation 'auto' lets Studio choose the turn; remove lay_on_face and rotate, or drop 'auto'"
+                    )
                 if part.parts and part.height_ranges:
                     pass  # allowed: ranges go to assembled_params
                 for r in part.height_ranges:

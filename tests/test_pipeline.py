@@ -141,6 +141,19 @@ def test_plan_not_ok_skips_export(tmp_path, stls, resolver):
     assert "not exported" in r.report and "## Problems" in r.report
 
 
+def test_failed_checks_report_says_nothing_was_exported(tmp_path, stls, resolver):
+    """Two parts at one position overlap: the plan fails, the build stops before the export, and the report sends the
+    user back to the spec, not to a project that may not exist or may be stale."""
+    parts = [{"path": str(stls["body"]), "name": "a", "at": [20, 20]}, {"path": str(stls["base"]), "name": "b", "at": [20, 20]}]
+    studio = FakeStudio()
+    r = pipeline(resolver, studio).build(make_spec(tmp_path, stls, plates=[{"name": "p", "parts": parts}]), export=True)
+    assert not r.plan.ok and r.run is None
+    assert [k for k, _ in studio.calls if k == "run"] == []
+    assert "FAIL: a and b overlap" in r.report
+    assert "## Next" in r.report and "nothing was exported" in r.report and "Fix the spec and build again" in r.report
+    assert "Owner steps" not in r.report and "Open the project" not in r.report
+
+
 def test_keep_going_exports_anyway(tmp_path, stls, resolver, cli_export):
     r = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls, process={"base": "0.20mm Wrong"}), keep_going=True)
     assert r.run is not None and not r.ok

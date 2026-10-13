@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import struct
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -272,13 +273,24 @@ def split_bodies(facets: Sequence[Facet], tol: float = 1e-6) -> list[list[Facet]
     groups: dict[int, list[Facet]] = {}
     for f, i in zip(facets, ids, strict=True):
         groups.setdefault(find(i), []).append(f)
-    # an inward-facing shell (negative signed volume) is a cavity inside another body, not a part of its own
-    bodies = [g for g in groups.values() if volume(g) >= 0]
+    # An inward-facing shell (negative signed volume) inside the bbox of an outward shell is a cavity of that body,
+    # not a part of its own. A negative shell that no outward shell encloses is a body with reversed winding: it
+    # comes back with its facets flipped, so every body has a positive volume.
+    shells = list(groups.values())
+    outer = [bbox(g) for g in shells if volume(g) >= 0]
+    bodies = []
+    for g in shells:
+        if volume(g) >= 0:
+            bodies.append(g)
+            continue
+        lo, hi = bbox(g)
+        if not any(all(o_lo[i] - tol <= lo[i] and hi[i] <= o_hi[i] + tol for i in range(3)) for o_lo, o_hi in outer):
+            bodies.append([(a, c, b) for a, b, c in g])
     return sorted(bodies, key=lambda g: -volume(g))
 
 
 def cavities(facets: Sequence[Facet], tol: float = 1e-6) -> int:
-    """How many inward shells `split_bodies` dropped (for the report)."""
+    """How many inward shells `split_bodies` dropped as cavities (for the report)."""
     return count_shells(facets, tol) - len(split_bodies(facets, tol))
 
 
@@ -508,14 +520,17 @@ def describe_candidates(cands: Sequence[Candidate]) -> list[str]:
 
 @dataclass(frozen=True)
 class Orientation:
-    """How a spec asks for a part to be turned: lay a face down first, then rotate by Euler angles."""
+    """How a spec asks for a part to be turned: lay a face down first, then rotate by Euler angles. `auto` (spec
+    `"orientation": "auto"`) leaves the choice to Studio's auto-orient at build time; it has no matrix of its own and
+    excludes `lay_on_face` and `rotate` (`Spec.validate` reports the mix)."""
 
     lay_on_face: Vec | None = None
     rotate: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    auto: bool = False
 
     @property
     def is_identity(self) -> bool:
-        return self.lay_on_face is None and all(abs(a) < 1e-9 for a in self.rotate)
+        return not self.auto and self.lay_on_face is None and all(abs(a) < 1e-9 for a in self.rotate)
 
     def matrix(self) -> Matrix:
         m = IDENTITY if self.lay_on_face is None else lay_on_face_matrix(self.lay_on_face)
@@ -523,7 +538,7 @@ class Orientation:
 
     def tag(self) -> str:
         """A short file-name suffix that identifies the orientation."""
-        parts = []
+        parts = ["auto"] if self.auto else []
         if self.lay_on_face is not None:
             parts.append("face" + "_".join(f"{v:+.2f}" for v in self.lay_on_face))
         if any(abs(a) > 1e-9 for a in self.rotate):
@@ -531,7 +546,7 @@ class Orientation:
         return "-".join(parts).replace("+", "p").replace("-", "m").replace(".", "")
 
     def to_json(self) -> dict:
-        d: dict = {}
+        d: dict = {"orientation": "auto"} if self.auto else {}
         if self.lay_on_face is not None:
             d["lay_on_face"] = list(self.lay_on_face)
         if any(abs(a) > 1e-9 for a in self.rotate):
@@ -542,11 +557,30 @@ class Orientation:
     def from_json(cls, d: dict) -> Orientation:
         lof = d.get("lay_on_face")
         rot = d.get("rotate") or (0.0, 0.0, 0.0)
+        mode = d.get("orientation")
+        if mode is not None and mode != "auto":
+            raise BuildError(
+                f'orientation {mode!r}: the only value is "auto" (Studio\'s auto-orient); use lay_on_face/rotate for a fixed turn'
+            )
         if lof is not None and len(lof) != 3:
             raise BuildError("lay_on_face needs three numbers [nx, ny, nz]")
         if len(rot) != 3:
             raise BuildError("rotate needs three angles [x, y, z] in degrees")
-        return cls(tuple(float(v) for v in lof) if lof is not None else None, tuple(float(a) for a in rot))  # type: ignore[arg-type]
+        return cls(
+            tuple(float(v) for v in lof) if lof is not None else None,  # type: ignore[arg-type]
+            tuple(float(a) for a in rot),  # type: ignore[arg-type]
+            mode == "auto",
+        )
+
+
+def from_studio_vector(v: Sequence[float]) -> Orientation:
+    """The spec orientation for a row of Studio's auto-orient table. Studio prints the mesh direction that ends up
+    pointing UP, so the face on the bed has outward normal -v: `lay_on_face = -v`, no extra rotation. Checked live on
+    five parts (bracket, carrier, jaw_posy, tag_bridge, bottle-funnel): Studio's exported STL and shambu's copy with
+    `lay_on_face = -best` give the same contact and support numbers."""
+    if len(v) != 3:
+        raise BuildError("a Studio orientation vector has three numbers")
+    return Orientation(lay_on_face=tuple(0.0 if x == 0 else -float(x) for x in v), rotate=(0.0, 0.0, 0.0))  # type: ignore[arg-type]
 
 
 def _orientation_hash(srcs: Sequence[Path], orientation: Orientation) -> str:
@@ -557,11 +591,13 @@ def _orientation_hash(srcs: Sequence[Path], orientation: Orientation) -> str:
 
 
 def oriented_copies(srcs: Sequence[str | Path], orientation: Orientation, outdir: str | Path) -> list[Path]:
-    """Write `<outdir>/<stem>__<tag>-<hash>.stl` for every file with the orientation applied in ONE shared frame: the
-    files of a merged object are rotated together and moved by one translation (from their combined bounding box)
+    """Write `<outdir>/<stem>__<tag>-<hash>.stl` for every file (`-<n>` after the hash, n = the file's 1-based index,
+    when two files share a stem) with the orientation applied in ONE shared frame: the files of a merged object are rotated together and moved by one translation (from their combined bounding box)
     so they keep their alignment, and the group ends on z = 0 at x, y >= 0. Returns the new paths in order.
     Nothing is written for the identity orientation (the original paths come back)."""
     paths = [Path(p) for p in srcs]
+    if orientation.auto:
+        raise BuildError("orientation 'auto' has no fixed rotation: Studio picks it at build time (StudioCLI.orient)")
     if orientation.is_identity or not paths:
         return paths
     m = orientation.matrix()
@@ -569,11 +605,12 @@ def oriented_copies(srcs: Sequence[str | Path], orientation: Orientation, outdir
     lo, _ = bbox([f for mesh in meshes for f in mesh])
     shift = (-lo[0], -lo[1], -lo[2])
     h = _orientation_hash(paths, orientation)
+    stems = Counter(p.stem for p in paths)
     out = []
-    for p, mesh in zip(paths, meshes, strict=True):
-        out.append(
-            write_stl(Path(outdir) / f"{p.stem}__{orientation.tag()}-{h}.stl", translate(mesh, shift), f"{p.stem} {orientation.tag()}")
-        )
+    for i, (p, mesh) in enumerate(zip(paths, meshes, strict=True), 1):
+        # two members with one stem from different folders (body/part.stl, label/part.stl) need two files
+        name = f"{p.stem}__{orientation.tag()}-{h}" + (f"-{i}" if stems[p.stem] > 1 else "")
+        out.append(write_stl(Path(outdir) / f"{name}.stl", translate(mesh, shift), f"{p.stem} {orientation.tag()}"))
     return out
 
 
