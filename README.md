@@ -150,6 +150,10 @@ Exit codes: 0 ok, 1 a check or verification failed, 2 usage, 3 environment (bina
 - `support_filament` 0 ("default") lets Studio print a part's support with whichever filament is loaded. On a
   two-filament plate that put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102). The
   planner pins `support_filament` and `support_interface_filament` to the part's own filament when they are unset.
+- Tree support spreads past a part's box: 15.6 mm on a 170 mm bracket, which conflicted at a 15 mm gap. The layout
+  keeps 0.25 x height, clamped to 5..25 mm, round a supported part, and checks extruder reach on that rect.
+- A mesh whose whole bbox is under 1 mm is in metres (URDF exports); Studio fails it with -100. `check` refuses it,
+  and `shambu rotate --scale 1000` writes a mm copy.
 
 ## Repository layout
 

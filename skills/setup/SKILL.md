@@ -1,14 +1,16 @@
 ---
 name: setup
-description: One-time install of the shambu CLI (uv tool) and a check of the Bambu Studio install, so the /shambu skill can run `shambu` commands. USE ONLY when the user runs /shambu:setup or asks to install, update or repair shambu.
+description: Installs or updates the shambu CLI (uv tool) and checks the Bambu Studio install, so the /shambu skill can run `shambu` commands. Use when the user runs /shambu:setup or asks to install, update or repair shambu.
 disable-model-invocation: true
-allowed-tools: Bash, Read, AskUserQuestion
+argument-hint: "[install | update | check]"
+allowed-tools: Bash(uv *), Bash(uvx *), Bash(shambu *), Bash(command -v *), Bash(ls *), Bash(defaults read *), Read, AskUserQuestion
 ---
 
 # shambu setup
 
 Installs the `shambu` command line that the `/shambu` skill drives, then checks the machine. Everything here is
-idempotent: run it again to update or repair.
+idempotent: run it again to update or repair. `$ARGUMENTS` says which part the user wants: `install` (all steps),
+`update` (step 5), `check` (steps 3 and 4); with nothing given, run all steps.
 
 ## 1. Preflight
 
@@ -43,7 +45,7 @@ bundle), the GUI's current presets and bed type, whether a printer is selected a
 (the code itself is never printed), the machine's bed and per-extruder reach, and the recipe list. Then:
 
 ```
-shambu presets list filament --printer "Bambu Lab X2D 0.4 nozzle" | head
+shambu presets list filament --printer "<the machine preset doctor printed>" | head
 shambu recipes
 ```
 

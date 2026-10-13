@@ -14,6 +14,16 @@ machine `Bambu Lab X2D 0.4 nozzle`), `src/libslic3r/PrintConfig.cpp` / `PrintCon
 `bin-re/dbg.app/Contents/Resources/profiles/BBL/`, and report 03 (3MF format). The Bambu wiki returned
 HTTP 402 to WebFetch, so nothing here comes from the wiki. Every value below is a string, as in a preset.
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [0. Scope rules a library needs before any recipe](#0-scope-rules-a-library-needs-before-any-recipe) | Where each key can live: process, object, height range, plate |
+| [1. Tip table](#1-tip-table) | Every tip from the notes with its scope, exact keys and caveats |
+| [2. Named recipes (paste into a Python dict)](#2-named-recipes-paste-into-a-python-dict) | The named recipes as Python dict entries |
+| [3. Facts for the skill text, not for code](#3-facts-for-the-skill-text-not-for-code) | CAD and handling facts for the skill text, not for code |
+| [4. Contradictions between the notes and the presets or machine profile](#4-contradictions-between-the-notes-and-the-presets-or-machine-profile) | Where the notes disagree with the presets or the machine profile |
+
 ## 0. Scope rules a library needs before any recipe
 
 Where a key can live is set by its config class in `PH`:

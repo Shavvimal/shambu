@@ -223,6 +223,7 @@ class MeshInfo:
     parts: int
     volume_mm3: float
     raw: dict = field(default_factory=dict, repr=False)
+    objects: int = 1  # blocks in Studio's --info output: one per object of a 3MF, 1 for an STL
 
     @property
     def centre_xy(self) -> tuple[float, float]:
@@ -236,6 +237,7 @@ class MeshInfo:
             f"{self.path.name}: {self.size[0]:.1f} x {self.size[1]:.1f} x {self.size[2]:.1f} mm, "
             f"x {self.min[0]:.1f}..{self.max[0]:.1f}, y {self.min[1]:.1f}..{self.max[1]:.1f}, z {self.min[2]:.2f}..{self.max[2]:.1f}, "
             f"{self.facets} facets, {self.parts} part(s), {self.volume_mm3 / 1000:.1f} cm3, manifold {'yes' if self.manifold else 'NO'}"
+            + (f" ({self.objects} objects: summed, bbox is the union of their own frames)" if self.objects > 1 else "")
         )
 
 
@@ -366,29 +368,7 @@ class StudioCLI:
                 f"--info failed for {path}: exit {signed(r.returncode)} "
                 f"({RETURN_CODES.get(signed(r.returncode), 'unknown')}); tail: {out[-500:]}"
             )
-        d: dict[str, str] = {}
-        for line in out.splitlines():
-            if "=" in line and not line.startswith("["):
-                k, v = line.split("=", 1)
-                d[k.strip()] = v.strip()
-        missing = [k for k in _INFO_KEYS if k not in d]
-        if missing:
-            raise StudioError(f"--info failed for {path} (missing {missing}); exit {r.returncode}; tail: {out[-500:]}")
-        try:
-            f = lambda k: float(d[k])  # noqa: E731
-            return MeshInfo(
-                path,
-                (f("size_x"), f("size_y"), f("size_z")),
-                (f("min_x"), f("min_y"), f("min_z")),
-                (f("max_x"), f("max_y"), f("max_z")),
-                d["manifold"].lower() == "yes",
-                int(d.get("number_of_facets", "0") or 0),
-                int(d.get("number_of_parts", "1") or 1),
-                float(d.get("volume", "0") or 0),
-                d,
-            )
-        except ValueError as e:
-            raise StudioError(f"--info output for {path} has a bad number ({e}); tail: {out[-500:]}") from e
+        return parse_info(path, out)
 
     def export_settings(self, cmd: CliCommand, out: Path, name: str = "settings", timeout: int = 300) -> dict:
         """Run `--export-settings` with the given loads: the full merged config as the CLI sees it.
@@ -411,6 +391,60 @@ class StudioCLI:
         if not isinstance(data, dict):
             raise StudioError(f"--export-settings wrote {type(data).__name__}, not a JSON object, to {out}")
         return data
+
+
+def _info_blocks(out: str) -> list[dict[str, str]]:
+    """`key = value` blocks of --info output. Studio prints one block per object (a `[file name]` line, then the
+    keys); a new block starts at a header line or when `size_x` repeats. Log lines (`[2026-...] [trace] ...`) hold no
+    `=` before their first `]`, so they are skipped."""
+    blocks: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    for line in out.splitlines():
+        if line.startswith("[") or "=" not in line:
+            continue
+        k, v = (x.strip() for x in line.split("=", 1))
+        if k == "size_x" and cur:
+            blocks.append(cur)
+            cur = {}
+        cur[k] = v
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def parse_info(path: Path, out: str) -> MeshInfo:
+    """MeshInfo from --info output. A multi-object 3MF prints one block per object: facets, parts and volume are
+    summed, the bounding box is the union (each object in its own frame, not its plate position), and the file is
+    manifold only if every object is. Raises StudioError when a key is missing or a number is bad."""
+    blocks = _info_blocks(out)
+    if not blocks:
+        raise StudioError(f"--info failed for {path} (missing {list(_INFO_KEYS)}); tail: {out[-500:]}")
+    for d in blocks:
+        missing = [k for k in _INFO_KEYS if k not in d]
+        if missing:
+            raise StudioError(f"--info failed for {path} (missing {missing}); tail: {out[-500:]}")
+    try:
+        lo = tuple(min(float(d[f"min_{a}"]) for d in blocks) for a in "xyz")
+        hi = tuple(max(float(d[f"max_{a}"]) for d in blocks) for a in "xyz")
+        size = (
+            tuple(float(blocks[0][f"size_{a}"]) for a in "xyz")
+            if len(blocks) == 1
+            else tuple(h - lo_ for lo_, h in zip(lo, hi, strict=True))
+        )
+        return MeshInfo(
+            path,
+            size,  # type: ignore[arg-type]
+            lo,  # type: ignore[arg-type]
+            hi,  # type: ignore[arg-type]
+            all(d["manifold"].lower() == "yes" for d in blocks),
+            sum(int(d.get("number_of_facets", "0") or 0) for d in blocks),
+            sum(int(d.get("number_of_parts", "1") or 1) for d in blocks),
+            sum(float(d.get("volume", "0") or 0) for d in blocks),
+            blocks[-1] if len(blocks) == 1 else {"blocks": blocks},
+            len(blocks),
+        )
+    except ValueError as e:
+        raise StudioError(f"--info output for {path} has a bad number ({e}); tail: {out[-500:]}") from e
 
 
 def progress_from_log(log_path: Path) -> dict:

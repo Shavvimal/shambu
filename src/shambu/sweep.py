@@ -10,7 +10,7 @@ the answer off a table instead of guessing. A variant is a small JSON patch over
 
 {
   "name": "flat-by-object",                       # becomes <outdir>/sweep/<name>/<spec name>.gcode.3mf
-  "process": {"set": {"layer_height": "0.28"}, "recipes": ["coarse-fast"]},   # set merges, recipes replace
+  "process": {"set": {"layer_height": "0.28"}, "recipes": ["coarse-fast"]},   # set merges, recipes REPLACE the list
   "plates": {"jaws": {"print_sequence": "by object"}},                        # by plate name or 1-based index
   "parts": {"jaw_print": {"lay_on_face": [0, 0, 1], "set": {"enable_support": "0"}}},  # by part key, every plate
   "merge": {"bed_type": "Cool Plate"}             # RFC 7386 merge patch over the whole spec, applied last
@@ -60,6 +60,8 @@ def _part_key(p: dict) -> str:
 
 
 def _patch_part(part: dict, change: dict) -> dict:
+    """`set` merges; every other key (including `recipes`) replaces, so a variant that adds a recipe must repeat the
+    part's existing ones."""
     out = dict(part)
     for k, v in change.items():
         if k == "set":
@@ -110,7 +112,7 @@ def apply_variant(spec_json: dict, variant: dict) -> dict:
     return d
 
 
-def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold_deg: float = 45.0) -> list[dict]:
+def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold_deg: float = M.DEFAULT_THRESHOLD) -> list[dict]:
     """One variant per best orientation of the part (its first file), from `mesh.candidates()`."""
     path = None
     for pl in spec_json.get("plates", []):
@@ -120,6 +122,10 @@ def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold
     if not path:
         raise BuildError(f"no part with key {part_key!r} in the spec")
     cands = [c for c in M.candidates(M.read_stl(Path(path).expanduser()), threshold_deg) if c.metrics.stands][:top]
+    if not cands:
+        raise BuildError(
+            f"{part_key}: no orientation puts a flat face on the bed (an organic part); orient it by hand or add a flat base in CAD"
+        )
     out = []
     for i, c in enumerate(cands, 1):
         label = re.sub(r"[^A-Za-z0-9._-]", "", c.label.replace("+", "p").replace("-", "m").replace(" ", "-"))
@@ -241,8 +247,13 @@ def run(spec_json: dict, variants: Sequence[dict], build: Builder, *, do_slice: 
     return out
 
 
+def _mins(s: int) -> int:
+    return round(s / 60)
+
+
 def _hms(s: int) -> str:
-    return f"{s // 3600}h{s % 3600 // 60:02d}"
+    m = _mins(s)
+    return f"{m // 60}h{m % 60:02d}"
 
 
 def table(results: Sequence[VariantResult]) -> list[str]:
@@ -254,7 +265,7 @@ def table(results: Sequence[VariantResult]) -> list[str]:
         f"{'variant':34s} {'time':>7} {'grams':>7} {'vs best':>8} {'support':>8} {'waste':>6} {'swaps':>5}  filament grams per slot / problems"
     ]
     for r in ok:
-        delta = f"+{_hms(r.total_s - best.total_s)}" if best and r is not best else ("best" if best else "")
+        delta = f"+{_hms(60 * (_mins(r.total_s) - _mins(best.total_s)))}" if best and r is not best else ("best" if best else "")
         fil = ", ".join(f"{f['id']}:{f['used_g']:.0f}" for p in r.plates for f in p["filaments"])
         feats = any(p.get("features") for p in r.plates)
         sup = f"{r.feature_total('support_g'):8.1f}" if feats else f"{'-':>8}"

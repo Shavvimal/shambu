@@ -16,6 +16,7 @@ JSON shape:
   "layout": {"gap": 5, "edge": 2},
   "plates": [{"name": "jaws",
               "print_sequence": "by object",           # optional; default "by layer". See layout.SequentialClearance
+              "group_by_filament": true,               # by object only: same-filament, same-settings parts print as one object
               "parts": [{"path": "/abs/jaw_print.stl", "filament": 1, "count": 2,
                          "recipes": ["tall-outer-brim", "tree-supports"], "set": {"wall_loops": "8"},
                          "height_ranges": [{"min_z": 0, "max_z": 0.6, "set": {"extruder": "2"}}],
@@ -108,7 +109,7 @@ class PartSpec:
         ranges: list[HeightRangeSpec] = []
         for r in d.get("recipes", []):
             if recipe_sets is not None and r not in recipe_sets:
-                raise BuildError(f"unknown recipe '{r}'; run `bambu recipes`")
+                raise BuildError(f"unknown recipe '{r}'; run `shambu recipes`")
             settings.update((recipe_sets or {}).get(r, {}))
             ranges += recipe_ranges(r)
         settings.update(_strs(d.get("set")))
@@ -162,6 +163,7 @@ class PlateSpec:
     pause_at_z: tuple[float, ...] = ()
     colour_changes: tuple[ColourChange, ...] = ()
     print_sequence: str | None = None  # None = the process preset's print_sequence (by layer unless the user set it)
+    group_by_filament: bool = False  # by object: merge single-file parts with one filament and identical settings into one object
 
     @property
     def by_object(self) -> bool:
@@ -182,12 +184,15 @@ class PlateSpec:
                 for c in d.get("colour_changes", d.get("colour_change", []))
             ),
             str(d["print_sequence"]).replace("_", " ") if d.get("print_sequence") else None,
+            bool(d.get("group_by_filament", False)),
         )
 
     def to_json(self) -> dict:
         d: dict[str, Any] = {"name": self.name, "parts": [p.to_json() for p in self.parts]}
         if self.print_sequence:
             d["print_sequence"] = self.print_sequence
+        if self.group_by_filament:
+            d["group_by_filament"] = True
         if self.pause_at_z:
             d["pause_at_z"] = list(self.pause_at_z)
         if self.colour_changes:
@@ -243,7 +248,7 @@ class Spec:
         pset: dict[str, str] = {}
         for r in pr.get("recipes", []):
             if r not in recipe_sets:
-                raise BuildError(f"unknown recipe '{r}'; run `bambu recipes`")
+                raise BuildError(f"unknown recipe '{r}'; run `shambu recipes`")
             pset.update(recipe_sets[r])
         pset.update(_strs(pr.get("set")))
         lay = d.get("layout", {})
@@ -299,6 +304,8 @@ class Spec:
                 errs.append(f"plate {pi}: no parts")
             if pl.print_sequence is not None and pl.print_sequence not in PRINT_SEQUENCES:
                 errs.append(f"plate {pi}: print_sequence {pl.print_sequence!r} not in {PRINT_SEQUENCES}")
+            if pl.group_by_filament and pl.print_sequence == "by layer":
+                errs.append(f"plate {pi}: group_by_filament needs print_sequence 'by object' (by layer already prints every part together)")
             for si, part in enumerate(pl.parts, 1):
                 try:
                     files = part.files()
@@ -379,8 +386,9 @@ class SpecBuilder:
         pause_at_z: tuple[float, ...] = (),
         colour_changes: tuple[ColourChange, ...] = (),
         print_sequence: str | None = None,
+        group_by_filament: bool = False,
     ) -> SpecBuilder:
-        self._plates.append(PlateSpec(name, tuple(parts), tuple(pause_at_z), tuple(colour_changes), print_sequence))
+        self._plates.append(PlateSpec(name, tuple(parts), tuple(pause_at_z), tuple(colour_changes), print_sequence, group_by_filament))
         return self
 
     @staticmethod

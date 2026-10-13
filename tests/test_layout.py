@@ -168,3 +168,57 @@ def test_custom_rule_set():
             yield L.Check(False, "custom rule")
 
     assert [c.text for c in L.LimitChecker((Always(),)).check([], L.Context(FACTS))] == ["custom rule"]
+
+
+# ---------------------------------------------------------------------------- batch 1 (real-STL test findings)
+def test_mesh_in_metres_fails_the_check():
+    t = failures([part("jaw", w=0.022, h=0.092, z=0.048, x0=30, y0=30)])
+    assert any("probably a mesh in metres" in x and "--scale 1000" in x for x in t)
+    assert not any("metres" in x for x in failures([part("a", w=0.5, h=20, z=10, x0=30, y0=30)]))  # one thin axis is fine
+
+
+def test_multi_body_stl_is_a_note():
+    from dataclasses import replace
+
+    p = L.Placed("jaw", replace(mesh("jaw.stl"), parts=3), 1, 30, 30)
+    checks = L.LimitChecker().check([p], L.Context(FACTS))
+    assert all(c.ok for c in checks)
+    assert any("holds 3 bodies" in c.text and "shambu split" in c.text for c in checks)
+
+
+SEQ_FACTS = {
+    **FACTS,
+    "clearance": {"radius": 60.0, "height_to_rod": 32.8, "height_to_lid": 133.0, "dist_to_rod": 33.0, "nozzle_height": 4.0},
+}
+
+
+def test_sequential_clearance_has_no_ok_line_after_a_fail():
+    rule = L.SequentialClearance()
+    ctx = L.Context(SEQ_FACTS, by_object=True)
+    bad = list(rule.check([part("a", x0=2, y0=2), part("b", x0=40, y0=2)], ctx))
+    assert [c.ok for c in bad] == [False]  # the gap failure only, no "print-by-object: ... within the gantry limits"
+    good = list(rule.check([part("a", x0=2, y0=2), part("b", x0=90, y0=2)], ctx))
+    assert [c.ok for c in good] == [True] and good[0].text.startswith("print-by-object")
+
+
+def test_extruder_reach_counts_the_margin():
+    """Brim and support spread print with the part's filament, so they must stay in that extruder's reach."""
+    assert failures([part("a", filament=2, x0=25, y0=30)]) == []
+    t = failures([part("a", filament=2, x0=25, y0=30, margin=5)])  # 25 - 5 = 20 < 20.5
+    assert any("spans x 20.0..50.0 with its brim and support margin (5.0 mm)" in x for x in t)
+
+
+@pytest.mark.parametrize(
+    ("params", "height", "margin"),
+    [
+        ({"enable_support": "1"}, 10.0, 5.0),  # clamped up to 5
+        ({"enable_support": "1"}, 40.0, 10.0),  # a quarter of the height
+        ({"enable_support": "true"}, 95.0, 23.75),
+        ({"enable_support": "1"}, 200.0, 25.0),  # clamped down to 25
+        ({"enable_support": "0"}, 95.0, 0.0),
+        ({}, 95.0, 0.0),
+        (None, 95.0, 0.0),
+    ],
+)
+def test_support_margin(params, height, margin):
+    assert L.support_margin(params, height) == pytest.approx(margin)

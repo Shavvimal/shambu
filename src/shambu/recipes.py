@@ -309,6 +309,27 @@ RECIPES: tuple[Recipe, ...] = (
         "isotropic strength matters.",
     ),
     Recipe(
+        "fine-0.16",
+        "process",
+        "0.16 mm layers on the Standard base: finer curves without the High Quality preset's slow walls.",
+        {"layer_height": "0.16"},
+        "Curved or visible surfaces that show 0.2 mm steps. Measured on a 30 mm cube: 1062 s against 852 s at 0.20; the "
+        "0.16mm High Quality preset took 1666 s for the same layers.",
+        "research 08 / notes",
+        "Flat solid tops look worse at 0.16 and print slower: keep 0.20 there. Every object on a plate with a prime tower shares "
+        "one layer height; a `height_ranges` entry can switch to 0.28 above the detail instead (13 min 07 against 14 min 41 on a cube).",
+    ),
+    Recipe(
+        "top-concentric",
+        "object",
+        "Concentric top-surface lines for round tops.",
+        {"top_surface_pattern": "concentric"},
+        "A round or ring-shaped show face whose monotonic lines show their direction.",
+        "notes / research 08",
+        "Region key, so it works on a modifier or a height range too. Flat rectangular tops keep the X2D default `monotonicline`. "
+        "One wall on top surfaces is already Studio's default (`top_one_wall_type` all top); `topmost` limits it to the top face.",
+    ),
+    Recipe(
         "no-hole-compensation",
         "process",
         "Hole and contour compensation off: clearance lives in the CAD, qualified by coupons.",

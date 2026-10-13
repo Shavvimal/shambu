@@ -11,6 +11,18 @@ Target: `/Applications/BambuStudio.app` (02.08.02.61, universal x86_64 + arm64, 
 Workspace: `$S = <scratch>/bin-re`.
 All CLI runs used `--datadir $S/datadir`. Logs are in `$S/logs/`, outputs in `$S/out/<experiment>/`, the run index in `$S/logs/results.jsonl`.
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [Verdict in five lines](#verdict-in-five-lines) | The five-line verdict on the crash, the hidden flags and the time sink |
+| [1. Headless slice crash](#1-headless-slice-crash) | The exit-139 headless slice crash: crash frames, cause and fix |
+| [2. Hidden surface](#2-hidden-surface) | Hidden CLI flags, and every config key as a flag |
+| [3. Time sink](#3-time-sink) | Wall-clock time per variant and where the export time goes |
+| [4. `--info` and `--export-settings`](#4---info-and---export-settings) | What `--info` prints for an STL, and what `--export-settings` writes |
+| [5. Preset resolver defect (found on the way)](#5-preset-resolver-defect-found-on-the-way) | The preset resolver bug with `include` templates |
+| [Recommendations for the wrapper](#recommendations-for-the-wrapper) | The rules for the wrapper that follow from these tests |
+
 ## Verdict in five lines
 
 1. Headless slicing works on this Mac. The exit 139 is not GL, Metal, AppKit or a missing NSApplication. It is a null-pointer read in the filament-grouping code: the flush matrix is never sized for 2 filaments when the project has no filament colours.

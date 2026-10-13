@@ -12,6 +12,21 @@ Workspace: `scratchpad/ctl-re` ($S). All tests were read-only. No MQTT message w
 
 Source references below use a sparse clone of `bambulab/BambuStudio` master at `47a13ee` (2026-10-08), which is newer than the installed 02.08.02.61 (`926a719`). Line numbers are from master.
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [TL;DR](#tldr) | Short answers to each control and printer question |
+| [Track 1 - GUI automation through Accessibility](#track-1---gui-automation-through-accessibility) | What AppleScript and Accessibility can see and click in Studio |
+| [Track 2 - Launch and open behaviour](#track-2---launch-and-open-behaviour) | Bundle identity, URL scheme and how Studio opens a file |
+| [Track 3 - Printer protocols (read-only use)](#track-3---printer-protocols-read-only-use) | MQTT, FTPS and SSDP details for reading the printer |
+| [Track 4 - Studio config files](#track-4---studio-config-files) | Studio config files, where the serial and access code live |
+| [Track 5 - Community landscape](#track-5---community-landscape) | Other Bambu tools and libraries, and what to copy from them |
+| [Track 6 - Language](#track-6---language) | Why the tool uses Python with uv, and the toolchains present |
+| [Recommended command set for the wrapper](#recommended-command-set-for-the-wrapper) | The proposed read-only subcommands |
+| [Citations](#citations) | Source links for the claims above |
+| [Artefacts in $S](#artefacts-in-s) | Files the investigation left in the scratch workspace |
+
 ## TL;DR
 
 | Question | Answer |

@@ -23,7 +23,7 @@ from . import presets as P
 from . import recipes as R
 from .errors import BambuError, BuildError
 from .patches import AddCustomGcode, PatchSet, RenameObject, SetBedTypeEverywhere, SetFilamentColours, SetFilamentMap
-from .spec import PartSpec, Spec
+from .spec import FileRef, PartSpec, Spec
 from .studio import CliCommand, MeshInfo, RunResult, StudioCLI
 from .threemf import Project
 
@@ -123,10 +123,23 @@ class PlannedPart:
     placed: L.Placed
     cli_name: str = ""  # the object name the CLI gives it (<stem>_<n> or assemble_<k>); renamed to `key` after export
     rename: bool = True  # False when `cli_name` is not unique in the project: the object keeps `cli_name`
+    # group_by_filament: the single-file parts merged into this one object, and each one's bbox offset from the
+    # group's bbox start (x0, y0). Their `placed` holds bed coordinates once `place_members` ran.
+    members: list[PlannedPart] = field(default_factory=list)
+    offsets: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def assembled(self) -> bool:
         return len(self.files) > 1
+
+    @property
+    def grouped(self) -> bool:
+        return bool(self.members)
+
+    def place_members(self) -> None:
+        """Move every member to the group's bed position plus its offset inside the group."""
+        for m, (dx, dy) in zip(self.members, self.offsets, strict=True):
+            m.placed.x0, m.placed.y0 = self.placed.x0 + dx, self.placed.y0 + dy
 
     @property
     def file_name(self) -> str:
@@ -188,21 +201,55 @@ class BuildResult:
     def ok(self) -> bool:
         return self.plan.ok and self.run is not None and self.run.ok and not self.verify_problems
 
+    @property
+    def exported(self) -> bool:
+        return self.run is not None and self.run.ok
+
+    def export_problem(self) -> str | None:
+        if self.run is None or self.run.ok:
+            return None
+        err = (self.run.result or {}).get("error_string") or ""
+        return f"export failed: {self.run.summary()}" + (f"; Studio: {err}" if err else "")
+
+    def slicer_warnings(self) -> list[str]:
+        """Studio's own slicing warnings from result.json (floating cantilevers, regions), not a failure."""
+        w = (self.run.result or {}).get("warning_message") if self.run else None
+        return [str(w)] if w else []
+
     def to_json(self) -> dict:
+        problems = list(self.plan.problems) + ([self.export_problem()] if self.export_problem() else [])
         return {
             "name": self.plan.spec.name,
-            "project": str(self.project),
+            "project": str(self.project) if self.exported else None,
             "ok": self.ok,
             "plan_ok": self.plan.ok,
-            "sliced": self.sliced,
+            "sliced": self.sliced and self.exported,
             "estimates": [{"plate": p["id"], **p["slice"]} for p in (self.summary or {}).get("plates", []) if p.get("slice")],
-            "problems": self.plan.problems,
-            "warnings": self.plan.warnings,
+            "problems": problems,
+            "warnings": list(dict.fromkeys(self.plan.warnings + self.slicer_warnings())),
             "plates": [
                 {
                     "name": p.name,
                     "print_sequence": p.print_sequence,
                     "layout": L.describe([x.placed for x in p.parts]),
+                    "groups": [
+                        {
+                            "name": x.key,
+                            "filament": x.placed.filament,
+                            "members": [
+                                {
+                                    "name": m.key,
+                                    "filament": m.placed.filament,
+                                    "size": [round(v, 2) for v in m.placed.info.size],
+                                    "offset": [round(dx, 2), round(dy, 2)],
+                                    "bbox": [round(v, 2) for v in m.placed.rect(with_margin=False)],
+                                }
+                                for m, (dx, dy) in zip(x.members, x.offsets, strict=True)
+                            ],
+                        }
+                        for x in p.parts
+                        if x.grouped
+                    ],
                     "checks": [[c.ok, c.text] for c in p.checks],
                 }
                 for p in self.plan.plates
@@ -318,6 +365,14 @@ class Pipeline:
         for pi, (pspec, seq) in enumerate(zip(spec.plates, sequences, strict=True), 1):
             parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir)
             by_object = seq == "by object"
+            if pspec.group_by_filament:
+                if by_object:
+                    parts, notes = self._group_by_filament(parts, spec.layout.gap, bed, used_keys)
+                    warnings += [f"plate {pi} '{pspec.name}': {n}" for n in notes]
+                else:
+                    problems.append(
+                        f"plate {pi} '{pspec.name}': group_by_filament needs print_sequence 'by object'; the plate prints {seq}"
+                    )
             sequential = by_object and len(parts) > 1  # Studio applies the by-object rules (and drops the tower) only then
             if by_object:
                 # Studio prints a by-object plate in object order. Group by main filament (two single-filament groups
@@ -350,12 +405,20 @@ class Pipeline:
                 except BambuError as e:
                     problems.append(f"plate {pi} '{pspec.name}': {e}")
                     packed = [free]
-                if len(packed) > 1:
+                overflow = len(packed) > 1
+                if overflow:
                     problems.append(
                         f"plate {pi} '{pspec.name}': the parts need {len(packed)} plates; move some to another plate in the spec"
                     )
-            checks = self.checker.check([p.placed for p in parts], pctx)
-            checks += self._subpart_checks(parts, pctx)
+            else:
+                overflow = False
+            for p in parts:
+                p.place_members()
+            if overflow:  # the overflow parts sit on a second virtual plate: overlap and reach checks would only repeat the problem
+                checks = [L.Check(False, f"the parts need {len(packed)} plates (see Problems); no further placement checks")]
+            else:
+                checks = self.checker.check([p.placed for p in parts], pctx)
+                checks += self._subpart_checks(parts, pctx)
             plate = A.Plate(
                 name=pspec.name or f"plate {pi}",
                 need_arrange=False,
@@ -387,7 +450,21 @@ class Pipeline:
                     A.HeightRange(r.min_z, r.max_z, {"layer_height": str(process.get("layer_height", "0.2")), **r.set})
                     for r in first.spec.height_ranges
                 ]
-                if first.assembled:
+                if first.grouped:
+                    # One merged object `assemble_k`; the merge keeps each volume's own translation (notes-research
+                    # section A). Copies of one spec share an Item, positioned like copies above (pos[i] = T_i - T_0).
+                    k += 1
+                    by_spec: dict[int, list[PlannedPart]] = {}
+                    for m in first.members:
+                        by_spec.setdefault(id(m.spec), []).append(m)
+                    for copies in by_spec.values():
+                        t0 = copies[0].placed.pos()
+                        pos = [t0] + [(c.placed.pos()[0] - t0[0], c.placed.pos()[1] - t0[1], c.placed.pos()[2] - t0[2]) for c in copies[1:]]
+                        fp, _, sub = copies[0].files[0]
+                        plate.items.append(A.Item(fp, first.placed.filament, len(copies), sub, [k] * len(copies), pos))
+                    plate.assembled.append(A.Assembled(k, settings, ranges))
+                    first.cli_name = f"assemble_{k}"
+                elif first.assembled:
                     idx = list(range(k + 1, k + 1 + len(group)))
                     k += len(group)
                     for fp, fil, sub in first.files:
@@ -433,6 +510,12 @@ class Pipeline:
                 try:
                     turned = M.oriented_copies([fp for fp, _, _ in files], ps.orientation, (workdir or files[0][0].parent) / "oriented")
                     files = [(t, fil, sub) for t, (_, fil, sub) in zip(turned, files, strict=True)]
+                    stands = M.metrics([f for t in turned for f in M.read_stl(t)]).stands
+                    if not stands:
+                        problems.append(
+                            f"{where} ({ps.key()}): the orientation leaves no flat face on the bed (the part would stand on an edge); "
+                            f"pick a lay_on_face from `shambu orient`"
+                        )
                 except BambuError as e:
                     problems.append(f"{where}: cannot orient {ps.key()}: {e}")
             measured: dict[Path, MeshInfo | None] = {}
@@ -464,7 +547,12 @@ class Pipeline:
                 )
             main = files[0][1] if not eff or files[0][1] in eff else min(eff)
             body = L.union_info(ok_infos)  # merged sub-parts share one translation: pack their union bbox
-            margin = ps.brim_margin if ps.brim_margin is not None else L.brim_margin({**process, **ps.set})
+            eff_settings = {**process, **ps.set}
+            margin = (
+                ps.brim_margin
+                if ps.brim_margin is not None
+                else max(L.brim_margin(eff_settings), L.support_margin(eff_settings, body.size[2]))
+            )
             for copy in range(ps.count):
                 key = _unique_key(ps.key(), used_keys)
                 placed = L.Placed(key, body, main, margin=margin, also_filaments=frozenset(eff - {main}))
@@ -474,10 +562,92 @@ class Pipeline:
         return out
 
     @staticmethod
+    def _group_by_filament(parts: list[PlannedPart], gap: float, bed: dict, used_keys: set[str]) -> tuple[list[PlannedPart], list[str]]:
+        """Merge single-file parts without `at` that share the main filament, the settings and the height ranges into
+        one object per cluster (print-by-object then prints the cluster together, by layer, with no nozzle change).
+        The members pack locally with `gap`; the cluster is one `Placed` (union bbox from (0, 0, 0)) for the plate
+        packer. A cluster of one stays as it is. Returns the new part list and notes for the warnings."""
+        clusters: dict[tuple, list[PlannedPart]] = {}
+        order: list[PlannedPart | tuple] = []
+        for p in parts:
+            if p.assembled or p.spec.at is not None:
+                order.append(p)
+                continue
+            ck = (
+                p.placed.filament,
+                p.placed.also_filaments,
+                tuple(sorted(p.spec.set.items())),
+                tuple((r.min_z, r.max_z, tuple(sorted(r.set.items()))) for r in p.spec.height_ranges),
+            )
+            if ck not in clusters:
+                clusters[ck] = []
+                order.append(ck)
+            clusters[ck].append(p)
+        per_fil = Counter(ck[0] for ck, ms in clusters.items() if len(ms) > 1)
+        seen: Counter[int] = Counter()
+        out: list[PlannedPart] = []
+        notes: list[str] = []
+        for o in order:
+            if isinstance(o, PlannedPart):
+                out.append(o)
+                continue
+            members = clusters[o]
+            if len(members) == 1:
+                out += members
+                continue
+            fil = members[0].placed.filament
+            seen[fil] += 1
+            base = f"group-f{fil}" if per_fil[fil] == 1 else f"group-f{fil}-{seen[fil]}"
+            local = L.ShelfPacker((0.0, bed["x"][1] - bed["x"][0]), (0.0, bed["y"][1] - bed["y"][0]), gap)
+            try:
+                fits, why = len(local.place([m.placed for m in members])) == 1, f"its {len(members)} parts do not fit one bed together"
+            except BambuError as e:
+                fits, why = False, str(e)
+            if not fits:
+                notes.append(f"{base} not merged: {why}; the parts print as separate objects")
+                out += members
+                continue
+            x0, y0 = min(m.placed.x0 for m in members), min(m.placed.y0 for m in members)
+            x1, y1 = max(m.placed.x1 for m in members), max(m.placed.y1 for m in members)
+            size = (x1 - x0, y1 - y0, max(m.placed.info.size[2] for m in members))
+            info = MeshInfo(
+                members[0].infos[0].path,
+                size,
+                (0.0, 0.0, 0.0),
+                size,
+                all(m.placed.info.manifold for m in members),
+                sum(m.placed.info.facets for m in members),
+                1,
+                sum(m.placed.info.volume_mm3 for m in members),
+            )
+            key = _unique_key(base, used_keys)
+            first = members[0]
+            files = [(m.files[0][0], fil, m.files[0][2]) for m in members]
+            gspec = PartSpec(
+                None,
+                tuple(FileRef(fp, f, sub) for fp, f, sub in files),
+                key,
+                fil,
+                1,
+                "normal_part",
+                first.spec.recipes,
+                dict(first.spec.set),
+                first.spec.height_ranges,
+            )
+            placed = L.Placed(key, info, fil, margin=max(m.placed.margin for m in members), also_filaments=first.placed.also_filaments)
+            offsets = [(m.placed.x0 - x0, m.placed.y0 - y0) for m in members]
+            out.append(PlannedPart(gspec, key, files, [m.infos[0] for m in members], placed, members=members, offsets=offsets))
+        return out, notes
+
+    @staticmethod
     def _subpart_checks(parts: list[PlannedPart], ctx: L.Context) -> list[L.Check]:
-        """Per sub-part of a merged object: manifold, and the x reach of the sub-part's own filament."""
+        """Per sub-part of a merged object: manifold, and the x reach of the sub-part's own filament. A filament group's
+        members get the mesh checks (manifold, metres, bodies) by name; the group's own rect covers their reach."""
         out = []
         for p in parts:
+            if p.grouped:
+                out += list(L.MeshSane().check([m.placed for m in p.members], ctx))
+                continue
             if not p.assembled:
                 continue
             pos = p.placed.pos()
@@ -655,6 +825,7 @@ class Pipeline:
         if len(s["plates"]) != len(plan.spec.plates):
             probs.append(f"{len(s['plates'])} plates in file, expected {len(plan.spec.plates)}")
         want = sum(p.count for pl in plan.spec.plates for p in pl.parts)  # the spec, not a plan that may have dropped parts
+        want -= sum(len(x.members) - 1 for x in plan.parts if x.grouped)  # a filament group is one object
         if len(s["objects"]) != want:
             probs.append(f"{len(s['objects'])} objects in file, expected {want}")
         have = Counter(o["name"] for o in s["objects"])

@@ -1,0 +1,22 @@
+[
+  {"query": "I've got three STLs in ~/prints/gripper (base.stl, finger.stl x4, cap.stl). can you make me a bambu studio project with them all on one plate, PETG, 6 walls?", "should_trigger": true},
+  {"query": "how long would parts/housing.stl take to print at 0.2mm layers with 15% gyroid? and how many grams of filament", "should_trigger": true},
+  {"query": "which way up should I print this hook (hook.stl)? it has to hold a backpack and I don't want it to snap at the bend", "should_trigger": true},
+  {"query": "how far is my print? it started like 3 hours ago", "should_trigger": true},
+  {"query": "open projects/fixture.3mf and turn supports on for the second object only, tree supports, then save it", "should_trigger": true},
+  {"query": "slice these parts for my X2D: lid.stl and box.stl, box in black PETG on the left nozzle, lid in white PLA on the right", "should_trigger": true},
+  {"query": "is it faster to print these 8 small knobs one at a time (by object) or all together by layer? two colours", "should_trigger": true},
+  {"query": "my plate has like 400 filament changes and the purge waste is insane. can you rearrange it so there are fewer swaps? file is out/coaster.3mf", "should_trigger": true},
+  {"query": "add a pause at 10.2 mm in magnet-box.3mf so I can drop the magnets in", "should_trigger": true},
+  {"query": "the gridfinity bin STL I downloaded is tiny when I import it, I think it's in metres. make a project with 4 of them at the right size", "should_trigger": true},
+  {"query": "design a wall-mount bracket for a 25mm pipe with two M4 screw holes 40mm apart, I need a STEP", "should_trigger": false},
+  {"query": "start the print on my X2D, the file is already on the SD card", "should_trigger": false},
+  {"query": "pause the printer, the first layer looks bad", "should_trigger": false},
+  {"query": "repair this non-manifold mesh, Bambu Studio keeps saying there are 37 open edges in scan.stl", "should_trigger": false},
+  {"query": "generate a 3D model of a duck wearing a top hat that I can print", "should_trigger": false},
+  {"query": "convert enclosure.step to STL with a fine tessellation", "should_trigger": false},
+  {"query": "what is PETG and how is it different from PLA for outdoor parts?", "should_trigger": false},
+  {"query": "install Bambu Studio on my new mac, the dmg won't open", "should_trigger": false},
+  {"query": "write a python script that parses a gcode file and plots the extrusion per layer with matplotlib", "should_trigger": false},
+  {"query": "my bambu printer shows HMS error 0300_0100_0001_0001, what does it mean and how do I fix the hardware?", "should_trigger": false}
+]

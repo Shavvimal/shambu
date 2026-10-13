@@ -9,8 +9,8 @@ agent can compare orientations by numbers and then slice the winner.
 Conventions: a mesh is a list of facets, each a tuple of three vertices (x, y, z) in mm. Normals are always
 recomputed from the winding (STL normals are unreliable). Angles are degrees. The bed is the plane z = min z
 of the mesh, and `overhang` counts facets that face down more than `threshold` degrees FROM VERTICAL (0 = a
-vertical wall, 90 = a flat ceiling), the usual "45 degree rule". Bambu's `support_threshold_angle` counts from
-horizontal instead (its default 30 equals 60 here): convert with 90 - angle.
+vertical wall, 90 = a flat ceiling). The default 60 is what Studio supports by default (`support_threshold_angle`
+30 counts from horizontal: convert with 90 - angle); 45 is the conservative "45 degree rule" for a clean print.
 
 Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), convex hulls, painted supports, and
 anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those.
@@ -272,7 +272,42 @@ def split_bodies(facets: Sequence[Facet], tol: float = 1e-6) -> list[list[Facet]
     groups: dict[int, list[Facet]] = {}
     for f, i in zip(facets, ids, strict=True):
         groups.setdefault(find(i), []).append(f)
-    return sorted(groups.values(), key=lambda g: -abs(volume(g)))
+    # an inward-facing shell (negative signed volume) is a cavity inside another body, not a part of its own
+    bodies = [g for g in groups.values() if volume(g) >= 0]
+    return sorted(bodies, key=lambda g: -volume(g))
+
+
+def cavities(facets: Sequence[Facet], tol: float = 1e-6) -> int:
+    """How many inward shells `split_bodies` dropped (for the report)."""
+    return count_shells(facets, tol) - len(split_bodies(facets, tol))
+
+
+def count_shells(facets: Sequence[Facet], tol: float = 1e-6) -> int:
+    key: dict[tuple[int, int, int], int] = {}
+    parent: list[int] = []
+
+    def vid(v: Vec) -> int:
+        k = (round(v[0] / tol), round(v[1] / tol), round(v[2] / tol))
+        if k not in key:
+            key[k] = len(key)
+            parent.append(key[k])
+        return key[k]
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    roots = set()
+    for f in facets:
+        a, b, c = (vid(v) for v in f)
+        ra, rb, rc = find(a), find(b), find(c)
+        parent[rb] = ra
+        parent[rc] = ra
+    for f in facets:
+        roots.add(find(vid(f[0])))
+    return len(roots)
 
 
 # ---------------------------------------------------------------------------- orientation metrics
@@ -302,7 +337,19 @@ class Metrics:
         earns credit (adhesion, no brim), and height costs a little (a tall print is a slow, wobbly print).
         The weights are the tool's own, chosen so one mm2 of support outweighs one mm2 of contact. Bridges count
         as overhang here (as in Studio's auto-orient), so `shambu sweep` has the last word."""
-        return self.shadow_mm2 - 0.25 * self.contact_mm2 + 2.0 * self.height + (NO_CONTACT_PENALTY if not self.stands else 0.0)
+        return (
+            self.shadow_mm2
+            - 0.25 * self.contact_mm2
+            + 2.0 * self.height
+            + 50.0 * max(0.0, self.slenderness - 3.0)
+            + (NO_CONTACT_PENALTY if not self.stands else 0.0)
+        )
+
+    @property
+    def slenderness(self) -> float:
+        """Height over the square root of the bed contact: a 6 mm rod standing 204 mm tall scores about 38, a cube 1.
+        Above 3 the score adds 50 per unit: a tall thin stand wobbles, needs a brim, and prints slowly."""
+        return self.height / math.sqrt(max(self.contact_mm2, 1.0))
 
     @property
     def stands(self) -> bool:
@@ -322,13 +369,17 @@ class Metrics:
             "steepest_deg": round(self.steepest_deg, 1),
             "centroid_z": round(self.centroid_z, 2),
             "stands": self.stands,
+            "slenderness": round(self.slenderness, 1),
             "threshold_deg": self.threshold_deg,
             "volume_mm3": round(self.volume_mm3, 1),
             "score": round(self.score, 1),
         }
 
 
-def metrics(facets: Sequence[Facet], threshold_deg: float = 45.0, bed_tol: float = 0.05) -> Metrics:
+DEFAULT_THRESHOLD = 60.0  # degrees from vertical = Bambu's default support_threshold_angle 30 from horizontal
+
+
+def metrics(facets: Sequence[Facet], threshold_deg: float = DEFAULT_THRESHOLD, bed_tol: float = 0.05) -> Metrics:
     lo, hi = bbox(facets)
     size = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
     cos_thr = math.cos(math.radians(90.0 - threshold_deg))  # -n.z above this = steeper than the threshold
@@ -357,7 +408,7 @@ def metrics(facets: Sequence[Facet], threshold_deg: float = 45.0, bed_tol: float
             continue
         angle = math.degrees(math.asin(min(1.0, -nz)))
         steepest = max(steepest, angle)
-        if -nz > cos_thr:
+        if -nz > cos_thr + 1e-6:  # a facet at exactly the threshold angle (45-degree feet, chamfers) is printable
             overhang += area
             shadow += area * -nz
     vol = vol6 / 6
@@ -412,7 +463,7 @@ def face_normals(facets: Sequence[Facet], top: int = 12, quantum: float = 0.02) 
     return out[:top]
 
 
-def candidates(facets: Sequence[Facet], threshold_deg: float = 45.0, top: int = 12) -> list[Candidate]:
+def candidates(facets: Sequence[Facet], threshold_deg: float = DEFAULT_THRESHOLD, top: int = 12) -> list[Candidate]:
     """Orientations worth comparing: as-is, the six axis faces, and the largest flat faces laid on the bed.
     Sorted by score, best first. Candidates whose rotations coincide (within 1 degree) are merged."""
     seen: list[Vec] = []

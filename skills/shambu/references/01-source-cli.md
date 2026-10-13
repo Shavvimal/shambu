@@ -18,6 +18,21 @@ marked **UNVERIFIED** are inferences that need a run to confirm.
 
 ---
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [0. Ten findings that matter most](#0-ten-findings-that-matter-most) | The ten source facts that shape the wrapper most |
+| [1. Command-line parsing](#1-command-line-parsing) | How `read_cli` splits actions, transforms, options and input files |
+| [2. Assemble list (`--load-assemble-list`)](#2-assemble-list---load-assemble-list) | The `--load-assemble-list` JSON keys and how Studio applies them |
+| [3. Order of operations in `CLI::run` (`BS.cpp:1488-8268`)](#3-order-of-operations-in-clirun-bscpp1488-8268) | The order in which `CLI::run` loads, arranges, slices and exports |
+| [4. Slicing path (`--slice`)](#4-slicing-path---slice) | What `--slice` checks and does, with its exit codes |
+| [5. Presets](#5-presets) | Preset file keys, `inherits` and `include`, and loading rules |
+| [6. result.json and return codes](#6-resultjson-and-return-codes) | The `result.json` writer and every return code |
+| [7. Bambu 3MF layout (writer `_save_model_to_file`, `bbs_3mf.cpp:6426-6905`)](#7-bambu-3mf-layout-writer-_save_model_to_file-bbs_3mfcpp6426-6905) | Which files the 3MF writer puts in the zip, and their format |
+| [8. X2D machine profile facts (`resources/profiles/BBL/machine/`)](#8-x2d-machine-profile-facts-resourcesprofilesbblmachine) | X2D machine profile values: model id, bed, nozzle reach, heights |
+| [9. Implications for a Python wrapper](#9-implications-for-a-python-wrapper) | Rules a Python wrapper must follow when it calls the CLI |
+
 ## 0. Ten findings that matter most
 
 1. **Action order on the command line is execution order.** `--slice`, `--no-check`,

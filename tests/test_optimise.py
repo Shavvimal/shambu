@@ -619,3 +619,104 @@ def test_support_filament_is_pinned_on_a_two_filament_plate(tmp_path, stls, reso
     d["plates"][0]["parts"][1]["filament"] = 1
     plan = Pipeline(FakeStudio(), resolver).plan(Spec.from_json(d))
     assert "support_filament" not in plan.assemble.plates[0].items[0].print_params
+
+
+# ---------------------------------------------------------------------------- batch 1 (real-STL test findings)
+def test_orient_json_carries_the_metres_warning(capsys, tmp_path):
+    from test_mesh import box
+
+    tiny = M.write_stl(tmp_path / "tiny.stl", box((0, 0, 0), (0.02, 0.01, 0.005)))
+    code, out, _ = run(capsys, "--json", "orient", str(tiny))
+    j = json.loads(out)
+    assert code == 0 and len(j["warnings"]) == 1 and "probably in metres" in j["warnings"][0]
+    assert j["candidates"][0]["threshold_deg"] == 60  # Studio's default, not the cautious 45
+    code, out, _ = run(capsys, "orient", "--json", str(M.write_stl(tmp_path / "mm.stl", box((0, 0, 0), (20, 10, 5)))))
+    assert code == 0 and json.loads(out)["warnings"] == []
+
+
+def test_rotate_scale_alone_drops_the_copy_onto_the_bed(capsys, tmp_path):
+    from test_mesh import box
+
+    off = M.write_stl(tmp_path / "jaw.stl", box((-0.01, 0.064, -0.038), (0.012, 0.092, 0.01)))  # metres, in an assembly frame
+    code, out, _ = run(capsys, "--json", "rotate", str(off), "-o", str(tmp_path / "r"), "--scale", "1000")
+    j = json.loads(out)
+    assert code == 0 and j["written"].endswith("jaw__x1000.stl")
+    lo, hi = M.bbox(M.read_stl(j["written"]))
+    assert lo == pytest.approx((0, 0, 0), abs=1e-4) and hi == pytest.approx((22, 28, 48), abs=1e-4)  # float32 STL
+
+
+def test_split_reports_inward_shells(capsys, tmp_path):
+    from test_mesh import box
+
+    cavity = [(a, c, b) for a, b, c in box((5, 2, 1), (10, 6, 3))]  # reversed winding: an inward shell inside the box
+    f = M.write_stl(tmp_path / "jaw.stl", box((0, 0, 0), (30, 10, 5)) + cavity)
+    code, out, _ = run(capsys, "--json", "split", str(f), "-o", str(tmp_path / "s"))
+    j = json.loads(out)
+    assert code == 0 and (j["bodies"], j["cavities"], len(j["written"])) == (1, 1, 1)
+    code, out, _ = run(capsys, "split", str(f), "-o", str(tmp_path / "s"))
+    assert "1 inward shell(s)" in out
+    plain = M.write_stl(tmp_path / "plain.stl", box((0, 0, 0), (30, 10, 5)))
+    code, out, _ = run(capsys, "split", str(plain), "-o", str(tmp_path / "s"))
+    assert "inward shell" not in out
+
+
+def test_feature_usage_counts_from_an_indented_first_tool(tmp_path):
+    """The start G-code selects the loaded filament with an indented `T1 H-1`: no change, and grams land on filament 2."""
+    from conftest import make_3mf
+    from shambu.threemf import Project
+
+    gcode = """; filament_density: 1.26,1.24
+; filament_diameter: 1.75,1.75
+M83
+  T1 H-1
+; FEATURE: Outer wall
+G1 X1 E10
+T0
+; FEATURE: Outer wall
+G1 X2 E5
+"""
+    f = make_3mf(tmp_path / "s.3mf")
+    with zipfile.ZipFile(f, "a") as z:
+        z.writestr("Metadata/plate_1.gcode", gcode)
+    ft = Project(str(f)).feature_usage(1)
+    area = math.pi * 0.875**2 / 1000
+    assert ft["filament_changes"] == 1  # T1 (start) -> T0 only
+    assert ft["per_filament"]["2"]["model"] == pytest.approx(10 * area * 1.24, abs=0.006)
+    assert ft["per_filament"]["1"]["model"] == pytest.approx(5 * area * 1.26, abs=0.006)
+
+
+def test_hms_rounds_to_the_minute_and_the_delta_matches_the_rows():
+    assert S._hms(2299) == "0h38" and S._hms(2404) == "0h40" and S._hms(3599) == "1h00"
+    res = S.run(
+        BASE,
+        [{"name": "slow"}],
+        lambda spec, do_slice: _Result(True, 2404 if str(spec.outdir).endswith("/sweep/slow") else 2299, 1.0),
+    )
+    lines = S.table(res)
+    assert lines[1].startswith("baseline") and "0h38" in lines[1] and "best" in lines[1]
+    assert lines[2].startswith("slow") and "0h40" in lines[2] and "+0h02" in lines[2]  # 40 - 38, not +0h01 from raw seconds
+
+
+def uv_sphere(r=10.0, rings=16, segs=32):
+    """A closed, outward-wound sphere: no facet is large enough to stand on."""
+    pts = [[(r * math.sin(math.pi * i / rings) * math.cos(2 * math.pi * j / segs),
+             r * math.sin(math.pi * i / rings) * math.sin(2 * math.pi * j / segs),
+             r * math.cos(math.pi * i / rings)) for j in range(segs)] for i in range(rings + 1)]  # fmt: skip
+    out = []
+    for i in range(rings):
+        for j in range(segs):
+            a, b, c, d = pts[i][j], pts[i][(j + 1) % segs], pts[i + 1][(j + 1) % segs], pts[i + 1][j]
+            for tri in ((a, b, c), (a, c, d)):
+                if M.facet_area(tri) < 1e-9:
+                    continue
+                centre = tuple(sum(v[k] for v in tri) / 3 for k in range(3))
+                out.append(tri if M._dot(M.facet_normal(tri), centre) > 0 else (tri[0], tri[2], tri[1]))
+    return out
+
+
+def test_orientation_variants_raise_when_nothing_stands(tmp_path):
+    stl = M.write_stl(tmp_path / "ball.stl", uv_sphere())
+    assert not any(c.metrics.stands for c in M.candidates(M.read_stl(stl)))
+    d = {**BASE, "plates": [{"name": "p", "parts": [{"path": str(stl)}]}]}
+    with pytest.raises(BuildError, match="no orientation puts a flat face on the bed"):
+        S.orientation_variants(d, "ball")

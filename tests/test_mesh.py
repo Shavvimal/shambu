@@ -181,3 +181,46 @@ def test_no_flat_contact_sinks_to_the_bottom():
     assert tilted and all(c.metrics.score > M.NO_CONTACT_PENALTY for c in tilted)
     assert cands[-1].metrics.stands is False
     assert "NO FLAT CONTACT" in "\n".join(M.describe_candidates(cands))
+
+
+# ---------------------------------------------------------------------------- batch 1 (real-STL test findings)
+def wedge45():
+    """A 20 x 10 x 10 wedge: a flat base, a back wall and a slope at exactly 45 degrees (facing up as modelled)."""
+    a, b, c, d = (0, 0, 0), (20, 0, 0), (20, 10, 0), (0, 10, 0)  # bed face, y 0..10
+    e, f = (0, 10, 10), (20, 10, 10)  # top edge above the back
+    return [
+        (a, c, b), (a, d, c),  # bottom
+        (a, b, f), (a, f, e),  # sloped front face, normal (0, -1, 1): faces up, 45 degrees
+        (d, e, f), (d, f, c),  # back wall
+        (a, e, d), (b, c, f),  # sides
+    ]  # fmt: skip
+
+
+def test_exact_threshold_facet_is_printable():
+    """A facet that faces down at exactly the threshold angle (Gridfinity's 45-degree foot) needs no support."""
+    upside_down = M.transform(wedge45(), M.euler_matrix(180, 0, 0))  # the slope now faces down at 45
+    lo, _ = M.bbox(upside_down)
+    facets = M.translate(upside_down, (-lo[0], -lo[1], -lo[2]))
+    slope = [f for f in facets if abs(M.facet_normal(f)[2] + math.sqrt(0.5)) < 1e-6]
+    assert slope, "the wedge must have a 45-degree downward face"
+    assert M.metrics(facets, threshold_deg=45).overhang_mm2 == pytest.approx(0)
+    assert M.metrics(facets, threshold_deg=44).overhang_mm2 > 0  # one degree stricter: it counts
+
+
+def test_slenderness_ranks_a_rod_lying_down_above_standing():
+    rod = box((0, 0, 0), (6, 6, 204))  # a 6 mm rod, 204 mm tall as modelled
+    standing = M.metrics(rod)
+    assert standing.slenderness == pytest.approx(204 / 6)
+    cands = M.candidates(rod)
+    assert cands[0].metrics.height == pytest.approx(6)  # best: lying down
+    as_is = next(c for c in cands if c.label == "as is")
+    assert as_is.metrics.score > cands[0].metrics.score + 50 * (34 - 3) - 1  # the slenderness penalty dominates
+
+
+def test_split_bodies_drops_an_inward_shell():
+    cavity = [(a, c, b) for a, b, c in box((5, 2, 1), (10, 6, 3))]  # reversed winding: a void inside the box
+    facets = box((0, 0, 0), (30, 10, 5)) + cavity
+    bodies = M.split_bodies(facets)
+    assert len(bodies) == 1 and len(bodies[0]) == 12 and M.volume(bodies[0]) == pytest.approx(1500)
+    assert M.count_shells(facets) == 2 and M.cavities(facets) == 1
+    assert M.cavities(box((0, 0, 0), (1, 1, 1))) == 0

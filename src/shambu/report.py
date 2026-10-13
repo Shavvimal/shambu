@@ -68,7 +68,7 @@ def render(r: BuildResult) -> str:
                 extras.append("settings " + ", ".join(f"{k}={v}" for k, v in x.spec.set.items()))
             if x.spec.height_ranges:
                 extras.append("height ranges " + "; ".join(f"z {h.min_z}..{h.max_z}: {h.set}" for h in x.spec.height_ranges))
-            if x.assembled:
+            if x.assembled and not x.grouped:
                 extras.append("parts " + ", ".join(f"{fp.name} on filament {fil}" for fp, fil, _ in x.files))
             try:
                 eff = effective_filaments(x.spec, x.files)
@@ -80,6 +80,19 @@ def render(r: BuildResult) -> str:
                 extras.append(f"keeps the CLI name '{x.cli_name}' in the project")
             if extras:
                 out.append(f"  - {x.key}: " + "; ".join(extras))
+            if x.grouped:
+                out.append(
+                    f"  - {x.key} is one object of {len(x.members)} parts on filament {x.placed.filament} (group_by_filament): "
+                    "they print together, layer by layer, with no nozzle change between them"
+                )
+                for m, (dx, dy) in zip(x.members, x.offsets, strict=True):
+                    sx, sy, sz = m.placed.info.size
+                    o = m.spec.orientation
+                    turned = "" if o.is_identity else f"; oriented (copy {m.files[0][0].name})"
+                    out.append(
+                        f"    - {m.key}: filament {m.placed.filament}, {sx:.1f} x {sy:.1f} x {sz:.1f} mm, "
+                        f"at x {dx:.1f} y {dy:.1f} in the group (bed x {m.placed.x0:.1f} y {m.placed.y0:.1f}){turned}"
+                    )
         out += [("- OK: " if c.ok else "- FAIL: ") + c.text for c in p.checks]
     if pl.problems:
         out += ["", "## Problems"] + ["- " + x for x in pl.problems]
@@ -87,6 +100,11 @@ def render(r: BuildResult) -> str:
         out += ["", "## Warnings"] + ["- " + x for x in pl.warnings]
     if r.run:
         out += ["", "## Export", "- " + r.run.summary()]
+        ep = r.export_problem()
+        if ep:
+            out.append("- " + ep)
+        for w in r.slicer_warnings():
+            out.append(f"- slicer warning: {w}")
         out += ["- patched: " + x for x in r.patches]
         if r.verify_problems == []:
             out.append(
@@ -109,6 +127,10 @@ def render(r: BuildResult) -> str:
                         f"prime tower {ft['tower_g']:.1f} g, flush {ft['flush_g']:.1f} g; {ft['filament_changes']} filament change(s)"
                     )
         out += ["- VERIFY FAIL: " + x for x in (r.verify_problems or [])]
+    if r.run is not None and not r.run.ok:
+        out += ["", "## Next", "- The export failed (above): nothing to open. Fix the spec or the part and build again."]
+        out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
+        return "\n".join(out) + "\n"
     out += ["", "## Owner steps in Bambu Studio"]
     step = 1
     out.append(
@@ -124,7 +146,8 @@ def render(r: BuildResult) -> str:
     step += 1
     if r.sliced:
         out.append(
-            f"{step}. The plate is already sliced (the estimate above comes from the slicer). Check the preview, then Print. Re-slice in Studio after any change."
+            f"{step}. The plate is already sliced (the estimate above comes from the slicer). In Preview, set the colour scheme to Line Type and "
+            "look at the Overhang wall, Bridge and Support rows and at the first layer; then Print. Re-slice in Studio after any change."
         )
     else:
         out.append(f"{step}. Slice Plate, read the time and filament estimate, then Print.")

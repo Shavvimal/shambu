@@ -65,10 +65,12 @@ Per candidate orientation (as is, six axis faces, the largest flat faces laid do
 bed contact area (facets flat on z = min), overhang area (downward facets steeper than the threshold, off the bed),
 its shadow (the same area projected onto the bed and summed: overlapping projections count twice and nothing is
 occluded, so it is a proxy for the support footprint, not the footprint itself), the steepest overhang present,
-height, centroid height and volume. Score = shadow - 0.25 x contact + 2 x height, lower is better. The weights are
-the tool's own. Bridges are counted as overhang (Studio's auto-orient has the same blind spot, and its wiki says
-bridges are its main error source), so a part with real bridges needs the sweep, not the score alone. Internal faces
-in a non-watertight STL count as overhang: fix the mesh first.
+height, centroid height and volume. Score = shadow - 0.25 x contact + 2 x height + 50 x (slenderness - 3 when above
+3), lower is better; slenderness = height / sqrt(contact). The weights are the tool's own. The default threshold is 60
+deg from vertical (Studio's own 30 from horizontal); a facet at exactly the threshold counts as printable. Bridges are
+counted as overhang (Studio's auto-orient has the same blind spot, and its wiki says bridges are its main error
+source), so a part with real bridges needs the sweep, not the score alone. Internal faces in a non-watertight STL
+count as overhang: fix the mesh first.
 
 Studio's auto-orient (`Orient.cpp`, a Tweaker-style method) for comparison: candidates are the current down
 direction, the 10 largest facet-normal clusters, the 14 largest convex-hull normal clusters and 18 fixed axis and
@@ -136,6 +138,18 @@ over 32.8 mm so nothing later shares its Y band, writes the plate `print_sequenc
 process settings counts, the plate's own value wins), warns that a multi-object plate has no tower, and refuses
 Smooth timelapse and clumping detection. With one object on the plate none of this applies, as in Studio.
 
+**Merged groups (`group_by_filament: true`, by object only).** The CLI translates each assemble-list Item by its
+own `pos`, then merges it into `assemble_k` with `add_volume`, which copies the volume's transformation
+(BambuStudio.cpp 1251-1287, Model.cpp 1452-1467). So the volumes of one merged object keep their own positions,
+and Studio prints that object by layer as one unit: every layer of the group holds all its members, then the next
+object starts. shambu merges single-file parts with no `at` that share the main filament, the settings (`set`)
+and the height ranges. It packs each cluster locally with the layout gap (5 mm plus brim margins), places the
+cluster as one object 60 mm from the others, and writes one Item per member spec with `assemble_index` k and
+`pos` = group start + member offset - STL min (copies relative to the first copy). A cluster of one stays a
+plain object. Groups take the names `group-f<n>` (or `group-f<n>-<k>` when two clusters share a filament), and
+the report lists the members. Live (2026-10-13, X2D, 2 x PLA): two filament-1 boxes and two filament-2 boxes
+gave 2 objects, 1 tool change, and every box printed within 0.2 mm of its planned bbox.
+
 ---
 
 ## 3. Supports, overhangs and bridging
@@ -185,8 +199,8 @@ print, mostly from fewer nozzle switches.
 
 Keys that do not exist in Bambu Studio (OrcaSlicer only; writing them does nothing): `make_overhang_printable*`,
 `extra_perimeters_on_overhangs`, `overhang_reverse`, `internal_bridge_flow`, `bridge_density`, `thick_internal_bridges`,
-`tree_support_tip_diameter`, `dont_support_bridges`, `wall_direction`, `only_one_wall_top`, `hole_to_polyhole`,
-`resonance_avoidance`. `tree_support_with_infill` is on Bambu's obsolete list. Teardrop holes, chamfers and
+`tree_support_tip_diameter`, `dont_support_bridges`, `wall_direction`, `only_one_wall_top` (Bambu's key for one wall
+on top surfaces is `top_one_wall_type`: `not apply`, `all top`, `topmost`), `hole_to_polyhole`, `resonance_avoidance`. `tree_support_with_infill` is on Bambu's obsolete list. Teardrop holes, chamfers and
 "make overhang printable" cones belong in CAD. One X post measured the same part at 45 min with tree supports in
 Bambu Studio and 19 min with Orca's cone conversion and no supports: the geometry change, not the slicer, saved it.
 
@@ -212,6 +226,17 @@ before relying on them. Manual support types (`tree(manual)`, `normal(manual)`) 
 Since 2.5.0 `enable_support_ironing` (needs interface spacing 0, not grid, Developer mode) irons the interface. One
 X post: the ironed side's PETG-under-PLA supports fell off on their own and the underside came out smooth.
 
+### 3.6 Tree support spreads past the part's box (live finding, 2026-10-13)
+
+The planner used to measure only the model footprint. A gripper bracket (95 x 170 x 90 in its CAD frame, laid on its
+-y cheek, tree supports) next to a nut holder 5 mm away passed `check` and failed in Studio with exit -101 (G-code
+path conflicts). In the bracket-alone G-code, Support extrusions below z 10 reach x 110.1 and y 107.4 against an outer
+wall at x 96.8, y 91.8: 13 to 15.6 mm past the box. With `layout.gap` 15 it still conflicted; with gap 20 it sliced
+(8 h 25 min, 231.7 g). On a two-filament SO-101 plate the jaw on filament 2 (bbox from x 25.7) put T1 support at x 15.0,
+inside the right nozzle's dead strip, and Studio refused it with -102. Rule now: a part with supports gets a margin of
+0.25 x its height, clamped to 5..25 mm (the bracket, 170 mm tall on its cheek face, gets the 25 mm cap), and the
+extruder-reach check uses the rect with the margin (`layout.support_margin`).
+
 ---
 
 ## 4. Time
@@ -226,6 +251,14 @@ X post: the ironed side's PETG-under-PLA supports fell off on their own and the 
 | 6 x 10 mm cubes, one filament | 14.5 m | 27.8 m |
 | gripper: 2 links (PETG, tree supports) + tag bridge (PLA, 210 x 3 x 96 standing as exported) | 3 h 38, 72.4 g, 61 changes, 6.2 g tower | 3 h 13, 66.2 g, 1 change |
 | the same plate with the tag bridge laid flat (its designer's bed face) | **2 h 27, 62.0 g, 14 changes, 1.6 g tower** | (by object not re-run) |
+| 4 x 10x10x15 mm cubes, 2 per filament, merged into 2 groups (notes-research A) | 42 m 16 s, 75 changes | **21 m 04 s merged**; 29 m 05 s as 4 separate objects; 1 change each |
+| 2 boxes (20x20x10, 15x25x12) on filament 1 + 2 x 18x18x8 on filament 2 (`group_by_filament`, live) | not run | **23 m 30 s grouped** (1410 s); 26 m 32 s separate (1592 s); 1 change each |
+| OpenArm: J7_joint_B + camera_mount (PLA, f1), shaft_A (PETG, f2) | 1 h 24, 20.6 g, 70 changes, 7.2 g tower | **59 m, 13.3 g, 1 change** |
+| SO-101 wrist: wrist_roll_follower, wrist_roll_pitch, moving_jaw (PLA, one filament, 20 to 65 mm tall, tree supports) | **3 h 23, 84.5 g** | 3 h 24, 84.4 g (1 min slower) |
+| SO-101: 3 x motor_holder_wrist (28 mm, one filament) | 1 h 20 | **1 h 19** |
+| Gridfinity: 6 labels, text part on filament 2 | **38 m (2299 s), 8.5 g, 3 changes, 0.3 g tower** | 40 m (2404 s, +105 s), 8.1 g, 23 changes, no tower |
+| Gridfinity: 3 bins a01, a17, a21 (one filament) | **2 h 09 (7786 s), 76.4 g** | 2 h 11 (7863 s, +77 s) |
+| organic: duck + bottle funnel (f1) + spout funnel (f2) | 2 h 40, 49.8 g, 273 changes, 18.9 g tower | **1 h 13, 30.9 g, 1 change** |
 
 Why it works: by layer, two single-colour object groups cost about one nozzle change per layer (0.2 mm x 20 mm =
 100 changes) and a prime tower wipe after each. The slicer charges about 14.5 s per X2D nozzle change (a forum test:
@@ -236,6 +269,15 @@ forced a filament-2 layer on every one of 480 layers and the flat one on 15. Rul
 (`shambu sweep --by-object`) and keep the faster one. Expect by object to win when each object is single-colour with
 real layer area, and by layer to win for many tiny parts. By layer with `enable_prime_tower` 0 is faster still on
 tiny parts but the idle nozzle then oozes with no wipe (Bambu built ramming and pre-cooling because of that).
+Merged same-filament groups fix most of the tiny-part loss: the members of a group share each layer, so they share
+the minimum layer time (outer wall 278 s merged vs 421 s separate on the four cubes; this cause is inferred, not
+measured). Each group was timed once.
+
+The real-part rows (one slice each) agree: by object won by about 1 h 27 min on the duck and funnels and by 25 min on
+the OpenArm plate, where each filament holds whole objects; it lost 1 min to 105 s on single-filament or tiny
+two-colour plates (SO-101 wrist, Gridfinity bins and labels). On six Gridfinity bins a recipe beat both: `fast-infill`
+4 h 39 against 5 h 21 for the baseline (`wide-line-two-loop-walls` 4 h 44, `coarse-fast` 4 h 58); by object did not
+fit one plate.
 
 ### 4.2 The right nozzle is slow
 
@@ -383,6 +425,20 @@ Not verified: whether a native `classcad-cli` worker build imports STL as a soli
   (STL at z -38): copy 2 floated at z 38 and sat off the bed. Fixed in `build.py`.
 - Real-part findings in one place: the copy bug, the support-filament pin (3.3b), zero-contact orientation
   candidates (1.2), meshes in metres (`shambu rotate --scale`). The manual loop lives in `data/README.md`.
+- Support spread: tree support reached 15.6 mm past a gripper bracket's box (Studio -101 at gap 15, sliced at 20).
+  The layout now keeps 0.25 x height, 5..25 mm, round a supported part (3.6).
+- Metres: `check` passed an OpenArm J7_joint_B scaled to metres (0.0 x 0.0 x 0.0 mm, OK) and Studio failed with -100.
+  A mesh under 1 mm now fails `check`; the SO-101 URDF meshes are the real case.
+- Export failure: on the gripper p5-bracket plate (-101), OpenArm G3 (-63) and SO-101 plate-arms the report said
+  "already sliced" and pointed at a missing `.gcode.3mf`. It now says "export failed" with Studio's error.
+- T lines: Gridfinity labels with a height range on filament 2 reported 0 filament changes; the start G-code's
+  indented `T1 H-1` was skipped. The first T line now sets the loaded filament.
+- Threshold: `orient` used 45 deg from vertical and counted Gridfinity's exact-45 foot and lip by float noise. The
+  default is now 60, Studio's own 30 from horizontal, and an exact-threshold facet is printable.
+- Slenderness: a 6 mm guide rod (organic gripper set) ranked standing 204 mm tall with 27.6 mm2 of contact. The
+  score now adds 50 per unit of height / sqrt(contact) above 3 (1.2).
+- Cavities: `split` wrote an SO-101 moving_jaw's inward shell (signed volume -76.5 mm3) as a second body. Inward
+  shells are now dropped and counted as cavities.
 
 ---
 

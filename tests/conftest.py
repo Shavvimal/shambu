@@ -294,7 +294,8 @@ def mesh(path: Path | str = "part.stl", size=(20.0, 20.0, 10.0), lo=(0.0, 0.0, 0
 
 @dataclass
 class FakeStudio:
-    """Same surface as StudioCLI. `run()` copies `fixture` to the expected output, or fails with `code`."""
+    """Same surface as StudioCLI. `run()` copies `fixture` to the expected output, or fails with `code`; `result` adds
+    keys to the run's result.json (as Studio writes `error_string` and `warning_message`)."""
 
     fixture: Path | None = None
     code: int = 0
@@ -303,6 +304,7 @@ class FakeStudio:
     scratch: Path = Path("/nonexistent")
     binary: Path = Path("/Applications/FakeStudio.app/Contents/MacOS/BambuStudio")
     calls: list[tuple[str, object]] = field(default_factory=list)
+    result: dict | None = None  # extra result.json keys (error_string, warning_message); None keeps the default result
 
     def info(self, path) -> MeshInfo:
         path = Path(path)
@@ -325,7 +327,9 @@ class FakeStudio:
             self.code,
             0.1,
             log,
-            {"return_code": self.code} if self.code == 0 else None,
+            {"return_code": self.code, **self.result}
+            if self.result is not None
+            else ({"return_code": self.code} if self.code == 0 else None),
             expect_output,
         )
 

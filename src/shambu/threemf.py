@@ -311,10 +311,11 @@ class Project:
         """Filament by feature from the plate's G-code (Metadata/plate_N.gcode), which is the only headless output
         that separates support, prime tower and flush from the model (reference 08 section 4). Extrusion is
         relative (M83); `; FEATURE: <name>` tags each block, `; FLUSH_START/END` brackets a flush, and a `T<n>` line
-        selects the filament (the start G-code selects filament 1 without a bare T line, so every T line is a change).
-        Retractions are repaid by the following positive moves before anything counts as deposited, so a retract in
-        one feature and its deretract in the next cancel. Absolute extrusion (M82, G92) is handled; the loaded
-        filament at start is taken as filament 1 (true for Bambu's start G-code, not verified for others).
+        selects the filament: the start G-code selects the loaded filament with an indented `T<n> H-1` line, so the first
+        T line sets the tool without counting and every later T line with another tool is a change (live-checked on
+        by-layer, by-object and filament-2-first plates). Retractions are repaid by the following positive moves
+        before anything counts as deposited, so a retract in one feature and its deretract in the next cancel.
+        Absolute extrusion (M82, G92) is handled.
         Returns grams per class and per filament, plus the number of filament changes."""
         name = f"Metadata/plate_{plate}.gcode"
         if not self.has(name):
@@ -323,10 +324,11 @@ class Project:
         densities: list[float] = []
         diameters: list[float] = []
         mm: dict[tuple[str, int], float] = {}
-        feature, tool, in_flush, changes = "other", 0, False, 0  # filament 1 is loaded by the start G-code
+        feature, tool, in_flush, changes = "other", -1, False, 0  # the first T line (in the start G-code) is the loaded filament
         absolute, last_e = False, 0.0  # M82 absolute / M83 relative extrusion; G92 E resets the absolute position
         debt: dict[int, float] = {}  # retracted filament per tool, repaid by the next positive moves (not deposited)
-        for line in text.splitlines():
+        for raw in text.splitlines():
+            line = raw.lstrip()  # the start G-code indents its T lines
             if not line:
                 continue
             c = line[0]
@@ -348,8 +350,9 @@ class Project:
             word = head[0]
             if c == "T" and len(word) > 1 and word[1:].isdigit():
                 t = int(word[1:])
-                if t < 100 and t != tool:  # T255 / T65535 are "no tool" markers; the start G-code emits no bare T line
-                    changes += 1
+                if t < 100 and t != tool:  # T255 / T65535 are "no tool" markers
+                    if tool >= 0:
+                        changes += 1
                     tool = t
                     last_e = 0.0
             elif word == "M82":
@@ -366,12 +369,13 @@ class Project:
                         e = _float_or(tok[1:], 0.0)
                         if absolute:
                             e, last_e = e - last_e, e
+                        tl = max(tool, 0)
                         if e < 0:
-                            debt[tool] = debt.get(tool, 0.0) - e
+                            debt[tl] = debt.get(tl, 0.0) - e
                         else:
-                            repay = min(e, debt.get(tool, 0.0))
-                            debt[tool] = debt.get(tool, 0.0) - repay
-                            k = ("flush" if in_flush else feature, tool)
+                            repay = min(e, debt.get(tl, 0.0))
+                            debt[tl] = debt.get(tl, 0.0) - repay
+                            k = ("flush" if in_flush else feature, max(tool, 0))
                             mm[k] = mm.get(k, 0.0) + e - repay
                         break
         out: dict = {
@@ -487,6 +491,7 @@ class Project:
             "printer": ps.get("printer_settings_id"),
             "process": ps.get("print_settings_id"),
             "bed_type": ps.get("curr_bed_type"),
+            "print_sequence": ps.get("print_sequence"),
             "filaments": [
                 {
                     "slot": i + 1,

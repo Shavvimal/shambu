@@ -94,6 +94,16 @@ def overlaps(a: Rect, b: Rect) -> bool:
     return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
 
 
+def support_margin(params: dict | None, height: float) -> float:
+    """How far tree supports may spread past a supported part's footprint: a quarter of the height, 5 to 25 mm.
+    Measured: a 95 mm bracket's trees reached 13 to 15.6 mm past its bbox (a 15 mm gap still conflicted, 20 mm
+    sliced); a jaw's support reached 5.5 mm into the right nozzle's dead strip (reference 08 section 3.3b)."""
+    p = params or {}
+    if str(p.get("enable_support", "0")) not in ("1", "true"):
+        return 0.0
+    return max(5.0, min(25.0, 0.25 * height))
+
+
 def brim_margin(params: dict | None, default_brim_width: float = 5.0) -> float:
     """Footprint growth from a brim: outer_only/auto grow by brim_width, no_brim by 0, ears by 3."""
     p = params or {}
@@ -268,11 +278,12 @@ class ExtruderReach:
                 e = ctx.extruder_of(fil)
                 if p.info.size[2] > e["z_max"]:
                     yield Check(False, f"{p.key} is {p.info.size[2]:.1f} mm tall; extruder {e['index']} prints up to {e['z_max']:.0f} mm")
-                if p.x0 < e["x"][0] or p.x1 > e["x"][1] or p.y0 < e["y"][0] or p.y1 > e["y"][1]:
+                mx0, my0, mx1, my1 = p.rect(with_margin=True)  # brim and support spread must stay in reach too
+                if mx0 < e["x"][0] or mx1 > e["x"][1] or my0 < e["y"][0] or my1 > e["y"][1]:
                     yield Check(
                         False,
-                        f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and spans x {p.x0:.1f}..{p.x1:.1f}; "
-                        f"that extruder reaches x {e['x'][0]:.1f}..{e['x'][1]:.1f}",
+                        f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and spans x {mx0:.1f}..{mx1:.1f} "
+                        f"with its brim and support margin ({p.margin:.1f} mm); that extruder reaches x {e['x'][0]:.1f}..{e['x'][1]:.1f}",
                     )
                 if e["index"] == 2 and ctx.aux_x_limit is not None and p.x1 > ctx.aux_x_limit:
                     yield Check(
@@ -297,6 +308,14 @@ class MeshSane:
         for p in placed:
             if not p.info.manifold:
                 yield Check(False, f"{p.key} is not manifold")
+            if max(p.info.size) < 1.0:
+                yield Check(
+                    False,
+                    f"{p.key} is {p.info.size[0]:.3f} x {p.info.size[1]:.3f} x {p.info.size[2]:.3f} mm: probably a mesh in metres; "
+                    f"`shambu rotate FILE -o DIR --scale 1000` writes a mm copy",
+                )
+            if p.info.parts > 1:
+                yield Check(True, f"{p.key}: the STL holds {p.info.parts} bodies; `shambu split` if they are separate parts")
             if not p.info.on_bed():
                 yield Check(True, f"{p.key}: STL min z is {p.info.min[2]:.2f}; the placement drops it onto the bed")
 
@@ -322,14 +341,17 @@ class SequentialClearance:
             return
         c = ctx.clearance
         need = ctx.sequential_gap(all(p.info.size[2] < c["nozzle_height"] for p in placed))
+        fails: list[Check] = []
         for i, a in enumerate(placed):
             for b in placed[i + 1 :]:
                 g = gap_between(a.rect(with_margin=False), b.rect(with_margin=False))
                 if g < need - 1e-6:
-                    yield Check(
-                        False,
-                        f"{a.key} and {b.key} are {g:.1f} mm apart; print-by-object needs {need:.1f} mm between objects "
-                        f"(extruder_clearance_max_radius {c['radius']:.0f})",
+                    fails.append(
+                        Check(
+                            False,
+                            f"{a.key} and {b.key} are {g:.1f} mm apart; print-by-object needs {need:.1f} mm between objects "
+                            f"(extruder_clearance_max_radius {c['radius']:.0f})",
+                        )
                     )
         for i, a in enumerate(placed):
             later = placed[i + 1 :]
@@ -340,8 +362,14 @@ class SequentialClearance:
             else:
                 limit, why = c["height_to_lid"], "the lid"
             if a.info.size[2] > limit:
-                yield Check(False, f"{a.key} is {a.info.size[2]:.1f} mm tall; print-by-object allows {limit:.1f} mm here because of {why}")
-        yield Check(True, f"print-by-object: {len(placed)} object(s) in print order, {need:.1f} mm apart, heights within the gantry limits")
+                fails.append(
+                    Check(False, f"{a.key} is {a.info.size[2]:.1f} mm tall; print-by-object allows {limit:.1f} mm here because of {why}")
+                )
+        yield from fails
+        if not fails:
+            yield Check(
+                True, f"print-by-object: {len(placed)} object(s) in print order, {need:.1f} mm apart, heights within the gantry limits"
+            )
 
 
 DEFAULT_RULES: tuple[Rule, ...] = (
