@@ -123,7 +123,10 @@ def test_summarise_parses_when_two_filaments_are_loaded_but_one_has_grams(tmp_pa
     assert [x["used_g"] for x in s["plates"][0]["slice"]["filaments"]] == [2.12, 0.0]
     assert len(s["filaments"]) == 2 and calls == [1]
     calls.clear()
-    summarise(sliced_project(tmp_path / "one.gcode.3mf", support="false", two=False, loaded=1), run_result({"sliced_plates": copy.deepcopy(SLICED_PLATES)}))
+    summarise(
+        sliced_project(tmp_path / "one.gcode.3mf", support="false", two=False, loaded=1),
+        run_result({"sliced_plates": copy.deepcopy(SLICED_PLATES)}),
+    )
     assert calls == []  # one filament loaded, no support, native grams: skips
 
 
