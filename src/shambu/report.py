@@ -46,9 +46,22 @@ def render(r: BuildResult) -> str:
         out.append("Process settings: " + ", ".join(f"{k}={v}" for k, v in spec.process.set.items()) + ".")
     for p in pl.plates:
         out += ["", f"## Plate: {p.name}"]
+        if p.print_sequence == "by object":
+            out.append(
+                "- print sequence: by object (objects print one after another in the order listed"
+                + ("; Studio builds no prime tower on such a plate)" if len(p.parts) > 1 else ")")
+            )
         out += ["- " + line for line in L.describe([x.placed for x in p.parts])]
         for x in p.parts:
             extras = []
+            if not x.spec.orientation.is_identity:
+                o = x.spec.orientation
+                extras.append(
+                    "oriented: "
+                    + (f"face {list(o.lay_on_face)} on the bed" if o.lay_on_face else "")
+                    + (f" rotated {list(o.rotate)} deg" if any(o.rotate) else "")
+                    + f" (copy {x.files[0][0].name})"
+                )
             if x.spec.recipes:
                 extras.append("recipes " + ", ".join(x.spec.recipes))
             if x.spec.set:
@@ -89,6 +102,12 @@ def render(r: BuildResult) -> str:
                     + ")"
                     + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")
                 )
+                ft = sl.get("features")
+                if ft:
+                    out.append(
+                        f"- plate {plate_s['id']} filament by feature: model {ft['model_g']:.1f} g, support {ft['support_g']:.1f} g, "
+                        f"prime tower {ft['tower_g']:.1f} g, flush {ft['flush_g']:.1f} g; {ft['filament_changes']} filament change(s)"
+                    )
         out += ["- VERIFY FAIL: " + x for x in (r.verify_problems or [])]
     out += ["", "## Owner steps in Bambu Studio"]
     step = 1

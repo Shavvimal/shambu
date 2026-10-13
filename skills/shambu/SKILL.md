@@ -28,10 +28,14 @@ shambu info part.stl ...            # size, bbox, facets, manifold (Studio's --i
 shambu presets list filament --contains PETG
 shambu recipes                      # named settings bundles validated on real prints
 shambu spec                         # the spec JSON shape
+shambu orient part.stl [--threshold 45] [--write DIR]   # score orientations: contact, support shadow, height
+shambu rotate part.stl -o DIR --lay-on-face 0,0,1 [--rotate 0,0,45]   # write a turned STL copy
+shambu split  part.stl -o DIR       # one STL per body (Studio's "Split to objects")
 shambu check  plate.json            # presets, STL measurements, placement, limit checks; no export
 shambu build  plate.json [--slice] [--open]   # export, patch, verify, report (+ headless slice)
+shambu sweep  plate.json --orientations PART --by-object [--variants v.json]   # slice variants, compare
 shambu inspect project.3mf          # plates, objects, parts, filaments, settings, pauses, estimates
-shambu patch   project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 ...
+shambu patch   project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 --print-sequence "1:by object" ...
 shambu printer status [--ip <printer-ip>]     # read-only MQTT pushall
 shambu printer watch --every 300              # until the printer leaves RUNNING/PAUSE
 ```
@@ -45,14 +49,16 @@ printer). Module map and the rules the code encodes: the repository README. Revi
 1. **Write the spec** (one JSON, see `bambu.py spec`). Name, outdir, printer `Bambu Lab X2D 0.4 nozzle`,
    process (`base` preset, a `name`, `recipes`, `set` overrides as strings), filaments (preset and colour per
    slot), `bed_type`, plates with parts. A part is a `path` with `filament`, `count`, `recipes`, `set`,
-   `height_ranges`, optional `at` [x, y] for the bbox corner; or `parts` (several files merged into one object,
-   e.g. a label body on filament 1 and its text on filament 2). Per plate: `pause_at_z`, `colour_changes`.
-   Use `aux_x_limit: 235.5` when the user's note about the auxiliary nozzle must hold.
+   `height_ranges`, optional `at` [x, y] for the bbox corner, optional `lay_on_face` [nx, ny, nz] and `rotate`
+   [x, y, z] degrees (the tool writes a turned copy of the STL; the CLI cannot turn one object); or `parts` (several
+   files merged into one object, e.g. a label body on filament 1 and its text on filament 2). Per plate:
+   `pause_at_z`, `colour_changes`, `print_sequence` ("by layer" default, or "by object"). Use `aux_x_limit: 235.5`
+   when the user's note about the auxiliary nozzle must hold.
 2. **`check`** it. The tool resolves the presets (`inherits` and `include`, so the X2D start G-code is the
    real 14848-character one), measures every STL, packs the parts (shelf packing, 2 mm edge, 5 mm gap, brim
    margins, parts on filament 2 pushed to x >= 20.5, the prime-tower corner kept free), and checks overlap,
-   bed, both nozzles' reach and height, TPU on the main nozzle, manifold meshes. Fix the spec until every
-   check reads OK.
+   bed, both nozzles' reach and height, TPU on the main nozzle, manifold meshes, and on a by-object plate the
+   head clearance and gantry height rules. Fix the spec until every check reads OK.
 3. **`build`** it. Unsliced: `<name>.3mf` in about 0.3 s. With `--slice`: `<name>.gcode.3mf` in about 1 s
    with G-code, time and filament estimates in the report. The tool passes the colours, the bed type, the
    nozzle map and the prime-tower position on the command line, adds `layer_height` to every height range,
@@ -110,7 +116,13 @@ Supports:
   `snug-normal-supports`, `no-supports`), never for the whole plate.
 - Tree supports by default; normal snug supports only for a flat area supported straight up from the plate
   (63-tip video). A few spots only: the user paints enforcers and blockers in Studio.
-- Printers bridge further than expected, PLA best. Skip supports where the finish does not matter.
+- Printers bridge further than expected, PLA best (10 to 40 mm clean on a measured plate). The Bambu preset puts
+  tree support under every bridge (`max_bridge_length` 0): `bridge-short-spans` frees spans up to 10 mm.
+  `minimal-supports` keeps only sharp tails and cantilevers; `counterbore-bridging` closes screw counterbores
+  with one sacrificial layer; `petg-supports` widens the gaps so PETG-on-PETG comes off; `more-support` raises
+  Bambu's threshold (it counts from horizontal: default 30 = support only under faces within 30 deg of flat).
+- Never write a scalar into an X2D speed key (`*_speed`, `*_acceleration`, `enable_overhang_speed`): they are
+  six-slot per-nozzle arrays and a scalar wipes the other five (reference 08, section 3).
 
 Different-material support interface (`dual-material-interface`, notes):
 - PETG part: PETG tree supports, PLA interface. PLA part: PLA supports, PETG interface. They barely bond.
@@ -137,6 +149,79 @@ Filament and Studio setup:
 Out of scope here: fillets, teardrop holes, nut slots, inserts, polishing, design advice. They belong to the
 CAD step.
 
+## Optimising a print: orientation, supports, time (reference 08)
+
+The slicer is the only honest judge of time and filament, and a headless slice takes about a second, so the
+skill iterates instead of guessing: score, slice the candidates, read the table, pick, hand back the numbers.
+
+The loop:
+
+1. `shambu orient part.stl` for every part whose orientation is not obvious. It lists the as-is orientation, the
+   six axis faces and the largest flat faces laid down, with bed contact, support shadow (the overhang area
+   projected onto the bed and summed; stacked overhangs count twice), the steepest overhang, and height. The threshold is 45 deg from vertical (the rule of thumb; Bambu's own
+   `support_threshold_angle` counts from horizontal and defaults to 30). Internal faces of a non-watertight STL
+   count as overhang: `shambu info` says whether the mesh is manifold.
+2. Put the chosen face in the spec (`"lay_on_face": [nx, ny, nz]` copied from the table's lay_on_face column,
+   or from `--json`) or let the sweep try the best few: `shambu sweep plate.json --orientations <part key> --top 3`.
+3. On a plate with two filaments and several objects, add `--by-object`. The table shows time, grams, support
+   grams, waste (prime tower plus flush) and filament changes per variant, fastest first.
+4. Pick by the user's priority in this order: load direction (layers are the weak direction: upright PLA keeps
+   about half the flat strength), then supports and finish, then time. Report the table rows that mattered.
+
+Orientation rules (details and sources in reference 08, section 1):
+- Largest flat face on the bed unless the load or a show face forbids it. Loads pull along X/Y lines, never
+  across layers; a hook or a clip lies down. Pins and snap arms lie down with a D-flat; bolts stand, nuts lie;
+  gears lie; cylinders stand for roundness.
+- Steep features point up. 45 deg from vertical is safe at 0.2 mm on the 0.4 nozzle, 45 to 60 is "test it".
+  Fillets facing the bed are overhangs: chamfer them in CAD. Horizontal holes droop and go oval: teardrop them.
+- Show faces up or on a side, never on supports. A face on the textured plate gets its matte texture; text on the
+  bottom prints face down with no overhang.
+- Height costs time on every layer, and on a two-nozzle plate every layer with both filaments costs a nozzle
+  switch and a tower wipe. Colour boundaries go horizontal (Z bands): text on top of a box added 12 min, on a side
+  68 min.
+- A part with no good face: cut it (Studio's Cut tool, C, with dowel connectors) and print both halves flat.
+  shambu has no mesh boolean; say so and hand the cut to the user.
+- Studio's auto-orient (Shift+R) scores overhang against bottom area only: no strength, no time, and bridges read
+  as overhang. The tool's own score has the same bridge blind spot, which is why the sweep slices the candidates.
+
+Print by object (`print_sequence: "by object"` on the plate; exact source rules in reference 08, section 2):
+- What it does: each object prints start to finish before the next. With two filaments on two nozzles that
+  removes the prime tower and the one-nozzle-change-per-layer cost: the measured bracket-plus-cubes plate went
+  from 1 h 24 (7.2 g tower, 100 changes) to 40 min (1 change). The research agent's four cubes: 1 h 13 to 48 min.
+- When it loses: many tiny parts. Each object meets the filament's minimum layer time alone (PLA 4 s per layer),
+  so six 10 mm cubes took 28 min by object against 14.5 by layer. Always slice both (`--by-object`) and keep the
+  faster one.
+- Rules the tool enforces on the X2D (only when the plate holds more than one object, as in Studio): 60 mm
+  between object footprints (4 mm when every object is under 4 mm tall; more with a per-object skirt); objects
+  print in list order, which the tool sets to main filament then height, so two groups of single-filament objects
+  need one nozzle change in total (an object that itself uses two filaments, through sub-parts, height ranges
+  or a support interface, still changes within itself); an object over 32.8 mm must not be followed by one within
+  33 mm in Y (the gantry rods), so the packer gives it the rest of its row; nothing but the last object may pass
+  133 mm; Smooth timelapse and clumping detection are refused. Studio drops the prime tower itself, so the idle
+  nozzle is not wiped between objects. A `print_sequence` in the process settings counts too; the plate's own
+  value wins.
+- Studio GUI equivalent for the user: right-click the plate, Plate Settings, Print sequence, By object; then
+  Arrange (A) spaces the objects at 60 mm and the object list order is the print order.
+
+Other time levers worth a sweep variant (reference 08, section 4): the right (Bowden) nozzle runs the outer wall at
+50 mm/s against 200 on the left, so the filament with the most volume goes on filament 1 (an 80 mm box: 1 h 08 left,
+2 h 09 right); `0.20mm Standard`, not High Quality (19 vs 27 min on a cube); `fast-infill` (adaptive cubic plus
+combined infill: grid 1 h 09, adaptive cubic 0 h 59, gyroid 1 h 43 on an 80 mm box); `coarse-fast` 0.28 mm layers
+(27 % fewer colour changes in Bambu's example); colour changes near the bottom so the tower stops early.
+
+Finish (reference 08, section 5): `scarf-seam` on cylinders and `seam-back` on cornered parts (rotate the hidden
+side to +Y); `show-walls` (classic, three loops, inner-outer-inner) on cosmetic parts without overhangs;
+`iron-top` on one flat show face; `precise-fit` for fit-critical parts (precise outer wall works only with
+inner-then-outer order). Keep the X2D defaults (classic walls, monotonic-line tops, arc fitting, continuous
+outer-wall speed in Z). `enable_circle_compensation` only helps PLA Basic, PLA CF, PET CF, PETG CF and PETG HF.
+
+What to tell the user to do in Studio (checked against the 2.8 source; reference 08, section 7): Lay on face is F
+(click a white plane), Rotate is R (snaps at 45 deg on the inner ring, 5 deg on the ticks), Cut is C, Auto orient
+is Shift+R, Show Overhang is Cmd L, Supports painting is L, Seam painting is P, bottom view is Cmd 2. After Slice
+Plate, the Preview colour scheme has no "Overhang speed" entry in 2.8: use Line Type and read the Overhang wall,
+Bridge and Support rows, or Speed; the filament table under the legend splits each filament into Model, Support,
+Flushed, Tower and Total. Toggle Supports in the Process panel and re-slice to see where support goes.
+
 ## Machine limits the tool checks
 
 - Bed 256 x 256, 261 tall. Check footprints, not counts: two 200 g parts do not share the bed (227 + 95).
@@ -154,13 +239,15 @@ CAD step.
 
 Hand back the report file's content plus plain statements with numbers. Before building, the `check` output
 answers: every STL exists and is manifold; each footprint and the layout fit; every STL lies on its bed face
-(the tool never rotates parts; an STL in an assembly frame is a CAD fix, say so and stop); filament 2 parts
+(an STL in an assembly frame gets `lay_on_face` or `rotate` in the spec after `shambu orient`, never a guess);
+filament 2 parts
 and their x extents; TPU on the main nozzle; brims and supports per part with the recipe used; the process
 matches the material.
 
-After building: project path, sliced or not, estimate per plate when sliced, per plate the objects with
-filament and material, the process name and the key settings, the patches made, and what the user still sets
-by hand in Studio (painted enforcers, brim ear points, variable layer height, anything the spec could not
+After building: project path, sliced or not, estimate per plate when sliced (with filament by feature: model,
+support, tower, flush grams and the number of filament changes), per plate the objects with filament, material
+and orientation, the print sequence, the process name and the key settings, the patches made, the sweep table
+when one ran, and what the user still sets by hand in Studio (painted enforcers, brim ear points, variable layer height, anything the spec could not
 express). Then: open, check, slice (if unsliced), print.
 
 Standing warnings (include every time):
@@ -211,4 +298,6 @@ MQTT; status pushes are exempt from Bambu's Authorization Control, so no Develop
   `open -a BambuStudio file.3mf`.
 - Reports with the evidence, file:line citations and experiment tables sit beside this file:
   `references/01-source-cli.md`, `02-binary-crash.md`, `03-3mf-format.md`, `04-app-printer-control.md`,
-  `05-bambu-cli-ideas.md`, `07-print-recipes.md` (2026-10-13). Read the relevant one before changing the library.
+  `05-bambu-cli-ideas.md`, `07-print-recipes.md`, `08-optimisation.md` (orientation, print-by-object source rules,
+  supports, time, finish, headless metrics, the Studio GUI workflow, the ClassCAD evaluation; 2026-10-13). Read the
+  relevant one before changing the library.

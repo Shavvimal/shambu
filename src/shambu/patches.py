@@ -43,6 +43,18 @@ class SetBedTypeEverywhere:
 
 
 @dataclass(frozen=True)
+class SetPrintSequence:
+    sequence: str  # "by layer" | "by object"
+    plate: int | None = None
+
+    def apply(self, p: Project) -> None:
+        p.set_print_sequence(self.sequence, self.plate)
+
+    def describe(self) -> str:
+        return f"print sequence {self.sequence}" + (f" on plate {self.plate}" if self.plate else " (project)")
+
+
+@dataclass(frozen=True)
 class SetFilamentColours:
     colours: tuple[str, ...]
 

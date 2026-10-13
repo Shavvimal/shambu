@@ -18,7 +18,9 @@ from pathlib import Path
 
 from . import assemble as A
 from . import layout as L
+from . import mesh as M
 from . import presets as P
+from . import recipes as R
 from .errors import BambuError, BuildError
 from .patches import AddCustomGcode, PatchSet, RenameObject, SetBedTypeEverywhere, SetFilamentColours, SetFilamentMap
 from .spec import PartSpec, Spec
@@ -78,6 +80,13 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None) -> s
     return out
 
 
+def _num(v, default: float) -> float:
+    try:
+        return float(v if not isinstance(v, list) else v[0])
+    except (TypeError, ValueError, IndexError):
+        return default
+
+
 def _unique_key(base: str, used: set[str]) -> str:
     """`base`, or `base #n` with the lowest free n >= 2. Object names are global across plates."""
     key, n = base, 2
@@ -130,6 +139,7 @@ class PlannedPlate:
     name: str
     parts: list[PlannedPart]
     checks: list[L.Check] = field(default_factory=list)
+    print_sequence: str = "by layer"
 
 
 @dataclass
@@ -189,7 +199,12 @@ class BuildResult:
             "problems": self.plan.problems,
             "warnings": self.plan.warnings,
             "plates": [
-                {"name": p.name, "layout": L.describe([x.placed for x in p.parts]), "checks": [[c.ok, c.text] for c in p.checks]}
+                {
+                    "name": p.name,
+                    "print_sequence": p.print_sequence,
+                    "layout": L.describe([x.placed for x in p.parts]),
+                    "checks": [[c.ok, c.text] for c in p.checks],
+                }
                 for p in self.plan.plates
             ],
             "cli": self.run.summary() if self.run else None,
@@ -263,7 +278,14 @@ class Pipeline:
         fmap = list(spec.filament_map) if spec.filament_map else [min(i, n_ext) for i in range(1, len(filaments) + 1)]
         if len(fmap) != len(filaments) or any(not 1 <= v <= n_ext for v in fmap):
             problems.append(f"filament_map {fmap} must give one extruder (1..{n_ext}) per filament ({len(filaments)})")
-        known = set(process) | set(machine) | set().union(*(set(f) for f in filaments)) | {"extruder"} | set(A.PLATE_PARAMS_SAVED)
+        known = (
+            set(process)
+            | set(machine)
+            | set().union(*(set(f) for f in filaments))
+            | {"extruder"}
+            | set(A.PLATE_PARAMS_SAVED)
+            | R.all_keys()
+        )
         tpu = {i for i, f in enumerate(filaments, 1) if "TPU" in str(f.get("filament_type", ""))}
         ctx = L.Context(facts, {i + 1: fmap[i] for i in range(len(fmap))}, tpu, spec.aux_x_limit)
         bed = facts["bed"]
@@ -271,22 +293,60 @@ class Pipeline:
             (spec.layout.edge, bed["x"][1] - spec.layout.edge), (spec.layout.edge, bed["y"][1] - spec.layout.edge), spec.layout.gap
         )
         map_applies = bool(spec.filament_map) or len(filaments) > 1
+        # The plate's print_sequence metadata beats the process key (reference 08 section 2), so the effective value
+        # per plate is the plate's own, else the process preset's (a user may set it in process.set).
+        proc_seq = str(process.get("print_sequence", "by layer"))
+        sequences = [p.sequence(proc_seq) for p in spec.plates]
+        if any(sq == "by object" for sq in sequences):
+            # Studio refuses these two with print-by-object (Print.cpp validate, reference 08).
+            if str(process.get("timelapse_type", "0")) == "1":
+                problems.append("print_sequence 'by object' does not allow Smooth timelapse (timelapse_type 1)")
+            if str(process.get("enable_wrapping_detection", "0")) == "1":
+                problems.append("print_sequence 'by object' does not allow clumping detection (enable_wrapping_detection 1)")
+        clr = facts["clearance"]
+        skirt_extra = 0.0
+        if _num(process.get("skirt_loops"), 0) > 0 and str(process.get("skirt_per_object", "1")) not in ("0", "false"):
+            skirt_extra = _num(process.get("skirt_distance"), 2.0) + _num(process.get("skirt_loops"), 0) * _num(
+                process.get("line_width"), 0.42
+            )
+        ctx = replace(ctx, skirt_extra=skirt_extra)
 
         alist = A.AssembleList()
         plates: list[PlannedPlate] = []
         used_keys: set[str] = set()
         k = 0  # assemble_index: unique across the project, as object names are global
-        for pi, pspec in enumerate(spec.plates, 1):
-            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys)
-            multi = len({f for p in parts for f in p.placed.filaments}) > 1
-            pctx = replace(ctx, reserve=WIPE_TOWER_RESERVE if multi else None)
+        for pi, (pspec, seq) in enumerate(zip(spec.plates, sequences, strict=True), 1):
+            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir)
+            by_object = seq == "by object"
+            sequential = by_object and len(parts) > 1  # Studio applies the by-object rules (and drops the tower) only then
+            if by_object:
+                # Studio prints a by-object plate in object order. Group by main filament (two single-filament groups
+                # then need one nozzle change in total), shortest first within a group so an object over the rod height
+                # prints after the shorter ones that could share its Y band; the packer closes the row after a tall one.
+                parts.sort(key=lambda p: (min(p.placed.filaments), p.placed.info.size[2]))
+                if sequential and len({f for p in parts for f in p.placed.filaments}) > 1:
+                    warnings.append(
+                        f"plate {pi} '{pspec.name}': print-by-object, so Studio builds no prime tower; the idle nozzle is not wiped between objects"
+                    )
+            multi = len({f for p in parts for f in p.placed.filaments}) > 1 and not sequential
+            pctx = replace(ctx, reserve=WIPE_TOWER_RESERVE if multi else None, by_object=sequential)
             fixed = [p for p in parts if p.placed.fixed]
             free = [p.placed for p in parts if not p.placed.fixed]
             obstacles = [p.rect() for p in (x.placed for x in fixed)] + ([WIPE_TOWER_RESERVE] if multi else [])
             if free:
                 x_min_of = {p.key: max(ctx.extruder_of(f)["x"][0] for f in p.filaments) for p in free}
+                plate_placer = placer
+                if sequential and self.placer is None:
+                    all_short = all(p.placed.info.size[2] < clr["nozzle_height"] for p in parts)
+                    plate_placer = L.ShelfPacker(
+                        (spec.layout.edge, bed["x"][1] - spec.layout.edge),
+                        (spec.layout.edge, bed["y"][1] - spec.layout.edge),
+                        max(spec.layout.gap, pctx.sequential_gap(all_short)),
+                        keep_order=True,
+                        solo_row_above=clr["height_to_rod"],
+                    )
                 try:
-                    packed = placer.place(free, obstacles, x_min_of)
+                    packed = plate_placer.place(free, obstacles, x_min_of)
                 except BambuError as e:
                     problems.append(f"plate {pi} '{pspec.name}': {e}")
                     packed = [free]
@@ -296,7 +356,11 @@ class Pipeline:
                     )
             checks = self.checker.check([p.placed for p in parts], pctx)
             checks += self._subpart_checks(parts, pctx)
-            plate = A.Plate(name=pspec.name or f"plate {pi}", need_arrange=False, plate_params=self._plate_params(spec, fmap, map_applies))
+            plate = A.Plate(
+                name=pspec.name or f"plate {pi}",
+                need_arrange=False,
+                plate_params=self._plate_params(spec, fmap, map_applies, seq if (pspec.print_sequence or proc_seq != "by layer") else None),
+            )
             groups: dict[int, list[PlannedPart]] = {}
             for p in parts:  # copies of one spec share an Item (count + pos list)
                 groups.setdefault(id(p.spec), []).append(p)
@@ -323,18 +387,33 @@ class Pipeline:
                     for n, p in enumerate(group, 1):
                         p.cli_name = f"{fp.stem}_{n}"
             alist.plates.append(plate)
-            plates.append(PlannedPlate(plate.name, parts, checks))
+            plates.append(PlannedPlate(plate.name, parts, checks, seq))
         warnings += self._name_objects([x for p in plates for x in p.parts])
         problems += A.validate(alist.to_json(), known_keys=known, filament_count=len(filaments))
         return Plan(spec, outdir, workdir, machine, process, filaments, facts, fmap, plates, alist, problems, warnings)
 
     def _measure(
-        self, part_specs: Sequence[PartSpec], plate_no: int, process: dict, problems: list[str], n_filaments: int, used_keys: set[str]
+        self,
+        part_specs: Sequence[PartSpec],
+        plate_no: int,
+        process: dict,
+        problems: list[str],
+        n_filaments: int,
+        used_keys: set[str],
+        workdir: Path | None = None,
     ) -> list[PlannedPart]:
         out: list[PlannedPart] = []
         for si, ps in enumerate(part_specs, 1):
             where = f"plate {plate_no} part {si}"
             files = [(f.path.expanduser().resolve(), f.filament, f.subtype) for f in ps.files()]
+            if not ps.orientation.is_identity and all(fp.is_file() for fp, _, _ in files):
+                # The CLI cannot turn one object (reference 01), so the orientation is baked into copies of the STLs,
+                # all in one shared frame so the sub-parts of a merged object keep their alignment.
+                try:
+                    turned = M.oriented_copies([fp for fp, _, _ in files], ps.orientation, (workdir or files[0][0].parent) / "oriented")
+                    files = [(t, fil, sub) for t, (_, fil, sub) in zip(turned, files, strict=True)]
+                except BambuError as e:
+                    problems.append(f"{where}: cannot orient {ps.key()}: {e}")
             measured: dict[Path, MeshInfo | None] = {}
             for fp, _, _ in files:  # one measurement per path; success is tracked per file reference
                 if fp in measured:
@@ -420,8 +499,10 @@ class Pipeline:
         return warnings
 
     @staticmethod
-    def _plate_params(spec: Spec, fmap: list[int], map_applies: bool) -> dict[str, str]:
+    def _plate_params(spec: Spec, fmap: list[int], map_applies: bool, print_sequence: str | None = None) -> dict[str, str]:
         params = {"curr_bed_type": spec.bed_type}
+        if print_sequence:  # written whenever the plate or the process says anything but the default
+            params["print_sequence"] = print_sequence
         if map_applies:
             params.update({"filament_map_mode": "Manual", "filament_map": ",".join(str(v) for v in fmap)})
         return params
@@ -542,6 +623,10 @@ class Pipeline:
                 probs.append(f"plate {pl['id']} filament_maps is {pl['filament_maps']!r}, expected {' '.join(want_map)!r}")
             if plan.map_applies and pl.get("filament_map_mode") not in (None, "Manual"):
                 probs.append(f"plate {pl['id']} filament_map_mode is {pl['filament_map_mode']!r}, expected 'Manual'")
+            want_seq = next((p.print_sequence for i, p in enumerate(plan.plates, 1) if i == pl["id"]), "by layer")
+            got_seq = pl.get("print_sequence") or str(ps.get("print_sequence") or "by layer")
+            if want_seq != got_seq:
+                probs.append(f"plate {pl['id']} print_sequence is {got_seq!r}, expected {want_seq!r}")
         if s["process"] != plan.process["name"]:
             probs.append(f"process in file is {s['process']}, expected {plan.process['name']}")
         if len(s["filaments"]) != len(plan.filaments):

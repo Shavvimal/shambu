@@ -38,9 +38,12 @@ Where a key can live is set by its config class in `PH`:
 - Filament slots and nozzles: `filament_printable` bit 0 = left, bit 1 = right (PC:2900). Index 0 of every per-extruder
   machine array is the left (main, Direct Drive) nozzle. Index 1 is the right (auxiliary, Bowden) nozzle.
   `filament_map` / plate `filament_maps` are 1-based: `"1"` = left, `"2"` = right.
-- Prime tower rules (P:1472-1547): no prime tower with `print_sequence` `"by object"` and more than one extruder. With more
-  than one object on the plate, every object must share `layer_height`, `initial_layer_print_height`, `raft_layers` and
-  any variable-layer profile. With supports on, the support gap must be a multiple of the layer height.
+- Prime tower rules (P:1472-1547): the "no prime tower with `print_sequence` `"by object"` and more than one extruder"
+  check sits inside `#if 0` and never runs (corrected 2026-10-13, reference 08 section 2); Studio instead switches the
+  tower off itself on a by-object plate with more than one object (`normalize_fdm_2`). With more than one object on the
+  plate, every object must share `layer_height`, `initial_layer_print_height`, `raft_layers` and any variable-layer
+  profile. With supports on and `independent_support_layer_height` off, the slicer rounds the support gap to a
+  multiple of the layer height (no error).
 - Line width validation (P:1575-1591): width must be > layer height and <= 2.5 x nozzle = `1.0` mm on a 0.4 nozzle.
 
 ## 1. Tip table
@@ -71,7 +74,7 @@ Scope words: **process** (whole plate), **per-object**, **height range**, **modi
 | 19 | Supports only in a few places (paint) | notes (jaw finger block), notes | per-object + modifier or user-in-GUI | `"enable_support": "1"`, `"support_type": "tree(manual)"` or `"normal(manual)"`, plus `support_enforcer` volumes or painted triangles (`paint_supports`) | Jaw finger: one 10 mm block | Manual types make only enforced support. Enforcer volumes are a 3MF write (report 03: whole-triangle painting is feasible) |
 | 20 | Interface layers and top Z distance (single material) | not in notes | per-object | `"support_interface_top_layers": "2"`, `"support_interface_bottom_layers": "2"`, `"support_top_z_distance": "0.2"`, `"support_bottom_z_distance": "0.2"` (all preset) | Default | Datum faces on support are rough. Plan to file them (notes) |
 | 21 | Different-material support interface | notes | per-object (support keys) + plate (filament map) + process (prime tower) | `"enable_support": "1"`, `"support_type": "tree(auto)"`, `"support_filament": "0"` (Default = part filament; or the part's slot, e.g. `"1"`), `"support_interface_filament": "2"`, `"support_top_z_distance": "0"`, `"support_interface_not_for_body": "1"`, `"enable_prime_tower": "1"`; plate `filament_map_mode` `"Manual"`, `filament_maps` `"1 2"` | PETG part with PLA interface, or PLA part with PETG interface | Needs one material per nozzle. Interface nozzle (right) cannot reach X < 20.5 mm (section 4). Right nozzle speeds are lower (outer wall 50 vs 200 mm/s). Bed follows `bed_temperature_formula` `"by_highest_temp"`: PETG 70 deg C applies to a PLA part too. The GUI suggests more (section 2, recipe 8) |
-| 22 | Prime tower | notes | process (global) | `"enable_prime_tower": "1"` (preset), `"prime_tower_width": "35"` | Any plate with two filaments | Forces equal layering on multi-object plates. Not allowed with `"print_sequence": "by object"` and two extruders |
+| 22 | Prime tower | notes | process (global) | `"enable_prime_tower": "1"` (preset), `"prime_tower_width": "35"` | Any plate with two filaments | Forces equal layering on multi-object plates. On a by-object plate with more than one object Studio drops the tower itself (reference 08) |
 | 23 | Fuzzy skin, outer wall only, tiny | notes | per-object, modifier, or paint | `"fuzzy_skin": "external"`, `"fuzzy_skin_thickness": "0.15"`, `"fuzzy_skin_point_distance": "0.4"`, `"fuzzy_skin_first_layer": "0"` | Decorative parts to hide layer lines | 0.15 / 0.4 are my starting values. The notes only say "tiny". Preset is 0.3 / 0.8. Not for functional parts (notes): it grows the outside by up to the thickness. Thickness must stay below the outer wall width |
 | 24 | X-Y hole compensation | notes | per-object | `"xy_hole_compensation": "0.02"` (notes range 0.01-0.03; preset `"0"`) | Only a part whose holes are all vertical and none sets a shared dimension | It offsets holes in each layer's XY slice, so it only reaches vertical holes. Horizontal bridged bores (0.2-0.3 mm under) get nothing. Do NOT use on gripper parts: notes chose CAD clearance + coupons because the error depends on orientation and bore length |
 | 25 | X-Y contour compensation | notes | per-object | `"xy_contour_compensation": "0"` (keep) | Never on current data | Outsides measured on size (18.01-18.06 for 18.00). Nothing to correct |

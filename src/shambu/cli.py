@@ -15,7 +15,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from . import __version__, recipes
-from .errors import BambuError
+from .errors import BambuError, BuildError
 from .facade import Bambu
 from .patches import (
     AddCustomGcode,
@@ -30,6 +30,7 @@ from .patches import (
     SetFilamentMap,
     SetHeightRange,
     SetObjectSetting,
+    SetPrintSequence,
 )
 from .spec import Spec
 
@@ -65,6 +66,12 @@ class Output:
         else:
             for line in text_lines if text_lines is not None else _default_lines(data):
                 print(line)
+
+
+def usage(out: Output, msg: str) -> int:
+    """A usage error: one error document (or one line) and exit code 2."""
+    out.emit({"error": msg}, [msg])
+    return 2
 
 
 def _jsonable(x):
@@ -204,6 +211,127 @@ class SpecCmd(Command):
         return 0 if not errs else 1
 
 
+@command("orient", "Score orientations of an STL: bed contact, overhang shadow, height; optionally write the best as a new STL")
+class Orient(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("--threshold", type=float, default=45.0, help="overhang angle from vertical that needs support (default 45)")
+        p.add_argument("--top", type=int, default=12, help="how many of the largest flat faces to try (default 12)")
+        p.add_argument("--write", metavar="DIR", help="write the best orientation as <DIR>/<stem>__<tag>.stl")
+        p.add_argument("--pick", type=int, default=1, help="with --write: which row of the table to write (1 = best)")
+
+    def run(self, a, app, out):
+        from . import mesh as M
+
+        facets = M.read_stl(a.file)
+        if not facets:
+            return usage(out, f"{a.file}: the STL has no facets")
+        cands = M.candidates(facets, a.threshold, a.top)
+        summary = M.Summary(Path(a.file), len(facets), len(M.split_bodies(facets)), cands)
+        lines = [f"{a.file}: {len(facets)} facets, {summary.bodies} body(ies); overhang threshold {a.threshold:g} deg from vertical", ""]
+        lines += M.describe_candidates(cands)
+        lines += [
+            "",
+            'spec: add "lay_on_face": [nx, ny, nz] (and optionally "rotate": [x, y, z]) to the part; `shambu sweep --orientations <part>` slices the best few.',
+        ]
+        data = summary.to_json()
+        if a.write:
+            c = cands[max(0, min(len(cands), a.pick) - 1)]
+            path = M.oriented_copy(a.file, M.Orientation(lay_on_face=c.normal), a.write)
+            data["written"] = str(path)
+            lines.append(f"written: {path} ({c.label})")
+        out.emit(data, lines)
+        return 0
+
+
+@command("rotate", "Write a rotated copy of an STL (lay a face on the bed and/or Euler angles), dropped onto z = 0")
+class Rotate(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("-o", "--outdir", required=True)
+        p.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="outward normal of the face to put on the bed")
+        p.add_argument("--rotate", metavar="X,Y,Z", help="degrees about X, then Y, then Z (applied after --lay-on-face)")
+
+    def run(self, a, app, out):
+        from . import mesh as M
+
+        d: dict = {}
+        try:
+            if a.lay_on_face:
+                d["lay_on_face"] = [float(v) for v in a.lay_on_face.split(",")]
+            if a.rotate:
+                d["rotate"] = [float(v) for v in a.rotate.split(",")]
+            o = M.Orientation.from_json(d)
+        except (ValueError, BuildError) as e:
+            return usage(out, f"bad --lay-on-face or --rotate: {e}")
+        if o.is_identity:
+            return usage(out, "nothing to do: give --lay-on-face and/or --rotate")
+        path = M.oriented_copy(a.file, o, a.outdir)
+        m = M.metrics(M.read_stl(path))
+        out.emit(
+            {"written": str(path), **m.to_json()},
+            [
+                f"written {path}: {m.size[0]:.1f} x {m.size[1]:.1f} x {m.size[2]:.1f} mm, contact {m.contact_mm2:.0f} mm2, support shadow {m.shadow_mm2:.0f} mm2"
+            ],
+        )
+        return 0
+
+
+@command("split", "Split an STL with several bodies into one STL per body (Studio's 'Split to objects')")
+class Split(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("-o", "--outdir", required=True)
+
+    def run(self, a, app, out):
+        from . import mesh as M
+
+        bodies = M.split_bodies(M.read_stl(a.file))
+        stem = Path(a.file).stem
+        written = [str(M.write_stl(Path(a.outdir) / f"{stem}_body{i}.stl", b, f"{stem} body {i}")) for i, b in enumerate(bodies, 1)]
+        out.emit({"bodies": len(bodies), "written": written}, [f"{len(bodies)} body(ies):", *written])
+        return 0
+
+
+@command("sweep", "Build (and slice) variants of a spec and compare time and filament: orientations, by-object, settings")
+class Sweep(Command):
+    def configure(self, p):
+        p.add_argument("spec")
+        p.add_argument("--variants", metavar="JSON", help="a JSON file: a list of variants (see `shambu spec` and sweep.py)")
+        p.add_argument("--orientations", metavar="PART", action="append", default=[], help="try the best orientations of this part key")
+        p.add_argument("--top", type=int, default=4, help="orientations per part for --orientations (default 4)")
+        p.add_argument("--threshold", type=float, default=45.0)
+        p.add_argument("--by-object", action="store_true", help="add a variant with every plate on print_sequence 'by object'")
+        p.add_argument("--no-slice", action="store_true", help="only plan and export; no time or filament numbers")
+        p.add_argument("--no-baseline", action="store_true")
+        p.add_argument("--timeout", type=int, default=1200)
+
+    def run(self, a, app, out):
+        from . import sweep as S
+
+        try:
+            spec_json = json.loads(Path(a.spec).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise BuildError(f"{a.spec}: cannot read the spec: {e}") from e
+        variants: list[dict] = S.load_variants(a.variants) if a.variants else []
+        for key in a.orientations:
+            variants += S.orientation_variants(spec_json, key, a.top, a.threshold)
+        if a.by_object:
+            variants.append(S.by_object_variant(spec_json))
+        if not variants and a.no_baseline:
+            return usage(out, "no variants: give --variants, --orientations or --by-object")
+        S.check_names(variants, baseline=not a.no_baseline)
+        results = S.run(
+            spec_json,
+            variants,
+            lambda spec, do_slice: app.build(spec, timeout=a.timeout, do_slice=do_slice),
+            do_slice=not a.no_slice,
+            baseline=not a.no_baseline,
+        )
+        out.emit([r.to_json() for r in results], S.table(results))
+        return 0 if all(r.ok for r in results) else 1  # one failed variant is a failed check (exit 1), as for `build`
+
+
 @command("check", "Plan a spec: resolve presets, measure STLs, place parts, check limits. No export.")
 class Check(Command):
     def configure(self, p):
@@ -280,6 +408,13 @@ class PatchCmd(Command):
         p.add_argument("-o", "--out")
         p.add_argument("--bed-type", help="e.g. 'Textured PEI Plate' (project and every plate)")
         p.add_argument("--plate-bed-type", action="append", default=[], metavar="PLATE:TYPE")
+        p.add_argument(
+            "--print-sequence",
+            action="append",
+            default=[],
+            metavar="[PLATE:]SEQUENCE",
+            help="'by object' or 'by layer', per plate or project-wide",
+        )
         p.add_argument("--colours", help="comma list, one #RRGGBB per filament")
         p.add_argument("--map", help="comma list of extruder per filament, e.g. 1,2")
         p.add_argument("--set", action="append", default=[], metavar="OBJECT:KEY=VALUE", help="per-object setting")
@@ -317,6 +452,9 @@ class PatchCmd(Command):
         for x in a.plate_bed_type:
             n, t = x.split(":", 1)
             ps.add(SetBedType(t, int(n)))
+        for x in a.print_sequence:
+            n, _, seq = x.rpartition(":")
+            ps.add(SetPrintSequence(seq.strip().replace("_", " "), int(n) if n else None))
         if a.colours:
             ps.add(SetFilamentColours(tuple(c.strip() for c in a.colours.split(","))))
         if a.map:
