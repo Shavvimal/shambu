@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -11,13 +13,19 @@ from pathlib import Path
 import pytest
 
 from shambu import presets as P
-from shambu.studio import CliCommand, MeshInfo, RunResult
+from shambu.studio import BINARY, CliCommand, MeshInfo, OrientCandidate, OrientResult, OrientTable, RunResult
 
 MACHINE = "Test X2D 0.4 nozzle"
 PROCESS = "0.20mm Test"
 PROCESS_NAME = "Test Process"  # the name the fixture 3MF carries in print_settings_id
 LONG_START = "G28 ; home\n" * 200  # > 1000 chars, like a resolved include template
 LONG_END = "M104 S0 ; off\n" * 100
+# Tests that run the real Bambu Studio binary (about 0.1 s per orient run): they run only with SHAMBU_INTEGRATION=1 and
+# the binary installed (CONTRIBUTING: the default suite never calls Studio). They also carry the `integration` marker.
+requires_studio = pytest.mark.skipif(
+    os.environ.get("SHAMBU_INTEGRATION") != "1" or not BINARY.is_file(),
+    reason=f"set SHAMBU_INTEGRATION=1 with Bambu Studio installed at {BINARY}",
+)
 
 
 # ---------------------------------------------------------------------------- 3MF fixture
@@ -292,21 +300,122 @@ def mesh(path: Path | str = "part.stl", size=(20.0, 20.0, 10.0), lo=(0.0, 0.0, 0
     )
 
 
+# result.json `sliced_plates[]` as Studio 02.08.02.61 wrote it for a two-object by-object plate (PLAN-native-cli §2.5,
+# LIVE), with filament 2 given 0.5 g of flush and tower so total_used_g and main_used_g differ.
+SLICED_PLATES: list[dict] = [
+    {
+        "feature_type_times": {
+            "Bottom surface": 33.55055236816406,
+            "Bridge": 34.165504455566406,
+            "Custom": 287.0181884765625,
+            "Flush": 63.0,
+            "Inner wall": 95.69586181640625,
+            "Internal solid infill": 109.47734069824219,
+            "Outer wall": 147.86422729492188,
+            "Sparse infill": 225.83209228515625,
+            "Top surface": 18.776708602905273,
+            "Travel": 57.97702407836914,
+            "Undefined": 50.51105499267578,
+        },
+        "filament_change_times": 0,
+        "filaments": [
+            {"filament_id": "GFA00", "id": 1, "main_used_g": 2.119844436645508, "total_used_g": 2.119844436645508},
+            {"filament_id": "GFA00", "id": 2, "main_used_g": 2.119844436645508, "total_used_g": 2.619844436645508},
+        ],
+        "generate_support_material_time": 1,
+        "id": 1,
+        "infill_time": 3,
+        "layer_filament_change": 0,
+        "main_predication": 694.3615112304688,
+        "make_perimeters_time": 4,
+        "obj_cached_cnt": 0,
+        "objects": [
+            {
+                "bbox": {"depth": 20.0, "height": 10.0, "width": 20.0, "x": 40.0, "y": 60.0, "z": 0.0},
+                "id": 15,
+                "name": "a_1",
+                "triangle_count": 12,
+            },
+            {
+                "bbox": {"depth": 20.0, "height": 10.0, "width": 20.0, "x": 160.0, "y": 60.0, "z": 0.0},
+                "id": 35,
+                "name": "b_1",
+                "triangle_count": 12,
+            },
+        ],
+        "sliced_time": 48,
+        "sliced_time_with_cache": 36,
+        "total_predication": 1065.9136962890625,
+        "triangle_count": 24,
+        "warning_message": "",
+    }
+]
+
+
 @dataclass
 class FakeStudio:
-    """Same surface as StudioCLI. `run()` copies `fixture` to the expected output, or fails with `code`."""
+    """Same surface as StudioCLI. `run()` copies `fixture` to the expected output, or fails with `code`; `result` adds
+    keys to the run's result.json (as Studio writes `error_string` and `warning_message`)."""
 
     fixture: Path | None = None
     code: int = 0
     sizes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    los: dict[str, tuple[float, float, float]] = field(default_factory=dict)  # STL bbox minimum per file name (default origin)
     scratch: Path = Path("/nonexistent")
     binary: Path = Path("/Applications/FakeStudio.app/Contents/MacOS/BambuStudio")
     calls: list[tuple[str, object]] = field(default_factory=list)
+    result: dict | None = None  # extra result.json keys (error_string, warning_message); None keeps the default result
+    # orient(): the table it returns (Studio's bracket best by default); it copies each input to obj_<i>_<stem>.stl
+    orient_table: list[OrientCandidate] = field(
+        default_factory=lambda: [OrientCandidate((-1.0, 0.0, 0.0), 3790.4, 4314.0, 9010.0, 262.7, 485.1, 0.0, 0.6)]
+    )
+
+    orient_best: OrientCandidate | None = None  # the `best:` row; None: the first row after sorting
+
+    def orient(self, paths, outdir, *, settings=None, convert_unit=True, timeout=300, name="orient") -> OrientResult:
+        """Copies each input to obj_<i>_<stem>.stl, scaled by 1000 when `convert_unit` and the mesh is under 1 mm."""
+        from shambu import mesh as M
+
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        self.calls.append(("orient", ([Path(p) for p in paths], settings, convert_unit)))
+        files = []
+        for i, p in enumerate(paths, 1):
+            f = outdir / f"obj_{i}_{Path(p).stem}.stl"
+            facets = M.read_stl(p) if convert_unit else []
+            if facets and M.looks_like_metres(facets):
+                M.write_stl(f, M.scale(facets, 1000))
+            else:
+                shutil.copyfile(p, f)
+            files.append(f)
+        log = outdir / f"{name}.log"
+        log.write_text("$ fake orient\n", encoding="utf-8")
+        best = self.orient_best
+        cands = sorted(self.orient_table, key=lambda c: c.unprintability)  # Studio's order on a tie: as given
+        table = OrientTable(cands, best or (cands[0] if cands else None))  # not ranked toward best: callers must do it
+        return OrientResult(files, [table] * len(files), RunResult(["BambuStudio", "--orient=1"], 0, 0, 0.05, log, {"return_code": 0}))
+
+    def normalise(self, paths, outdir, *, timeout=300, name="convert-unit") -> list[Path]:
+        """Copies every input as obj_<i>_<stem>.stl, scaled by 1000 when the whole mesh is under 1 mm (Studio's metres guess)."""
+        from shambu import mesh as M
+
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        self.calls.append(("normalise", [Path(p) for p in paths]))
+        out = []
+        for i, p in enumerate(paths, 1):
+            facets = M.read_stl(p)
+            out.append(
+                M.write_stl(outdir / f"obj_{i}_{Path(p).stem}.stl", M.scale(facets, 1000) if M.looks_like_metres(facets) else facets)
+            )
+        return out
+
+    sliced_plates: list[dict] | None = None  # result.json sliced_plates[] (e.g. SLICED_PLATES); None leaves it out
 
     def info(self, path) -> MeshInfo:
         path = Path(path)
         self.calls.append(("info", path))
-        return mesh(path, self.sizes.get(path.name, (20.0, 20.0, 10.0)))
+        return mesh(path, self.sizes.get(path.name, (20.0, 20.0, 10.0)), self.los.get(path.name, (0.0, 0.0, 0.0)))
 
     def run(
         self, cmd: CliCommand, *, name: str = "run", outputdir: Path | None = None, timeout: int = 1200, expect_output: Path | None = None
@@ -318,15 +427,14 @@ class FakeStudio:
             log.write_text("$ fake\n", encoding="utf-8")
         if self.code == 0 and expect_output is not None and self.fixture is not None:
             shutil.copyfile(self.fixture, expect_output)
-        return RunResult(
-            ["BambuStudio", *args],
-            self.code % 256,
-            self.code,
-            0.1,
-            log,
-            {"return_code": self.code} if self.code == 0 else None,
-            expect_output,
+        res = (
+            {"return_code": self.code, **self.result}
+            if self.result is not None
+            else ({"return_code": self.code} if self.code == 0 else None)
         )
+        if self.sliced_plates is not None:
+            res = {**(res or {"return_code": self.code}), "sliced_plates": copy.deepcopy(self.sliced_plates)}
+        return RunResult(["BambuStudio", *args], self.code % 256, self.code, 0.1, log, res, expect_output)
 
     def version(self) -> str:
         return "02.08.02.61"

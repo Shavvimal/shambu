@@ -246,12 +246,27 @@ def machine_facts(machine: dict) -> dict:
                 "nozzle": (machine.get("nozzle_diameter") or ["?"] * n)[i],
             }
         )
+
+    def num(key: str, default: float) -> float:
+        try:
+            return float(machine.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
     return {
         "name": machine.get("name"),
         "printer_model": machine.get("printer_model"),
         "bed": bed,
         "z_max": float(machine.get("printable_height", 0)),
         "extruders": extruders,
+        # Sequential ("by object") printing: the head's reach around the nozzle and the two height limits.
+        "clearance": {
+            "radius": num("extruder_clearance_max_radius", 60.0),
+            "height_to_rod": num("extruder_clearance_height_to_rod", 32.8),
+            "height_to_lid": num("extruder_clearance_height_to_lid", 133.0),
+            "dist_to_rod": num("extruder_clearance_dist_to_rod", 33.0),
+            "nozzle_height": num("nozzle_height", 4.0),
+        },
     }
 
 

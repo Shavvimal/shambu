@@ -1,0 +1,19 @@
+{
+  "skill_name": "setup",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "/shambu:setup install -- I ran it already and uv said it installed, but now `shambu doctor` gives me `zsh: command not found: shambu`",
+      "expected_output": "Diagnoses that uv's tool directory is not on PATH. Tells the user to run `uv tool update-shell` and open a new shell (or offers the `uvx --from \"git+https://github.com/Shavvimal/shambu\" shambu doctor` fallback), then confirms with `shambu --version` and `shambu doctor`.",
+      "files": [],
+      "expectations": [
+        "Checks for uv with `command -v uv` (or equivalent) before it reinstalls anything",
+        "Names the cause: the uv tool bin directory is not on PATH",
+        "Runs or tells the user to run `uv tool update-shell` and then open a new shell",
+        "Mentions the `uvx --from \"git+https://github.com/Shavvimal/shambu\" shambu doctor` fallback, or reinstalls with `uv tool install --reinstall`",
+        "Confirms the fix with `shambu --version` or `shambu doctor` once the command resolves",
+        "Does not edit shell rc files by hand or use sudo"
+      ]
+    }
+  ]
+}

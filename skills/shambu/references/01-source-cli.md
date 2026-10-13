@@ -18,6 +18,21 @@ marked **UNVERIFIED** are inferences that need a run to confirm.
 
 ---
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [0. Ten findings that matter most](#0-ten-findings-that-matter-most) | The ten source facts that shape the wrapper most |
+| [1. Command-line parsing](#1-command-line-parsing) | How `read_cli` splits actions, transforms, options and input files |
+| [2. Assemble list (`--load-assemble-list`)](#2-assemble-list---load-assemble-list) | The `--load-assemble-list` JSON keys and how Studio applies them |
+| [3. Order of operations in `CLI::run` (`BS.cpp:1488-8268`)](#3-order-of-operations-in-clirun-bscpp1488-8268) | The order in which `CLI::run` loads, arranges, slices and exports |
+| [4. Slicing path (`--slice`)](#4-slicing-path---slice) | What `--slice` checks and does, with its exit codes |
+| [5. Presets](#5-presets) | Preset file keys, `inherits` and `include`, and loading rules |
+| [6. result.json and return codes](#6-resultjson-and-return-codes) | The `result.json` writer and every return code |
+| [7. Bambu 3MF layout (writer `_save_model_to_file`, `bbs_3mf.cpp:6426-6905`)](#7-bambu-3mf-layout-writer-_save_model_to_file-bbs_3mfcpp6426-6905) | Which files the 3MF writer puts in the zip, and their format |
+| [8. X2D machine profile facts (`resources/profiles/BBL/machine/`)](#8-x2d-machine-profile-facts-resourcesprofilesbblmachine) | X2D machine profile values: model id, bed, nozzle reach, heights |
+| [9. Implications for a Python wrapper](#9-implications-for-a-python-wrapper) | Rules a Python wrapper must follow when it calls the CLI |
+
 ## 0. Ten findings that matter most
 
 1. **Action order on the command line is execution order.** `--slice`, `--no-check`,
@@ -68,7 +83,12 @@ marked **UNVERIFIED** are inferences that need a run to confirm.
 10. **`--orient 1` overwrites each object's config with the whole process preset**
     (`o->config.assign_config(load_process_config)`, `BS.cpp:5216`). This drops the
     per-object `extruder` and turns every process key into a per-object override.
-    Do not use `--orient 1` with `--load-settings`; orient meshes yourself.
+    The replacement happens only when `--load-settings` loaded a process (`BS.cpp:5215-5217`)
+    and only hurts objects that already carry per-object keys (assemble-list `print_params`,
+    `extruder`). So: never pass `--orient 1` on the slicing run with an assemble list. An
+    orient-only run on positional STLs is safe, even with `--load-settings` (it then uses the
+    process's `support_threshold_angle`). shambu runs it as pass 1 for `"orientation": "auto"`
+    (PLAN-native-cli section 2.1).
 
 ---
 
@@ -159,7 +179,7 @@ String, Strings (`;`-list), Ints (`,`-list). "A" = action, "T" = transform, "M" 
 | `--normative-check` | A | Bool | **true** | For 3MF input only: non-empty `post_process` → -19 (`BS.cpp:1950-1960`). Disable with `--normative-check=0`. |
 | `--pipe <name>` | A | String | "" | Linux only (finding 4). On macOS: no effect, but it is an action. |
 | `--arrange <n>` | T | Int | 0 | 0 → `need_arrange=false`; 1 → true; other → keep automatic (`BS.cpp:5060-5075`). Automatic = false for a Bambu 3MF, true for STL/OBJ input. **Ignored for assemble lists** (they use per-plate `need_arrange`). |
-| `--orient <n>` | T | Int | 0 | 1 → orient every object with `orientation::orient()`, after replacing the object config with the process preset (finding 10, `BS.cpp:4982-5011, 5207-5223`). 0 → no orient. |
+| `--orient <n>` | T | Int | 0 | 1 → orient every object with `orientation::orient()`, after replacing the object config with the process preset (finding 10, `BS.cpp:4982-5011, 5207-5223`). 0 → no orient. The config replacement happens only when `--load-settings` loaded a process (`BS.cpp:5215-5217`) and only hurts when objects already carry `print_params`. An orient-only run on positional STLs is safe (PLAN-native-cli section 2.1). The candidate table (vector, then `overhang, bottom, bothull, contour, A_laf, A_prj, unprintability`; sorted by the last) goes to stdout at any debug level; the printed vector ends up pointing up, so `lay_on_face = -best`. |
 | `--ensure-on-bed` | T | Bool | false | After transforms/arrange: `o->ensure_on_bed()` for all objects (`BS.cpp:6182-6188`). STL/OBJ *positional* inputs are always put on the bed at load (`BS.cpp:2124`); assemble-list objects are not. |
 | `--repetitions <n>` | T | Int | 1 | Duplicates the plate n-1 times with a binary search for the largest count that fits; needs `--slice <plate>` > 0 (`BS.cpp:4947-4968, 5232-5260, 5585-6165`). |
 | `--assemble` | T | Bool | false | Merges all loaded objects into one object "Assembly" (`BS.cpp:4925-4946`). Not with `--clone-objects`. |
@@ -283,6 +303,12 @@ scalars. `min_z`/`max_z` are numbers.
    **world position = STL native coordinates + pos** (+ plate origin later). To put a
    part's bbox centre at (X, Y), use `pos = (X, Y) - stl_bbox_centre_xy`, and
    `pos_z = -stl_min_z` to sit it on the bed.
+   **Copies (live-verified 2026-10-13, reference 08):** copy 1 is translated by `pos[0]`; copies `2..count` are
+   cloned from that *already translated* object and then translated by their own `pos[i]`, so for a copy the
+   world position is `STL native + pos[0] + pos[i]`. Two links (STL z -38..-26) with `pos_z [38, 38]` put copy 2 at
+   z 38..50 ("Object can't be printed for empty layer between 0 and 38.2") and its y off the bed. A tool must
+   write `pos[i] = T_i - T_0` for copies, where `T_i` is the translation it wants. shambu 0.1.x got this wrong for
+   every `count > 1` part; 0.2.0 fixes it (`build.py`, the `positions` list).
 7. **Copy-index bug:** for copy `i`, the code picks `array_index = i` if
    `i < pos_x.size()`, else 0, and then uses that index for `pos_y` and `pos_z` too
    (`BS.cpp:1268-1270`). If `pos_x` has `count` entries but `pos_y` has 1, it reads
@@ -744,7 +770,8 @@ On load, `bed_type` becomes plate `curr_bed_type`; `filament_map_mode="Auto"`
 ### 9.2 Avoid
 
 - `--min-save` (strips the model).
-- `--orient=1` with `--load-settings` (overwrites object configs).
+- `--orient=1` with `--load-settings` on a run with an assemble list (overwrites object configs). An orient-only
+  run on positional STLs is safe.
 - `--pipe` on macOS (no effect).
 - `--export-png` together with any other action.
 - Underscore option names, `--no-*` forms, and space-separated bool values.

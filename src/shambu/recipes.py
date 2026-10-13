@@ -3,7 +3,13 @@
 A recipe is data (frozen dataclass), applied by name from a spec (`"recipes": [...]`) at process
 or per-object scope. Sources: "gripper build" = a functional PETG gripper build on an X2D;
 "63-tip video" = a 16-year printer/designer's tips (2026-10-12); "notes" = other items in
-the author's print notes. Values are strings in Bambu preset form.
+the author's print notes; "research 08" = the 2026-10-13 optimisation research in
+`skills/shambu/references/08-optimisation.md` (Bambu wiki, Studio source, headless measurements).
+Values are strings in Bambu preset form.
+
+Never put a scalar into a per-nozzle array key on the X2D (`*_speed`, `*_acceleration`,
+`enable_overhang_speed`): the profile holds six values (three per nozzle) and a scalar wipes
+the other five (research 08, section 3).
 """
 
 from __future__ import annotations
@@ -127,22 +133,31 @@ RECIPES: tuple[Recipe, ...] = (
     Recipe(
         "dual-material-interface",
         "process",
-        "Support interface in the other material on nozzle 2, zero top gap.",
+        "Support interface in the other material on nozzle 2: Bambu's own X2D values for PLA/PETG pairs.",
         {
             "enable_support": "1",
             "support_type": "tree(auto)",
+            "support_style": "tree_hybrid",
+            "support_threshold_angle": "35",
+            "support_on_build_plate_only": "0",
             "support_interface_filament": "2",
             "support_filament": "0",
+            "support_interface_not_for_body": "1",
             "support_top_z_distance": "0",
             "support_interface_spacing": "0",
             "support_interface_pattern": "rectilinear_interlaced",
-            "support_interface_top_layers": "3",
+            "tree_support_branch_diameter": "3",
+            "tree_support_branch_diameter_angle": "7",
+            "raft_first_layer_expansion": "5",
+            "independent_support_layer_height": "0",
+            "thick_bridges": "0",
             "enable_prime_tower": "1",
         },
         "PETG part with PLA interface or PLA part with PETG interface; they barely bond. Expect a prime tower.",
-        "notes",
+        "notes / research 08 (Studio's support_recommended_params.json, which the headless CLI never applies)",
         "Filament 2 must be the other material on nozzle 2 (filament_map 1,2); supported features must sit at x >= 20.5. "
-        "Bed temperature follows the hotter filament (PETG 70 C under a PLA part). Interface spacing 0 and the interlaced pattern are Studio's own suggestion, unverified for PLA/PETG.",
+        "Bed temperature follows the hotter filament (PETG 70 C under a PLA part). Bambu prints PLA interface at 230 C and PETG HF "
+        "interface at 265 C with a 10 mm3/s cap; the slicer's own table also sets support_interface_speed 50, a per-nozzle array left alone here.",
     ),
     Recipe(
         "fuzzy-skin",
@@ -191,6 +206,130 @@ RECIPES: tuple[Recipe, ...] = (
         height_ranges=({"min_z": 0.0, "max_z": 0.6, "set": {"extruder": "2"}},),
     ),
     Recipe(
+        "bridge-short-spans",
+        "object",
+        "Let bridges up to 10 mm print in the air instead of growing tree supports under them.",
+        {"max_bridge_length": "10", "bridge_no_support": "1"},
+        "Any supported part with short flat spans (slots, counterbores, box lids). The Bambu preset sets max_bridge_length 0, so "
+        "tree support goes under every bridge.",
+        "research 08",
+        "PLA bridges 10 to 40 mm cleanly on a measured plate; PETG less. Over 40 mm keep the support.",
+    ),
+    Recipe(
+        "minimal-supports",
+        "object",
+        "Tree supports only under sharp tails and cantilevers (critical regions).",
+        {"enable_support": "1", "support_type": "tree(auto)", "support_critical_regions_only": "1", "max_bridge_length": "10"},
+        "The floor of an orientation sweep: what still needs support when everything printable is left alone.",
+        "research 08",
+        "Flat ceilings over the model are left to sag. Compare the sweep's support grams against `tree-supports`.",
+    ),
+    Recipe(
+        "petg-supports",
+        "object",
+        "Same-material PETG supports that come off: wider top gap and XY gap.",
+        {"enable_support": "1", "support_type": "tree(auto)", "support_top_z_distance": "0.25", "support_object_xy_distance": "0.5"},
+        "PETG part supported in PETG. PETG welds to itself at the 0.2 mm default gap.",
+        "research 08 (forum reports, medium confidence)",
+        "0.25 to 0.3 mm top gap; a 0.2 mm layer rounds it to 0.2 or 0.4 unless independent_support_layer_height stays on (it does by default).",
+    ),
+    Recipe(
+        "counterbore-bridging",
+        "object",
+        "Print screw counterbores without support: one sacrificial bridged layer to drill out.",
+        {"counterbore_hole_bridging": "sacrificiallayer"},
+        "Counterbored holes that print with the bore vertical and the counterbore underneath.",
+        "research 08",
+        "`partiallybridge` bridges only the ring; `sacrificiallayer` closes the hole with one layer. Both are object scope.",
+    ),
+    Recipe(
+        "more-support",
+        "object",
+        "Support threshold 45 degrees from horizontal: supports under anything flatter than 45.",
+        {"support_threshold_angle": "45"},
+        "A part whose 45 to 60 degree faces drooped on the first print.",
+        "research 08",
+        "Bambu's support_threshold_angle counts from HORIZONTAL (default 30 = only faces within 30 degrees of flat get support). "
+        "The 45-degree rule of thumb is from vertical, so 45 here is more support than the default, not less.",
+    ),
+    Recipe(
+        "scarf-seam",
+        "object",
+        "Scarf joint seams on outer walls, conditional (loops with a corner keep a hidden normal seam).",
+        {"override_filament_scarf_seam_setting": "1", "seam_slope_type": "external", "seam_slope_conditional": "1"},
+        "Cylinders, domes and smooth curves where no corner can hide the seam.",
+        "research 08",
+        "Reduces the seam, never removes it. Users report it shows more on silk filaments. Bambu's X2D filament profiles set scarf to none, "
+        "so the override is needed.",
+    ),
+    Recipe(
+        "seam-back",
+        "object",
+        "Seam at the back (+Y) of the part.",
+        {"seam_position": "back"},
+        "A show part whose back faces away: rotate the part so the hidden side faces +Y.",
+        "research 08",
+    ),
+    Recipe(
+        "iron-top",
+        "object",
+        "Iron the topmost flat surface only.",
+        {"ironing_type": "topmost", "ironing_flow": "10%", "ironing_spacing": "0.1"},
+        "One flat top face that shows (lids, plaques, name plates). Adds time on that face only.",
+        "research 08",
+        "`top` would iron every stair step on a sloped part. For a lower face, use a height range with ironing_type=top instead.",
+    ),
+    Recipe(
+        "precise-fit",
+        "object",
+        "Precise outer wall with inner-then-outer order, elephant foot 0.15.",
+        {"precise_outer_wall": "1", "wall_sequence": "inner wall/outer wall", "elefant_foot_compensation": "0.15"},
+        "Fit-critical parts: the outer wall keeps its nominal width instead of overlapping the inner one.",
+        "research 08",
+        "Studio silently ignores precise_outer_wall with any other wall order. Holes still print undersize: qualify with a coupon.",
+    ),
+    Recipe(
+        "show-walls",
+        "object",
+        "Three walls printed inner, outer, inner: the cleanest outer skin on parts without overhangs.",
+        {"wall_loops": "3", "wall_sequence": "inner-outer-inner wall", "wall_generator": "classic"},
+        "Cosmetic parts with vertical walls. Classic walls give one loop per layer, so one seam.",
+        "research 08",
+        "Not for overhang-heavy parts: inner/outer order prints overhangs better. Arachne is better for small text and thin ribs.",
+    ),
+    Recipe(
+        "fast-infill",
+        "process",
+        "Adaptive cubic infill with sparse layers combined: the fast infill that is still strong.",
+        {"sparse_infill_pattern": "adaptivecubic", "infill_combination": "1"},
+        "Any solid-looking part where time matters. Measured on an 80 mm box: grid 1 h 09, adaptive cubic 0 h 59, gyroid 1 h 43; "
+        "combination saved another 8 %.",
+        "research 08 (headless estimates)",
+        "Lightning (0 h 47) is faster still but only holds up top skins. Gyroid is the slowest common pattern; keep it only where "
+        "isotropic strength matters.",
+    ),
+    Recipe(
+        "fine-0.16",
+        "process",
+        "0.16 mm layers on the Standard base: finer curves without the High Quality preset's slow walls.",
+        {"layer_height": "0.16"},
+        "Curved or visible surfaces that show 0.2 mm steps. Measured on a 30 mm cube: 1062 s against 852 s at 0.20; the "
+        "0.16mm High Quality preset took 1666 s for the same layers.",
+        "research 08 / notes",
+        "Flat solid tops look worse at 0.16 and print slower: keep 0.20 there. Every object on a plate with a prime tower shares "
+        "one layer height; a `height_ranges` entry can switch to 0.28 above the detail instead (13 min 07 against 14 min 41 on a cube).",
+    ),
+    Recipe(
+        "top-concentric",
+        "object",
+        "Concentric top-surface lines for round tops.",
+        {"top_surface_pattern": "concentric"},
+        "A round or ring-shaped show face whose monotonic lines show their direction.",
+        "notes / research 08",
+        "Region key, so it works on a modifier or a height range too. Flat rectangular tops keep the X2D default `monotonicline`. "
+        "One wall on top surfaces is already Studio's default (`top_one_wall_type` all top); `topmost` limits it to the top face.",
+    ),
+    Recipe(
         "no-hole-compensation",
         "process",
         "Hole and contour compensation off: clearance lives in the CAD, qualified by coupons.",
@@ -199,6 +338,12 @@ RECIPES: tuple[Recipe, ...] = (
         "gripper build / notes",
     ),
 )
+
+
+def all_keys() -> set[str]:
+    """Every setting key a recipe writes: these are vetted names, so the plan's unknown-key check accepts them even
+    when the resolved preset does not list them (the shipped X2D presets omit several valid keys)."""
+    return {k for r in RECIPES for k in r.set} | {k for r in RECIPES for h in r.height_ranges for k in h["set"]}
 
 
 def by_name() -> dict[str, Recipe]:

@@ -13,6 +13,17 @@ Verdict in one line: the parts worth copying are the HMS decoder, the `slice_inf
 
 ---
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [1. Inventory](#1-inventory) | The commands of davglass/bambu-cli and their protocol |
+| [2. Config model](#2-config-model) | Its config file path and shape |
+| [3. UX patterns worth copying](#3-ux-patterns-worth-copying) | UX patterns worth copying into shambu |
+| [4. Protocol details](#4-protocol-details) | LAN MQTT connection, init payloads and FTP details |
+| [5. Known issues and why it was archived](#5-known-issues-and-why-it-was-archived) | Open issues and why the project was archived |
+| [6. Features to adopt in our Python bambu tool](#6-features-to-adopt-in-our-python-bambu-tool) | Ranked features to adopt in shambu |
+
 ## 1. Inventory
 
 Command dispatch: `bin/cli.js` uses yargs. Positional arg 1 is the command, arg 2 is a machine id or name. A command can be any unique prefix (`s` -> `status`, `con` -> `config`). If no `machines` key is in the config, any command becomes `login`.

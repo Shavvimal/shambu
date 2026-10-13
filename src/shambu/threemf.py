@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import tempfile
@@ -51,6 +52,21 @@ FILAMENT_MAP_MODES = ("Auto For Flush", "Auto For Match", "Manual", "Nozzle Manu
 GCODE_TYPES = {"color_change": 0, "pause": 1, "tool_change": 2, "template": 3, "custom": 4}
 GCODE_TYPE_NAMES = {v: k for k, v in GCODE_TYPES.items()}
 
+
+def _float_or(text: str, default: float) -> float:
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+_FEATURE_CLASS = {
+    "Support": "support",
+    "Support interface": "support",
+    "Support transition": "support",
+    "Prime tower": "tower",
+    "Custom": "other",
+}
 _SLICE_ENTRY = re.compile(r"^Metadata/plate_\d+\.(gcode|gcode\.md5|json)$|^Metadata/plate_\d+\.gcode\.md5$")
 # plate metadata keys that only make sense for a sliced plate (bbs_3mf.cpp _handle_start_config_metadata)
 _SLICE_PLATE_KEYS = {
@@ -291,7 +307,100 @@ class Project:
             }
         return out
 
-    def summary(self) -> dict:
+    def feature_usage(self, plate: int) -> dict | None:
+        """Filament by feature from the plate's G-code (Metadata/plate_N.gcode), which is the only headless output
+        that separates support, prime tower and flush from the model (reference 08 section 4). Extrusion is
+        relative (M83); `; FEATURE: <name>` tags each block, `; FLUSH_START/END` brackets a flush, and a `T<n>` line
+        selects the filament: the start G-code selects the loaded filament with an indented `T<n> H-1` line, so the first
+        T line sets the tool without counting and every later T line with another tool is a change (live-checked on
+        by-layer, by-object and filament-2-first plates). Retractions are repaid by the following positive moves
+        before anything counts as deposited, so a retract in one feature and its deretract in the next cancel.
+        Absolute extrusion (M82, G92) is handled.
+        Returns grams per class and per filament, plus the number of filament changes."""
+        name = f"Metadata/plate_{plate}.gcode"
+        if not self.has(name):
+            return None
+        text = self.read(name).decode("utf-8", errors="replace")
+        densities: list[float] = []
+        diameters: list[float] = []
+        mm: dict[tuple[str, int], float] = {}
+        feature, tool, in_flush, changes = "other", -1, False, 0  # the first T line (in the start G-code) is the loaded filament
+        absolute, last_e = False, 0.0  # M82 absolute / M83 relative extrusion; G92 E resets the absolute position
+        debt: dict[int, float] = {}  # retracted filament per tool, repaid by the next positive moves (not deposited)
+        for raw in text.splitlines():
+            line = raw.lstrip()  # the start G-code indents its T lines
+            if not line:
+                continue
+            c = line[0]
+            if c == ";":
+                if line.startswith("; FEATURE: "):
+                    feature = _FEATURE_CLASS.get(line[11:].strip(), "model")
+                elif line.startswith("; FLUSH_START"):
+                    in_flush = True
+                elif line.startswith("; FLUSH_END"):
+                    in_flush = False
+                elif line.startswith("; filament_density:"):
+                    densities = [float(v) for v in line.split(":", 1)[1].split(",") if v.strip()]
+                elif line.startswith("; filament_diameter:"):
+                    diameters = [float(v) for v in line.split(":", 1)[1].split(",") if v.strip()]
+                continue
+            head = line.split(maxsplit=1)
+            if not head:
+                continue  # a line of spaces
+            word = head[0]
+            if c == "T" and len(word) > 1 and word[1:].isdigit():
+                t = int(word[1:])
+                if t < 100 and t != tool:  # T255 / T65535 are "no tool" markers
+                    if tool >= 0:
+                        changes += 1
+                    tool = t
+                    last_e = 0.0
+            elif word == "M82":
+                absolute = True
+            elif word == "M83":
+                absolute = False
+            elif word == "G92":
+                for tok in line.split()[1:]:
+                    if tok[0] == "E":
+                        last_e = _float_or(tok[1:], last_e)
+            elif word in ("G1", "G2", "G3") and " E" in line:
+                for tok in line.split()[1:]:
+                    if tok[0] == "E":
+                        e = _float_or(tok[1:], 0.0)
+                        if absolute:
+                            e, last_e = e - last_e, e
+                        tl = max(tool, 0)
+                        if e < 0:
+                            debt[tl] = debt.get(tl, 0.0) - e
+                        else:
+                            repay = min(e, debt.get(tl, 0.0))
+                            debt[tl] = debt.get(tl, 0.0) - repay
+                            k = ("flush" if in_flush else feature, max(tool, 0))
+                            mm[k] = mm.get(k, 0.0) + e - repay
+                        break
+        out: dict = {
+            "model_g": 0.0,
+            "support_g": 0.0,
+            "tower_g": 0.0,
+            "flush_g": 0.0,
+            "other_g": 0.0,
+            "filament_changes": changes,
+            "per_filament": {},
+        }
+        for (cls, t), length in mm.items():
+            d = diameters[t] if t < len(diameters) else 1.75
+            rho = densities[t] if t < len(densities) else 1.24
+            g = length * math.pi * (d / 2) ** 2 * rho / 1000
+            out[f"{cls}_g"] = round(out[f"{cls}_g"] + g, 2)
+            per = out["per_filament"].setdefault(str(t + 1), {})
+            per[cls] = round(per.get(cls, 0.0) + g, 2)
+        out["waste_g"] = round(out["tower_g"] + out["flush_g"], 2)
+        return out
+
+    def summary(self, features: bool = False) -> dict:
+        """The project as a dict. `features=True` adds `slice.features` per sliced plate from feature_usage(), which
+        parses the whole plate G-code: ask for it only when support grams (or the G-code cross-check) are needed.
+        A slice run's result.json gives seconds per feature and tower plus flush grams without that parse."""
         ps = self.project_settings
         order = self.build_order()
         index_of = {oid: i + 1 for i, oid in enumerate(order)}
@@ -347,6 +456,7 @@ class Project:
                     "name": keys.get("plater_name", ""),
                     "locked": keys.get("locked"),
                     "bed_type": keys.get("bed_type"),
+                    "print_sequence": keys.get("print_sequence"),
                     "filament_map_mode": keys.get("filament_map_mode"),
                     "filament_maps": keys.get("filament_maps"),
                     "gcode_file": keys.get("gcode_file"),
@@ -375,6 +485,8 @@ class Project:
         slices = self.slice_info()
         for plate_d in plates:
             plate_d["slice"] = slices.get(plate_d["id"])
+            if features and plate_d["slice"] is not None:
+                plate_d["slice"]["features"] = self.feature_usage(plate_d["id"])
         return {
             "file": self.path,
             "application": self.application(),
@@ -382,6 +494,7 @@ class Project:
             "printer": ps.get("printer_settings_id"),
             "process": ps.get("print_settings_id"),
             "bed_type": ps.get("curr_bed_type"),
+            "print_sequence": ps.get("print_sequence"),
             "filaments": [
                 {
                     "slot": i + 1,
@@ -428,6 +541,24 @@ class Project:
                     self._touch_ms()
         else:
             _set_meta(self._plate(plate), "bed_type", bed_type, after="locked")
+            self._touch_ms()
+
+    def set_print_sequence(self, sequence: str, plate: int | None = None) -> None:
+        """Per-plate <metadata key="print_sequence"> ("by layer" | "by object"), or with plate=None the project-wide
+        `print_sequence` plus every plate that already carries an override."""
+        if sequence not in ("by layer", "by object"):
+            raise ProjectError("print sequence must be 'by layer' or 'by object'")
+        if plate is None:
+            self.project_settings["print_sequence"] = sequence
+            self._touch_ps()
+            for p in self._plates():
+                if _meta(p, "print_sequence") is not None:
+                    _set_meta(p, "print_sequence", sequence)
+                    self._touch_ms()
+        else:
+            _set_meta(
+                self._plate(plate), "print_sequence", sequence, after="bed_type" if _meta(self._plate(plate), "bed_type") else "locked"
+            )
             self._touch_ms()
 
     def n_filaments(self) -> int:

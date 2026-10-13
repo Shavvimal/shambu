@@ -15,9 +15,14 @@ JSON shape:
   "aux_x_limit": 235.5,                     # optional stricter x limit for extruder 2
   "layout": {"gap": 5, "edge": 2},
   "plates": [{"name": "jaws",
+              "print_sequence": "by object",           # optional; default "by layer". See layout.SequentialClearance
+              "group_by_filament": true,               # by object only: same-filament, same-settings parts print as one object
               "parts": [{"path": "/abs/jaw_print.stl", "filament": 1, "count": 2,
                          "recipes": ["tall-outer-brim", "tree-supports"], "set": {"wall_loops": "8"},
                          "height_ranges": [{"min_z": 0, "max_z": 0.6, "set": {"extruder": "2"}}],
+                         "lay_on_face": [0, 0, 1], "rotate": [0, 0, 45],   # optional: turn the STL before placing it
+                         # or "orientation": "auto": Studio's auto-orient picks the face (single-file parts; a merged
+                         # part uses shambu's own best candidate). Not together with lay_on_face or rotate.
                          "at": [10, 10]},
                         {"name": "label", "parts": [{"path": "/abs/label.stl", "filament": 1},
                                                     {"path": "/abs/text.stl", "filament": 2}]}],
@@ -33,9 +38,11 @@ from pathlib import Path
 from typing import Any
 
 from .errors import BuildError
+from .mesh import Orientation
 
 BED_TYPES = ("Default Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Textured PEI Plate", "Supertack Plate")
 SUBTYPES = ("normal_part", "negative_part", "modifier_part", "support_enforcer", "support_blocker")
+PRINT_SEQUENCES = ("by layer", "by object")
 
 
 def _strs(d: dict | None) -> dict[str, str]:
@@ -85,6 +92,7 @@ class PartSpec:
     height_ranges: tuple[HeightRangeSpec, ...] = ()
     at: tuple[float, float] | None = None
     brim_margin: float | None = None
+    orientation: Orientation = field(default_factory=Orientation)
 
     def files(self) -> list[FileRef]:
         if self.parts:
@@ -103,7 +111,7 @@ class PartSpec:
         ranges: list[HeightRangeSpec] = []
         for r in d.get("recipes", []):
             if recipe_sets is not None and r not in recipe_sets:
-                raise BuildError(f"unknown recipe '{r}'; run `bambu recipes`")
+                raise BuildError(f"unknown recipe '{r}'; run `shambu recipes`")
             settings.update((recipe_sets or {}).get(r, {}))
             ranges += recipe_ranges(r)
         settings.update(_strs(d.get("set")))
@@ -123,6 +131,7 @@ class PartSpec:
             tuple(ranges),
             (float(d["at"][0]), float(d["at"][1])) if d.get("at") else None,
             float(d["brim_margin"]) if d.get("brim_margin") is not None else None,
+            Orientation.from_json(d),
         )
 
     def to_json(self) -> dict:
@@ -145,6 +154,7 @@ class PartSpec:
             d["at"] = list(self.at)
         if self.brim_margin is not None:
             d["brim_margin"] = self.brim_margin
+        d.update(self.orientation.to_json())
         return d
 
 
@@ -154,6 +164,16 @@ class PlateSpec:
     parts: tuple[PartSpec, ...] = ()
     pause_at_z: tuple[float, ...] = ()
     colour_changes: tuple[ColourChange, ...] = ()
+    print_sequence: str | None = None  # None = the process preset's print_sequence (by layer unless the user set it)
+    group_by_filament: bool = False  # by object: merge single-file parts with one filament and identical settings into one object
+
+    @property
+    def by_object(self) -> bool:
+        return self.print_sequence == "by object"
+
+    def sequence(self, process_default: str = "by layer") -> str:
+        """The effective print sequence: the plate's own value, else the process value (reference 08 section 2)."""
+        return self.print_sequence or (process_default or "by layer")
 
     @classmethod
     def from_json(cls, d: dict, i: int, recipe_sets=None) -> PlateSpec:
@@ -165,10 +185,16 @@ class PlateSpec:
                 ColourChange(float(c["z"]), int(c.get("filament", 2)), c.get("colour", ""))
                 for c in d.get("colour_changes", d.get("colour_change", []))
             ),
+            str(d["print_sequence"]).replace("_", " ") if d.get("print_sequence") else None,
+            bool(d.get("group_by_filament", False)),
         )
 
     def to_json(self) -> dict:
         d: dict[str, Any] = {"name": self.name, "parts": [p.to_json() for p in self.parts]}
+        if self.print_sequence:
+            d["print_sequence"] = self.print_sequence
+        if self.group_by_filament:
+            d["group_by_filament"] = True
         if self.pause_at_z:
             d["pause_at_z"] = list(self.pause_at_z)
         if self.colour_changes:
@@ -224,7 +250,7 @@ class Spec:
         pset: dict[str, str] = {}
         for r in pr.get("recipes", []):
             if r not in recipe_sets:
-                raise BuildError(f"unknown recipe '{r}'; run `bambu recipes`")
+                raise BuildError(f"unknown recipe '{r}'; run `shambu recipes`")
             pset.update(recipe_sets[r])
         pset.update(_strs(pr.get("set")))
         lay = d.get("layout", {})
@@ -278,6 +304,10 @@ class Spec:
         for pi, pl in enumerate(self.plates, 1):
             if not pl.parts:
                 errs.append(f"plate {pi}: no parts")
+            if pl.print_sequence is not None and pl.print_sequence not in PRINT_SEQUENCES:
+                errs.append(f"plate {pi}: print_sequence {pl.print_sequence!r} not in {PRINT_SEQUENCES}")
+            if pl.group_by_filament and pl.print_sequence == "by layer":
+                errs.append(f"plate {pi}: group_by_filament needs print_sequence 'by object' (by layer already prints every part together)")
             for si, part in enumerate(pl.parts, 1):
                 try:
                     files = part.files()
@@ -291,6 +321,11 @@ class Spec:
                         errs.append(f"plate {pi} part {si}: subtype {f.subtype!r} not in {SUBTYPES}")
                 if part.count < 1:
                     errs.append(f"plate {pi} part {si}: count must be >= 1")
+                o = part.orientation
+                if o.auto and (o.lay_on_face is not None or any(abs(a) > 1e-9 for a in o.rotate)):
+                    errs.append(
+                        f"plate {pi} part {si}: orientation 'auto' lets Studio choose the turn; remove lay_on_face and rotate, or drop 'auto'"
+                    )
                 if part.parts and part.height_ranges:
                     pass  # allowed: ranges go to assembled_params
                 for r in part.height_ranges:
@@ -352,9 +387,15 @@ class SpecBuilder:
         return self
 
     def plate(
-        self, name: str, *parts: PartSpec, pause_at_z: tuple[float, ...] = (), colour_changes: tuple[ColourChange, ...] = ()
+        self,
+        name: str,
+        *parts: PartSpec,
+        pause_at_z: tuple[float, ...] = (),
+        colour_changes: tuple[ColourChange, ...] = (),
+        print_sequence: str | None = None,
+        group_by_filament: bool = False,
     ) -> SpecBuilder:
-        self._plates.append(PlateSpec(name, tuple(parts), tuple(pause_at_z), tuple(colour_changes)))
+        self._plates.append(PlateSpec(name, tuple(parts), tuple(pause_at_z), tuple(colour_changes), print_sequence, group_by_filament))
         return self
 
     @staticmethod
@@ -365,9 +406,12 @@ class SpecBuilder:
         name: str | None = None,
         at: tuple[float, float] | None = None,
         height_ranges: tuple[HeightRangeSpec, ...] = (),
+        orientation: Orientation | None = None,
         **settings: str,
     ) -> PartSpec:
-        return PartSpec(Path(path), (), name, filament, count, "normal_part", (), _strs(settings), height_ranges, at)
+        return PartSpec(
+            Path(path), (), name, filament, count, "normal_part", (), _strs(settings), height_ranges, at, None, orientation or Orientation()
+        )
 
     @staticmethod
     def multipart(name: str, *files: tuple[str | Path, int], at: tuple[float, float] | None = None, **settings: str) -> PartSpec:

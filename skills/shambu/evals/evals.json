@@ -1,0 +1,51 @@
+{
+  "skill_name": "shambu",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have two STLs, parts/jaw.stl (I need 2 of them, PETG black) and parts/label.stl (1 copy, white PLA). Make me one Bambu Studio plate for my X2D: jaws in PETG on the left nozzle, the label in PLA on the right nozzle, print by object so there is no prime tower, Textured PEI. Slice it and tell me the time and grams. Put the output in /abs/out/jaws.",
+      "expected_output": "A spec file with two filaments, print_sequence 'by object' and group_by_filament, built with `shambu build plate.json --slice` after `shambu check` reads OK. The reply uses the hand-back template: project path, sliced status, per-plate time and grams with the filament-change count, one line per object with its filament, and both standing warnings.",
+      "files": [],
+      "expectations": [
+        "Runs `shambu doctor --json` before it writes the spec",
+        "Writes a plate.json spec with two entries in `filaments`: a PETG preset first and a PLA preset second",
+        "Assigns jaw.stl to filament 1 with count 2, and label.stl to filament 2",
+        "Sets `print_sequence` to \"by object\" on the plate, and sets `group_by_filament`",
+        "Sets `bed_type` to \"Textured PEI Plate\"",
+        "Runs `shambu check plate.json` and gets every line to OK before it builds",
+        "Runs `shambu build plate.json --slice` (not `BambuStudio` directly)",
+        "Does not hand-assemble BambuStudio command-line flags",
+        "Hands back using the template: a Project line with sliced status, a Plate line with time, grams and filament changes, and one line per object",
+        "Includes both standing warnings: the first print of a new fit is a coupon in the same orientation, and holes print undersize (about 0.1 mm vertical, 0.2 to 0.3 mm horizontal)",
+        "Quotes time and gram numbers from the report or the build output, and does not invent them"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "orient this bracket for strength: parts/bracket.stl. it's an L bracket that holds a shelf, the load pulls down on the long arm. PETG on the X2D.",
+      "expected_output": "Runs `shambu orient parts/bracket.stl`, then explains that the load direction decides over the orientation score (layers are the weak direction, so the load must run along the layer lines, not across them). Compares the candidate faces with `shambu sweep plate.json --orientations ...` before it commits, and puts the chosen `lay_on_face` in the spec.",
+      "files": [],
+      "expectations": [
+        "Runs `shambu orient` on parts/bracket.stl",
+        "States that the load direction outranks the orientation score: the layers must not split under the load on the long arm",
+        "Says that the score is a heuristic (for example, it counts bridges as overhang) and that the slicer sweep decides",
+        "Runs or proposes `shambu sweep` with `--orientations` to compare the candidate faces by time, grams and support",
+        "Puts the chosen orientation into the spec as `lay_on_face` [nx, ny, nz], not as a guessed rotation",
+        "Does not simply pick the orientation with the best score and ignore the load"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "change the bed type in projects/gripper.3mf to Textured PEI, everything else stays the same",
+      "expected_output": "Runs `shambu patch projects/gripper.3mf --bed-type \"Textured PEI Plate\"` (after an optional `shambu inspect`), and does not rebuild the project from STLs. If the file is a sliced .gcode.3mf, it warns that the patch drops the G-code and the user must re-slice.",
+      "files": [],
+      "expectations": [
+        "Uses `shambu patch` with `--bed-type \"Textured PEI Plate\"`",
+        "Does not rebuild the project with `shambu build` or write a new spec",
+        "Does not unzip and edit the 3MF XML by hand",
+        "Optionally runs `shambu inspect` before or after the patch to confirm the bed type",
+        "If the project is sliced, says that patching drops the G-code and the user must re-slice (or rebuild with --slice)"
+      ]
+    }
+  ]
+}

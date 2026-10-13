@@ -1,7 +1,8 @@
-"""Command line: `bambu <command> ...`. Each subcommand is a small class registered with @command.
+"""Command line: `shambu <command> ...`. Each subcommand is a small class registered with @command.
 
-Output is human text by default and JSON with `--json`, so an agent can parse it. Exit codes:
-0 ok, 1 a check or verification failed, 2 bad usage, 3 an environment error (binary, config).
+Output is human text by default and JSON with `--json` (before or after the command name), so an agent can parse
+it. Exit codes: 0 ok, 1 a check or verification failed or the spec is invalid, 2 bad usage, 3 an environment error
+(binary, config).
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from . import __version__, recipes
-from .errors import BambuError
+from .errors import BambuError, BuildError, StudioError
 from .facade import Bambu
+from .mesh import DEFAULT_THRESHOLD
 from .patches import (
     AddCustomGcode,
     ClearObjectSetting,
@@ -30,6 +32,7 @@ from .patches import (
     SetFilamentMap,
     SetHeightRange,
     SetObjectSetting,
+    SetPrintSequence,
 )
 from .spec import Spec
 
@@ -65,6 +68,34 @@ class Output:
         else:
             for line in text_lines if text_lines is not None else _default_lines(data):
                 print(line)
+
+
+def usage(out: Output, msg: str) -> int:
+    """A usage error: one error document (or one line) and exit code 2."""
+    out.emit({"error": msg}, [msg])
+    return 2
+
+
+METRES_WARNING = (
+    "the whole mesh is under 1 mm; it is probably in metres. `shambu rotate FILE -o DIR --convert-unit` writes a mm copy "
+    '(Studio\'s own unit fix), and "orientation": "auto" on a spec part converts it during the build.'
+)
+THRESHOLD_HELP = "overhang angle from vertical that needs support (default 60, Studio's own; 45 is the cautious rule)"
+
+
+def load_spec_or_error(path: str, out: Output) -> Spec | int:
+    """The spec, or exit code 1 after one error document: a bad spec (unreadable JSON, unknown recipe, missing
+    key) is the user's input failing a check, not an environment error (3)."""
+    from .build import load_spec
+
+    try:
+        return load_spec(path)
+    except BuildError as e:
+        msg = f"BuildError: {e}"
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
+        msg = f"BuildError: {path}: bad spec ({type(e).__name__}: {e})"
+    out.emit({"error": msg}, [msg])
+    return 1
 
 
 def _jsonable(x):
@@ -123,9 +154,25 @@ class Info(Command):
         p.add_argument("files", nargs="+")
 
     def run(self, a, app, out):
-        infos = [app.info(f) for f in a.files]
-        out.emit(infos, [i.describe() for i in infos])
-        return 0 if all(i.manifold for i in infos) else 1
+        app.studio_cli()  # a missing binary is an environment error (exit 3), not a bad file
+        entries = []
+        lines = []
+        failed = False
+        for f in a.files:
+            try:
+                i = app.info(f)
+            except BambuError as e:  # one bad file must not hide the others
+                msg = f"{type(e).__name__}: {e}"
+                entries.append({"file": f, "error": msg})
+                lines.append(f"{f}: ERROR {msg}")
+                failed = True
+                continue
+            warnings = [METRES_WARNING] if max(i.size) < 1.0 else []
+            entries.append({**_jsonable(i), "warnings": warnings})
+            lines += [i.describe()] + [f"  WARNING: {w}" for w in warnings]
+            failed = failed or not i.manifold
+        out.emit(entries, lines)
+        return 1 if failed else 0
 
 
 @command("presets", "List or resolve Bambu presets (machine | process | filament)")
@@ -196,12 +243,273 @@ class SpecCmd(Command):
             example = (sys.modules[Spec.__module__].__doc__ or "").split("JSON shape:", 1)[1].strip()
             out.emit({"example": example}, [example])
             return 0
-        from .build import load_spec
-
-        s = load_spec(a.file)
+        s = load_spec_or_error(a.file, out)
+        if isinstance(s, int):
+            return s
         errs = s.validate()
         out.emit({"ok": not errs, "problems": errs}, ["spec ok" if not errs else "spec problems:"] + ["- " + e for e in errs])
         return 0 if not errs else 1
+
+
+@command("orient", "Score orientations of an STL: bed contact, overhang shadow, height; optionally write the best as a new STL")
+class Orient(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=THRESHOLD_HELP)
+        p.add_argument("--top", type=int, default=12, help="largest flat faces to try, on top of as-is and the six axis faces (default 12)")
+        p.add_argument("--write", metavar="DIR", help="write the best orientation as <DIR>/<stem>__<tag>.stl")
+        p.add_argument(
+            "--pick",
+            type=int,
+            default=1,
+            help="with --write: which row of the table to write (1 = best); with --native, a row of Studio's table (1 keeps its export)",
+        )
+        p.add_argument(
+            "--native",
+            action="store_true",
+            help="print Studio's own auto-orient table (--orient 1) instead of shambu's; with --write, keep Studio's export in DIR",
+        )
+
+    def run(self, a, app, out):
+        from . import mesh as M
+
+        if a.native:
+            return self._native(a, app, out)
+        facets = M.read_stl(a.file)
+        if not facets:
+            return usage(out, f"{a.file}: the STL has no facets")
+        cands = M.candidates(facets, a.threshold, a.top)
+        summary = M.Summary(Path(a.file), len(facets), len(M.split_bodies(facets)), cands)
+        lines = [f"{a.file}: {len(facets)} facets, {summary.bodies} body(ies); overhang threshold {a.threshold:g} deg from vertical", ""]
+        warnings = [METRES_WARNING] if M.looks_like_metres(facets) else []
+        for w in warnings:
+            lines += [f"WARNING: {w}", ""]
+        lines += M.describe_candidates(cands)
+        lines += [
+            "",
+            'spec: add "lay_on_face": [nx, ny, nz] (and optionally "rotate": [x, y, z]) to the part; `shambu sweep --orientations <part>` slices the best few.',
+        ]
+        data = {**summary.to_json(), "warnings": warnings}
+        if a.write:
+            c = cands[max(0, min(len(cands), a.pick) - 1)]
+            path = M.oriented_copy(a.file, M.Orientation(lay_on_face=c.normal), a.write)
+            data["written"] = str(path)
+            lines.append(f"written: {path} ({c.label})")
+        out.emit(data, lines)
+        return 0
+
+    @staticmethod
+    def _native(a, app, out) -> int:
+        import tempfile
+
+        from . import mesh as M
+        from .sweep import unit_scale
+
+        src = Path(a.file)
+        if not src.is_file():
+            return usage(out, f"{a.file}: no such file")
+        if a.pick < 1:
+            return usage(out, f"--pick {a.pick}: rows start at 1")
+        st = app.studio_cli()
+        with tempfile.TemporaryDirectory(prefix="shambu-orient-") as tmp:
+            res = st.orient([src], Path(a.write) if a.write and a.pick == 1 else Path(tmp))  # row N > 1 is baked below
+            k = unit_scale(M.read_stl(src), M.read_stl(res.files[0])) if a.write and a.pick > 1 and res.files else 1.0
+        best = res.best
+        cands = res.candidates
+        if a.pick > len(cands):
+            return usage(out, f"--pick {a.pick}: Studio's table has {len(cands)} row(s)")
+        data: dict = {
+            "path": str(src),
+            "source": "studio",
+            "seconds": round(res.seconds, 2),
+            "best": best.to_json() if best else None,
+            "candidates": [c.to_json() for c in cands],
+        }
+        lines = [
+            f"{a.file}: Studio auto-orient, {len(cands)} candidates sorted by unprintability (lower is better); {res.seconds:.2f} s",
+            "",
+            f"{'#':>2} {'vector (up)':28s} {'overhang':>9} {'bottom':>8} {'bot_hull':>8} {'contour':>8} {'area_laf':>8} {'area_prj':>8} "
+            f"{'unprint':>9}  lay_on_face [nx, ny, nz]",
+        ]
+
+        def vec(v) -> str:
+            return "[" + ", ".join(f"{x:.4f}" for x in v) + "]"
+
+        for i, c in enumerate(cands, 1):
+            is_best = best is not None and all(abs(x - y) < 1e-3 for x, y in zip(c.vector, best.vector, strict=True))
+            lines.append(
+                f"{i:>2} {vec(c.vector):28s} {c.overhang:9.1f} {c.bottom:8.1f} {c.bottom_hull:8.1f} {c.contour:8.1f} {c.area_laf:8.1f} "
+                f"{c.area_projected:8.1f} {c.unprintability:9.1f}  {vec(c.lay_on_face)}" + ("  BEST" if is_best else "")
+            )
+        lines += [
+            "",
+            'spec: "orientation": "auto" lets Studio pick at build time; "lay_on_face": <a row\'s lay_on_face> fixes one row. '
+            "`shambu sweep --orientations <part> --source studio` slices the best few.",
+        ]
+        if a.write and a.pick == 1:
+            data["written"] = str(res.files[0])
+            lines.append(f"written: {res.files[0]} (Studio's best, unit converted)")
+        elif a.write:
+            # Row N > 1: bake its lay_on_face into the file (unit-converted first, as Studio's export is)
+            c = cands[a.pick - 1]
+            base = src
+            try:
+                if k != 1.0:
+                    base = M.write_stl(Path(a.write) / f"{src.stem}__mm.stl", M.scale(M.read_stl(src), k), f"{src.stem} mm")
+                path = M.oriented_copy(base, M.from_studio_vector(c.vector), a.write)
+            except OSError as e:
+                raise StudioError(f"cannot write row {a.pick} into {a.write}: {e}") from e
+            data["written"] = str(path)
+            data["picked"] = {"row": a.pick, **c.to_json(), **({"unit_scale": k} if k != 1.0 else {})}
+            lines.append(f"written: {path} (row {a.pick}, lay_on_face {vec(c.lay_on_face)}" + (f", scaled by {k:g})" if k != 1.0 else ")"))
+        out.emit(data, lines)
+        return 0
+
+
+@command("rotate", "Write a rotated copy of an STL (lay a face on the bed and/or Euler angles), dropped onto z = 0")
+class Rotate(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("-o", "--outdir", required=True)
+        p.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="outward normal of the face to put on the bed")
+        p.add_argument("--rotate", metavar="X,Y,Z", help="degrees about X, then Y, then Z (applied after --lay-on-face)")
+        unit = p.add_mutually_exclusive_group()
+        unit.add_argument(
+            "--scale",
+            type=float,
+            default=1.0,
+            help="multiply every coordinate first, e.g. 1000 for a mesh in metres (alone: scale and drop)",
+        )
+        unit.add_argument(
+            "--convert-unit",
+            action="store_true",
+            help="let Studio detect metres or inches and convert to mm first (its --convert-unit); alone: convert and drop",
+        )
+
+    def run(self, a, app, out):
+        from . import mesh as M
+
+        d: dict = {}
+        try:
+            if a.lay_on_face:
+                d["lay_on_face"] = [float(v) for v in a.lay_on_face.split(",")]
+            if a.rotate:
+                d["rotate"] = [float(v) for v in a.rotate.split(",")]
+            o = M.Orientation.from_json(d)
+        except (ValueError, BuildError) as e:
+            return usage(out, f"bad --lay-on-face or --rotate: {e}")
+        if o.is_identity and a.scale == 1.0 and not a.convert_unit:
+            return usage(out, "nothing to do: give --lay-on-face, --rotate, --scale or --convert-unit")
+        if a.scale <= 0:
+            return usage(out, "--scale must be positive")
+        src = Path(a.file)
+        note = ""
+        if a.convert_unit:  # Studio's unit fix first, so the oriented copy (and its hash) start from mm
+            import tempfile
+
+            if not src.is_file():
+                return usage(out, f"{a.file}: no such file")
+            before = M.bbox(M.read_stl(src))
+            with tempfile.TemporaryDirectory(prefix="shambu-unit-") as tmp:
+                converted = M.read_stl(app.studio_cli().normalise([src], Path(tmp))[0])
+            lo, hi = M.bbox(converted)
+            k = max(hi[i] - lo[i] for i in range(3)) / max(*(before[1][i] - before[0][i] for i in range(3)), 1e-12)
+            note = f"Studio scaled by {k:g}" if abs(k - 1) > 1e-6 else "Studio judged the file to be in mm already: unchanged"
+            converted = M.translate(converted, (-lo[0], -lo[1], -lo[2]))  # dropped onto z = 0 at x, y >= 0
+            src = M.write_stl(Path(a.outdir) / f"{src.stem}__mm.stl", converted, f"{src.stem} mm")
+        elif a.scale != 1.0:  # a scaled copy first, so the oriented copy (and its hash) start from mm
+            scaled = M.scale(M.read_stl(src), a.scale)
+            lo, _ = M.bbox(scaled)
+            scaled = M.translate(scaled, (-lo[0], -lo[1], -lo[2]))  # dropped onto z = 0 at x, y >= 0, as an oriented copy is
+            src = M.write_stl(Path(a.outdir) / f"{src.stem}__x{a.scale:g}.stl", scaled, f"{src.stem} x{a.scale:g}")
+        path = M.oriented_copy(src, o, a.outdir)  # the identity orientation (--scale or --convert-unit alone) returns that copy
+        m = M.metrics(M.read_stl(path))
+        out.emit(
+            {"written": str(path), **m.to_json(), **({"unit": note} if note else {})},
+            [
+                f"written {path}: {m.size[0]:.1f} x {m.size[1]:.1f} x {m.size[2]:.1f} mm, contact {m.contact_mm2:.0f} mm2, support shadow {m.shadow_mm2:.0f} mm2"
+                + (f" ({note})" if note else "")
+            ],
+        )
+        return 0
+
+
+@command("split", "Split an STL with several bodies into one STL per body (Studio's 'Split to objects')")
+class Split(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("-o", "--outdir", required=True)
+
+    def run(self, a, app, out):
+        from . import mesh as M
+
+        facets = M.read_stl(a.file)
+        bodies = M.split_bodies(facets)
+        n_cav = M.cavities(facets)
+        stem = Path(a.file).stem
+        written = [str(M.write_stl(Path(a.outdir) / f"{stem}_body{i}.stl", b, f"{stem} body {i}")) for i, b in enumerate(bodies, 1)]
+        lines = [f"{len(bodies)} body(ies):", *written]
+        if n_cav:
+            lines.append(
+                f"{n_cav} inward shell(s) (cavities inside a body) left out of the body files; slice the original file to keep them"
+            )
+        out.emit({"bodies": len(bodies), "cavities": n_cav, "written": written}, lines)
+        return 0
+
+
+@command("sweep", "Build (and slice) variants of a spec and compare time and filament: orientations, by-object, settings")
+class Sweep(Command):
+    def configure(self, p):
+        p.add_argument("spec")
+        p.add_argument("--variants", metavar="JSON", help="a JSON file: a list of variants (see `shambu spec` and sweep.py)")
+        p.add_argument("--orientations", metavar="PART", action="append", default=[], help="try the best orientations of this part key")
+        p.add_argument("--top", type=int, default=4, help="orientations per part for --orientations (default 4)")
+        p.add_argument(
+            "--source",
+            choices=("own", "studio"),
+            default="own",
+            help="candidates for --orientations: shambu's own score (default) or Studio's auto-orient table, ranked by unprintability",
+        )
+        p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=THRESHOLD_HELP)
+        p.add_argument("--by-object", action="store_true", help="add a variant with every plate on print_sequence 'by object'")
+        p.add_argument("--no-slice", action="store_true", help="only plan and export; no time or filament numbers")
+        p.add_argument("--no-baseline", action="store_true")
+        p.add_argument("--timeout", type=int, default=1200)
+
+    def run(self, a, app, out):
+        from . import sweep as S
+
+        try:  # a bad spec, variant file or part key is a failed check (exit 1), not an environment error
+            try:
+                spec_json = json.loads(Path(a.spec).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise BuildError(f"{a.spec}: cannot read the spec: {e}") from e
+            variants: list[dict] = S.load_variants(a.variants) if a.variants else []
+            for key in a.orientations:
+                variants += S.orientation_variants(
+                    spec_json, key, a.top, a.threshold, source=a.source, studio=app.studio_cli() if a.source == "studio" else None
+                )
+            if a.by_object:
+                variants.append(S.by_object_variant(spec_json))
+            if not variants and a.no_baseline:
+                return usage(out, "no variants: give --variants, --orientations or --by-object")
+            S.check_names(variants, baseline=not a.no_baseline)
+        except BuildError as e:
+            out.emit({"error": f"BuildError: {e}"}, [f"BuildError: {e}"])
+            return 1
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:  # a structurally bad spec or variant
+            msg = f"BuildError: {a.spec}: bad spec ({type(e).__name__}: {e})"
+            out.emit({"error": msg}, [msg])
+            return 1
+        results = S.run(
+            spec_json,
+            variants,
+            lambda spec, do_slice: app.build(spec, timeout=a.timeout, do_slice=do_slice),
+            do_slice=not a.no_slice,
+            baseline=not a.no_baseline,
+        )
+        out.emit([r.to_json() for r in results], S.table(results))
+        return 0 if all(r.ok for r in results) else 1  # one failed variant is a failed check (exit 1), as for `build`
 
 
 @command("check", "Plan a spec: resolve presets, measure STLs, place parts, check limits. No export.")
@@ -210,7 +518,10 @@ class Check(Command):
         p.add_argument("spec")
 
     def run(self, a, app, out):
-        r = app.build(a.spec, export=False)
+        spec = load_spec_or_error(a.spec, out)
+        if isinstance(spec, int):
+            return spec
+        r = app.build(spec, export=False)
         out.emit(r.to_json(), r.report.splitlines())
         return 0 if r.plan.ok else 1
 
@@ -227,8 +538,11 @@ class Build(Command):
         )
 
     def run(self, a, app, out):
+        spec = load_spec_or_error(a.spec, out)
+        if isinstance(spec, int):
+            return spec
         app.listeners.append(lambda ev, d: log.info("%s %s", ev, {k: v for k, v in d.items() if k != "argv"}))
-        r = app.build(a.spec, timeout=a.timeout, keep_going=a.keep_going, do_slice=a.slice)
+        r = app.build(spec, timeout=a.timeout, keep_going=a.keep_going, do_slice=a.slice)
         out.emit(r.to_json(), r.report.splitlines())
         if a.open and r.run and r.run.ok:
             app.open_in_studio(r.project)
@@ -241,16 +555,18 @@ class Inspect(Command):
         p.add_argument("file")
 
     def run(self, a, app, out):
-        s = app.inspect(a.file)
+        s = app.inspect(a.file, features=out.as_json)  # only --json shows grams by feature, so only it parses the G-code
         lines = [
             f"{a.file}: {s['application']}, {'SLICED' if s['sliced'] else 'unsliced'}",
-            f"printer {s['printer']}; process {s['process']}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']})",
+            f"printer {s['printer']}; process {s['process']}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']}); "
+            f"print sequence {s.get('print_sequence') or 'not set (by layer)'}",
         ]
         for f in s["filaments"]:
             lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}")
         for p in s["plates"]:
             lines.append(
-                f"plate {p['id']} '{p['name']}': bed {p['bed_type'] or 'project default'}, map {p['filament_maps'] or 'project default'}, objects {p['objects']}"
+                f"plate {p['id']} '{p['name']}': bed {p['bed_type'] or 'project default'}, map {p['filament_maps'] or 'project default'}, "
+                f"print sequence {p.get('print_sequence') or 'project default'}, objects {p['objects']}"
             )
             if p.get("slice"):
                 sl = p["slice"]
@@ -280,6 +596,13 @@ class PatchCmd(Command):
         p.add_argument("-o", "--out")
         p.add_argument("--bed-type", help="e.g. 'Textured PEI Plate' (project and every plate)")
         p.add_argument("--plate-bed-type", action="append", default=[], metavar="PLATE:TYPE")
+        p.add_argument(
+            "--print-sequence",
+            action="append",
+            default=[],
+            metavar="[PLATE:]SEQUENCE",
+            help="'by object' or 'by layer', per plate or project-wide",
+        )
         p.add_argument("--colours", help="comma list, one #RRGGBB per filament")
         p.add_argument("--map", help="comma list of extruder per filament, e.g. 1,2")
         p.add_argument("--set", action="append", default=[], metavar="OBJECT:KEY=VALUE", help="per-object setting")
@@ -317,6 +640,9 @@ class PatchCmd(Command):
         for x in a.plate_bed_type:
             n, t = x.split(":", 1)
             ps.add(SetBedType(t, int(n)))
+        for x in a.print_sequence:
+            n, _, seq = x.rpartition(":")
+            ps.add(SetPrintSequence(seq.strip().replace("_", " "), int(n) if n else None))
         if a.colours:
             ps.add(SetFilamentColours(tuple(c.strip() for c in a.colours.split(","))))
         if a.map:
@@ -417,7 +743,18 @@ def build_parser() -> argparse.ArgumentParser:
     for name, c in _REGISTRY.items():
         sp = sub.add_parser(name, help=c.help, description=c.help)
         c.configure(sp)
+        _add_json_flag(sp)
     return p
+
+
+def _add_json_flag(p: argparse.ArgumentParser) -> None:
+    """`--json` after the command name too (`shambu info --json f.stl`), in nested subcommands as well. The default
+    is SUPPRESS, so a subcommand that does not see the flag keeps the global one's value."""
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="machine-readable output (as the global --json)")
+    for act in p._actions:
+        if isinstance(act, argparse._SubParsersAction):
+            for child in act.choices.values():
+                _add_json_flag(child)
 
 
 def main(argv: list[str] | None = None) -> int:

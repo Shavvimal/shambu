@@ -8,13 +8,85 @@ from . import layout as L
 from .errors import BuildError
 
 if TYPE_CHECKING:
-    from .build import BuildResult
+    from .build import BuildResult, PlannedPart
 
 STANDING_WARNINGS = (
     "This project is unsliced: slice in Bambu Studio (or build it with --slice for a .gcode.3mf with estimates).",
     "First print of a new fit: one coupon or one part, in the same orientation as the feature.",
     "Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores.",
 )
+
+
+FEATURE_TIME_ROLES = ("Support", "Support interface", "Prime tower", "Flush", "Travel")
+
+
+def estimate_lines(sl: dict) -> list[str]:
+    """Report lines for one entry of BuildResult.estimates(). Each number names its source: slice_info.config,
+    result.json (seconds per feature, tower plus flush grams) or the G-code parser (support grams, filament changes
+    as tool switches, and everything by feature when the run left no result.json)."""
+    n = sl["plate"]
+    out = [
+        f"- plate {n} estimate: {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min, {sl['weight_g']:.1f} g ("
+        + ", ".join(f"filament {f['id']} {f['type']} {f['used_g']:.1f} g" for f in sl["filaments"])
+        + ")"
+        + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")
+    ]
+    ft = sl.get("features")
+    native_waste = [f["waste_g"] for f in sl["filaments"] if "waste_g" in f]
+    if "feature_times_s" in sl or native_waste:
+        if ft:
+            support = f"support {ft['support_g']:.1f} g (G-code parser)"
+        elif sl.get("support_used") == "false":
+            support = "support 0.0 g (the slicer used none)"
+        else:
+            support = "support not measured"
+        if native_waste:
+            waste = f"prime tower + flush {sum(float(w) for w in native_waste):.1f} g (result.json)"
+        elif ft:
+            waste = f"prime tower + flush {ft['waste_g']:.1f} g (G-code parser)"
+        else:
+            waste = "prime tower + flush not available"
+        changes = sl.get("filament_changes")
+        swaps = (
+            "filament changes not measured"
+            if changes is None
+            else f"{changes} filament change(s) ({'G-code parser' if ft else 'one filament'})"
+        )
+        out.append(f"- plate {n} filament by feature: {support}, {waste}; {swaps}")
+        times = sl.get("feature_times_s") or {}
+        shown = [f"{k.lower()} {times[k] / 60:.1f} min" for k in FEATURE_TIME_ROLES if times.get(k)]
+        if shown:
+            out.append(f"- plate {n} time by feature (result.json): " + ", ".join(shown))
+    elif ft:
+        out.append(
+            f"- plate {n} filament by feature (G-code parser, no result.json grams): model {ft['model_g']:.1f} g, support {ft['support_g']:.1f} g, "
+            f"prime tower {ft['tower_g']:.1f} g, flush {ft['flush_g']:.1f} g; {ft['filament_changes']} filament change(s)"
+        )
+    return out
+
+
+def _vec(v) -> str:
+    return "[" + ", ".join(f"{x:g}" for x in v) + "]"
+
+
+def orientation_text(x: PlannedPart) -> str:
+    """How the part was turned: Studio's auto-orient (pass 1), shambu's own pick for a merged auto part, or the spec's
+    explicit lay_on_face / rotate."""
+    o = x.spec.orientation
+    copy = f"copy {x.files[0][0].name}"
+    if x.orient is not None:
+        b = x.orient.best
+        if b is None:
+            return f"oriented by Studio (no candidate table in its log; {copy})"
+        return f"oriented by Studio: best {_vec(b.vector)}, unprintability {b.unprintability:g} (lay_on_face {_vec(b.lay_on_face)}; {copy})"
+    if x.auto_face is not None:
+        return f"oriented by shambu's own score (orientation auto on a merged part): face {_vec(x.auto_face)} on the bed ({copy})"
+    return (
+        "oriented: "
+        + (f"face {list(o.lay_on_face)} on the bed" if o.lay_on_face else "")
+        + (f" rotated {list(o.rotate)} deg" if any(o.rotate) else "")
+        + f" ({copy})"
+    )
 
 
 def render(r: BuildResult) -> str:
@@ -46,16 +118,23 @@ def render(r: BuildResult) -> str:
         out.append("Process settings: " + ", ".join(f"{k}={v}" for k, v in spec.process.set.items()) + ".")
     for p in pl.plates:
         out += ["", f"## Plate: {p.name}"]
+        if p.print_sequence == "by object":
+            out.append(
+                "- print sequence: by object (objects print one after another in the order listed"
+                + ("; Studio builds no prime tower on such a plate)" if len(p.parts) > 1 else ")")
+            )
         out += ["- " + line for line in L.describe([x.placed for x in p.parts])]
         for x in p.parts:
             extras = []
+            if not x.spec.orientation.is_identity:
+                extras.append(orientation_text(x))
             if x.spec.recipes:
                 extras.append("recipes " + ", ".join(x.spec.recipes))
             if x.spec.set:
                 extras.append("settings " + ", ".join(f"{k}={v}" for k, v in x.spec.set.items()))
             if x.spec.height_ranges:
                 extras.append("height ranges " + "; ".join(f"z {h.min_z}..{h.max_z}: {h.set}" for h in x.spec.height_ranges))
-            if x.assembled:
+            if x.assembled and not x.grouped:
                 extras.append("parts " + ", ".join(f"{fp.name} on filament {fil}" for fp, fil, _ in x.files))
             try:
                 eff = effective_filaments(x.spec, x.files)
@@ -67,6 +146,19 @@ def render(r: BuildResult) -> str:
                 extras.append(f"keeps the CLI name '{x.cli_name}' in the project")
             if extras:
                 out.append(f"  - {x.key}: " + "; ".join(extras))
+            if x.grouped:
+                out.append(
+                    f"  - {x.key} is one object of {len(x.members)} parts on filament {x.placed.filament} (group_by_filament): "
+                    "they print together, layer by layer, with no nozzle change between them"
+                )
+                for m, (dx, dy) in zip(x.members, x.offsets, strict=True):
+                    sx, sy, sz = m.placed.info.size
+                    o = m.spec.orientation
+                    turned = "" if o.is_identity else f"; {orientation_text(m)}"
+                    out.append(
+                        f"    - {m.key}: filament {m.placed.filament}, {sx:.1f} x {sy:.1f} x {sz:.1f} mm, "
+                        f"at x {dx:.1f} y {dy:.1f} in the group (bed x {m.placed.x0:.1f} y {m.placed.y0:.1f}){turned}"
+                    )
         out += [("- OK: " if c.ok else "- FAIL: ") + c.text for c in p.checks]
     if pl.problems:
         out += ["", "## Problems"] + ["- " + x for x in pl.problems]
@@ -74,22 +166,42 @@ def render(r: BuildResult) -> str:
         out += ["", "## Warnings"] + ["- " + x for x in pl.warnings]
     if r.run:
         out += ["", "## Export", "- " + r.run.summary()]
+        ep = r.export_problem()
+        if ep:
+            out.append("- " + ep)
+        for w in r.slicer_warnings():
+            out.append(f"- slicer warning: {w}")
         out += ["- patched: " + x for x in r.patches]
         if r.verify_problems == []:
             out.append(
                 "- verified: bed type (project and plates), process name and every override, filament presets, colours and map, "
                 "plate and object counts, object names, machine start/end/filament-change G-code" + (", G-code present" if r.sliced else "")
             )
-        for plate_s in (r.summary or {}).get("plates", []):
-            if plate_s.get("slice"):
-                sl = plate_s["slice"]
-                out.append(
-                    f"- plate {plate_s['id']} estimate: {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min, {sl['weight_g']:.1f} g ("
-                    + ", ".join(f"filament {f['id']} {f['type']} {f['used_g']:.1f} g" for f in sl["filaments"])
-                    + ")"
-                    + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")
-                )
+        for sl in r.estimates():
+            out += estimate_lines(sl)
         out += ["- VERIFY FAIL: " + x for x in (r.verify_problems or [])]
+    if r.run is not None and not r.run.ok:
+        out += ["", "## Next", "- The export failed (above): nothing to open. Fix the spec or the part and build again."]
+        out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
+        return "\n".join(out) + "\n"
+    if r.run is None and not pl.ok:  # the build stopped at the plan: a project at the output path is absent or stale
+        out += [
+            "",
+            "## Next",
+            "- The checks failed (see Problems and the FAIL lines above): nothing was exported, so there is no new project to open. "
+            "Fix the spec and build again.",
+        ]
+        out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
+        return "\n".join(out) + "\n"
+    if r.run is None:  # a check-only run (`shambu check`): the plan passed, nothing was exported
+        out += [
+            "",
+            "## Next",
+            f"- Check only: the plan passed, but nothing was exported, so there is no project at `{r.project}` from this run. "
+            "Run `shambu build` on the spec to write it.",
+        ]
+        out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
+        return "\n".join(out) + "\n"
     out += ["", "## Owner steps in Bambu Studio"]
     step = 1
     out.append(
@@ -105,7 +217,8 @@ def render(r: BuildResult) -> str:
     step += 1
     if r.sliced:
         out.append(
-            f"{step}. The plate is already sliced (the estimate above comes from the slicer). Check the preview, then Print. Re-slice in Studio after any change."
+            f"{step}. The plate is already sliced (the estimate above comes from the slicer). In Preview, set the colour scheme to Line Type and "
+            "look at the Overhang wall, Bridge and Support rows and at the first layer; then Print. Re-slice in Studio after any change."
         )
     else:
         out.append(f"{step}. Slice Plate, read the time and filament estimate, then Print.")

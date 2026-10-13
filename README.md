@@ -84,15 +84,27 @@ plates with their parts (a file with filament, count, recipes, settings, height 
 several files merged into one object). `build` writes `<outdir>/<name>.3mf`, `<name>.report.md`, `<name>.log` and
 the CLI inputs under `<outdir>/shambu/`.
 
-**2. Inspect or patch an existing project.**
+**2. Find the best orientation and print sequence.** Score orientations without slicing, then let the slicer judge.
+
+```
+shambu orient bracket.stl                       # bed contact, support shadow, height per candidate face
+shambu sweep plate.json --orientations bracket --by-object   # slices each variant: time, grams, support, waste, swaps
+shambu rotate part.stl -o out --lay-on-face 0,0,1          # write a turned copy; shambu split a.stl -o out
+```
+
+A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`
+(one object after another: on a two-filament plate that drops the prime tower and the per-layer nozzle changes,
+40 min instead of 1 h 24 on the measured plate). The sweep writes each variant to `<outdir>/sweep/<name>/`.
+
+**3. Inspect or patch an existing project.**
 
 ```
 shambu inspect project.3mf
 shambu patch project.3mf --bed-type "Textured PEI Plate" --colours "#1A1A1A,#F0F0F0" --map 1,2 \
-    --set "carrier_1:enable_support=1" --pause 1:10.2 --rename-plate "1:carrier D.6"
+    --set "carrier_1:enable_support=1" --pause 1:10.2 --rename-plate "1:carrier D.6" --print-sequence "1:by object"
 ```
 
-**3. Read the printer (read-only).**
+**4. Read the printer (read-only).**
 
 ```
 shambu printer status [--ip <printer-ip>]
@@ -123,17 +135,31 @@ Exit codes: 0 ok, 1 a check or verification failed, 2 usage, 3 environment (bina
   the default prime tower (it sits off the bed). The pipeline sets all three; a plate slices in about one second.
 - After any Studio crash, macOS shows a modal alert inside the CLI process that blocks it for ever (the fabled
   "five-minute export"). Every call runs with `CFFIXED_USER_HOME` pointed at a private empty directory.
-- Assemble-list `pos_*` are translations added to the STL's own coordinates, and `pos_x`, `pos_y`, `pos_z` must
-  have the same length (an indexing bug). A merged part loses its height ranges (use `assembled_params`).
+- Assemble-list `pos_*` are translations added to the STL's own coordinates for the first copy; copies 2..n are
+  cloned from the translated first copy, so their `pos` is relative to it. `pos_x`, `pos_y`, `pos_z` must have the
+  same length (an indexing bug). A merged part loses its height ranges (use `assembled_params`).
 - Extruder 2 (right, Bowden) reaches only x >= 20.5 mm and z <= 256 mm. Anything on filament 2, including a height
   range or a sub-part, must sit inside that. A filament moved to nozzle 2 also needs `filament_extruder_variant`.
 - `layer_config_ranges.xml` keys objects by build order, not id. Thumbnails are optional.
+- Print by object (Studio `sequential_print_clearance_valid`): objects need a 59.8 mm hull gap on the X2D (3.8 mm
+  when all are under 4 mm tall), print in object-list order, and an object over 32.8 mm must not be followed by one
+  in its Y band (33 mm); nothing but the last may pass 133 mm. Studio drops the prime tower itself. The layout
+  packs in print order with a 60 mm gap and closes the row after a tall object.
+- The CLI's `--rotate*` flags turn every object; a per-part orientation is baked into an STL copy instead.
+- X2D speed keys are six-slot per-nozzle arrays; no recipe writes a scalar into them.
+- `support_filament` 0 ("default") lets Studio print a part's support with whichever filament is loaded. On a
+  two-filament plate that put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102). The
+  planner pins `support_filament` and `support_interface_filament` to the part's own filament when they are unset.
+- Tree support spreads past a part's box: 15.6 mm on a 170 mm bracket, which conflicted at a 15 mm gap. The layout
+  keeps 0.25 x height, clamped to 5..25 mm, round a supported part, and checks extruder reach on that rect.
+- A mesh whose whole bbox is under 1 mm is in metres (URDF exports); Studio fails it with -100. `check` refuses it,
+  and `shambu rotate --scale 1000` writes a mm copy.
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `src/shambu/` | The package: `presets` (chain of profile sources, flattening), `studio` (binary adapter, `CliCommand` builder), `assemble` (assemble-list model and validation), `layout` (placer and limit rules), `threemf` + `patches` (3MF read/patch commands), `spec` (typed spec, builder), `recipes`, `build` (template-method pipeline), `report`, `printer` (discovery, MQTT reader, decoder), `conf`, `facade`, `cli` |
+| `src/shambu/` | The package: `presets` (chain of profile sources, flattening), `studio` (binary adapter, `CliCommand` builder), `assemble` (assemble-list model and validation), `layout` (placer and limit rules), `mesh` (STL read/write, orientation scoring), `threemf` + `patches` (3MF read/patch commands, G-code feature usage), `spec` (typed spec, builder), `recipes`, `build` (template-method pipeline), `sweep` (variant builds and the comparison table), `report`, `printer` (discovery, MQTT reader, decoder), `conf`, `facade`, `cli` |
 | `tests/` | Offline pytest suite with fakes for the binary, the profile tree and the MQTT transport |
 | `skills/shambu/` | The Claude Code skill and the reverse-engineering references |
 | `skills/setup/` | `/shambu:setup`: installs the CLI, runs `shambu doctor` |
@@ -151,6 +177,7 @@ claude --plugin-dir .            # try the skills from this checkout
 uv tool install --reinstall .    # install the CLI from this checkout
 ```
 
+Before a release, run the real-CAD loop in `data/README.md` (the folder is gitignored; copy your own STLs in).
 Bump `__version__` in `src/shambu/__init__.py` and `version` in `.claude-plugin/plugin.json` together whenever
 anything under `src/`, `skills/` or `.claude-plugin/` changes; CI enforces the bump and the release workflow tags
 `v<version>` on `main`.

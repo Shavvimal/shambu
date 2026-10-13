@@ -141,6 +141,28 @@ def test_plan_not_ok_skips_export(tmp_path, stls, resolver):
     assert "not exported" in r.report and "## Problems" in r.report
 
 
+def test_failed_checks_report_says_nothing_was_exported(tmp_path, stls, resolver):
+    """Two parts at one position overlap: the plan fails, the build stops before the export, and the report sends the
+    user back to the spec, not to a project that may not exist or may be stale."""
+    parts = [{"path": str(stls["body"]), "name": "a", "at": [20, 20]}, {"path": str(stls["base"]), "name": "b", "at": [20, 20]}]
+    studio = FakeStudio()
+    r = pipeline(resolver, studio).build(make_spec(tmp_path, stls, plates=[{"name": "p", "parts": parts}]), export=True)
+    assert not r.plan.ok and r.run is None
+    assert [k for k, _ in studio.calls if k == "run"] == []
+    assert "FAIL: a and b overlap" in r.report
+    assert "## Next" in r.report and "nothing was exported" in r.report and "Fix the spec and build again" in r.report
+    assert "Owner steps" not in r.report and "Open the project" not in r.report
+
+
+def test_check_only_report_says_nothing_was_exported(tmp_path, stls, resolver, cli_export):
+    """`shambu check` (export=False) with a plan that passes: the Next section says nothing was exported and to run
+    `shambu build`; no owner step tells the user to open a project this run never wrote."""
+    r = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls), export=False)
+    assert r.plan.ok and r.run is None
+    assert "## Next" in r.report and "nothing was exported" in r.report and "`shambu build`" in r.report
+    assert "Owner steps" not in r.report and "Open the project" not in r.report
+
+
 def test_keep_going_exports_anyway(tmp_path, stls, resolver, cli_export):
     r = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls, process={"base": "0.20mm Wrong"}), keep_going=True)
     assert r.run is not None and not r.ok
@@ -177,3 +199,63 @@ def test_tpu_on_aux_nozzle_fails_check(tmp_path, stls, resolver):
 def test_tpu_subpart_on_aux_nozzle_fails_check(tmp_path, stls, resolver):
     plan = pipeline(resolver, FakeStudio()).plan(make_spec(tmp_path, stls, filaments=TPU_FILAMENTS))
     assert any("TPU" in c.text for p in plan.plates for c in p.checks if not c.ok)
+
+
+# ---------------------------------------------------------------------------- batch 1 (real-STL test findings)
+def one_part_spec(tmp_path, path, **part):
+    return Spec.from_json(
+        {
+            "name": "one",
+            "outdir": str(tmp_path / "out"),
+            "printer": MACHINE,
+            "process": {"base": PROCESS, "name": PROCESS_NAME},
+            "filaments": [{"preset": "Test PLA"}],
+            "plates": [{"name": "p", "parts": [{"path": str(path), **part}]}],
+        }
+    )
+
+
+def test_overflow_gives_one_fail_line(tmp_path, stls, resolver):
+    studio = FakeStudio(sizes={"body.stl": (200.0, 200.0, 10.0)})
+    plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], count=3))
+    fails = [c.text for c in plan.plates[0].checks if not c.ok]
+    assert len(fails) == 1 and "the parts need 3 plates" in fails[0]  # no repeated overlap and reach failures
+    assert sum("need 3 plates" in p for p in plan.problems) == 1
+
+
+def test_orientation_without_flat_contact_is_a_problem(tmp_path, resolver):
+    from shambu import mesh as M
+    from test_mesh import box
+
+    stl = M.write_stl(tmp_path / "block.stl", box((0, 0, 0), (30, 20, 10)))
+    plan = pipeline(resolver, FakeStudio()).plan(one_part_spec(tmp_path, stl, lay_on_face=[1, 1, 0]))  # stands on an edge
+    assert any("leaves no flat face on the bed" in p and "block" in p for p in plan.problems)
+    plan = pipeline(resolver, FakeStudio()).plan(one_part_spec(tmp_path, stl, lay_on_face=[1, 0, 0]))
+    assert not any("no flat face" in p for p in plan.problems)
+
+
+def test_to_json_after_a_failed_export(tmp_path, stls, resolver):
+    studio = FakeStudio(code=-101, result={"error_string": "G-code path conflicts", "warning_message": "floating cantilever"})
+    r = pipeline(resolver, studio).build(make_spec(tmp_path, stls), do_slice=True)
+    j = r.to_json()
+    assert j["ok"] is False and j["project"] is None and j["sliced"] is False
+    assert any(
+        p.startswith("export failed: exit -101 (G-code path conflicts)") and "Studio: G-code path conflicts" in p for p in j["problems"]
+    )
+    assert "floating cantilever" in j["warnings"]
+    assert "## Next" in r.report and "nothing to open" in r.report and "slicer warning: floating cantilever" in r.report
+    json.dumps(j)
+
+
+def test_failed_export_without_result_json_keeps_the_old_shape(tmp_path, stls, resolver):
+    r = pipeline(resolver, FakeStudio(code=-17)).build(make_spec(tmp_path, stls))
+    assert r.run.result is None and r.slicer_warnings() == []
+    assert r.export_problem().startswith("export failed: exit -17") and "Studio:" not in r.export_problem()
+
+
+def test_supported_part_gets_the_support_margin(tmp_path, stls, resolver):
+    studio = FakeStudio(sizes={"body.stl": (20.0, 20.0, 40.0)})
+    plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], recipes=["tree-supports"]))
+    assert plan.plates[0].parts[0].placed.margin == pytest.approx(10.0)  # 0.25 x 40, above the 5.2 mm brim
+    plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"]))
+    assert plan.plates[0].parts[0].placed.margin == pytest.approx(5.2)  # no supports: the brim only

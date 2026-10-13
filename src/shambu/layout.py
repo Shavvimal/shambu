@@ -23,6 +23,8 @@ GAP = 5.0
 WIPE_TOWER = (15.0, 220.0, 35.0, 35.0)  # x, y, w, h reserved when a plate uses two filaments (CLI default position)
 
 Rect = tuple[float, float, float, float]  # x0, y0, x1, y1
+# Print-by-object head clearance (Bambu Lab X2D values; the machine preset overrides them). See SequentialClearance.
+DEFAULT_CLEARANCE = {"radius": 60.0, "height_to_rod": 32.8, "height_to_lid": 133.0, "dist_to_rod": 33.0, "nozzle_height": 4.0}
 
 
 @dataclass
@@ -92,6 +94,16 @@ def overlaps(a: Rect, b: Rect) -> bool:
     return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
 
 
+def support_margin(params: dict | None, height: float) -> float:
+    """How far tree supports may spread past a supported part's footprint: a quarter of the height, 5 to 25 mm.
+    Measured: a 95 mm bracket's trees reached 13 to 15.6 mm past its bbox (a 15 mm gap still conflicted, 20 mm
+    sliced); a jaw's support reached 5.5 mm into the right nozzle's dead strip (reference 08 section 3.3b)."""
+    p = params or {}
+    if str(p.get("enable_support", "0")) not in ("1", "true"):
+        return 0.0
+    return max(5.0, min(25.0, 0.25 * height))
+
+
 def brim_margin(params: dict | None, default_brim_width: float = 5.0) -> float:
     """Footprint growth from a brim: outer_only/auto grow by brim_width, no_brim by 0, ears by 3."""
     p = params or {}
@@ -122,22 +134,30 @@ class ShelfPacker:
     x_range: tuple[float, float] = (EDGE, BED - EDGE)
     y_range: tuple[float, float] = (EDGE, BED - EDGE)
     gap: float = GAP
+    keep_order: bool = False  # print-by-object: the list order is the print order, so no re-sorting by depth
+    solo_row_above: float | None = None  # print-by-object: an object taller than this ends its row (nothing later shares its Y band)
 
     def place(self, parts: list[Placed], obstacles: Sequence[Rect] = (), x_min_of: Mapping[str, float] | None = None) -> list[list[Placed]]:
         x_min = dict(x_min_of or {})
-        left = sorted(parts, key=lambda p: (-(p.h + 2 * p.margin), -(p.w + 2 * p.margin)))
+        left = list(parts) if self.keep_order else sorted(parts, key=lambda p: (-(p.h + 2 * p.margin), -(p.w + 2 * p.margin)))
         plates: list[list[Placed]] = []
         plate: list[Placed] = []
         y = self.y_range[0]
         while left:
             row = [left.pop(0)]
             x_after = max(self.x_range[0], x_min.get(row[0].key, self.x_range[0])) + row[0].w + 2 * row[0].margin + self.gap
+            closed = self.solo_row_above is not None and row[0].info.size[2] > self.solo_row_above
             for o in list(left):
+                if closed:
+                    break
                 start = max(x_after, x_min.get(o.key, self.x_range[0]))
                 if start + o.w + 2 * o.margin <= self.x_range[1]:
                     row.append(o)
                     left.remove(o)
                     x_after = start + o.w + 2 * o.margin + self.gap
+                    closed = self.solo_row_above is not None and o.info.size[2] > self.solo_row_above
+                elif self.keep_order:
+                    break  # the next object in print order starts the next row
             row_h = max(r.h + 2 * r.margin for r in row)
             if y + row_h > self.y_range[1] and plate:
                 plates.append(plate)
@@ -176,6 +196,23 @@ class Context:
     tpu_filaments: set[int] = field(default_factory=set)
     aux_x_limit: float | None = None
     reserve: Rect | None = None
+    by_object: bool = False  # the plate prints one object at a time: head clearance and height limits apply
+    skirt_extra: float = 0.0  # per-object skirt width (distance + loops x line), added to the by-object gap
+
+    def sequential_gap(self, all_short: bool) -> float:
+        """The bounding-box gap print-by-object needs (reference 08 section 2): Studio grows each hull by
+        `0.5 * radius - 0.1` (or `0.5 * nozzle_height - 0.1` when every object is under `nozzle_height`), and a
+        per-object skirt turns that into `max(d + skirt / 2, skirt)`. Two grown hulls may not touch, so the gap is
+        twice the growth; the radius itself (not radius - 0.2) is used as the safe round-up."""
+        c = self.clearance
+        d = (c["nozzle_height"] if all_short else c["radius"]) / 2
+        if self.skirt_extra > 0:
+            d = max(d + self.skirt_extra / 2, self.skirt_extra)
+        return 2 * d
+
+    @property
+    def clearance(self) -> dict:
+        return {**DEFAULT_CLEARANCE, **self.facts.get("clearance", {})}
 
     def known(self, filament: int) -> bool:
         """A loaded filament slot. With no map (bare rule tests) every slot that names an extruder counts."""
@@ -241,16 +278,18 @@ class ExtruderReach:
                 e = ctx.extruder_of(fil)
                 if p.info.size[2] > e["z_max"]:
                     yield Check(False, f"{p.key} is {p.info.size[2]:.1f} mm tall; extruder {e['index']} prints up to {e['z_max']:.0f} mm")
-                if p.x0 < e["x"][0] or p.x1 > e["x"][1] or p.y0 < e["y"][0] or p.y1 > e["y"][1]:
+                mx0, my0, mx1, my1 = p.rect(with_margin=True)  # brim and support spread must stay in reach too
+                if mx0 < e["x"][0] or mx1 > e["x"][1] or my0 < e["y"][0] or my1 > e["y"][1]:
                     yield Check(
                         False,
-                        f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and spans x {p.x0:.1f}..{p.x1:.1f}; "
-                        f"that extruder reaches x {e['x'][0]:.1f}..{e['x'][1]:.1f}",
+                        f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and spans x {mx0:.1f}..{mx1:.1f} "
+                        f"with its brim and support margin ({p.margin:.1f} mm); that extruder reaches x {e['x'][0]:.1f}..{e['x'][1]:.1f}",
                     )
-                if e["index"] == 2 and ctx.aux_x_limit is not None and p.x1 > ctx.aux_x_limit:
+                if e["index"] == 2 and ctx.aux_x_limit is not None and mx1 > ctx.aux_x_limit:
                     yield Check(
                         False,
-                        f"{p.key} uses extruder 2 and ends at x {p.x1:.1f}; the configured aux_x_limit for the auxiliary nozzle is {ctx.aux_x_limit} mm",
+                        f"{p.key} uses extruder 2 and ends at x {mx1:.1f} with its brim and support margin ({p.margin:.1f} mm); "
+                        f"the configured aux_x_limit for the auxiliary nozzle is {ctx.aux_x_limit} mm",
                     )
 
 
@@ -270,11 +309,80 @@ class MeshSane:
         for p in placed:
             if not p.info.manifold:
                 yield Check(False, f"{p.key} is not manifold")
+            if max(p.info.size) < 1.0:
+                yield Check(
+                    False,
+                    f"{p.key} is {p.info.size[0]:.3f} x {p.info.size[1]:.3f} x {p.info.size[2]:.3f} mm: probably a mesh in metres; "
+                    f'add "orientation": "auto" to the part (Studio converts the unit first) or run '
+                    f"`shambu rotate FILE -o DIR --convert-unit` for a mm copy",
+                )
+            if p.info.parts > 1:
+                yield Check(True, f"{p.key}: the STL holds {p.info.parts} bodies; `shambu split` if they are separate parts")
             if not p.info.on_bed():
                 yield Check(True, f"{p.key}: STL min z is {p.info.min[2]:.2f}; the placement drops it onto the bed")
 
 
-DEFAULT_RULES: tuple[Rule, ...] = (NoOverlap(), InsideBed(), ReserveClear(), ExtruderReach(), TpuOnMain(), MeshSane())
+def gap_between(a: Rect, b: Rect) -> float:
+    """Shortest axis-aligned distance between two rectangles (0 when they touch or overlap)."""
+    dx = max(b[0] - a[2], a[0] - b[2], 0.0)
+    dy = max(b[1] - a[3], a[1] - b[3], 0.0)
+    return max(dx, dy) if (dx == 0 or dy == 0) else (dx * dx + dy * dy) ** 0.5
+
+
+class SequentialClearance:
+    """Print-by-object (Studio 02.08, Print.cpp `sequential_print_clearance_valid`, reference 08):
+    - the gap between two objects' convex hulls must be at least `radius - 0.2` mm (59.8 on the X2D); a bounding-box
+      gap of `radius` is the safe over-estimate used here. If every object is shorter than `nozzle_height`, 3.8 mm
+      (the outer nozzle) is enough.
+    - objects print in list order. An object taller than `height_to_rod` (32.8) collides with the gantry rods
+      if a LATER object shares its Y band (raw Y gap under `dist_to_rod`, 33 mm). Otherwise the limit is
+      `height_to_lid` (133). The last object only has to fit under the printable height."""
+
+    def check(self, placed, ctx):
+        if not ctx.by_object or not placed:
+            return
+        c = ctx.clearance
+        need = ctx.sequential_gap(all(p.info.size[2] < c["nozzle_height"] for p in placed))
+        fails: list[Check] = []
+        for i, a in enumerate(placed):
+            for b in placed[i + 1 :]:
+                g = gap_between(a.rect(with_margin=False), b.rect(with_margin=False))
+                if g < need - 1e-6:
+                    fails.append(
+                        Check(
+                            False,
+                            f"{a.key} and {b.key} are {g:.1f} mm apart; print-by-object needs {need:.1f} mm between objects "
+                            f"(extruder_clearance_max_radius {c['radius']:.0f})",
+                        )
+                    )
+        for i, a in enumerate(placed):
+            later = placed[i + 1 :]
+            if not later:
+                limit, why = ctx.facts.get("z_max", c["height_to_lid"]), "the printable height"
+            elif any(min(abs(b.y0 - a.y1), abs(a.y0 - b.y1)) < c["dist_to_rod"] or (b.y0 < a.y1 and a.y0 < b.y1) for b in later):
+                limit, why = c["height_to_rod"], f"the gantry rods: a later object shares its Y band (within {c['dist_to_rod']:.0f} mm)"
+            else:
+                limit, why = c["height_to_lid"], "the lid"
+            if a.info.size[2] > limit:
+                fails.append(
+                    Check(False, f"{a.key} is {a.info.size[2]:.1f} mm tall; print-by-object allows {limit:.1f} mm here because of {why}")
+                )
+        yield from fails
+        if not fails:
+            yield Check(
+                True, f"print-by-object: {len(placed)} object(s) in print order, {need:.1f} mm apart, heights within the gantry limits"
+            )
+
+
+DEFAULT_RULES: tuple[Rule, ...] = (
+    NoOverlap(),
+    InsideBed(),
+    ReserveClear(),
+    ExtruderReach(),
+    TpuOnMain(),
+    MeshSane(),
+    SequentialClearance(),
+)
 
 
 @dataclass

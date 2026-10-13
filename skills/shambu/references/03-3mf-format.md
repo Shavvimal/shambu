@@ -18,6 +18,20 @@ Work dir: `$S = <scratch>/3mf-re`.
 Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate from STL),
 `$S/proto/test_roundtrip.py` (patch test). No file outside `$S` was changed.
 
+## Contents
+
+| Section | What it holds |
+|---|---|
+| [0. Headline findings](#0-headline-findings) | The main findings about the project files that were examined |
+| [1. File inventory](#1-file-inventory) | The input files, their source and the program that made them |
+| [2. Schemas](#2-schemas) | The XML and config schema of each file in the project zip |
+| [3. CLI fit test vs its assemble list](#3-cli-fit-test-vs-its-assemble-list) | How a CLI assemble list maps to the saved project files |
+| [4. What the GUI stores that the CLI does not](#4-what-the-gui-stores-that-the-cli-does-not) | Exact forms of GUI-only data: per-part settings, painting, brim ears |
+| [5. Prototype and patch survival](#5-prototype-and-patch-survival) | The read-and-patch prototype, and which patches survive a Studio reload |
+| [6. Generating a project from STLs with no CLI](#6-generating-a-project-from-stls-with-no-cli) | Writing a project from STLs without the CLI |
+| [7. Gaps and next steps](#7-gaps-and-next-steps) | Open questions and the tests that would close them |
+| [Appendix: `project_settings.config` keys by source](#appendix-project_settingsconfig-keys-by-source) | Each `project_settings.config` key, grouped by preset source |
+
 ## 0. Headline findings
 
 1. **All 7 "GUI-saved" inputs are CLI exports.** Each has a CLI log with the same timestamp as
