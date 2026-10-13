@@ -84,7 +84,7 @@ def default_source() -> ChainedSource:
     if user_base.is_dir():
         for d in sorted(user_base.iterdir()):
             if d.is_dir():
-                chain.sources.append(DirectorySource(d, f"user {d.name[:2]}…"))   # the Bambu account id is masked in output
+                chain.sources.append(DirectorySource(d, f"user {d.name[:2]}…"))  # the Bambu account id is masked in output
     for root, label in ((SYSTEM_PROFILES, "Application Support system profiles"), (BUNDLE_PROFILES, "app bundle profiles")):
         if (root / "machine").is_dir():
             chain.sources.append(DirectorySource(root, label))
