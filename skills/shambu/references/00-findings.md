@@ -75,8 +75,10 @@ the flush and prime-tower waste; nothing splits support from the model, which is
 support grams (BS.cpp:500-600, 7265-7330 at v02.08.02.61; PLAN-native-cli section 2.5). `filament_change_times`
 counts filament loads, not nozzle switches: it is 0 on a two-nozzle X2D plate (0 against 41 tool switches in the
 G-code, live), so the swap count comes from the parser's T lines and shambu keeps Studio's value only as
-`studio_filament_change_times`. Only the slicing path
-writes the file, and each run overwrites it, so `inspect` on a project built elsewhere falls back to the parser.
+`studio_filament_change_times`. The slicing path is not the only one that writes the file, and each run
+overwrites it: an orient-only run writes a 204-byte `result.json` with `return_code` 0, `error_string` "Success."
+and no `sliced_plates` (live). The presence of `sliced_plates`, not of the file, shows that a slice happened.
+`inspect` on a project built elsewhere has no run, so it falls back to the parser.
 
 ## 7. The Studio GUI
 

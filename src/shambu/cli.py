@@ -16,7 +16,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from . import __version__, recipes
-from .errors import BambuError, BuildError
+from .errors import BambuError, BuildError, StudioError
 from .facade import Bambu
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
@@ -258,7 +258,12 @@ class Orient(Command):
         p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=THRESHOLD_HELP)
         p.add_argument("--top", type=int, default=12, help="largest flat faces to try, on top of as-is and the six axis faces (default 12)")
         p.add_argument("--write", metavar="DIR", help="write the best orientation as <DIR>/<stem>__<tag>.stl")
-        p.add_argument("--pick", type=int, default=1, help="with --write: which row of the table to write (1 = best)")
+        p.add_argument(
+            "--pick",
+            type=int,
+            default=1,
+            help="with --write: which row of the table to write (1 = best); with --native, a row of Studio's table (1 keeps its export)",
+        )
         p.add_argument(
             "--native",
             action="store_true",
@@ -297,14 +302,22 @@ class Orient(Command):
     def _native(a, app, out) -> int:
         import tempfile
 
+        from . import mesh as M
+        from .sweep import unit_scale
+
         src = Path(a.file)
         if not src.is_file():
             return usage(out, f"{a.file}: no such file")
+        if a.pick < 1:
+            return usage(out, f"--pick {a.pick}: rows start at 1")
         st = app.studio_cli()
         with tempfile.TemporaryDirectory(prefix="shambu-orient-") as tmp:
-            res = st.orient([src], Path(a.write) if a.write else Path(tmp))
+            res = st.orient([src], Path(a.write) if a.write and a.pick == 1 else Path(tmp))  # row N > 1 is baked below
+            k = unit_scale(M.read_stl(src), M.read_stl(res.files[0])) if a.write and a.pick > 1 and res.files else 1.0
         best = res.best
         cands = res.candidates
+        if a.pick > len(cands):
+            return usage(out, f"--pick {a.pick}: Studio's table has {len(cands)} row(s)")
         data: dict = {
             "path": str(src),
             "source": "studio",
@@ -333,9 +346,22 @@ class Orient(Command):
             'spec: "orientation": "auto" lets Studio pick at build time; "lay_on_face": <a row\'s lay_on_face> fixes one row. '
             "`shambu sweep --orientations <part> --source studio` slices the best few.",
         ]
-        if a.write:
+        if a.write and a.pick == 1:
             data["written"] = str(res.files[0])
             lines.append(f"written: {res.files[0]} (Studio's best, unit converted)")
+        elif a.write:
+            # Row N > 1: bake its lay_on_face into the file (unit-converted first, as Studio's export is)
+            c = cands[a.pick - 1]
+            base = src
+            try:
+                if k != 1.0:
+                    base = M.write_stl(Path(a.write) / f"{src.stem}__mm.stl", M.scale(M.read_stl(src), k), f"{src.stem} mm")
+                path = M.oriented_copy(base, M.from_studio_vector(c.vector), a.write)
+            except OSError as e:
+                raise StudioError(f"cannot write row {a.pick} into {a.write}: {e}") from e
+            data["written"] = str(path)
+            data["picked"] = {"row": a.pick, **c.to_json(), **({"unit_scale": k} if k != 1.0 else {})}
+            lines.append(f"written: {path} (row {a.pick}, lay_on_face {vec(c.lay_on_face)}" + (f", scaled by {k:g})" if k != 1.0 else ")"))
         out.emit(data, lines)
         return 0
 

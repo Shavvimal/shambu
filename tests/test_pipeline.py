@@ -154,6 +154,15 @@ def test_failed_checks_report_says_nothing_was_exported(tmp_path, stls, resolver
     assert "Owner steps" not in r.report and "Open the project" not in r.report
 
 
+def test_check_only_report_says_nothing_was_exported(tmp_path, stls, resolver, cli_export):
+    """`shambu check` (export=False) with a plan that passes: the Next section says nothing was exported and to run
+    `shambu build`; no owner step tells the user to open a project this run never wrote."""
+    r = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls), export=False)
+    assert r.plan.ok and r.run is None
+    assert "## Next" in r.report and "nothing was exported" in r.report and "`shambu build`" in r.report
+    assert "Owner steps" not in r.report and "Open the project" not in r.report
+
+
 def test_keep_going_exports_anyway(tmp_path, stls, resolver, cli_export):
     r = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls, process={"base": "0.20mm Wrong"}), keep_going=True)
     assert r.run is not None and not r.ok

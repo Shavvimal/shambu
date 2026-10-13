@@ -370,19 +370,29 @@ class FakeStudio:
         default_factory=lambda: [OrientCandidate((-1.0, 0.0, 0.0), 3790.4, 4314.0, 9010.0, 262.7, 485.1, 0.0, 0.6)]
     )
 
+    orient_best: OrientCandidate | None = None  # the `best:` row; None: the first row after sorting
+
     def orient(self, paths, outdir, *, settings=None, convert_unit=True, timeout=300, name="orient") -> OrientResult:
+        """Copies each input to obj_<i>_<stem>.stl, scaled by 1000 when `convert_unit` and the mesh is under 1 mm."""
+        from shambu import mesh as M
+
         outdir = Path(outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         self.calls.append(("orient", ([Path(p) for p in paths], settings, convert_unit)))
         files = []
         for i, p in enumerate(paths, 1):
             f = outdir / f"obj_{i}_{Path(p).stem}.stl"
-            shutil.copyfile(p, f)
+            facets = M.read_stl(p) if convert_unit else []
+            if facets and M.looks_like_metres(facets):
+                M.write_stl(f, M.scale(facets, 1000))
+            else:
+                shutil.copyfile(p, f)
             files.append(f)
         log = outdir / f"{name}.log"
         log.write_text("$ fake orient\n", encoding="utf-8")
-        cands = sorted(self.orient_table, key=lambda c: c.unprintability)
-        table = OrientTable(cands, cands[0] if cands else None)
+        best = self.orient_best
+        cands = sorted(self.orient_table, key=lambda c: c.unprintability)  # Studio's order on a tie: as given
+        table = OrientTable(cands, best or (cands[0] if cands else None))  # not ranked toward best: callers must do it
         return OrientResult(files, [table] * len(files), RunResult(["BambuStudio", "--orient=1"], 0, 0, 0.05, log, {"return_code": 0}))
 
     def normalise(self, paths, outdir, *, timeout=300, name="convert-unit") -> list[Path]:

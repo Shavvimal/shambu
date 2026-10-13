@@ -68,6 +68,12 @@ All notable changes to this project are documented here. The format follows
   metres warning.
 - `--threshold` defaults to 60 in `orient` and `sweep`.
 - `rotate --scale` alone drops the scaled copy onto z = 0, as the help says.
+- Native orient and review fixes: `orient`/`normalise` refuse an input that is a file the run writes (an input
+  named `obj_<i>_<stem>.stl` in the output directory was deleted) and report a bad output directory as one error
+  (exit 3); `sweep --source studio` converts units in pass 1, checks contact on the mm mesh and points each variant
+  at a mm copy; a tie in Studio's table goes to its `best:` row; `orient --native --pick N` writes row N; the
+  G-code parse and the tower + flush grams are decided per plate, a project with two filaments loaded always
+  parses, and absent result.json fields add no zero-valued keys; `check` says nothing was exported.
 - `split` reports the cavities it dropped.
 - Text `inspect` prints the project and per-plate print sequence.
 - A bad spec (unknown recipe, bad JSON) in `check` or `build` gives one error document and exit 1, not 3. The

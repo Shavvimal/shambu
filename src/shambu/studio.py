@@ -197,33 +197,50 @@ def _num(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _opt(v: Any) -> float | None:
+    """A number, or None when the key is absent or not a number (no zero default: 0 g and "unknown" differ)."""
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class SlicedFilament:
-    """One filament of a sliced plate in result.json. `main_g` is model plus support; `total_g` adds flush and prime tower."""
+    """One filament of a sliced plate in result.json. `main_g` is model plus support; `total_g` adds flush and prime
+    tower. None when result.json lacks the field."""
 
     id: int  # 1-based slot
     filament_id: str  # e.g. "GFA00"
-    total_g: float
-    main_g: float
+    total_g: float | None
+    main_g: float | None
 
     @property
-    def waste_g(self) -> float:
-        """Flush plus prime tower: total minus main (BS.cpp:7308-7330)."""
+    def waste_g(self) -> float | None:
+        """Flush plus prime tower: total minus main (BS.cpp:7308-7330); None unless both are present."""
+        if self.total_g is None or self.main_g is None:
+            return None
         return max(self.total_g - self.main_g, 0.0)
 
 
 @dataclass(frozen=True)
 class SlicedPlate:
-    """One entry of result.json `sliced_plates[]` (BS.cpp:500-600, 7265-7330). Times are seconds in Normal mode."""
+    """One entry of result.json `sliced_plates[]` (BS.cpp:500-600, 7265-7330). Times are seconds in Normal mode.
+    A field the entry does not carry is None (or an empty list), never a made-up zero."""
 
     id: int  # 1-based plate
-    total_s: float  # total_predication
-    main_s: float  # main_predication: total minus prepare, prime tower and flush time
-    filament_change_times: int  # Studio counts filament loads, not nozzle switches: 0 on a two-nozzle X2D plate
-    feature_times_s: dict[str, float]  # feature_type_times: ExtrusionRole name (and "Travel") -> seconds
+    total_s: float | None  # total_predication
+    main_s: float | None  # main_predication: total minus prepare, prime tower and flush time
+    filament_change_times: int | None  # Studio counts filament loads, not nozzle switches: 0 on a two-nozzle X2D plate
+    feature_times_s: dict[str, float] | None  # feature_type_times: ExtrusionRole name (and "Travel") -> seconds
     objects: list[dict]  # {id, name, triangle_count, bbox{x, y, z, width, depth, height}} after arrange
     filaments: list[SlicedFilament]
     warning_message: str = ""
+
+    @property
+    def has_waste(self) -> bool:
+        """Tower plus flush grams are known for every filament (the G-code parser is not needed for them)."""
+        return bool(self.filaments) and all(f.waste_g is not None for f in self.filaments)
 
 
 @dataclass
@@ -255,17 +272,18 @@ class RunResult:
                 continue
             times = p.get("feature_type_times")
             fils = p.get("filaments")
+            changes = _opt(p.get("filament_change_times"))
             out.append(
                 SlicedPlate(
                     id=int(_num(p.get("id"))),
-                    total_s=_num(p.get("total_predication")),
-                    main_s=_num(p.get("main_predication")),
-                    filament_change_times=int(_num(p.get("filament_change_times"))),
-                    feature_times_s={str(k): _num(v) for k, v in times.items()} if isinstance(times, dict) else {},
+                    total_s=_opt(p.get("total_predication")),
+                    main_s=_opt(p.get("main_predication")),
+                    filament_change_times=None if changes is None else int(changes),
+                    feature_times_s={str(k): _num(v) for k, v in times.items()} if isinstance(times, dict) else None,
                     objects=[o for o in p.get("objects") or [] if isinstance(o, dict)],
                     filaments=[
                         SlicedFilament(
-                            int(_num(f.get("id"))), str(f.get("filament_id") or ""), _num(f.get("total_used_g")), _num(f.get("main_used_g"))
+                            int(_num(f.get("id"))), str(f.get("filament_id") or ""), _opt(f.get("total_used_g")), _opt(f.get("main_used_g"))
                         )
                         for f in (fils if isinstance(fils, list) else [])
                         if isinstance(f, dict)
@@ -393,8 +411,11 @@ class StudioCLI:
         datadir = self.datadir(name)
         if outputdir is not None:
             outputdir = Path(outputdir).resolve()
-            outputdir.mkdir(parents=True, exist_ok=True)
-            (outputdir / "result.json").unlink(missing_ok=True)
+            try:
+                outputdir.mkdir(parents=True, exist_ok=True)
+                (outputdir / "result.json").unlink(missing_ok=True)
+            except OSError as e:
+                raise StudioError(f"cannot prepare the output directory {outputdir}: {e}") from e
         log_path = (outputdir or datadir) / f"{name}.log"
         argv = self._argv(datadir, self.debug if debug is None else debug, cmd.args())
         self._emit("start", name=name, argv=argv, log=str(log_path))
@@ -487,14 +508,8 @@ class StudioCLI:
         it uses 30 degrees. The candidate table comes from the run's stdout. Raises StudioError when the run fails
         or an exported file is missing."""
         srcs = [Path(p).resolve() for p in paths]
-        for p in srcs:
-            if not p.is_file():
-                raise StudioError(f"model file not found: {p}")
+        files = _prepare_exports(srcs, outdir, name)
         out = Path(outdir).resolve()
-        out.mkdir(parents=True, exist_ok=True)
-        files = [out / f"obj_{i}_{p.stem}.stl" for i, p in enumerate(srcs, 1)]
-        for f in files:  # a stale export from an earlier run must never pass for this one
-            f.unlink(missing_ok=True)
         # debug 1: the stdout table and stderr logging share the log file; few stderr lines keep the table lines whole
         rr = self.run(
             orient_command(srcs, out, settings, convert_unit),
@@ -518,19 +533,56 @@ class StudioCLI:
         looks_like_imperial_units) and scale, one `<outdir>/obj_<i>_<stem>.stl` per input. A file Studio judges to be
         in mm comes back unscaled. Raises StudioError when the run fails or a file is missing."""
         srcs = [Path(p).resolve() for p in paths]
-        for p in srcs:
-            if not p.is_file():
-                raise StudioError(f"model file not found: {p}")
+        files = _prepare_exports(srcs, outdir, name)
         out = Path(outdir).resolve()
-        out.mkdir(parents=True, exist_ok=True)
-        files = [out / f"obj_{i}_{p.stem}.stl" for i, p in enumerate(srcs, 1)]
-        for f in files:
-            f.unlink(missing_ok=True)
         rr = self.run(orient_command(srcs, out, orient=False), name=name, outputdir=out, timeout=timeout, debug=1)
         missing = [f for f in files if not f.is_file()]
         if rr.code != 0 or missing:
             raise StudioError(f"--convert-unit failed: {rr.summary()}" + (f"; missing {[str(f) for f in missing]}" if missing else ""))
         return files
+
+
+def export_paths(srcs: list[Path], outdir: Path) -> list[Path]:
+    """The files `--export-stls <outdir>` writes for these inputs: `obj_<i>_<stem>.stl`, i = argv order from 1 (§2.3)."""
+    out = Path(outdir).resolve()
+    return [out / f"obj_{i}_{Path(p).stem}.stl" for i, p in enumerate(srcs, 1)]
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """One file under two names: equal resolved paths, or (both existing) the same inode, so a hard link counts."""
+    if a.resolve() == b.resolve():
+        return True
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def stale_exports(srcs: list[Path], files: list[Path]) -> list[Path]:
+    """The export paths safe to delete before a run: every one that is not an input. An input is never returned."""
+    return [f for f in files if not any(_same_file(f, s) for s in srcs)]
+
+
+def _prepare_exports(srcs: list[Path], outdir: Path, name: str) -> list[Path]:
+    """Check the inputs, create `outdir` and delete stale exports from an earlier run (a stale file must never pass
+    for this run's output). Raises StudioError when an input is missing, when an input IS a path the run writes
+    (an export, result.json or the log: Studio would overwrite it), or when the directory cannot be prepared."""
+    for p in srcs:
+        if not p.is_file():
+            raise StudioError(f"model file not found: {p}")
+    out = Path(outdir).resolve()
+    files = export_paths(srcs, out)
+    written = [*files, out / "result.json", out / f"{name}.log"]
+    clash = [str(s) for s in srcs if any(_same_file(s, w) for w in written)]
+    if clash:
+        raise StudioError(f"input {clash[0]} is a file this run writes in {out}; move it or choose another output directory")
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for f in stale_exports(srcs, files):
+            f.unlink(missing_ok=True)
+    except OSError as e:
+        raise StudioError(f"cannot prepare the output directory {out}: {e}") from e
+    return files
 
 
 def _info_blocks(out: str) -> list[dict[str, str]]:
@@ -630,6 +682,10 @@ class OrientCandidate:
     def lay_on_face(self) -> Vec3:
         return tuple(0.0 if v == 0 else -v for v in self.vector)  # type: ignore[return-value]
 
+    def same_direction(self, other: OrientCandidate, tol: float = 1e-3) -> bool:
+        """Same vector within `tol` per axis (Studio prints candidates with 4 decimals and `best:` with 6)."""
+        return all(abs(a - b) < tol for a, b in zip(self.vector, other.vector, strict=True))
+
     def costs(self) -> dict[str, float]:
         return {k: getattr(self, k) for k in ORIENT_COLUMNS}
 
@@ -639,8 +695,8 @@ class OrientCandidate:
 
 @dataclass(frozen=True)
 class OrientTable:
-    """The table Studio printed for one object: candidates sorted by unprintability (ties keep Studio's order), and
-    the `best:` row (None when the run printed none)."""
+    """The table Studio printed for one object: candidates sorted by unprintability (on a tie the row matching
+    `best:` first, then Studio's order), and the `best:` row (None when the run printed none)."""
 
     candidates: list[OrientCandidate]
     best: OrientCandidate | None
@@ -679,6 +735,12 @@ def _orient_row(m: re.Match) -> OrientCandidate | None:
     return OrientCandidate(vec, *vals)  # type: ignore[arg-type]
 
 
+def rank_candidates(cands: list[OrientCandidate], best: OrientCandidate | None) -> list[OrientCandidate]:
+    """Sorted by unprintability; among rows with the same printed unprintability the one that matches Studio's
+    `best:` row comes first (Studio's own tie-break, Orient.cpp:161-176, is not visible in the printed numbers)."""
+    return sorted(cands, key=lambda c: (c.unprintability, not (best is not None and c.same_direction(best))))
+
+
 def parse_orient(text: str) -> list[OrientTable]:
     """Studio's auto-orient tables from a CLI log, one per oriented object. A `best:` line closes a table."""
     tables: list[OrientTable] = []
@@ -693,10 +755,10 @@ def parse_orient(text: str) -> list[OrientTable]:
         if m.group(1) == "orientation":
             cur.append(row)
         else:
-            tables.append(OrientTable(sorted(cur, key=lambda c: c.unprintability), row))
+            tables.append(OrientTable(rank_candidates(cur, row), row))
             cur = []
     if cur:
-        tables.append(OrientTable(sorted(cur, key=lambda c: c.unprintability), None))
+        tables.append(OrientTable(rank_candidates(cur, None), None))
     return tables
 
 

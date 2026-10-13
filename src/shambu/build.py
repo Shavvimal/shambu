@@ -209,26 +209,37 @@ def _estimate(plate: dict, sp: SlicedPlate | None) -> dict:
             rf = by_slot.get(int(f.get("id")))
         except (TypeError, ValueError):
             rf = None
-        if rf is not None:
-            f = {**f, "total_g": round(rf.total_g, 2), "main_g": round(rf.main_g, 2), "waste_g": round(rf.waste_g, 2)}
+        if rf is not None:  # only the fields the result.json entry carries: an absent field is not 0 g
+            native = {"total_g": rf.total_g, "main_g": rf.main_g, "waste_g": rf.waste_g}
+            f = {**f, **{k: round(v, 2) for k, v in native.items() if v is not None}}
         fils.append(f)
     e["filaments"] = fils
-    e["feature_times_s"] = {k: round(v, 1) for k, v in sp.feature_times_s.items()}
-    e["main_prediction_s"] = int(sp.main_s)
-    e["studio_filament_change_times"] = sp.filament_change_times
+    if sp.feature_times_s is not None:
+        e["feature_times_s"] = {k: round(v, 1) for k, v in sp.feature_times_s.items()}
+    if sp.main_s is not None:
+        e["main_prediction_s"] = int(sp.main_s)
+    if sp.filament_change_times is not None:
+        e["studio_filament_change_times"] = sp.filament_change_times
     return e
 
 
+def needs_parse(slice_d: dict, sp: SlicedPlate | None, loaded: int) -> bool:
+    """The G-code parser runs on a plate when it adds something: no result.json tower and flush grams for THIS plate,
+    support used (support grams), or more than one filament loaded in the project (the tool-switch count; a slot's
+    grams in slice_info do not prove the other slot never printed). A one-filament project without support skips."""
+    return sp is None or not sp.has_waste or slice_d.get("support_used") != "false" or loaded > 1
+
+
 def summarise(project: Path, run: RunResult | None) -> dict:
-    """Project.summary() plus the G-code parser only where it adds something: support grams on a plate whose slice
-    used support, the tool-switch count on a plate with more than one filament (one filament means 0 switches), and
-    every plate when the run left no result.json (the parser is then the only source of tower and flush grams)."""
+    """Project.summary() plus the G-code parser only where it adds something (`needs_parse`), decided per plate: a
+    plate without its own result.json grams parses, a plate with them takes the native numbers."""
     pr = Project(str(project))
     s = pr.summary()
-    have_result = bool(run and run.plates())
+    by_id = {sp.id: sp for sp in (run.plates() if run else [])}
+    loaded = len(s.get("filaments") or [])
     for p in s["plates"]:
         sl = p.get("slice")
-        if sl is not None and (not have_result or sl.get("support_used") != "false" or used_filaments(sl) > 1):
+        if sl is not None and needs_parse(sl, by_id.get(p["id"]), loaded):
             sl["features"] = pr.feature_usage(p["id"])
     return s
 
@@ -269,8 +280,9 @@ class BuildResult:
         """Per sliced plate: slice_info.config (time, grams, filaments; `features` from the G-code parser when present),
         merged with the run's result.json: `feature_times_s` (role -> seconds), `main_prediction_s` (without prepare,
         tower and flush), `studio_filament_change_times` (filament loads, 0 on a two-nozzle plate), and per filament
-        `total_g`, `main_g` (model + support) and `waste_g` (flush + tower). The result.json keys are absent when the
-        run left no result.json. `filament_changes` is the parser's tool-switch count (0 on a one-filament plate)."""
+        `total_g`, `main_g` (model + support) and `waste_g` (flush + tower). Each result.json key is absent when the
+        run left no result.json or the plate's entry lacks that field. `filament_changes` is the parser's tool-switch
+        count (0 on a one-filament plate)."""
         by_id = {sp.id: sp for sp in (self.run.plates() if self.run else [])}
         return [_estimate(p, by_id.get(p["id"])) for p in (self.summary or {}).get("plates", []) if p.get("slice")]
 

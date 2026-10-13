@@ -9,6 +9,7 @@ import pytest
 from conftest import SLICED_PLATES, FakeStudio, make_3mf
 from shambu import sweep as S
 from shambu.build import Pipeline, summarise
+from shambu.report import estimate_lines
 from shambu.studio import RunResult
 from shambu.threemf import Project
 from test_optimise import GCODE
@@ -32,13 +33,16 @@ SLICE_INFO = """<?xml version="1.0" encoding="UTF-8"?>
 FIL2 = '    <filament id="2" type="PLA" color="#FFFFFF" used_m="0.86" used_g="2.62"/>\n'
 
 
-def sliced_project(path, support="true", two=True):
-    """A project with a real slice_info plate (index 1, one or two filaments used) and plate_1.gcode holding GCODE."""
-    src = make_3mf(path.with_suffix(".src.3mf"), sliced=True)
+def sliced_project(path, support="true", two=True, loaded=None, fil2=None):
+    """A project with a real slice_info plate (index 1, one or two filaments used) and plate_1.gcode holding GCODE.
+    `loaded` filaments in project_settings (default: 2 when two are used, else 1); `fil2` replaces the second
+    filament's slice_info line."""
+    n = loaded if loaded is not None else (2 if two else 1)
+    src = make_3mf(path.with_suffix(".src.3mf"), sliced=True, filament_settings_id=["Test PLA"] * n, filament_type=["PLA"] * n)
     with zipfile.ZipFile(src) as zin, zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
             if info.filename == "Metadata/slice_info.config":
-                zout.writestr(info, SLICE_INFO.format(support=support, fil2=FIL2 if two else ""))
+                zout.writestr(info, SLICE_INFO.format(support=support, fil2=fil2 if fil2 is not None else (FIL2 if two else "")))
             elif info.filename == "Metadata/plate_1.gcode":
                 zout.writestr(info, GCODE)
             else:
@@ -73,8 +77,9 @@ def test_plates_empty_without_slice_data(result):
 
 def test_plates_tolerates_missing_and_bad_fields():
     (p,) = run_result({"sliced_plates": [{"id": "2", "total_predication": None, "filaments": [{"id": 1, "main_used_g": "x"}]}]}).plates()
-    assert p.id == 2 and p.total_s == 0.0 and p.feature_times_s == {} and p.objects == []
-    assert p.filaments[0].main_g == 0.0 and p.filaments[0].total_g == 0.0
+    assert p.id == 2 and p.total_s is None and p.feature_times_s is None and p.objects == []
+    assert p.filaments[0].main_g is None and p.filaments[0].total_g is None and p.filaments[0].waste_g is None
+    assert p.main_s is None and p.filament_change_times is None and not p.has_waste
 
 
 # ---------------------------------------------------------------------------- summary(features=...)
@@ -106,6 +111,41 @@ def test_summarise_parses_only_where_the_parser_adds_something(tmp_path, monkeyp
     assert calls == [1, 1]  # two filaments: the tool-switch count
     summarise(sliced_project(tmp_path / "noresult.gcode.3mf", support="false", two=False), run_result({"return_code": 0}))
     assert calls == [1, 1, 1]  # no result.json: the parser is the only source of tower and flush grams
+
+
+def test_summarise_parses_when_two_filaments_are_loaded_but_one_has_grams(tmp_path, monkeypatch):
+    """Finding 7: the rule counts filaments LOADED in the project, not slots with grams in slice_info."""
+    calls = []
+    monkeypatch.setattr(Project, "feature_usage", lambda self, plate: calls.append(plate) or {"support_g": 0.0})
+    zero = '    <filament id="2" type="PLA" color="#FFFFFF" used_m="0" used_g="0.0"/>\n'
+    f = sliced_project(tmp_path / "s.gcode.3mf", support="false", two=True, loaded=2, fil2=zero)
+    s = summarise(f, run_result({"sliced_plates": copy.deepcopy(SLICED_PLATES)}))
+    assert [x["used_g"] for x in s["plates"][0]["slice"]["filaments"]] == [2.12, 0.0]
+    assert len(s["filaments"]) == 2 and calls == [1]
+    calls.clear()
+    summarise(sliced_project(tmp_path / "one.gcode.3mf", support="false", two=False, loaded=1), run_result({"sliced_plates": copy.deepcopy(SLICED_PLATES)}))
+    assert calls == []  # one filament loaded, no support, native grams: skips
+
+
+def test_summarise_decides_the_parse_per_plate(tmp_path, monkeypatch):
+    """Finding 4: a plate without its own result.json entry parses; the plate with one takes the native grams."""
+    f = sliced_project(tmp_path / "s.gcode.3mf", support="false", two=False, loaded=1)
+    real = Project.summary
+
+    def two_plates(self, features=False):
+        s = real(self, features)
+        p2 = copy.deepcopy(s["plates"][0])
+        p2["id"] = 2
+        p2["slice"] = {**copy.deepcopy(s["plates"][0]["slice"]), "index": 2}
+        s["plates"].append(p2)
+        return s
+
+    calls = []
+    monkeypatch.setattr(Project, "summary", two_plates)
+    monkeypatch.setattr(Project, "feature_usage", lambda self, plate: calls.append(plate) or {"waste_g": 2.0})
+    s = summarise(f, run_result({"sliced_plates": copy.deepcopy(SLICED_PLATES)}))  # result.json covers plate 1 only
+    assert calls == [2]
+    assert "features" not in s["plates"][0]["slice"] and s["plates"][1]["slice"]["features"] == {"waste_g": 2.0}
 
 
 def test_inspect_keeps_feature_grams(tmp_path):
@@ -145,7 +185,23 @@ def test_to_json_without_result_json_keeps_old_shape(tmp_path, stls, resolver):
     (e,) = r.to_json()["estimates"]
     assert "feature_times_s" not in e and "main_g" not in e["filaments"][0]
     assert e["features"]["tower_g"] > 0
-    assert "(G-code parser, no result.json)" in r.report
+    assert "(G-code parser, no result.json grams)" in r.report
+
+
+def test_result_json_without_fields_adds_no_native_keys(tmp_path, stls, resolver):
+    """Finding 5: `sliced_plates: [{"id": 1}]` gives no zero-filled native keys, and the report does not claim
+    0.0 g of tower and flush from result.json."""
+    r = build(tmp_path, stls, resolver, sliced_plates=[{"id": 1}])
+    (e,) = r.to_json()["estimates"]
+    assert not {"feature_times_s", "main_prediction_s", "studio_filament_change_times"} & set(e)
+    assert all(not {"main_g", "waste_g", "total_g"} & set(f) for f in e["filaments"])
+    assert e["features"]["tower_g"] > 0  # no native grams for the plate: the parser ran
+    assert "(result.json)" not in r.report and "(G-code parser, no result.json grams)" in r.report
+    lines = [line for sl in r.estimates() for line in estimate_lines({**sl, "feature_times_s": {}, "features": None})]
+    assert any("prime tower + flush not available" in line for line in lines)
+    r = build(tmp_path, stls, resolver, sliced_plates=[{"id": 1, "filaments": [{"id": 1, "total_used_g": 2.0}]}])
+    f1 = r.to_json()["estimates"][0]["filaments"][0]
+    assert f1["total_g"] == 2.0 and "main_g" not in f1 and "waste_g" not in f1
 
 
 def test_one_filament_without_support_skips_the_parser(tmp_path, stls, resolver):
@@ -186,6 +242,8 @@ def _estimate(support_used="true", features=None, times=None, changes=None):
         e["filament_changes"] = changes
     if times is not None:
         e.update(feature_times_s=times, main_prediction_s=694, studio_filament_change_times=0)
+    else:  # no result.json: slice_info grams only, no native waste
+        e["filaments"] = [{k: v for k, v in f.items() if k != "waste_g"} for f in e["filaments"]]
     return e
 
 
@@ -233,3 +291,12 @@ def test_sweep_unknown_support_shows_a_dash(tmp_path):
     res = S.run(d, [], lambda spec, do_slice: _Result([_estimate("true", None, {"Travel": 60.0})]))
     assert res[0].to_json()["support_g"] is None
     assert S.table(res)[1].split()[4] == "-"
+
+
+def test_sweep_waste_mixes_native_and_parser_per_plate():
+    """Finding 6: plate 1 has result.json waste (5 g), plate 2 only the parser's (2 g): 7 g, not one source for all."""
+    p1 = {"plate": 1, "filaments": [{"id": "1", "used_g": 10.0, "waste_g": 3.0}, {"id": "2", "used_g": 4.0, "waste_g": 2.0}]}
+    p2 = {"plate": 2, "filaments": [{"id": "1", "used_g": 8.0}], "features": {"waste_g": 2.0}}
+    r = S.VariantResult("v", True, "/p", True, [p1, p2])
+    assert r.waste_g() == pytest.approx(7.0)
+    assert S.VariantResult("v", True, "/p", True, [p1, {"plate": 2, "filaments": [{"id": "1", "used_g": 8.0}]}]).waste_g() is None

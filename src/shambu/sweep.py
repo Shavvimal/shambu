@@ -132,21 +132,25 @@ def orientation_variants(
     studio: StudioCLI | None = None,
 ) -> list[dict]:
     """One variant per best orientation of the part (its first file). `source="own"`: `mesh.candidates()`, by
-    shambu's score. `source="studio"`: Studio's auto-orient table (`StudioCLI.orient()`), each vector negated into a
-    `lay_on_face`, kept when shambu's `stands` check passes, top `top` by Studio's unprintability; the variant still
-    bakes the turn with `mesh.oriented_copies()`. A variant drops a part's `"orientation": "auto"`."""
+    shambu's score. `source="studio"`: Studio's auto-orient table (`StudioCLI.orient()`, unit fix first), each vector
+    negated into a `lay_on_face`, kept when shambu's `stands` check passes on the converted mesh, top `top` by
+    Studio's unprintability (a tie goes to its `best:` row); the variant still bakes the turn with
+    `mesh.oriented_copies()`. When Studio scales the part (metres, inches), every variant also points the part's
+    `path` at a mm copy under `<outdir>/sweep/_units/`. A variant drops a part's `"orientation": "auto"`."""
     if source not in SOURCES:
         raise BuildError(f"orientation source {source!r} not in {SOURCES}")
     path = None
+    part: dict = {}
     for pl in spec_json.get("plates", []):
         for p in pl.get("parts", []):
             if _part_key(p) == part_key:
+                part = p
                 path = p.get("path") or (p.get("parts") or [{}])[0].get("path")
     if not path:
         raise BuildError(f"no part with key {part_key!r} in the spec")
     facets = M.read_stl(Path(path).expanduser())
     if source == "studio":
-        return _studio_variants(part_key, Path(path).expanduser(), facets, top, threshold_deg, studio)
+        return _studio_variants(part_key, spec_json, part, Path(path).expanduser(), facets, top, threshold_deg, studio)
     cands = [c for c in M.candidates(facets, threshold_deg) if c.metrics.stands][:top]
     if not cands:
         raise BuildError(
@@ -165,26 +169,59 @@ def orientation_variants(
     return out
 
 
+_SCALES = (1.0, 1000.0, 25.4)  # mm, metres, inches: the factors Studio's --convert-unit applies
+
+
+def unit_scale(original: Sequence[M.Facet], converted: Sequence[M.Facet]) -> float:
+    """The uniform factor Studio applied between two copies of one mesh, whatever rotation and translation it also
+    applied: the square root of the surface-area ratio, snapped to 1, 1000 or 25.4 when within 0.1 %."""
+    a0 = sum(M.facet_area(f) for f in original)
+    a1 = sum(M.facet_area(f) for f in converted)
+    if a0 <= 0 or a1 <= 0:
+        return 1.0
+    k = math.sqrt(a1 / a0)
+    return next((s for s in _SCALES if abs(k / s - 1) < 1e-3), k)
+
+
 def _studio_variants(
-    part_key: str, path: Path, facets: list[M.Facet], top: int, threshold_deg: float, studio: StudioCLI | None
+    part_key: str, spec_json: dict, part: dict, path: Path, facets: list[M.Facet], top: int, threshold_deg: float, studio: StudioCLI | None
 ) -> list[dict]:
     if studio is None:
         from .studio import StudioCLI
 
         studio = StudioCLI()
-    # No unit fix here: the variant bakes the turn into the ORIGINAL file, so the vectors must be in its frame
-    # (a direction does not change with a uniform scale anyway).
+    # Pass 1 as the build runs it: --convert-unit first, then --orient. The vectors are in the file's own frame (a
+    # uniform scale does not turn a direction); the stands check runs on the converted mesh, Studio's export scaled
+    # back into that frame.
     with tempfile.TemporaryDirectory(prefix="shambu-orient-") as tmp:
-        res = studio.orient([path], Path(tmp), convert_unit=False)
+        res = studio.orient([path], Path(tmp), convert_unit=True)
+        k = unit_scale(facets, M.read_stl(res.files[0])) if res.files else 1.0
+    converted = M.scale(facets, k) if k != 1.0 else facets
+    src: Path | None = None
+    if k != 1.0:
+        # Every variant must carry the unit fix: point it at a mm copy (same stem, so the part key and object name stay)
+        if part.get("parts"):
+            raise BuildError(
+                f"{part_key}: Studio scales this part by {k:g} (not mm) and it merges several files; "
+                "convert each file with `shambu rotate FILE -o DIR --convert-unit` first"
+            )
+        if not spec_json.get("outdir"):
+            raise BuildError(f"{part_key}: Studio scales this part by {k:g}; the spec needs 'outdir' for the mm copy")
+        sub = re.sub(r"[^A-Za-z0-9._-]", "_", part_key) or "part"
+        src = M.write_stl(
+            Path(spec_json["outdir"]).expanduser() / "sweep" / "_units" / sub / f"{path.stem}.stl", converted, f"{path.stem} mm"
+        )
     seen: list[M.Vec] = []
     picked = []
-    for c in res.candidates:  # sorted by unprintability, best first
+    from .studio import rank_candidates
+
+    for c in rank_candidates(res.candidates, res.best):  # by unprintability, a tie goes to Studio's best row
         o = M.from_studio_vector(c.vector)
         n = M.unit(o.lay_on_face)  # type: ignore[arg-type]
         if any(M._dot(s, n) > math.cos(math.radians(1.0)) for s in seen):
             continue
         seen.append(n)
-        m = M.metrics(M.transform(facets, M.lay_on_face_matrix(n)), threshold_deg)
+        m = M.metrics(M.transform(converted, M.lay_on_face_matrix(n)), threshold_deg)
         if m.stands:
             picked.append((c, o, m))
         if len(picked) >= top:
@@ -195,11 +232,20 @@ def _studio_variants(
         )
     out = []
     for i, (c, o, m) in enumerate(picked, 1):
+        change: dict[str, Any] = {"lay_on_face": [round(v, 6) for v in o.lay_on_face or ()], "rotate": [0, 0, 0], "orientation": None}
+        if src is not None:
+            change["path"] = str(src)
         out.append(
             {
                 "name": f"{part_key}-{i}-studio-{o.tag()}"[:80],
-                "parts": {part_key: {"lay_on_face": [round(v, 6) for v in o.lay_on_face or ()], "rotate": [0, 0, 0], "orientation": None}},
-                "orientation": {"label": f"studio {i}", "source": "studio", **c.to_json(), **m.to_json()},
+                "parts": {part_key: change},
+                "orientation": {
+                    "label": f"studio {i}",
+                    "source": "studio",
+                    **c.to_json(),
+                    **m.to_json(),
+                    **({"unit_scale": k, "converted": str(src)} if src is not None else {}),
+                },
             }
         )
     return out
@@ -278,10 +324,18 @@ class VariantResult:
         return total
 
     def waste_g(self) -> float | None:
-        """Prime tower plus flush grams: result.json (total minus main per filament), else the G-code parser."""
-        if self.has_result:
-            return sum(float(f.get("waste_g") or 0) for p in self.plates for f in p.get("filaments") or [])
-        return self.feature_total("waste_g") if any(p.get("features") for p in self.plates) else None
+        """Prime tower plus flush grams summed per plate: result.json (total minus main per filament) on a plate that
+        carries it, else that plate's G-code parser value; None when a plate has neither."""
+        total = 0.0
+        for p in self.plates:
+            native = [float(f["waste_g"]) for f in p.get("filaments") or [] if f.get("waste_g") is not None]
+            if native:
+                total += sum(native)
+            elif p.get("features"):
+                total += float(p["features"].get("waste_g") or 0)
+            else:
+                return None
+        return total if self.plates else None
 
     def filament_changes(self) -> int | None:
         """Tool switches from the G-code parser (0 on a one-filament plate); None when a plate lacks the count.

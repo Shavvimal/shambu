@@ -32,28 +32,34 @@ def estimate_lines(sl: dict) -> list[str]:
         + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")
     ]
     ft = sl.get("features")
-    if "feature_times_s" in sl:
+    native_waste = [f["waste_g"] for f in sl["filaments"] if "waste_g" in f]
+    if "feature_times_s" in sl or native_waste:
         if ft:
             support = f"support {ft['support_g']:.1f} g (G-code parser)"
         elif sl.get("support_used") == "false":
             support = "support 0.0 g (the slicer used none)"
         else:
             support = "support not measured"
-        waste = sum(float(f.get("waste_g") or 0) for f in sl["filaments"])
+        if native_waste:
+            waste = f"prime tower + flush {sum(float(w) for w in native_waste):.1f} g (result.json)"
+        elif ft:
+            waste = f"prime tower + flush {ft['waste_g']:.1f} g (G-code parser)"
+        else:
+            waste = "prime tower + flush not available"
         changes = sl.get("filament_changes")
         swaps = (
             "filament changes not measured"
             if changes is None
             else f"{changes} filament change(s) ({'G-code parser' if ft else 'one filament'})"
         )
-        out.append(f"- plate {n} filament by feature: {support}, prime tower + flush {waste:.1f} g (result.json); {swaps}")
-        times = sl["feature_times_s"]
+        out.append(f"- plate {n} filament by feature: {support}, {waste}; {swaps}")
+        times = sl.get("feature_times_s") or {}
         shown = [f"{k.lower()} {times[k] / 60:.1f} min" for k in FEATURE_TIME_ROLES if times.get(k)]
         if shown:
             out.append(f"- plate {n} time by feature (result.json): " + ", ".join(shown))
     elif ft:
         out.append(
-            f"- plate {n} filament by feature (G-code parser, no result.json): model {ft['model_g']:.1f} g, support {ft['support_g']:.1f} g, "
+            f"- plate {n} filament by feature (G-code parser, no result.json grams): model {ft['model_g']:.1f} g, support {ft['support_g']:.1f} g, "
             f"prime tower {ft['tower_g']:.1f} g, flush {ft['flush_g']:.1f} g; {ft['filament_changes']} filament change(s)"
         )
     return out
@@ -184,6 +190,15 @@ def render(r: BuildResult) -> str:
             "## Next",
             "- The checks failed (see Problems and the FAIL lines above): nothing was exported, so there is no new project to open. "
             "Fix the spec and build again.",
+        ]
+        out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
+        return "\n".join(out) + "\n"
+    if r.run is None:  # a check-only run (`shambu check`): the plan passed, nothing was exported
+        out += [
+            "",
+            "## Next",
+            f"- Check only: the plan passed, but nothing was exported, so there is no project at `{r.project}` from this run. "
+            "Run `shambu build` on the spec to write it.",
         ]
         out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
         return "\n".join(out) + "\n"

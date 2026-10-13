@@ -16,7 +16,7 @@ from shambu.build import Pipeline
 from shambu.errors import BuildError, StudioError
 from shambu.facade import Bambu
 from shambu.spec import Spec
-from shambu.studio import OrientCandidate, StudioCLI, orient_command, parse_orient
+from shambu.studio import OrientCandidate, StudioCLI, export_paths, orient_command, parse_orient, stale_exports
 from test_mesh import box
 
 DATA = Path(__file__).parent / "data"
@@ -72,6 +72,18 @@ def test_parse_several_tables_and_skips_noise():
     assert tables[0].best is not None and tables[0].best.vector == (0.0, 1.0, 0.0)
     assert tables[1].best is None and tables[1].candidates[0].lay_on_face == (1.0, 0.0, 0.0)
     assert parse_orient("no table here\n") == []
+
+
+def test_parse_tie_puts_the_best_row_first():
+    """Finding 8: two rows print 0.6; `best:` is the second, so it comes first."""
+    text = (
+        "orientation:0.0000 0.0000 1.0000, cost:1.0,\t2.0,\t3.0,\t4.0,\t5.0,\t0.0,\t0.6\n"
+        "orientation:-1.0000 0.0000 0.0000, cost:1.0,\t2.0,\t3.0,\t4.0,\t5.0,\t0.0,\t0.6\n"
+        "orientation:0.0000 1.0000 0.0000, cost:1.0,\t2.0,\t3.0,\t4.0,\t5.0,\t0.0,\t0.4\n"
+        "best:-1.000000 0.000000 0.000000, costs:1.0,\t2.0,\t3.0,\t4.0,\t5.0,\t0.0,\t0.6\n"
+    )
+    (t,) = parse_orient(text)
+    assert [c.vector for c in t.candidates] == [(0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, 1.0)]
 
 
 def test_from_studio_vector_negates():
@@ -147,6 +159,49 @@ def test_orient_missing_export_or_failure_is_studio_error(fake_cli, tmp_path, mo
         fake_cli.orient([src], tmp_path / "o")
     with pytest.raises(StudioError, match="not found"):
         fake_cli.orient([tmp_path / "nope.stl"], tmp_path / "o")
+
+
+def test_stale_cleanup_never_returns_an_input(tmp_path):
+    """Finding 1, the cleanup rule alone: with inputs part.stl and o/obj_1_part.stl (an earlier export), export 1 IS
+    input 2. An export path that is an input (same path, or a hard link) is never deleted; the others are."""
+    out = tmp_path / "o"
+    a = M.write_stl(tmp_path / "part.stl", box((0, 0, 0), (10, 10, 10)))
+    inp = M.write_stl(out / "obj_1_part.stl", box((0, 0, 0), (10, 10, 10)))
+    files = export_paths([a, inp], out)
+    assert files == [inp.resolve(), (out / "obj_2_obj_1_part.stl").resolve()]
+    assert stale_exports([a, inp], files) == files[1:]
+    files[1].write_text("stale")
+    link = tmp_path / "link.stl"
+    link.hardlink_to(files[1])
+    assert stale_exports([a, link], files) == files[:1]
+
+
+@pytest.mark.parametrize("method", ["orient", "normalise"])
+def test_input_inside_the_output_dir_is_refused_not_deleted(fake_cli, tmp_path, monkeypatch, method):
+    """Finding 1: an input that is a path the run writes (here export 1 = input 2) is refused before anything is
+    deleted or run."""
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    out = tmp_path / "o"
+    a = M.write_stl(tmp_path / "part.stl", box((0, 0, 0), (10, 10, 10)))
+    src = M.write_stl(out / "obj_1_part.stl", box((0, 0, 0), (5, 5, 5)))
+    data = src.read_bytes()
+    with pytest.raises(StudioError, match="is a file this run writes"):
+        getattr(fake_cli, method)([a, src], out)
+    assert src.read_bytes() == data
+    assert not list(out.glob("*.log"))  # Studio never ran
+
+
+def test_cli_native_write_onto_a_file_is_one_error_document(fake_cli, tmp_path, monkeypatch, capsys, resolver):
+    """Finding 2: `--write` naming an existing file gives exit 3 and one JSON error document, not a traceback."""
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=fake_cli, resolver=resolver))
+    src = M.write_stl(tmp_path / "part.stl", box((0, 0, 0), (10, 10, 10)))
+    taken = tmp_path / "taken"
+    taken.write_text("a file")
+    code, out = run(capsys, "--json", "orient", "--native", str(src), "--write", str(taken))
+    assert code == 3
+    (doc,) = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert doc["error"].startswith("StudioError: cannot prepare the output directory")
 
 
 # ---------------------------------------------------------------------------- spec
@@ -262,6 +317,39 @@ def test_sweep_studio_variants_filter_rank_and_negate(tmp_path):
         S.orientation_variants(d, "block", source="theirs")
 
 
+def test_sweep_studio_tie_prefers_the_best_row(tmp_path):
+    """Finding 8: two candidates print unprintability 0.6 and Studio's `best:` is the second: it becomes variant 1."""
+    src = M.write_stl(tmp_path / "block.stl", box((0, 0, 0), (30, 20, 10)))
+    up = OrientCandidate((0.0, 0.0, 1.0), 1, 0, 0, 0, 0, 0, 0.6)
+    side = OrientCandidate((-1.0, 0.0, 0.0), 1, 0, 0, 0, 0, 0, 0.6)
+    studio = FakeStudio(orient_table=[up, side], orient_best=side)
+    d = {"name": "n", "outdir": str(tmp_path), "plates": [{"name": "p", "parts": [{"path": str(src)}]}]}
+    vs = S.orientation_variants(d, "block", top=2, source="studio", studio=studio)
+    assert [v["parts"]["block"]["lay_on_face"] for v in vs] == [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]
+
+
+def test_sweep_studio_variants_carry_the_unit_fix(tmp_path):
+    """Finding 3: pass 1 runs with the unit fix, the stands check sees the mm mesh, and every variant points the part
+    at a mm copy (same stem, so the part key stays), so the build slices the jaw in mm, not in metres."""
+    jaw = REPO / "data" / "so101_moving_jaw_metres.stl"
+    axes = [(0.0, 0.0, 1.0), (0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0)]
+    studio = FakeStudio(orient_table=[OrientCandidate(v, 1, 0, 0, 0, 0, 0, 0.1 * i) for i, v in enumerate(axes, 1)])
+    d = spec_dict(tmp_path, {"path": str(jaw), "orientation": "auto"})
+    vs = S.orientation_variants(d, "so101_moving_jaw_metres", top=3, source="studio", studio=studio)
+    ((_, (_, _, convert)),) = [c for c in studio.calls if c[0] == "orient"]
+    assert convert is True and vs
+    for v in vs:
+        change = v["parts"]["so101_moving_jaw_metres"]
+        mm = Path(change["path"])
+        assert mm.stem == jaw.stem and mm.is_relative_to(tmp_path / "out" / "sweep" / "_units")
+        lo, hi = M.bbox(M.read_stl(mm))
+        assert (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) == pytest.approx((22.3, 92.0, 48.0), abs=0.05)
+        assert v["orientation"]["unit_scale"] == 1000.0 and v["orientation"]["height"] > 20  # metrics in mm
+        part = S.apply_variant(d, v)["plates"][0]["parts"][0]
+        assert part["path"] == str(mm) and "orientation" not in part
+    assert S.unit_scale(M.read_stl(jaw), M.read_stl(jaw)) == 1.0
+
+
 def test_sweep_studio_variants_raise_when_nothing_stands(tmp_path):
     src = M.write_stl(tmp_path / "block.stl", box((0, 0, 0), (30, 20, 10)))
     r2 = 1 / math.sqrt(2)
@@ -301,6 +389,33 @@ def test_cli_orient_native(app, capsys, tmp_path):
     assert code == 0 and j["source"] == "studio" and j["best"]["lay_on_face"] == [1.0, 0.0, 0.0]
     assert j["written"].endswith("obj_1_block.stl") and Path(j["written"]).is_file()
     assert run(capsys, "orient", "--native", str(tmp_path / "missing.stl"))[0] == 2
+
+
+def test_cli_orient_native_pick(app, capsys, tmp_path):
+    """Finding 9: --pick N with --native: 1 keeps Studio's export, N > 1 bakes row N (unit fix included), out of
+    range is a usage error."""
+    app.orient_table = [
+        OrientCandidate((-1.0, 0.0, 0.0), 1, 0, 0, 0, 0, 0, 0.6),
+        OrientCandidate((0.0, -1.0, 0.0), 1, 0, 0, 0, 0, 0, 0.9),  # +y face down
+    ]
+    src = M.write_stl(tmp_path / "block.stl", box((0, 0, 0), (30, 20, 10)))
+    code, out = run(capsys, "--json", "orient", "--native", str(src), "--write", str(tmp_path / "w1"), "--pick", "1")
+    assert code == 0 and json.loads(out)["written"].endswith("obj_1_block.stl")
+    code, out = run(capsys, "--json", "orient", "--native", str(src), "--write", str(tmp_path / "w2"), "--pick", "2")
+    j = json.loads(out)
+    assert code == 0 and j["picked"]["row"] == 2 and j["picked"]["lay_on_face"] == [0.0, 1.0, 0.0]
+    lo, hi = M.bbox(M.read_stl(j["written"]))
+    assert (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) == pytest.approx((30, 10, 20))
+    assert not (tmp_path / "w2" / "obj_1_block.stl").exists()  # Studio's best is not left beside the pick
+    tiny = M.write_stl(tmp_path / "tiny.stl", box((0, 0, 0), (0.03, 0.02, 0.01)))
+    code, out = run(capsys, "--json", "orient", "--native", str(tiny), "--write", str(tmp_path / "w3"), "--pick", "2")
+    j = json.loads(out)
+    lo, hi = M.bbox(M.read_stl(j["written"]))
+    assert code == 0 and j["picked"]["unit_scale"] == 1000.0
+    assert (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) == pytest.approx((30, 10, 20))
+    for n in ("3", "0"):
+        code, out = run(capsys, "--json", "orient", "--native", str(src), "--write", str(tmp_path / "w4"), "--pick", n)
+        assert code == 2 and "--pick" in json.loads(out)["error"]
 
 
 def test_cli_rotate_convert_unit(app, capsys, tmp_path):
@@ -380,5 +495,7 @@ def test_live_metres_jaw_convert_unit(tmp_path):
     lo, hi = M.bbox(M.read_stl(mm))
     assert (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) == pytest.approx((22.3, 92.0, 48.0), abs=0.05)
     assert st.info(mm).size[0] == pytest.approx(22.3, abs=0.05)
+    assert st.info(mm).parts == 2  # both bodies of the jaw survive the unit fix (Studio's number_of_parts)
     r = st.orient([src], tmp_path / "o")  # pass 1 converts the unit before it orients
     assert max(st.info(r.files[0]).size) > 40
+    assert st.info(r.files[0]).parts == 2 and M.count_shells(M.read_stl(r.files[0])) == 2
