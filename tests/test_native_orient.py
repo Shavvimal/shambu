@@ -331,15 +331,15 @@ def test_sweep_studio_tie_prefers_the_best_row(tmp_path):
 def test_sweep_studio_variants_carry_the_unit_fix(tmp_path):
     """Finding 3: pass 1 runs with the unit fix, the stands check sees the mm mesh, and every variant points the part
     at a mm copy (same stem, so the part key stays), so the build slices the jaw in mm, not in metres."""
-    jaw = REPO / "data" / "so101_moving_jaw_metres.stl"
+    jaw = M.write_stl(tmp_path / "jaw_metres.stl", box((0, 0, 0), (0.0223, 0.092, 0.048)))  # a mesh saved in metres
     axes = [(0.0, 0.0, 1.0), (0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0)]
     studio = FakeStudio(orient_table=[OrientCandidate(v, 1, 0, 0, 0, 0, 0, 0.1 * i) for i, v in enumerate(axes, 1)])
     d = spec_dict(tmp_path, {"path": str(jaw), "orientation": "auto"})
-    vs = S.orientation_variants(d, "so101_moving_jaw_metres", top=3, source="studio", studio=studio)
+    vs = S.orientation_variants(d, "jaw_metres", top=3, source="studio", studio=studio)
     ((_, (_, _, convert)),) = [c for c in studio.calls if c[0] == "orient"]
     assert convert is True and vs
     for v in vs:
-        change = v["parts"]["so101_moving_jaw_metres"]
+        change = v["parts"]["jaw_metres"]
         mm = Path(change["path"])
         assert mm.stem == jaw.stem and mm.is_relative_to(tmp_path / "out" / "sweep" / "_units")
         lo, hi = M.bbox(M.read_stl(mm))
