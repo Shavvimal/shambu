@@ -1,0 +1,45 @@
+name: Bug report
+description: Something shambu did wrong (a check, a build, a patch, a printer read)
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got.
+      placeholder: "shambu build plate.json --slice exits 1 with ..."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The spec JSON (with paths generalised) and the exact command. Attach the `<outdir>/<name>.log` if a build failed.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: shambu version
+      description: Output of `shambu --version`
+      placeholder: "shambu 0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: studio
+    attributes:
+      label: Bambu Studio version and OS
+      placeholder: "02.08.02.61 on macOS 26.6"
+    validations:
+      required: true
+  - type: input
+    id: printer
+    attributes:
+      label: Printer model and nozzle setup
+      placeholder: "X2D, 0.4 nozzle, two nozzles, no AMS"
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: The report contains no printer serial, access code, IP address or personal path.
+          required: true

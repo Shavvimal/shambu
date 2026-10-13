@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --group dev
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      - run: uv run mypy
+      - run: uv run pytest -q
+
+  version-bump:
+    name: version-bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require version bump when a user-facing file changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          file="src/shambu/__init__.py"
+          # Any file that ships to users - the CLI OR the plugin (skills,
+          # manifest, commands, agents) - must move the single version, so the plugin
+          # cache actually refreshes and stays locked to the engine. Docs/tests/CI are
+          # not user-facing and never require a bump.
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD -- \
+            'src/shambu/**' 'skills/**' '.claude-plugin/**' 'commands/**' 'agents/**')
+          if [ -z "$changed" ]; then
+            echo "No user-facing changes; version bump not required."
+            exit 0
+          fi
+          extract() { grep -Po '(?<=^__version__ = ")[^"]+'; }
+          head_v=$(extract < "$file")
+          base_v=$(git show "$BASE_SHA:$file" | extract)
+          echo "base=$base_v head=$head_v"
+          if ! [[ "$head_v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::__version__ '$head_v' is not valid X.Y.Z semver."
+            exit 1
+          fi
+          # Must be a strict INCREASE, not merely different. dpkg --compare-versions is
+          # Debian Policy's reference comparator (correct on 2.10.0 > 2.9.0, where a string
+          # compare is wrong); 'base lt head' holds only when the version genuinely went up,
+          # which also rejects an unchanged version and accidental downgrades.
+          if ! dpkg --compare-versions "$base_v" lt "$head_v"; then
+            echo "::error::__version__ must increase: base=$base_v head=$head_v."
+            exit 1
+          fi

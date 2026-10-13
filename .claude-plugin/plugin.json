@@ -1,0 +1,17 @@
+{
+  "name": "shambu",
+  "version": "0.1.0",
+  "description": "Prepare, inspect and patch Bambu Studio projects (.3mf) from STL files, slice them headless with estimates, and read a Bambu Lab printer's status over LAN (read-only). Built on Bambu Studio's own command line.",
+  "author": { "name": "Shav Vimalendiran" },
+  "homepage": "https://github.com/Shavvimal/shambu",
+  "repository": "https://github.com/Shavvimal/shambu",
+  "license": "MIT",
+  "keywords": [
+    "bambu-lab",
+    "bambu-studio",
+    "3mf",
+    "3d-printing",
+    "slicer",
+    "claude-code"
+  ]
+}

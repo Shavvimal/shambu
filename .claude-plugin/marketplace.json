@@ -1,0 +1,12 @@
+{
+  "name": "shambu",
+  "owner": { "name": "Shav Vimalendiran" },
+  "description": "shambu: Bambu Studio projects from STLs, 3MF patching and read-only printer status, driven by Claude. Run /shambu:setup once to install the shambu CLI.",
+  "plugins": [
+    {
+      "name": "shambu",
+      "source": "./",
+      "description": "Prepare, inspect and patch Bambu Studio projects (.3mf), slice headless with time and filament estimates, and read a Bambu Lab printer over LAN (read-only). Run /shambu:setup first to install the shambu CLI."
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+name: Feature request
+description: A setting, recipe, patch or check shambu should support
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - build / check (spec, placement, limits)
+        - patch / inspect (3MF)
+        - presets / recipes
+        - printer status (read-only)
+        - skills / plugin
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: need
+    attributes:
+      label: What you want to do and why
+      description: The print problem behind the request, with the Bambu Studio setting or 3MF field if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: A reference section, a Bambu Studio source line, or a measured result that supports the change.
