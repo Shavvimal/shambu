@@ -190,6 +190,16 @@ Keys that do not exist in Bambu Studio (OrcaSlicer only; writing them does nothi
 "make overhang printable" cones belong in CAD. One X post measured the same part at 45 min with tree supports in
 Bambu Studio and 19 min with Orca's cone conversion and no supports: the geometry change, not the slicer, saved it.
 
+### 3.3b `support_filament` 0 on a two-filament plate (live finding, 2026-10-13)
+
+`support_filament` and `support_interface_filament` default to 0, "default": Studio prints the support with
+whichever filament is loaded, to save a change. On a by-layer plate with a filament-1 link (tree supports, x 2..74)
+and a filament-2 part, the exported G-code printed seven "Support" moves at z 0.4 with T1 (the right nozzle) at
+x < 20.5, and the CLI refused the plate: exit -102, "Found G-code in unprintable area of multi-extruder printers".
+The same link without supports, or with `support_filament` 1 and `support_interface_filament` 1, slices. shambu
+pins both keys to the part's own filament whenever a supported part sits on a plate with more than one filament and
+the spec leaves them at 0; `dual-material-interface` sets them explicitly and is left alone.
+
 ### 3.4 Painted supports without the GUI
 
 An enforcer or blocker volume is a `<part subtype="support_enforcer|support_blocker">` in `model_settings.config`
@@ -214,12 +224,15 @@ X post: the ironed side's PETG-under-PLA supports fell off on their own and the 
 | bracket 60x40x30 + 2 x 20 mm cubes on filament 2 (this PR's live sweep) | 1 h 24 m, 27.4 g, 7.2 g tower, 100 changes | 40 m, 16.4 g, 0 g tower, 1 change |
 | 6 x 10 mm cubes, 3 per filament | 36 m (26.5 m with the tower off) | 29.5 m |
 | 6 x 10 mm cubes, one filament | 14.5 m | 27.8 m |
+| gripper: 2 links (PETG, tree supports) + tag bridge (PLA, 210 x 3 x 96 standing as exported) | 3 h 38, 72.4 g, 61 changes, 6.2 g tower | 3 h 13, 66.2 g, 1 change |
+| the same plate with the tag bridge laid flat (its designer's bed face) | **2 h 27, 62.0 g, 14 changes, 1.6 g tower** | (by object not re-run) |
 
 Why it works: by layer, two single-colour object groups cost about one nozzle change per layer (0.2 mm x 20 mm =
 100 changes) and a prime tower wipe after each. The slicer charges about 14.5 s per X2D nozzle change (a forum test:
 11.7 s on the H2D, 76 s for an AMS change on one nozzle, 95 s on an X1C), but the tower is the larger cost. Why it
 fails on tiny parts: by object each object meets the filament's minimum layer time alone (Bambu PLA
-`slow_down_layer_time` 4 s), so six 10 mm cubes spend 20 min waiting. Rule for the skill: slice both ways
+`slow_down_layer_time` 4 s), so six 10 mm cubes spend 20 min waiting. The gripper rows show the other lever: orientation beat print sequence there, because the standing tag bridge
+forced a filament-2 layer on every one of 480 layers and the flat one on 15. Rule for the skill: slice both ways
 (`shambu sweep --by-object`) and keep the faster one. Expect by object to win when each object is single-colour with
 real layer area, and by layer to win for many tiny parts. By layer with `enable_prime_tower` 0 is faster still on
 tiny parts but the idle nozzle then oozes with no wipe (Bambu built ramming and pre-cooling because of that).
@@ -365,6 +378,11 @@ Not verified: whether a native `classcad-cli` worker build imports STL as a soli
 - The shipped SKILL.md said "the tool never rotates parts". It now does, through an oriented STL copy.
 - `shambu check` reported "every reach and height limit holds" on a by-object plate the slicer then rejected with
   exit -63; `SequentialClearance` closes that gap.
+- Copies of a part (`count` > 1) were placed at the first copy's position plus their own: Studio clones the
+  translated first copy before translating the others (reference 01 section 2.4). Found with the gripper link
+  (STL at z -38): copy 2 floated at z 38 and sat off the bed. Fixed in `build.py`.
+- Real-part findings in one place: the copy bug, the support-filament pin (3.3b), zero-contact orientation
+  candidates (1.2), meshes in metres (`shambu rotate --scale`). The manual loop lives in `data/README.md`.
 
 ---
 

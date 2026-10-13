@@ -27,6 +27,16 @@ binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a 
 Every rule the code encodes about Bambu Studio should cite the reference that proved it. The
 review rubric in `REVIEW-RUBRIC.md` is what a pull request is judged against.
 
+## Test on real CAD before a release
+
+The unit tests use synthetic boxes. Real parts found every 0.2.0 bug: a link whose STL sits at z -38 printed its
+second copy floating, a supported part next to a second-filament part had its support base printed by the right
+nozzle, a carrier's chamfer band scored as the best orientation with nothing on the bed. Keep a few real STLs in
+`data/` (gitignored, `data/README.md` says what to keep and why) and run the loop from that README on them:
+`shambu info`, `shambu orient`, `shambu sweep ... --orientations ... --by-object`. Read the sweep table and the
+Studio log of any variant that fails; the failing exit code and the G-code Studio leaves in the variant folder
+say which nozzle printed what, where.
+
 ## Pull requests
 
 - One topic per PR, squash-merged. Add or change a test for every behaviour change.

@@ -229,6 +229,11 @@ class Orient(Command):
         cands = M.candidates(facets, a.threshold, a.top)
         summary = M.Summary(Path(a.file), len(facets), len(M.split_bodies(facets)), cands)
         lines = [f"{a.file}: {len(facets)} facets, {summary.bodies} body(ies); overhang threshold {a.threshold:g} deg from vertical", ""]
+        if M.looks_like_metres(facets):
+            lines.append(
+                "WARNING: the whole mesh is under 1 mm; it is probably in metres. `shambu rotate FILE -o DIR --scale 1000` writes a mm copy."
+            )
+            lines.append("")
         lines += M.describe_candidates(cands)
         lines += [
             "",
@@ -251,6 +256,7 @@ class Rotate(Command):
         p.add_argument("-o", "--outdir", required=True)
         p.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="outward normal of the face to put on the bed")
         p.add_argument("--rotate", metavar="X,Y,Z", help="degrees about X, then Y, then Z (applied after --lay-on-face)")
+        p.add_argument("--scale", type=float, default=1.0, help="multiply every coordinate first, e.g. 1000 for a mesh in metres")
 
     def run(self, a, app, out):
         from . import mesh as M
@@ -264,9 +270,16 @@ class Rotate(Command):
             o = M.Orientation.from_json(d)
         except (ValueError, BuildError) as e:
             return usage(out, f"bad --lay-on-face or --rotate: {e}")
-        if o.is_identity:
-            return usage(out, "nothing to do: give --lay-on-face and/or --rotate")
-        path = M.oriented_copy(a.file, o, a.outdir)
+        if o.is_identity and a.scale == 1.0:
+            return usage(out, "nothing to do: give --lay-on-face, --rotate and/or --scale")
+        if a.scale <= 0:
+            return usage(out, "--scale must be positive")
+        src = Path(a.file)
+        if a.scale != 1.0:  # a scaled copy first, so the oriented copy (and its hash) start from mm
+            src = M.write_stl(
+                Path(a.outdir) / f"{src.stem}__x{a.scale:g}.stl", M.scale(M.read_stl(src), a.scale), f"{src.stem} x{a.scale:g}"
+            )
+        path = M.oriented_copy(src, o, a.outdir)
         m = M.metrics(M.read_stl(path))
         out.emit(
             {"written": str(path), **m.to_json()},

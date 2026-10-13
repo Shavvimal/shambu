@@ -165,3 +165,19 @@ def test_orientation_json():
     assert M.Orientation.from_json({}).is_identity
     with pytest.raises(BuildError):
         M.Orientation.from_json({"rotate": [1, 2]})
+
+
+def test_no_flat_contact_sinks_to_the_bottom():
+    """A band of small 45-degree chamfers is a large normal cluster; laid down, nothing lies flat on the bed."""
+    facets = box((0, 0, 0), (40, 40, 10))
+    # replace the top with a shallow pyramid: four 45-degree-ish faces with the largest total area
+    apex = (20, 20, 30)
+    facets = [f for f in facets if not all(v[2] == 10 for v in f)]
+    for a, b in (((0, 0, 10), (40, 0, 10)), ((40, 0, 10), (40, 40, 10)), ((40, 40, 10), (0, 40, 10)), ((0, 40, 10), (0, 0, 10))):
+        facets.append((a, b, apex))
+    cands = M.candidates(facets)
+    assert cands[0].label == "as is" and cands[0].metrics.stands
+    tilted = [c for c in cands if not c.metrics.stands]
+    assert tilted and all(c.metrics.score > M.NO_CONTACT_PENALTY for c in tilted)
+    assert cands[-1].metrics.stands is False
+    assert "NO FLAT CONTACT" in "\n".join(M.describe_candidates(cands))

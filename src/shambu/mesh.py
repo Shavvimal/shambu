@@ -33,6 +33,8 @@ Facet = tuple[Vec, Vec, Vec]
 Matrix = tuple[Vec, Vec, Vec]  # rows
 
 IDENTITY: Matrix = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+MIN_CONTACT_MM2 = 25.0  # below this (and below 1 % of the footprint) an orientation cannot stand: Studio adds 100 for bottom < 0.1 mm2
+NO_CONTACT_PENALTY = 1.0e5
 AXES: dict[str, Vec] = {
     "-z": (0.0, 0.0, -1.0),
     "+z": (0.0, 0.0, 1.0),
@@ -203,6 +205,16 @@ def facet_area(f: Facet) -> float:
     return _norm(_cross(_sub(f[1], f[0]), _sub(f[2], f[0]))) / 2
 
 
+def looks_like_metres(facets: Sequence[Facet]) -> bool:
+    """A mesh whose whole bounding box is under 1 mm is almost certainly in metres (URDF and some CAD exports)."""
+    lo, hi = bbox(facets)
+    return max(hi[i] - lo[i] for i in range(3)) < 1.0
+
+
+def scale(facets: Iterable[Facet], k: float) -> list[Facet]:
+    return [tuple((v[0] * k, v[1] * k, v[2] * k) for v in f) for f in facets]  # type: ignore[misc]
+
+
 def transform(facets: Iterable[Facet], m: Matrix) -> list[Facet]:
     return [(apply(m, a), apply(m, b), apply(m, c)) for a, b, c in facets]
 
@@ -290,7 +302,13 @@ class Metrics:
         earns credit (adhesion, no brim), and height costs a little (a tall print is a slow, wobbly print).
         The weights are the tool's own, chosen so one mm2 of support outweighs one mm2 of contact. Bridges count
         as overhang here (as in Studio's auto-orient), so `shambu sweep` has the last word."""
-        return self.shadow_mm2 - 0.25 * self.contact_mm2 + 2.0 * self.height
+        return self.shadow_mm2 - 0.25 * self.contact_mm2 + 2.0 * self.height + (NO_CONTACT_PENALTY if not self.stands else 0.0)
+
+    @property
+    def stands(self) -> bool:
+        """Enough flat bed contact to print at all: at least MIN_CONTACT_MM2 and 1 % of the footprint. A candidate
+        that lays a band of small chamfers down ends with (almost) nothing on the bed and no first layer."""
+        return self.contact_mm2 >= max(MIN_CONTACT_MM2, 0.01 * self.footprint_mm2)
 
     def to_json(self) -> dict:
         return {
@@ -303,6 +321,7 @@ class Metrics:
             "support_share": round(self.support_share, 3),
             "steepest_deg": round(self.steepest_deg, 1),
             "centroid_z": round(self.centroid_z, 2),
+            "stands": self.stands,
             "threshold_deg": self.threshold_deg,
             "volume_mm3": round(self.volume_mm3, 1),
             "score": round(self.score, 1),
@@ -431,7 +450,7 @@ def describe_candidates(cands: Sequence[Candidate]) -> list[str]:
         n = ", ".join(f"{v:.4f}" for v in c.normal)
         lines.append(
             f"{i:>2} {c.label:20s} {m.score:8.1f} {m.shadow_mm2:11.1f} {m.support_share:6.2f} {m.contact_mm2:8.1f} {m.height:7.1f} {m.steepest_deg:8.1f}  "
-            f"[{n}]  [{c.rotate[0]:.1f}, {c.rotate[1]:.1f}, {c.rotate[2]:.1f}]"
+            f"[{n}]  [{c.rotate[0]:.1f}, {c.rotate[1]:.1f}, {c.rotate[2]:.1f}]" + ("" if m.stands else "  NO FLAT CONTACT: cannot stand")
         )
     return lines
 

@@ -119,10 +119,10 @@ def orientation_variants(spec_json: dict, part_key: str, top: int = 4, threshold
                 path = p.get("path") or (p.get("parts") or [{}])[0].get("path")
     if not path:
         raise BuildError(f"no part with key {part_key!r} in the spec")
-    cands = M.candidates(M.read_stl(Path(path).expanduser()), threshold_deg)[:top]
+    cands = [c for c in M.candidates(M.read_stl(Path(path).expanduser()), threshold_deg) if c.metrics.stands][:top]
     out = []
     for i, c in enumerate(cands, 1):
-        label = c.label.replace(" ", "-")
+        label = re.sub(r"[^A-Za-z0-9._-]", "", c.label.replace("+", "p").replace("-", "m").replace(" ", "-"))
         out.append(
             {
                 "name": f"{part_key}-{i}-{label}",

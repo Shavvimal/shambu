@@ -118,7 +118,6 @@ vite.config.ts.timestamp-*
 .ruff_cache/
 
 # Docker
-data/
 
 # Environment / Secrets
 .env
@@ -137,8 +136,9 @@ data/
 .classpath
 .settings/
 
-# Local data (e2e workspaces, docker volumes)
-data/
+# Local data (e2e workspaces, docker volumes) and real CAD parts for manual tests (data/README.md stays tracked)
+data/*
+!data/README.md
 
 # OS generated files
 .DS_Store
@@ -155,3 +155,4 @@ scratchpad/
 *.3mf
 *.gcode.3mf
 *.report.md
+

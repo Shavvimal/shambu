@@ -27,8 +27,22 @@ All notable changes to this project are documented here. The format follows
 - Reference `08-optimisation.md`: orientation, supports, time and finish research with sources, the by-object
   source rules, headless metrics, the Studio GUI workflow and the ClassCAD evaluation.
 
+### Fixed
+- Copies of a part (`count` 2 or more) landed at the first copy's position plus their own, because Studio's CLI
+  clones the translated first copy before translating the others. A link at z -38 in its CAD frame printed its
+  second copy floating at z 38 and off the bed. Copies now get positions relative to the first copy
+  (reference 01 section 2.4, live-verified).
+
+- On a plate with two filaments, a supported part's `support_filament` and `support_interface_filament` are
+  pinned to the part's own filament when the spec leaves them at Studio's "default" (0): Studio otherwise prints
+  the support base with whichever filament is loaded, and the right nozzle cannot reach x < 20.5 (exit -102,
+  found with a real gripper link next to a second-filament part).
+- Orientations that leave (almost) nothing flat on the bed sort last and are marked "NO FLAT CONTACT"; the sweep
+  skips them. `shambu orient` warns when a mesh is in metres; `shambu rotate --scale 1000` converts it.
+
 ### Changed
 - The skill explains orientation, supports and time hacks and runs the sweep loop to pick a configuration.
+- `data/` is gitignored for real CAD parts; `data/README.md` and CONTRIBUTING describe the manual real-CAD loop.
 - Reference 07: the prime-tower-with-by-object rule is compiled out in Studio (corrected).
 
 ## [0.1.1] - 2026-10-13

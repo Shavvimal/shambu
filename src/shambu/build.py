@@ -364,9 +364,24 @@ class Pipeline:
             groups: dict[int, list[PlannedPart]] = {}
             for p in parts:  # copies of one spec share an Item (count + pos list)
                 groups.setdefault(id(p.spec), []).append(p)
+            pinned: list[str] = []
             for group in groups.values():
                 first = group[0]
-                positions = [p.placed.pos() for p in group]
+                settings = dict(first.spec.set)
+                if len(filaments) > 1 and str(settings.get("enable_support", process.get("enable_support", "0"))) == "1":
+                    # Studio prints "default" (0) support with whichever filament is loaded; on a two-filament plate that
+                    # put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102, reference 08 3.3b).
+                    for key in ("support_filament", "support_interface_filament"):
+                        if str(settings.get(key, process.get(key, "0"))) in ("0", ""):
+                            settings[key] = str(first.placed.filament)
+                            pinned.append(f"{first.key}:{key}")
+                # The CLI translates copy 1 by pos[0], then CLONES that translated object for copies 2..n and translates
+                # each by its own pos[i] (reference 01 section 2.4, live-verified 2026-10-13): their pos is relative to
+                # copy 1's world position, so pos[i] = T_i - T_0.
+                first_t = group[0].placed.pos()
+                positions = [first_t] + [
+                    (p.placed.pos()[0] - first_t[0], p.placed.pos()[1] - first_t[1], p.placed.pos()[2] - first_t[2]) for p in group[1:]
+                ]
                 # A range without layer_height segfaults the slicer (layer_height_profile_from_ranges); the GUI always writes it.
                 ranges = [
                     A.HeightRange(r.min_z, r.max_z, {"layer_height": str(process.get("layer_height", "0.2")), **r.set})
@@ -378,14 +393,20 @@ class Pipeline:
                     for fp, fil, sub in first.files:
                         plate.items.append(A.Item(fp, fil, len(group), sub, idx, positions))
                     for i in idx:
-                        plate.assembled.append(A.Assembled(i, first.spec.set, ranges))
+                        plate.assembled.append(A.Assembled(i, settings, ranges))
                     for n, p in enumerate(group):
                         p.cli_name = f"assemble_{idx[n]}"
                 else:
                     fp, fil, sub = first.files[0]
-                    plate.items.append(A.Item(fp, fil, len(group), sub, 0, positions, first.spec.set, ranges))
+                    plate.items.append(A.Item(fp, fil, len(group), sub, 0, positions, settings, ranges))
                     for n, p in enumerate(group, 1):
                         p.cli_name = f"{fp.stem}_{n}"
+            if pinned:
+                warnings.append(
+                    f"plate {pi} '{pspec.name}': support filament pinned to the part's own filament for "
+                    + ", ".join(pinned)
+                    + " (Studio's default 0 prints support with whichever filament is loaded; the right nozzle cannot reach x < 20.5)"
+                )
             alist.plates.append(plate)
             plates.append(PlannedPlate(plate.name, parts, checks, seq))
         warnings += self._name_objects([x for p in plates for x in p.parts])

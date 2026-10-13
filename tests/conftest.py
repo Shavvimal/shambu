@@ -299,6 +299,7 @@ class FakeStudio:
     fixture: Path | None = None
     code: int = 0
     sizes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    los: dict[str, tuple[float, float, float]] = field(default_factory=dict)  # STL bbox minimum per file name (default origin)
     scratch: Path = Path("/nonexistent")
     binary: Path = Path("/Applications/FakeStudio.app/Contents/MacOS/BambuStudio")
     calls: list[tuple[str, object]] = field(default_factory=list)
@@ -306,7 +307,7 @@ class FakeStudio:
     def info(self, path) -> MeshInfo:
         path = Path(path)
         self.calls.append(("info", path))
-        return mesh(path, self.sizes.get(path.name, (20.0, 20.0, 10.0)))
+        return mesh(path, self.sizes.get(path.name, (20.0, 20.0, 10.0)), self.los.get(path.name, (0.0, 0.0, 0.0)))
 
     def run(
         self, cmd: CliCommand, *, name: str = "run", outputdir: Path | None = None, timeout: int = 1200, expect_output: Path | None = None

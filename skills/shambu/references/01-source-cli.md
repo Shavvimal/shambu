@@ -283,6 +283,12 @@ scalars. `min_z`/`max_z` are numbers.
    **world position = STL native coordinates + pos** (+ plate origin later). To put a
    part's bbox centre at (X, Y), use `pos = (X, Y) - stl_bbox_centre_xy`, and
    `pos_z = -stl_min_z` to sit it on the bed.
+   **Copies (live-verified 2026-10-13, reference 08):** copy 1 is translated by `pos[0]`; copies `2..count` are
+   cloned from that *already translated* object and then translated by their own `pos[i]`, so for a copy the
+   world position is `STL native + pos[0] + pos[i]`. Two links (STL z -38..-26) with `pos_z [38, 38]` put copy 2 at
+   z 38..50 ("Object can't be printed for empty layer between 0 and 38.2") and its y off the bed. A tool must
+   write `pos[i] = T_i - T_0` for copies, where `T_i` is the translation it wants. shambu 0.1.x got this wrong for
+   every `count > 1` part; 0.2.0 fixes it (`build.py`, the `positions` list).
 7. **Copy-index bug:** for copy `i`, the code picks `array_index = i` if
    `i < pos_x.size()`, else 0, and then uses that index for `pos_y` and `pos_z` too
    (`BS.cpp:1268-1270`). If `pos_x` has `count` entries but `pos_y` has 1, it reads

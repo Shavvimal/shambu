@@ -566,3 +566,56 @@ def test_cli_rotate_and_orient_error_contracts(capsys, tmp_path):
     assert code == 2 and "error" in json.loads(out)
     code, out, _ = run(capsys, "--json", "orient", str(tmp_path / "missing.stl"))
     assert code == 3 and "error" in json.loads(out)
+
+
+def test_orientation_variant_names_pass_the_name_check(tmp_path):
+    from test_mesh import table
+
+    stl = M.write_stl(tmp_path / "table.stl", table())
+    d = {**BASE, "plates": [{"name": "p", "parts": [{"path": str(stl)}]}]}
+    vs = S.orientation_variants(d, "table", top=12)
+    S.check_names(vs)  # "+z face down" and "-x face down" become plain names
+    assert any(v["name"].endswith("pz-face-down") for v in vs) and any(v["name"].endswith("mx-face-down") for v in vs)
+
+
+def test_rotate_scale_and_metre_warning(capsys, tmp_path):
+    from test_mesh import box
+
+    tiny = M.write_stl(tmp_path / "tiny.stl", box((0, 0, 0), (0.02, 0.01, 0.005)))  # a 20 x 10 x 5 mm part in metres
+    code, out, _ = run(capsys, "orient", str(tiny))
+    assert code == 0 and "probably in metres" in out
+    code, out, _ = run(capsys, "--json", "rotate", str(tiny), "-o", str(tmp_path / "r"), "--scale", "1000")
+    assert code == 0 and json.loads(out)["size"] == pytest.approx([20, 10, 5])
+    assert run(capsys, "rotate", str(tiny), "-o", str(tmp_path / "r"), "--scale", "0")[0] == 2
+    assert M.looks_like_metres(M.read_stl(tiny)) and not M.looks_like_metres(box((0, 0, 0), (2, 1, 1)))
+
+
+def test_copies_are_positioned_relative_to_the_first_copy(tmp_path, stls, resolver):
+    """Studio clones the translated first copy for copies 2..n, so their pos is relative (reference 01 section 2.4)."""
+    d = spec_json(tmp_path, stls)
+    d["filaments"] = d["filaments"][:1]
+    d["plates"][0]["parts"] = [{"path": str(stls["body"]), "count": 2, "recipes": ["flat-no-brim"]}]
+    studio = FakeStudio(sizes={"body.stl": (72, 20, 12)}, los={"body.stl": (-34.0, 64.0, -38.0)})  # the gripper link's frame
+    plan = Pipeline(studio, resolver).plan(Spec.from_json(d))
+    assert plan.ok, plan.problems
+    a, b = (x.placed for x in plan.plates[0].parts)
+    assert (a.x0, a.y0) == (2.0, 2.0) and (b.x0, b.y0) == (79.0, 2.0)
+    item = plan.assemble.plates[0].items[0]
+    assert item.count == 2
+    assert [tuple(v) for v in item.pos] == [(36.0, -62.0, 38.0), (77.0, 0.0, 0.0)]
+
+
+def test_support_filament_is_pinned_on_a_two_filament_plate(tmp_path, stls, resolver):
+    d = spec_json(tmp_path, stls)
+    d["plates"][0]["parts"][0]["recipes"] = ["tree-supports"]  # filament 1, support filaments left at Studio's default 0
+    d["plates"][0]["parts"][1]["set"] = {"enable_support": "1", "support_interface_filament": "1"}  # explicit value kept
+    plan = Pipeline(FakeStudio(), resolver).plan(Spec.from_json(d))
+    items = plan.assemble.plates[0].items
+    assert items[0].print_params["support_filament"] == "1" and items[0].print_params["support_interface_filament"] == "1"
+    assert items[1].print_params["support_filament"] == "2" and items[1].print_params["support_interface_filament"] == "1"
+    assert any("support filament pinned" in w and "body:support_filament" in w for w in plan.warnings)
+    # one filament: nothing to pin; no supports: nothing to pin
+    d["filaments"] = d["filaments"][:1]
+    d["plates"][0]["parts"][1]["filament"] = 1
+    plan = Pipeline(FakeStudio(), resolver).plan(Spec.from_json(d))
+    assert "support_filament" not in plan.assemble.plates[0].items[0].print_params
