@@ -31,11 +31,25 @@ review rubric in `REVIEW-RUBRIC.md` is what a pull request is judged against.
 
 The unit tests use synthetic boxes. Real parts found every 0.2.0 bug: a link whose STL sits at z -38 printed its
 second copy floating, a supported part next to a second-filament part had its support base printed by the right
-nozzle, a carrier's chamfer band scored as the best orientation with nothing on the bed. Keep a few real STLs in
-`data/` (gitignored, `data/README.md` says what to keep and why) and run the loop from that README on them:
-`shambu info`, `shambu orient`, `shambu sweep ... --orientations ... --by-object`. Read the sweep table and the
-Studio log of any variant that fails; the failing exit code and the G-code Studio leaves in the variant folder
-say which nozzle printed what, where.
+nozzle, a carrier's chamfer band scored as the best orientation with nothing on the bed. None of those shapes is in
+a unit test, and none would have been invented for one.
+
+So before a release, and after any change to `mesh.py`, `layout.py`, `build.py`, `sweep.py` or a recipe, run the
+CLI on actual STLs of several kinds, not one favourite part:
+
+- functional robot parts exported in an assembly frame (gripper links, brackets, motor mounts, gears): off-origin
+  STLs, copies, holes in every direction, tree supports;
+- URDF or simulation meshes in metres (SO-101, OpenArm): the metres warning and `rotate --scale 1000`;
+- Gridfinity bins, baseplates and labels: 45-degree feet and lips, thin two-colour plates, many small objects on
+  one plate (print-by-object should lose there);
+- organic forms (a character lamp, a logo duck, a funnel): dense meshes, no flat faces, supports everywhere,
+  the orientation scorer's blind spots;
+- an assembly STL with several bodies (`shambu split`) and a non-manifold mesh.
+
+Keep such files in `data/` (gitignored; `data/README.md` says what to keep and why) and run the loop from that
+README: `shambu info`, `shambu orient`, `shambu build --slice`, `shambu sweep ... --orientations ... --by-object`.
+Read the sweep table and the Studio log of any variant that fails; the failing exit code and the G-code Studio
+leaves in the variant folder say which nozzle printed what, where. A tool that only ever met cubes is not tested.
 
 ## Pull requests
 

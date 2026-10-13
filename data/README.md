@@ -5,7 +5,10 @@ ignored by git. Copy STLs here from your CAD exports (the gripper parts from the
 mesh in metres) and run the manual loop below before a release. Nothing here is committed, so sizes and
 licences do not matter.
 
-Suggested contents (what found the 0.2.0 bugs, see `skills/shambu/references/08-optimisation.md` section 9):
+Keep variety, not quantity: robot parts in an assembly frame, URDF meshes in metres, Gridfinity bins and labels,
+organic forms (lamps, figures, funnels), an assembly with several bodies, a non-manifold mesh. Each family breaks a
+different assumption. Suggested contents (what found the 0.2.0 bugs, see
+`skills/shambu/references/08-optimisation.md` section 9):
 
 - a part whose STL does not start at the origin and prints in two or more copies (`link.stl`, z -38 in its CAD
   frame): found the copy-position bug;
