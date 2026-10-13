@@ -294,7 +294,7 @@ fixed shapes:
 | Vector length | Keys (count) | Indexed by |
 |---|---|---|
 | scalar | 308 | — |
-| 1 | 30 (`filament_colour`, `filament_map`, `filament_nozzle_map`, `wipe_tower_x/y`, ...) | filament slot, but the CLI writes only 1 entry (bug, see below) |
+| 1 | 30 (`filament_colour`, `filament_map`, `filament_nozzle_map`, `wipe_tower_x/y`, ...) | filament slot, but the CLI writes only 1 entry (bug, see below). `wipe_tower_x/y` are indexed by plate, not slot: pass one value per plate (0.2.1, reference 00) |
 | 2 | 147 (`filament_settings_id`, `filament_type`, `nozzle_temperature`, `extruder_type`, `nozzle_diameter`, ...) | filament slot **or** extruder (both are 2 here) |
 | 4 | `different_settings_to_system`, `inherits_group`, `printable_area` | [process, filament 1, filament 2, printer] |
 | 6 | 65 (`outer_wall_speed`, `retraction_length`, `print_extruder_variant`, ...) | extruder variant (`print_extruder_variant` lists the 6) |

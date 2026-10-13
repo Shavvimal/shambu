@@ -343,3 +343,18 @@ def test_report_lists_effective_filaments(tmp_path, stls, resolver):
     )
     assert "prints with filament(s) 1, 2" in r.report
     json.dumps(r.to_json())
+
+
+# ---------------------------------------------------------------------------- 11. prime tower on every plate
+def test_wipe_tower_position_is_set_for_every_plate(tmp_path, stls, resolver):
+    """wipe_tower_x/y are per-plate vectors in Studio: a scalar moved the tower on plate 1 only, and every later plate
+    kept the CLI default (15, 220), inside the right nozzle's dead strip (measured: exit -102 on an 8-plate project)."""
+    fixture = make_3mf(tmp_path / "two.3mf", object_names=("body_1", "text_1"), **CHANGE_FILAMENT)
+    plates = [
+        {"name": "p", "parts": [{"path": str(stls["body"]), "name": "body"}]},
+        {"name": "q", "parts": [{"path": str(stls["text"]), "name": "text", "filament": 2}]},
+    ]
+    studio = FakeStudio(fixture)
+    Pipeline(studio, resolver).build(spec(tmp_path, plates), keep_going=True)
+    args = next(a for kind, a in studio.calls if kind == "run")
+    assert "--wipe-tower-x=208.0,208.0" in args and "--wipe-tower-y=208.0,208.0" in args

@@ -35,6 +35,8 @@ touching the real `~/Library` (reference 02).
 - Exit -63 "collision in sequential print": the print-by-object clearance and height rules (reference 08
   section 2). The tool checks them before export.
 
+**The prime tower position is a per-plate vector (0.2.1).** `wipe_tower_x` and `wipe_tower_y` hold one value per plate. Passed as a scalar on the command line, the value lands on plate 1 only and every later plate keeps the CLI default (15, 220), which sits inside the right nozzle's dead strip (x < 20.5): plate 2 of an 8-plate two-filament project failed with exit -102 "G-code in unprintable area" and, with a part in that corner, exit -101 "G-code path conflicts" (organiser build, 2026-10-13). The CLI now repeats the value once per plate, so the tower sits at (208, 208) everywhere.
+
 ## 3. Presets
 
 The CLI never resolves `inherits` or `include`. A half-resolved machine preset gives a project with the generic
