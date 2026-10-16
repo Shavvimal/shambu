@@ -8,8 +8,12 @@ JSON shape:
   "process": {"base": "0.20mm Standard @BBL X2D", "name": "PETG functional",
               "recipes": ["petg-functional"],            # named recipes from recipes.py, applied first
               "set": {"wall_loops": "6"}},               # explicit overrides, applied last
-  "filaments": [{"preset": "Bambu PETG Basic @BBL X2D 0.4 nozzle", "colour": "#000000"},
-                {"preset": "Bambu PLA Basic @BBL X2D 0.4 nozzle", "colour": "#FFFFFF"}],
+  "filaments": [{"preset": "loaded"},                 # the spool in that nozzle (left = 1, right = 2), with its colour
+                {"preset": "Bambu PLA Basic @BBL X2D 0.4 nozzle", "colour": "#FFFFFF",
+                 "colour_note": "owner wants white on the label whatever is loaded"}],
+                                            # a pinned preset must match the spool in that nozzle (check/build FAIL
+                                            # otherwise, or --allow-filament-mismatch); a pinned colour without a
+                                            # colour_note is replaced by the spool colour. Omitting "preset" = "loaded".
   "bed_type": "Textured PEI Plate",
   "filament_map": [1, 2],                   # extruder per filament slot; default slot n -> extruder n
   "aux_x_limit": 235.5,                     # optional stricter x limit for extruder 2
@@ -33,6 +37,7 @@ JSON shape:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -43,6 +48,7 @@ from .mesh import Orientation
 BED_TYPES = ("Default Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Textured PEI Plate", "Supertack Plate")
 SUBTYPES = ("normal_part", "negative_part", "modifier_part", "support_enforcer", "support_blocker")
 PRINT_SEQUENCES = ("by layer", "by object")
+COLOUR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 
 
 def _strs(d: dict | None) -> dict[str, str]:
@@ -210,12 +216,21 @@ class ProcessSpec:
     set: dict[str, str] = field(default_factory=dict)
 
 
+LOADED = "loaded"  # `preset` value meaning "whatever spool the printer holds in this nozzle"
+
+
 @dataclass(frozen=True)
 class FilamentSpec:
-    preset: str
+    preset: str = LOADED
     colour: str | None = None
     name: str | None = None
     set: dict[str, str] = field(default_factory=dict)
+    colour_note: str | None = None  # why the spec's colour stands even when the spool's colour differs
+
+    @property
+    def loaded(self) -> bool:
+        """True when the preset is left to the printer (`"loaded"`, empty or omitted)."""
+        return not self.preset or self.preset.strip().lower() == LOADED
 
 
 @dataclass(frozen=True)
@@ -259,7 +274,10 @@ class Spec:
             Path(d["outdir"]),
             str(d["printer"]),
             ProcessSpec(pr["base"], pr.get("name"), tuple(pr.get("recipes", [])), pset),
-            tuple(FilamentSpec(f["preset"], f.get("colour"), f.get("name"), _strs(f.get("set"))) for f in d["filaments"]),
+            tuple(
+                FilamentSpec(str(f.get("preset") or LOADED), f.get("colour"), f.get("name"), _strs(f.get("set")), f.get("colour_note"))
+                for f in d["filaments"]
+            ),
             tuple(PlateSpec.from_json(p, i, recipe_sets) for i, p in enumerate(d["plates"], 1)),
             d.get("bed_type", "Textured PEI Plate"),
             tuple(int(x) for x in d["filament_map"]) if d.get("filament_map") else None,
@@ -278,7 +296,16 @@ class Spec:
                 "recipes": list(self.process.recipes),
                 "set": dict(self.process.set),
             },
-            "filaments": [{"preset": f.preset, "colour": f.colour, "name": f.name, "set": dict(f.set)} for f in self.filaments],
+            "filaments": [
+                {
+                    "preset": f.preset,
+                    "colour": f.colour,
+                    "name": f.name,
+                    "set": dict(f.set),
+                    **({"colour_note": f.colour_note} if f.colour_note else {}),
+                }
+                for f in self.filaments
+            ],
             "bed_type": self.bed_type,
             "layout": {"gap": self.layout.gap, "edge": self.layout.edge},
             "plates": [p.to_json() for p in self.plates],
@@ -298,6 +325,9 @@ class Spec:
             errs.append(f"bed_type {self.bed_type!r} not in {BED_TYPES}")
         if not self.filaments:
             errs.append("at least one filament")
+        for i, fs in enumerate(self.filaments, 1):
+            if fs.colour is not None and not COLOUR_RE.fullmatch(fs.colour):
+                errs.append(f"filament {i}: colour {fs.colour!r} is not #RRGGBB")
         if not self.plates:
             errs.append("at least one plate")
         n = len(self.filaments)

@@ -295,6 +295,8 @@ class VariantResult:
     problems: list[str] = field(default_factory=list)
     report: str = ""
     orientation: dict | None = None
+    warnings: list[str] = field(default_factory=list)  # the build's warnings (the printer fallback WARNING among them)
+    filaments: str | None = None  # the build's `Filaments:` headline: where each preset came from
 
     @property
     def total_s(self) -> int:
@@ -371,6 +373,8 @@ class VariantResult:
             "feature_times_s": {k: round(v, 1) for k in TIME_ROLES if (v := self.feature_time(k)) is not None},
             "plates": self.plates,
             "problems": self.problems,
+            "warnings": self.warnings,
+            "filaments": self.filaments,
             "report": self.report,
             **({"orientation": self.orientation} if self.orientation else {}),
         }
@@ -417,7 +421,16 @@ def run(spec_json: dict, variants: Sequence[dict], build: Builder, *, do_slice: 
         ]
         out.append(
             VariantResult(
-                v["name"], bool(j.get("ok")), j.get("project", ""), do_slice, plates, problems, j.get("report") or "", v.get("orientation")
+                v["name"],
+                bool(j.get("ok")),
+                j.get("project", ""),
+                do_slice,
+                plates,
+                problems,
+                j.get("report") or "",
+                v.get("orientation"),
+                list(j.get("warnings") or []),
+                (j.get("filaments") or {}).get("headline"),
             )
         )
     return out
@@ -438,9 +451,11 @@ def table(results: Sequence[VariantResult]) -> list[str]:
     rest = [r for r in results if not (r.ok and r.plates)]
     best = ok[0] if ok else None
     mins = "".join(f" {h:>10}" for h in _TIME_HEADS)
-    lines = [
+    lines = list(dict.fromkeys(w for r in results for w in r.warnings if w.startswith("WARNING")))  # the printer fallback, once
+    lines += list(dict.fromkeys(r.filaments for r in results if r.filaments))  # the filament sources (one line when all agree)
+    lines.append(
         f"{'variant':34s} {'time':>7} {'grams':>7} {'vs best':>8} {'support':>8} {'waste':>6} {'swaps':>5}{mins}  filament grams per slot / problems"
-    ]
+    )
     for r in ok:
         delta = f"+{_hms(60 * (_mins(r.total_s) - _mins(best.total_s)))}" if best and r is not best else ("best" if best else "")
         fil = ", ".join(f"{f['id']}:{f['used_g']:.0f}" for p in r.plates for f in p["filaments"])

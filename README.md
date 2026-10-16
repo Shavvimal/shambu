@@ -79,7 +79,7 @@ shambu build  plate.json         # + export with Studio's CLI, patch, verify, wr
 shambu build  plate.json --slice # also slice headless: <name>.gcode.3mf with time and filament estimates
 ```
 
-A spec names the printer preset, a process preset with recipes and overrides, the filaments with colours, and the
+A spec names the printer preset, a process preset with recipes and overrides, the filaments (`"loaded"` takes the spool in that nozzle) and the
 plates with their parts (a file with filament, count, recipes, settings, height ranges, optional fixed position; or
 several files merged into one object). `build` writes `<outdir>/<name>.3mf`, `<name>.report.md`, `<name>.log` and
 the CLI inputs under `<outdir>/shambu/`.
@@ -107,9 +107,15 @@ shambu patch project.3mf --bed-type "Textured PEI Plate" --colours "#1A1A1A,#F0F
 **4. Read the printer (read-only).**
 
 ```
+shambu printer filaments [--ip <printer-ip>]   # the spool in each nozzle and slot, with the preset it resolves to
 shambu printer status [--ip <printer-ip>]
 shambu printer watch --every 300          # until the printer leaves RUNNING/PAUSE
 ```
+
+`check` and `build` read the same report before resolving a spec: a filament written as `{"preset": "loaded"}` takes
+the spool in that nozzle with its colour, and a pinned preset that is not loaded fails the check (exit 1) unless
+`--allow-filament-mismatch`. With the printer unreachable the report starts with a WARNING and the GUI's last-used
+presets stand in.
 
 Add `--json` to any command for machine-readable output (`printer watch --json` prints one document per poll).
 Exit codes: 0 ok, 1 a check or verification failed, 2 usage, 3 environment (binary, config, printer).

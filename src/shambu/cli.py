@@ -119,10 +119,51 @@ def _default_lines(data) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- commands
-@command("doctor", "Check the Studio install, profiles, config and the X2D machine facts")
+def _printer_flags(p: argparse.ArgumentParser) -> None:
+    """The printer read that check, build, sweep and doctor make before resolving a spec's filaments."""
+    p.add_argument("--no-printer", action="store_true", help='do not read the printer; take the GUI presets for "loaded" filaments (WARN)')
+    p.add_argument("--ip", dest="printer_ip", help="the printer's IP when LAN discovery does not find it")
+
+
+def _mismatch_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--allow-filament-mismatch",
+        action="store_true",
+        help="keep a pinned filament preset that differs from the spool in that nozzle (otherwise a FAIL); the report records it",
+    )
+
+
+def printer_lines(d: dict, config: dict) -> list[str]:
+    """Doctor's 'loaded on the printer' section next to the GUI presets, with a MISMATCH line per differing slot."""
+    if "error" in d:
+        return [f"loaded on the printer: not read ({d['error']})"]
+    lines = [f"loaded on the printer (read {d['read_at']}, presets for {d.get('printer_preset')}):"]
+    gui = list(config.get("gui_filament_presets") or [])
+    for z in d["nozzles"]:
+        t = z["tray"]
+        if t is None:
+            lines.append(f"  nozzle {z['nozzle']} ({z['name']}): nothing loaded")
+            continue
+        lines.append(
+            f"  nozzle {z['nozzle']} ({z['name']}): {t['label']}: {t['material'] or '?'} {t['colour'] or ''} ({t['preset_id'] or 'no id'}) "
+            f"-> {t['preset'] or 'no installed preset matches'}"
+        )
+        g = gui[z["nozzle"] - 1] if z["nozzle"] - 1 < len(gui) else None
+        if t["preset"] and g and g != t["preset"]:
+            lines.append(
+                f"  MISMATCH: the GUI's last-used filament {z['nozzle']} is '{g}', the spool in nozzle {z['nozzle']} is '{t['preset']}'"
+            )
+    return lines
+
+
+@command("doctor", "Check the Studio install, profiles, config, the X2D machine facts and the spools loaded on the printer")
 class Doctor(Command):
+    def configure(self, p):
+        _printer_flags(p)
+
     def run(self, a, app, out):
-        d = app.doctor()
+        app.printer_ip = a.printer_ip
+        d = app.doctor(printer=not a.no_printer)
         lines = [
             f"Bambu Studio {d['studio']['version']} at {d['studio']['binary']} (running pids: {d['studio']['running_pids'] or 'none'})",
             "profile sources: " + "; ".join(d["profiles"]),
@@ -143,6 +184,7 @@ class Doctor(Command):
                 lines.append(
                     f"  extruder {e['index']} ({e['type']}, {e['nozzle']} mm): x {e['x'][0]}..{e['x'][1]}, z up to {e['z_max']:.0f}"
                 )
+        lines += printer_lines(d.get("printer", {}), c)
         lines.append("recipes: " + ", ".join(d["recipes"]))
         out.emit(d, lines)
         return 0
@@ -475,9 +517,13 @@ class Sweep(Command):
         p.add_argument("--no-slice", action="store_true", help="only plan and export; no time or filament numbers")
         p.add_argument("--no-baseline", action="store_true")
         p.add_argument("--timeout", type=int, default=1200)
+        _printer_flags(p)
+        _mismatch_flag(p)
 
     def run(self, a, app, out):
         from . import sweep as S
+
+        app.printer_ip = a.printer_ip
 
         try:  # a bad spec, variant file or part key is a failed check (exit 1), not an environment error
             try:
@@ -504,7 +550,9 @@ class Sweep(Command):
         results = S.run(
             spec_json,
             variants,
-            lambda spec, do_slice: app.build(spec, timeout=a.timeout, do_slice=do_slice),
+            lambda spec, do_slice: app.build(
+                spec, timeout=a.timeout, do_slice=do_slice, printer=not a.no_printer, allow_filament_mismatch=a.allow_filament_mismatch
+            ),
             do_slice=not a.no_slice,
             baseline=not a.no_baseline,
         )
@@ -512,21 +560,24 @@ class Sweep(Command):
         return 0 if all(r.ok for r in results) else 1  # one failed variant is a failed check (exit 1), as for `build`
 
 
-@command("check", "Plan a spec: resolve presets, measure STLs, place parts, check limits. No export.")
+@command("check", "Plan a spec: read the printer's spools, resolve presets, measure STLs, place parts, check limits. No export.")
 class Check(Command):
     def configure(self, p):
         p.add_argument("spec")
+        _printer_flags(p)
+        _mismatch_flag(p)
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.spec, out)
         if isinstance(spec, int):
             return spec
-        r = app.build(spec, export=False)
+        app.printer_ip = a.printer_ip
+        r = app.build(spec, export=False, printer=not a.no_printer, allow_filament_mismatch=a.allow_filament_mismatch)
         out.emit(r.to_json(), r.report.splitlines())
         return 0 if r.plan.ok else 1
 
 
-@command("build", "Plan, export the .3mf with Studio's CLI, patch it, verify it, write the report")
+@command("build", "Read the printer's spools, plan, export the .3mf with Studio's CLI, patch it, verify it, write the report")
 class Build(Command):
     def configure(self, p):
         p.add_argument("spec")
@@ -536,13 +587,23 @@ class Build(Command):
         p.add_argument(
             "--slice", action="store_true", help="also slice headless: writes <name>.gcode.3mf with G-code and time/filament estimates"
         )
+        _printer_flags(p)
+        _mismatch_flag(p)
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.spec, out)
         if isinstance(spec, int):
             return spec
         app.listeners.append(lambda ev, d: log.info("%s %s", ev, {k: v for k, v in d.items() if k != "argv"}))
-        r = app.build(spec, timeout=a.timeout, keep_going=a.keep_going, do_slice=a.slice)
+        app.printer_ip = a.printer_ip
+        r = app.build(
+            spec,
+            timeout=a.timeout,
+            keep_going=a.keep_going,
+            do_slice=a.slice,
+            printer=not a.no_printer,
+            allow_filament_mismatch=a.allow_filament_mismatch,
+        )
         out.emit(r.to_json(), r.report.splitlines())
         if a.open and r.run and r.run.ok:
             app.open_in_studio(r.project)
@@ -691,15 +752,16 @@ class Open(Command):
         return 0
 
 
-@command("printer", "Read the printer over LAN MQTT (read-only): status | watch | discover | raw")
+@command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw")
 class Printer(Command):
     def configure(self, p):
-        p.add_argument("action", choices=("status", "watch", "discover", "raw"))
+        p.add_argument("action", choices=("status", "filaments", "watch", "discover", "raw"))
         p.add_argument("--ip")
         p.add_argument("--serial")
         p.add_argument("--wait", type=float, default=8.0)
         p.add_argument("--every", type=int, default=300, help="watch interval in seconds")
         p.add_argument("--ssdp", type=float, default=0, help="discover: also listen for SSDP this many seconds")
+        p.add_argument("--printer-preset", help="filaments: the machine preset to name presets for (default: the GUI's current one)")
         p.add_argument(
             "--insecure",
             action="store_true",
@@ -724,6 +786,10 @@ class Printer(Command):
         if a.action == "status":
             st = svc.status()
             out.emit(st.to_json(), st.lines())
+            return 0
+        if a.action == "filaments":
+            lf = svc.filaments(app.presets(), a.printer_preset or app.gui_machine_preset())
+            out.emit(lf.to_json(), lf.lines())
             return 0
         for st in svc.watch(a.every):
             out.emit(st.to_json(), st.lines() + [""])

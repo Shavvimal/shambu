@@ -104,12 +104,17 @@ def render(r: BuildResult) -> str:
     out.append(
         f"Printer `{pl.machine['name']}`; process `{pl.process['name']}` (from `{pl.process.get('inherits', pl.process['name'])}`); bed {spec.bed_type}."
     )
+    res = pl.filament_resolution
+    if res is not None:
+        out.append(res.headline + ".")
     for i, f in enumerate(pl.filaments, 1):
         col = spec.filaments[i - 1].colour or "colour unset"
         ext = pl.filament_map[i - 1]
         ftype = (f.get("filament_type") or ["?"])[0]
+        src = next((s for s in (res.sources if res else []) if s.slot == i), None)
         out.append(
             f"Filament {i}: `{f['name']}` ({ftype}), {col}, extruder {ext} ({pl.facts['extruders'][ext - 1]['type']})."
+            + (f" Source: {src.text}." if src else "")
             + (" Dry it before printing." if ftype.upper() not in ("PLA",) else "")
         )
     if spec.process.recipes:

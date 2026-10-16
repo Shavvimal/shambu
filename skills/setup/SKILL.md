@@ -42,22 +42,27 @@ shambu doctor
 
 Expected: the Bambu Studio version and binary, the profile sources (Application Support copy first, then the app
 bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is stored
-(the code itself is never printed), the machine's bed and per-extruder reach, and the recipe list. Then:
+(the code itself is never printed), the machine's bed and per-extruder reach, the spools loaded on the printer
+(`loaded on the printer (read HH:MM ...)`, one line per nozzle with the resolved preset name, and a `MISMATCH`
+line when the GUI's last-used filament differs), and the recipe list. `loaded on the printer: not read (...)`
+means the printer was not reachable: pass `--ip <printer-ip>` or check it is on. Then:
 
 ```
 shambu presets list filament --printer "<the machine preset doctor printed>" | head
 shambu recipes
 ```
 
-## 4. Optional: printer status (read-only)
+## 4. Printer read (read-only)
 
 ```
+shambu printer filaments
 shambu printer status
 ```
 
 shambu reads the printer's serial and LAN access code from Bambu Studio's own configuration, finds the printer on
-the LAN, and asks for one status report over MQTT with TLS verified against Bambu's certificate authority. It
-never sends a print command. If the printer is not found, pass `--ip <printer-ip>`. If TLS verification fails
+the LAN, and asks for one status report over MQTT with TLS verified against Bambu's certificate authority.
+`filaments` lists the spool in each nozzle with its resolved preset name; `check` and `build` read the same
+report before every build, so this step confirms the read works. It never sends a print command. If the printer is not found, pass `--ip <printer-ip>`. If TLS verification fails
 on your firmware, `--insecure` skips it; say so to the user because the access code then travels to an unverified
 endpoint.
 

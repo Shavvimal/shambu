@@ -22,6 +22,7 @@ from . import mesh as M
 from . import presets as P
 from . import recipes as R
 from .errors import BambuError, BuildError
+from .loaded import FilamentResolution
 from .patches import AddCustomGcode, PatchSet, RenameObject, SetBedTypeEverywhere, SetFilamentColours, SetFilamentMap
 from .spec import FileRef, LayoutSpec, PartSpec, Spec
 from .studio import CliCommand, MeshInfo, OrientResult, RunResult, SlicedPlate, StudioCLI
@@ -43,6 +44,7 @@ FILAMENT_KEYS = (
     "support_interface_filament",
 )
 PRINTING_SUBTYPES = ("normal_part", "modifier_part")  # sub-parts whose filament reaches the nozzle
+UNRESOLVED_FILAMENT = "loaded (unresolved)"  # placeholder preset name for a "loaded" slot the printer did not fill
 FileRefs = Sequence[tuple[Path, int, str]]
 
 
@@ -173,10 +175,16 @@ class Plan:
     assemble: A.AssembleList
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    filament_resolution: FilamentResolution | None = None  # how each filament was chosen: the printer, the GUI or the spec
 
     @property
     def ok(self) -> bool:
         return not self.problems and all(c.ok for p in self.plates for c in p.checks)
+
+    @property
+    def unresolved_filaments(self) -> list[int]:
+        """Slots still at the `"loaded"` placeholder: nothing to export for them, whatever `--keep-going` says."""
+        return [i for i, f in enumerate(self.filaments, 1) if f.get("name") == UNRESOLVED_FILAMENT]
 
     @property
     def map_applies(self) -> bool:
@@ -297,6 +305,7 @@ class BuildResult:
             "estimates": self.estimates(),
             "problems": problems,
             "warnings": list(dict.fromkeys(self.plan.warnings + self.slicer_warnings())),
+            "filaments": self.plan.filament_resolution.to_json() if self.plan.filament_resolution else None,
             "plates": [
                 {
                     "name": p.name,
@@ -355,14 +364,25 @@ class Pipeline:
 
     # ---------------------------------------------------------------- the template
     def build(
-        self, spec: Spec, *, export: bool = True, timeout: int = 1200, keep_going: bool = False, do_slice: bool = False
+        self,
+        spec: Spec,
+        *,
+        export: bool = True,
+        timeout: int = 1200,
+        keep_going: bool = False,
+        do_slice: bool = False,
+        filaments: FilamentResolution | None = None,
     ) -> BuildResult:
+        """`filaments` is the spec reconciled with the printer (loaded.reconcile): its spec replaces `spec`, and its
+        problems and warnings lead the plan's. Without it a `"loaded"` filament is a problem."""
+        if filaments is not None:
+            spec = filaments.spec
         self.emit("plan", name=spec.name)
-        plan = self.plan(spec)
+        plan = self.plan(spec, filaments)
         result = BuildResult(plan, plan.outdir / (f"{spec.name}.gcode.3mf" if do_slice else f"{spec.name}.3mf"), sliced=do_slice)
         result.inputs = self.write_inputs(plan)
         self.emit("planned", ok=plan.ok, problems=plan.problems)
-        if plan.ok or keep_going:
+        if plan.ok or (keep_going and not plan.unresolved_filaments):  # a placeholder filament can never export
             if export:
                 result.run = self.export(plan, result.inputs, result.project, timeout, do_slice)
                 if result.run.ok:
@@ -376,15 +396,29 @@ class Pipeline:
         return result
 
     # ---------------------------------------------------------------- steps
-    def plan(self, spec: Spec) -> Plan:
+    def plan(self, spec: Spec, resolution: FilamentResolution | None = None) -> Plan:
         outdir = spec.outdir.expanduser().resolve()
         workdir = outdir / "shambu"
         workdir.mkdir(parents=True, exist_ok=True)
-        problems: list[str] = list(spec.validate())
-        warnings: list[str] = []
+        problems: list[str] = list(resolution.problems) if resolution else []
+        warnings: list[str] = list(resolution.warnings) if resolution else []
+        problems += spec.validate()
         machine = self.resolver.for_cli("machine", spec.printer)
         process = self.resolver.for_cli("process", spec.process.base, spec.process.set, spec.process.name)
-        filaments = [self.resolver.for_cli("filament", f.preset, f.set, f.name) for f in spec.filaments]
+        filaments: list[dict] = []
+        for i, fspec in enumerate(spec.filaments, 1):
+            if fspec.loaded:
+                # Left to the printer but never resolved (no reconcile ran, or it found nothing to load): a placeholder
+                # keeps the placement checks running; the problem keeps the plan from exporting.
+                if resolution is None:
+                    problems.append(
+                        f'filament {i}: preset "loaded" was not resolved against the printer (`shambu check` and `build` read it)'
+                    )
+                filaments.append(
+                    {"name": "loaded (unresolved)", "type": "filament", "from": "system", "filament_type": ["?"], "compatible_printers": []}
+                )
+            else:
+                filaments.append(self.resolver.for_cli("filament", fspec.preset, fspec.set, fspec.name))
         for i, (f, fs) in enumerate(zip(filaments, spec.filaments, strict=True)):
             # Without a colour per filament the CLI leaves the flush matrix 1 x 1 and headless slicing segfaults
             # (FilamentGroup::calc_one_change_budget). The colour also shows in Studio.
@@ -565,7 +599,7 @@ class Pipeline:
             plates.append(PlannedPlate(plate.name, parts, checks, seq))
         warnings += self._name_objects([x for p in plates for x in p.parts])
         problems += A.validate(alist.to_json(), known_keys=known, filament_count=len(filaments))
-        return Plan(spec, outdir, workdir, machine, process, filaments, facts, fmap, plates, alist, problems, warnings)
+        return Plan(spec, outdir, workdir, machine, process, filaments, facts, fmap, plates, alist, problems, warnings, resolution)
 
     def _measure(
         self,

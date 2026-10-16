@@ -181,6 +181,30 @@ class PresetResolver:
             )
         return sorted(out, key=lambda e: e["name"])
 
+    def find_by_filament_id(self, filament_id: str, printer: str | None = None) -> str | None:
+        """The installed filament preset whose flattened `filament_id` equals a tray's `tray_info_idx` (GFG99 -> 'Generic
+        PETG @BBL X2D 0.4 nozzle' for the X2D 0.4 machine). System presets win over user ones, then the shortest name.
+        None when nothing matches. About 80 presets per machine, under 0.1 s."""
+        if not filament_id:
+            return None
+        found: list[tuple[bool, int, str]] = []
+        for e in self.list("filament", printer=printer):
+            try:
+                d = self.resolve("filament", e["name"])
+            except PresetError:
+                continue
+            if str(d.get("filament_id", "")) == filament_id:
+                found.append((e["from"] != "system", len(e["name"]), e["name"]))
+        return min(found)[2] if found else None
+
+    def generic_for_material(self, material: str, printer: str | None = None) -> str | None:
+        """'Generic <material> @...' for a spool without a usable preset id (an untagged spool chosen by hand)."""
+        if not material:
+            return None
+        prefix = f"generic {material.lower()} @"
+        names = [e["name"] for e in self.list("filament", printer=printer) if e["name"].lower().startswith(prefix)]
+        return min(names, key=len) if names else None
+
 
 def write(preset: dict, path: str | Path) -> Path:
     path = Path(path)

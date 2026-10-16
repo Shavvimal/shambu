@@ -1,0 +1,162 @@
+{
+ "_tls_verified": true,
+ "_topic": "device/00X0TEST0000999/report",
+ "print": {
+  "ams": {
+   "ams": [],
+   "ams_exist_bits": "0",
+   "ams_exist_bits_raw": "0",
+   "cali_id": 255,
+   "cali_stat": 0,
+   "insert_flag": true,
+   "power_on_flag": false,
+   "tray_exist_bits": "0",
+   "tray_is_bbl_bits": "0",
+   "tray_now": "0",
+   "tray_pre": "0",
+   "tray_read_done_bits": "0",
+   "tray_reading_bits": "0",
+   "tray_tar": "255",
+   "unbind_ams_stat": 0,
+   "version": 25
+  },
+  "ams_rfid_status": 0,
+  "ams_status": 0,
+  "bed_target_temper": 0.0,
+  "bed_temper": 70.0,
+  "command": "push_status",
+  "device": {
+   "bed": {
+    "info": {
+     "temp": 70
+    },
+    "state": 0
+   },
+   "ctc": {
+    "info": {
+     "temp": 33
+    },
+    "state": 0
+   },
+   "extruder": {
+    "info": [
+     {
+      "filam_bak": [],
+      "hnow": 0,
+      "hpre": 0,
+      "htar": 0,
+      "id": 0,
+      "info": 414,
+      "snow": 65280,
+      "spre": 65535,
+      "star": 65535,
+      "stat": 196608,
+      "temp": 47
+     },
+     {
+      "filam_bak": [],
+      "hnow": 1,
+      "hpre": 1,
+      "htar": 1,
+      "id": 1,
+      "info": 79,
+      "snow": 65024,
+      "spre": 65024,
+      "star": 65024,
+      "stat": 196608,
+      "temp": 16711935
+     }
+    ],
+    "state": 33042
+   },
+   "nozzle": {
+    "exist": 3,
+    "info": [
+     {
+      "diameter": 0.4,
+      "id": 0,
+      "tm": 0,
+      "type": "HS01",
+      "wear": 0
+     },
+     {
+      "diameter": 0.4,
+      "id": 1,
+      "tm": 0,
+      "type": "HS01",
+      "wear": 0
+     }
+    ],
+    "state": 0
+   }
+  },
+  "gcode_state": "RUNNING",
+  "hms": [],
+  "layer_num": 287,
+  "mapping": [
+   65024
+  ],
+  "mc_percent": 99,
+  "mc_remaining_time": 0,
+  "nozzle_diameter": "0.4",
+  "nozzle_target_temper": 255.0,
+  "nozzle_temper": 255.0,
+  "nozzle_type": "HS01",
+  "sequence_id": "2021",
+  "total_layer_num": 287,
+  "vir_slot": [
+   {
+    "bed_temp": "0",
+    "bed_temp_type": "0",
+    "cali_idx": -1,
+    "cols": [
+     "FFFFFFFF"
+    ],
+    "ctype": 2,
+    "drying_temp": "0",
+    "drying_time": "0",
+    "id": "254",
+    "nozzle_temp_max": "270",
+    "nozzle_temp_min": "220",
+    "remain": 0,
+    "tag_uid": "0000000000000000",
+    "total_len": 330000,
+    "tray_color": "FFFFFFFF",
+    "tray_diameter": "1.75",
+    "tray_id_name": "",
+    "tray_info_idx": "GFG99",
+    "tray_sub_brands": "",
+    "tray_type": "PETG",
+    "tray_uuid": "00000000000000000000000000000000",
+    "tray_weight": "0",
+    "xcam_info": "000000000000000000000000"
+   },
+   {
+    "bed_temp": "0",
+    "bed_temp_type": "0",
+    "cali_idx": -1,
+    "cols": [
+     "2850E0FF"
+    ],
+    "ctype": 2,
+    "drying_temp": "0",
+    "drying_time": "0",
+    "id": "255",
+    "nozzle_temp_max": "270",
+    "nozzle_temp_min": "230",
+    "remain": 0,
+    "tag_uid": "0000000000000000",
+    "total_len": 330000,
+    "tray_color": "2850E0FF",
+    "tray_diameter": "1.75",
+    "tray_id_name": "",
+    "tray_info_idx": "GFG00",
+    "tray_sub_brands": "",
+    "tray_type": "PETG",
+    "tray_uuid": "00000000000000000000000000000000",
+    "tray_weight": "0",
+    "xcam_info": "000000000000000000000000"
+   }
+  ]
+ }
+}

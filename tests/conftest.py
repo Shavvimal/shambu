@@ -12,8 +12,27 @@ from pathlib import Path
 
 import pytest
 
+from shambu import conf
 from shambu import presets as P
+from shambu.errors import PrinterError
+from shambu.facade import Bambu
 from shambu.studio import BINARY, CliCommand, MeshInfo, OrientCandidate, OrientResult, OrientTable, RunResult
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def offline(monkeypatch, tmp_path_factory):
+    """No test touches the LAN or this Mac's Bambu Studio config: the facade's printer read fails as an unreachable
+    printer does (the WARN fallback), and BambuStudio.conf is absent. A test that wants a report or a config
+    monkeypatches `Bambu.loaded_filaments` or `conf.CONF` again on top of this."""
+
+    def unreachable(self, *a, **k):
+        raise PrinterError("no printer in tests")
+
+    monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
+    monkeypatch.setattr(conf, "CONF", tmp_path_factory.mktemp("conf") / "no-such-BambuStudio.conf")
+
 
 MACHINE = "Test X2D 0.4 nozzle"
 PROCESS = "0.20mm Test"
@@ -241,13 +260,45 @@ def write_profiles(root: Path) -> Path:
         "0.20mm Wrong",
         {"from": "system", "instantiation": "true", "inherits": "fdm_process_common", "compatible_printers": ["Some Other Printer"]},
     )
-    # filament
+    # filament. `filament_id` is what a tray's `tray_info_idx` names (GFA00 Bambu PLA Basic, GFG00 Bambu PETG Basic,
+    # GFG99 Generic PETG); the X2D-specific presets inherit it from the @base one, as the real tree does.
     _w(root, "filament", "fdm_filament_common", {"from": "system", "instantiation": "false", "filament_type": ["PLA"]})
     _w(
         root,
         "filament",
         "Test PLA",
-        {"from": "system", "instantiation": "true", "inherits": "fdm_filament_common", "compatible_printers": [MACHINE]},
+        {
+            "from": "system",
+            "instantiation": "true",
+            "inherits": "fdm_filament_common",
+            "compatible_printers": [MACHINE],
+            "filament_id": "GFA00",
+        },
+    )
+    _w(
+        root,
+        "filament",
+        "Generic PETG @base",
+        {"from": "system", "instantiation": "false", "inherits": "fdm_filament_common", "filament_type": ["PETG"], "filament_id": "GFG99"},
+    )
+    _w(
+        root,
+        "filament",
+        "Generic PETG @Test X2D",
+        {"from": "system", "instantiation": "true", "inherits": "Generic PETG @base", "compatible_printers": [MACHINE]},
+    )
+    _w(
+        root,
+        "filament",
+        "Test PETG Basic",
+        {
+            "from": "system",
+            "instantiation": "true",
+            "inherits": "fdm_filament_common",
+            "filament_type": ["PETG"],
+            "filament_id": "GFG00",
+            "compatible_printers": [MACHINE],
+        },
     )
     _w(
         root,
