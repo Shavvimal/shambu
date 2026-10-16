@@ -167,7 +167,7 @@ def test_help_exit_0(capsys):
 def test_presets_list_json(capsys):
     code, out, _ = run(capsys, "--json", "presets", "list", "filament", "--printer", "Test X2D 0.4 nozzle")
     assert code == 0
-    assert [r["name"] for r in one_json(out)] == ["Test PLA", "Test TPU"]
+    assert [r["name"] for r in one_json(out)] == ["Generic PETG @Test X2D", "Test PETG Basic", "Test PLA", "Test TPU"]
 
 
 def test_recipes_work_without_studio_binary(capsys, monkeypatch):
@@ -185,7 +185,7 @@ def test_json_flag_after_the_subcommand(capsys):
         code, out, _ = run(capsys, *argv)
         assert code == 0 and [r["name"] for r in one_json(out)] == [r.name for r in recipes.RECIPES]
     code, out, _ = run(capsys, "presets", "list", "--json", "filament", "--printer", "Test X2D 0.4 nozzle")
-    assert code == 0 and [r["name"] for r in one_json(out)] == ["Test PLA", "Test TPU"]
+    assert code == 0 and [r["name"] for r in one_json(out)] == ["Generic PETG @Test X2D", "Test PETG Basic", "Test PLA", "Test TPU"]
     assert cli.build_parser().parse_args(["recipes"]).json is False  # the subcommand flag never resets the default
 
 

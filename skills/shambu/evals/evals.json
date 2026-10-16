@@ -7,14 +7,15 @@
       "expected_output": "A spec file with two filaments, print_sequence 'by object' and group_by_filament, built with `shambu build plate.json --slice` after `shambu check` reads OK. The reply uses the hand-back template: project path, sliced status, per-plate time and grams with the filament-change count, one line per object with its filament, and both standing warnings.",
       "files": [],
       "expectations": [
-        "Runs `shambu doctor --json` before it writes the spec",
-        "Writes a plate.json spec with two entries in `filaments`: a PETG preset first and a PLA preset second",
+        "Runs `shambu doctor --json` before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
+        "Writes a plate.json spec with two entries in `filaments`, each `{\"preset\": \"loaded\"}` (the PETG spool on the left nozzle is filament 1, the PLA spool on the right is filament 2), or pins the presets the printer reports and no others",
         "Assigns jaw.stl to filament 1 with count 2, and label.stl to filament 2",
         "Sets `print_sequence` to \"by object\" on the plate, and sets `group_by_filament`",
         "Sets `bed_type` to \"Textured PEI Plate\"",
         "Runs `shambu check plate.json` and gets every line to OK before it builds",
         "Runs `shambu build plate.json --slice` (not `BambuStudio` directly)",
         "Does not hand-assemble BambuStudio command-line flags",
+        "Hands back a `Filaments:` line that says the presets came from the printer at HH:MM (or that the printer was not read and the owner must confirm the spools by eye)",
         "Hands back using the template: a Project line with sliced status, a Plate line with time, grams and filament changes, and one line per object",
         "Includes both standing warnings: the first print of a new fit is a coupon in the same orientation, and holes print undersize (about 0.1 mm vertical, 0.2 to 0.3 mm horizontal)",
         "Quotes time and gram numbers from the report or the build output, and does not invent them"

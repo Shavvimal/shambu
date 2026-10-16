@@ -91,12 +91,37 @@ toolbar; Shift Cmd G is Print plate, so the tool never sends keystrokes. The onl
 ## 8. The printer (read-only)
 
 `shambu printer status` reads `BambuStudio.conf` for the selected serial and its LAN access code, finds the
-printer by probing the ARP hosts on TCP 8883 (or `--ip`), connects with TLS (Bambu's bundled CA, then unverified
-as a fallback), subscribes to `device/<serial>/report`, publishes one `pushall`, and prints state, percent,
-layer, remaining time and end time, both nozzles (id 1 = main left, id 0 = auxiliary right), bed and chamber,
-HMS codes with the offline text from Studio's `hms_en_20P.json`. `watch` polls until the state leaves
-RUNNING/PAUSE (the state after a finished print is FINISH). The access code never leaves memory. Nothing but
-`pushall` is ever published; starting, pausing or stopping stays with the user.
+printer by probing the ARP hosts on TCP 8883 (or `--ip`), connects with TLS verified against Bambu's bundled CA
+and the serial (no unverified fallback; `--insecure` turns verification off on request), subscribes to
+`device/<serial>/report`, publishes one `pushall`, and prints state, percent, layer, remaining time and end time,
+both nozzles (id 1 = main left, id 0 = auxiliary right), bed and chamber, HMS codes with the offline text from
+Studio's `hms_en_20P.json`. `watch` polls until the state leaves RUNNING/PAUSE (the state after a finished print
+is FINISH). The access code never leaves memory. Nothing but `pushall` is ever published; starting, pausing or
+stopping stays with the user.
+
+Loaded filament (`shambu printer filaments`, and what `doctor`, `check` and `build` read; live X2D capture
+2026-10-16 in `tests/fixtures/x2d_pushall_two_external_spools.json`): the same `pushall` carries the spools.
+The X2D reports its two external spools as `print.vir_slot[]` with ids "254" and "255" and no `vt_tray`; each
+extruder's `snow` in `print.device.extruder.info[]` packs the tray it holds as (ams id << 8) | slot, 0xFFFF for
+none, and the capture showed the left extruder (id 1) at 0xFE00 = 254 and the right one (id 0) at 0xFF00 = 255.
+So 254 is the left external spool and 255 the right one. AMS slots are `print.ams.ams[].tray[]`. Every tray
+carries `tray_type` (material), `tray_color` (RRGGBBAA), `tray_info_idx` (Bambu's filament id: GFG99 Generic
+PETG, GFG00 Bambu PETG Basic, GFA00 Bambu PLA Basic), `tray_sub_brands`, `remain` and `k`. The installed
+filament presets carry the same id as `filament_id` (inherited from the `@base` preset), so a tray resolves to
+the exact preset name for the machine preset in use (GFG99 + `Bambu Lab X2D 0.4 nozzle` -> `Generic PETG @BBL
+X2D 0.4 nozzle`); the Generic spool chosen by hand in Studio did carry its id. A tray without an id falls back
+to the Generic preset of its material. Single-nozzle firmware reports one external spool as `vt_tray` and the
+loaded slot as `ams.tray_now` (254 = external, 255 = none, else ams * 4 + slot).
+
+Why this matters (`docs/errors/2026-10-16-loaded-filament-not-used.md`): a spec written for one spool passed
+every check after the spool changed, Studio offered a swap on open, and the swap reset the process to the stock
+preset without a word (5 h 08 against 6 h 34 for the same part). `check` and `build` now read the trays before
+resolving the spec: `"preset": "loaded"` takes the spool (an unloaded nozzle is a problem that names the fitted
+spool, never a guess), a pinned preset that differs or cannot be compared is a FAIL unless
+`--allow-filament-mismatch` (which keeps the colour rule), a pinned colour gives way to the spool colour unless the
+spec has a `colour_note`, the nozzle compared follows `filament_map` and the machine preset's extruder count, and
+with the printer unreachable the GUI presets stand in after a WARNING on the first lines of the report, with the
+project's filaments marked unverified.
 
 Pitfalls: Studio holds UDP 2021 (SSDP) while it runs, so discovery probes 8883 instead (`printer discover
 --ssdp 10` listens with SO_REUSEPORT when needed). Newer firmware may need LAN-only mode for third-party MQTT;

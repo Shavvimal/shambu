@@ -1,6 +1,6 @@
 ---
 name: shambu
-description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It places parts, sets the process, filaments, brims, supports and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It also compares orientation and print-sequence variants, inspects and patches existing .3mf or .gcode.3mf files, and reads a Bambu Lab printer's progress over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a print time or filament estimate, wants to change settings in a 3MF, or asks how far the print is, even if Bambu Studio is not named. Not for designing parts (use a CAD skill), mesh repair, or starting, pausing or sending prints.
+description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It reads which spools the printer holds and uses them as the project's filaments, places parts, sets the process, brims, supports and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It also compares orientation and print-sequence variants, inspects and patches existing .3mf or .gcode.3mf files, and reads a Bambu Lab printer's progress over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a print time or filament estimate, wants to change settings in a 3MF, or asks how far the print is, even if Bambu Studio is not named. Not for designing parts (use a CAD skill), mesh repair, or starting, pausing or sending prints.
 argument-hint: "[stl files or project.3mf] [print notes]"
 allowed-tools: Bash(shambu *), Read
 ---
@@ -12,12 +12,28 @@ send a job. Request: $ARGUMENTS
 
 ## Before you start
 
-1. Run `shambu doctor --json`. It gives the printer preset, both nozzles' reach and height, the bed, the GUI's
-   current presets and bed type, and the recipe list. Use those values, not assumptions. If `shambu` is missing,
-   tell the user to run `/shambu:setup` and stop.
-2. One name per nozzle: left nozzle = filament 1 (main, direct drive); right nozzle = filament 2 (auxiliary,
-   Bowden; on the X2D it reaches x 20.5 to 256 only, up to 256 mm, and prints no TPU).
-3. Everything goes through the CLI. Never hand-assemble `BambuStudio` flags: the CLI encodes every rule found by
+1. Run `shambu doctor --json` before EVERY build, not once per session. It gives the printer preset, both nozzles'
+   reach and height, the bed, the GUI's current presets and bed type, the recipe list, and under `printer` the
+   spools loaded on the printer right now: per nozzle the material, colour, preset id and the resolved preset
+   name. Use those values, not assumptions, and not a spec from an earlier day. If `shambu` is missing, tell the
+   user to run `/shambu:setup` and stop.
+2. Filaments come from the printer. Write every filament as `{"preset": "loaded"}` unless the owner names a
+   spool; `check` and `build` read the printer again and fill in the preset and colour of the spool in that nozzle.
+   A pinned preset that is not the spool in its nozzle, or that cannot be compared with it (nothing loaded, no
+   installed preset for the spool), is a FAIL (exit 1): write `"loaded"`, or ask the owner to load or change the
+   spool. `--allow-filament-mismatch` only when the owner says the spool will change before the print,
+   and the hand-back says so. A pinned colour is replaced by the spool colour unless the spec gives a
+   `colour_note`. `shambu printer filaments` reads the spools alone (one `pushall`, read-only).
+3. If the doctor or the check says the printer was not read (`loaded on the printer: not read`, or a line starting
+   `Filaments: WARNING printer not read`), the filaments come from the GUI's last-used presets in
+   `BambuStudio.conf`, which can be days old. Then the project's filaments are UNVERIFIED: the hand-back's
+   `Filaments:` line says so, the `Next:` line starts with "confirm the spools by eye (Studio's filament dropdown
+   lists Left filaments and Right filaments) before Print", and the reply never calls the project ready to print.
+   Never pass `--no-printer` unless the owner says the printer is off.
+4. One name per nozzle: left nozzle = filament 1 (main, direct drive); right nozzle = filament 2 (auxiliary,
+   Bowden; on the X2D it reaches x 20.5 to 256 only, up to 256 mm, and prints no TPU). `filament_map` moves a
+   filament to the other nozzle, and the spool comparison follows it.
+5. Everything goes through the CLI. Never hand-assemble `BambuStudio` flags: the CLI encodes every rule found by
    reverse engineering Studio 02.08.02.61 (`references/00-findings.md`).
 
 ## Workflow (copy this checklist into the reply)
@@ -27,8 +43,9 @@ send a job. Request: $ARGUMENTS
       lets Studio's auto-orient turn it at build time (it also converts a mesh in metres). To choose by hand,
       `shambu orient part.stl` (add `--native` for Studio's table) and put the chosen `lay_on_face` in the spec. A
       mesh under 1 mm is in metres: `shambu rotate part.stl -o DIR --convert-unit`.
-- [ ] 3. Check: `shambu check plate.json` until every line reads OK (presets, measurements, placement, reach,
-      by-object rules).
+- [ ] 3. Check: `shambu check plate.json` until every line reads OK (the spools on the printer against the
+      filaments, presets, measurements, placement, reach, by-object rules). The `Filaments:` line near the top
+      names each filament's source: the printer at HH:MM, the spec (override), or the GUI with a WARNING.
 - [ ] 4. Compare when the answer is not obvious: `shambu sweep plate.json --orientations PART --by-object`
       (and `--variants v.json` for settings). The slicer's table decides: time, grams, support, waste, swaps.
 - [ ] 5. Build: `shambu build plate.json --slice`. Exit 1 means a check, the export or a verification failed:
@@ -47,8 +64,7 @@ by-layer layout still needs 60 mm between objects.
 {
   "name": "jaws", "outdir": "/abs/dir", "printer": "Bambu Lab X2D 0.4 nozzle",
   "process": {"base": "0.20mm Standard @BBL X2D", "name": "PETG functional", "recipes": ["petg-functional", "no-hole-compensation"]},
-  "filaments": [{"preset": "Bambu PETG Basic @BBL X2D 0.4 nozzle", "colour": "#000000"},
-                {"preset": "Bambu PLA Basic @BBL X2D 0.4 nozzle", "colour": "#FFFFFF"}],
+  "filaments": [{"preset": "loaded"}, {"preset": "loaded"}],
   "bed_type": "Textured PEI Plate",
   "plates": [{"name": "p", "print_sequence": "by object", "group_by_filament": true,
               "parts": [{"path": "/abs/jaw.stl", "count": 2, "lay_on_face": [0, 1, 0], "recipes": ["tree-supports"]},
@@ -60,12 +76,15 @@ A part is a `path` with `filament`, `count`, `recipes`, `set` (keys as strings),
 `lay_on_face` [nx, ny, nz] and `rotate` [x, y, z] degrees, or `"orientation": "auto"` (not with either); or
 `parts` (several files merged into one object, turned together). Per plate: `pause_at_z`, `colour_changes`, `print_sequence`, `group_by_filament` (by object:
 same-filament parts with the same settings merge into one object, packed close inside, 60 mm between groups).
-`aux_x_limit: 235.5` applies the user's stricter reading of the right nozzle.
+`aux_x_limit: 235.5` applies the user's stricter reading of the right nozzle. A filament is `{"preset": "loaded"}`
+(the spool in that nozzle, with its colour), or a pinned `preset` with an optional `colour` and `colour_note`.
 
 ## Hand-back (use this shape every time)
 
 ```
 Project: <path>  (sliced | unsliced | export FAILED: <Studio exit and reason>)   Printer: <preset>   Process: <name> (<base>, recipes ...)
+Filaments: from the printer at HH:MM: 1 = <preset> <colour> (<left/right external spool | AMS n slot m>), 2 = ...
+           | WARNING printer not read (<reason>): from the GUI presets, UNVERIFIED; confirm the spools by eye before Print
 Plate <n>: <time> h, <g> g (model <g>, support <g>, tower <g>, flush <g>, <k> filament changes)  print sequence: by layer | by object
   <object>  filament <n> (<material>)  <w> x <d> x <h> mm at x.., y..  face <normal> | as exported  recipes ...
 Checks: all OK | FAIL: ...        Patches: ...        Slicer warnings: ...
@@ -83,16 +102,17 @@ holds the same facts; quote it, do not paraphrase numbers.
 ## Commands
 
 ```
-shambu doctor | info FILE... | presets list filament --contains PETG | recipes | spec
+shambu doctor [--no-printer] [--ip IP] | info FILE... | presets list filament --contains PETG | recipes | spec
 shambu orient PART.stl [--threshold 60] [--top 12] [--write DIR]      # score orientations: contact, support shadow, height
 shambu orient PART.stl --native [--write DIR]                         # Studio's auto-orient table, lay_on_face = -vector
 shambu rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] [--rotate x,y,z] [--scale 1000 | --convert-unit]
 shambu split PART.stl -o DIR                                           # one STL per body
-shambu check plate.json | build plate.json [--slice] [--open]
+shambu check plate.json | build plate.json [--slice] [--open]          # both read the printer's spools first
+       [--allow-filament-mismatch] [--no-printer] [--ip IP]
 shambu sweep plate.json [--orientations PART]... [--source own|studio] [--by-object] [--variants v.json] [--no-slice]
 shambu inspect project.3mf
 shambu patch project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 --print-sequence "1:by object"
-shambu printer status [--ip IP] | printer watch --every 300            # read-only
+shambu printer filaments [--ip IP] | printer status | printer watch --every 300     # read-only
 ```
 
 `--json` gives one JSON document (`printer watch --json`: one per poll). Exit codes: 0 ok, 1 a check, export
@@ -140,14 +160,19 @@ Print sequence, By object; Arrange.
 - Guess an orientation for a part exported in an assembly frame: `shambu orient`, then `lay_on_face`.
 - Send keystrokes to Studio, press Print, or publish anything but one `pushall` to the printer.
 - Trust the orientation score over the slicer: bridges count as overhang in the score; the sweep decides.
+- Reuse a spec's filaments from an earlier day, or pin a preset the printer does not hold. A project whose
+  filament is not loaded makes Studio offer a swap on open, and the swap resets the process to the stock preset
+  (2 walls, 15 % infill) without a word: `"loaded"`, and `check` compares.
 
 ## Reading the printer
 
-`shambu printer status` reads the selected printer's serial and LAN access code from Bambu Studio's own
-configuration, finds the printer on the LAN, subscribes and sends one `pushall`, and prints state, progress,
-layer, remaining time, nozzle, bed and chamber temperatures and HMS codes. `watch` polls until the print leaves
-RUNNING/PAUSE. Nothing else is ever sent; the access code never leaves memory. Details and pitfalls:
-`references/00-findings.md` section 8.
+`shambu printer filaments` and `shambu printer status` read the selected printer's serial and LAN access code
+from Bambu Studio's own configuration, find the printer on the LAN, subscribe and send one `pushall`.
+`filaments` prints, per nozzle (1 = left, 2 = right) and per slot, the loaded state, material, colour, Bambu
+preset id and the installed preset name that id resolves to; `status` prints state, progress, layer, remaining
+time, nozzle, bed and chamber temperatures and HMS codes. `watch` polls until the print leaves RUNNING/PAUSE.
+Nothing else is ever sent; the access code never leaves memory. Details and pitfalls: `references/00-findings.md`
+section 8.
 
 ## References (read when the row says so)
 

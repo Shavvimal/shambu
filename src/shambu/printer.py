@@ -21,6 +21,14 @@ deeply, and a report counts as complete only when it carries `print.gcode_state`
 Dual-nozzle facts (X2D; pybambu and Studio's DevExtruderSystem.cpp): `print.device.extruder.info[]`
 has one entry per extruder, id 0 = auxiliary (right), id 1 = main (left). `temp` packs the current
 value (low 16 bits) and the target (high 16 bits). The top-level `nozzle_temper` mirrors one nozzle.
+
+Loaded filament (the same `pushall`; live X2D capture 2026-10-16, tests/fixtures/x2d_pushall_two_external_spools.json):
+the two external spools are `print.vir_slot[]` with ids "254" (feeds the main/left extruder, id 1) and "255"
+(feeds the auxiliary/right extruder, id 0); there is no `vt_tray` on this firmware. AMS slots are
+`print.ams.ams[].tray[]`. Each tray carries `tray_type` (material), `tray_color` (RRGGBBAA), `tray_info_idx`
+(Bambu's filament id, e.g. GFG99 = Generic PETG, GFG00 = Bambu PETG Basic; the installed filament presets carry the
+same value as `filament_id`), `tray_sub_brands`, `remain` and `k`. Each extruder's `snow` ("slot now") packs the tray
+it holds: (ams id << 8) | slot, 0xFFFF for none; the capture showed left snow 0xFE00 (= 254) and right 0xFF00 (= 255).
 """
 
 from __future__ import annotations
@@ -62,6 +70,27 @@ ACTIVE_STATES = ("printing", "paused", "preparing", "slicing")
 DONE_STATES = ("idle", "finished", "failed")  # watch() stops only on these; unknown or offline keeps it polling
 EXTRUDER_NAMES = {0: "auxiliary (right)", 1: "main (left)"}
 HMS_LEVELS = {1: "fatal", 2: "serious", 3: "common", 4: "info"}
+TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
+# External spools on a dual-nozzle printer: virtual tray id -> the extruder id it feeds (live X2D, 2026-10-16; each
+# extruder's `snow` confirmed it). Single-nozzle printers report one external spool as `vt_tray` with tray_now 254.
+EXTERNAL_TRAY_EXTRUDER = {254: 1, 255: 0}
+EXTERNAL_TRAY_LABELS = {254: "left external spool", 255: "right external spool"}
+# The spec's nozzle numbers (filament_map values): 1 = left/main (extruder id 1), 2 = right/auxiliary (extruder id 0).
+NOZZLE_OF_EXTRUDER = {1: 1, 0: 2}
+COLOUR_NAMES = {
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+    "grey": (128, 128, 128),
+    "red": (220, 30, 30),
+    "orange": (255, 128, 0),
+    "yellow": (255, 230, 0),
+    "green": (0, 174, 66),
+    "cyan": (0, 200, 220),
+    "blue": (30, 70, 220),
+    "purple": (128, 0, 160),
+    "pink": (255, 150, 190),
+    "brown": (120, 70, 20),
+}
 
 
 # ---------------------------------------------------------------------------------- discovery
@@ -553,6 +582,261 @@ class StatusDecoder:
         )
 
 
+# ---------------------------------------------------------------------------------- loaded filament
+def hex_colour(tray_color) -> str | None:
+    """`tray_color` RRGGBBAA (or RRGGBB) -> '#RRGGBB'; None when absent or all zero."""
+    s = str(tray_color or "").strip().lstrip("#")
+    if len(s) < 6 or not all(c in "0123456789abcdefABCDEF" for c in s[:6]):
+        return None
+    rgb = s[:6].upper()
+    return None if rgb == "000000" and s[6:8] == "00" else f"#{rgb}"
+
+
+def colour_name(colour: str | None) -> str:
+    """The nearest of a dozen plain colour names, for the hand-back ('white Generic PETG')."""
+    if not colour or len(colour) != 7:
+        return "unknown colour"
+    try:
+        r, g, b = (int(colour[i : i + 2], 16) for i in (1, 3, 5))
+    except ValueError:  # a malformed colour must not break a report line
+        return "unknown colour"
+    return min(COLOUR_NAMES, key=lambda n: sum((a - c) ** 2 for a, c in zip((r, g, b), COLOUR_NAMES[n], strict=True)))
+
+
+def decode_slot(value) -> tuple[int, int] | None:
+    """An extruder's `snow` (dual-nozzle) -> (ams id, slot); None for 0xFFFF or junk. 254/255 are the external spools."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    if v < 0 or v == TRAY_NONE:
+        return None
+    return (v >> 8) & 0xFF, v & 0xFF
+
+
+def decode_tray_now(value) -> tuple[int, int] | None:
+    """A single-nozzle `ams.tray_now` -> (ams id, slot): 254 = the external spool, 255 = none, else ams*4 + slot."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    if v == 255:
+        return None
+    if v == 254:
+        return 254, 0
+    return v // 4, v % 4
+
+
+@dataclass
+class Tray:
+    """One spool position: an external spool (ams 254 / 255, slot 0) or an AMS slot."""
+
+    ams: int
+    slot: int
+    label: str
+    material: str  # tray_type; "" when the slot is empty
+    colour: str | None  # "#RRGGBB"
+    preset_id: str  # tray_info_idx (Bambu filament id); "" when unknown
+    sub_brand: str = ""
+    remain: int | None = None
+    k: float | None = None
+    extruder: int | None = None  # the extruder id this position feeds, when known
+    preset: str | None = None  # the installed filament preset name, when resolved
+
+    @property
+    def empty(self) -> bool:
+        return not self.material and not self.preset_id
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.ams, self.slot
+
+    def describe(self) -> str:
+        """'white Generic PETG (GFG99)' or 'white PETG (GFG99)' when no preset is named; 'empty' for an empty slot."""
+        if self.empty:
+            return "empty"
+        base = self.preset.split(" @", 1)[0] if self.preset else (self.sub_brand or self.material or "unknown material")
+        return f"{colour_name(self.colour)} {base}" + (f" ({self.preset_id})" if self.preset_id else "")
+
+    def to_json(self) -> dict:
+        return dict(self.__dict__)
+
+
+@dataclass
+class NozzleLoad:
+    nozzle: int  # 1 = left/main, 2 = right/auxiliary (the spec's filament_map numbers)
+    extruder: int  # the printer's extruder id
+    name: str
+    tray: Tray | None  # what the nozzle holds now; None when nothing is loaded, or the named slot is not in the report
+    fitted: list[Tray] = field(default_factory=list)  # positions that feed this nozzle (the external spool on its side)
+    loaded_slot: tuple[int, int] | None = None  # the (ams, slot) the extruder says it holds, even when no tray matches
+
+    @property
+    def unlisted(self) -> bool:
+        """The extruder names a slot the report does not list: not "nothing loaded", and not a spool to guess at."""
+        return self.tray is None and self.loaded_slot is not None
+
+    def to_json(self) -> dict:
+        return {
+            "nozzle": self.nozzle,
+            "extruder": self.extruder,
+            "name": self.name,
+            "tray": self.tray.to_json() if self.tray else None,
+            "loaded_slot": list(self.loaded_slot) if self.loaded_slot else None,
+            "fitted": [t.to_json() for t in self.fitted],
+        }
+
+
+@dataclass
+class LoadedFilaments:
+    """What the printer holds, per nozzle and per slot, from one `pushall`."""
+
+    serial_masked: str
+    ip: str
+    read_at: str  # HH:MM local
+    read_epoch: float
+    tls_verified: bool | None
+    nozzles: list[NozzleLoad]
+    trays: list[Tray]
+    printer_preset: str | None = None  # the machine preset the preset names were resolved for
+
+    def nozzle(self, n: int) -> NozzleLoad | None:
+        return next((z for z in self.nozzles if z.nozzle == n), None)
+
+    def to_json(self) -> dict:
+        return {
+            "serial_masked": self.serial_masked,
+            "ip": self.ip,
+            "read_at": self.read_at,
+            "read_epoch": self.read_epoch,
+            "tls_verified": self.tls_verified,
+            "printer_preset": self.printer_preset,
+            "nozzles": [z.to_json() for z in self.nozzles],
+            "trays": [t.to_json() for t in self.trays],
+        }
+
+    def lines(self) -> list[str]:
+        out = [
+            f"printer {self.serial_masked} at {self.ip}: filaments read at {self.read_at}"
+            + ("" if self.tls_verified else ", TLS unverified")
+            + (f"; presets for {self.printer_preset}" if self.printer_preset else "")
+        ]
+        for z in self.nozzles:
+            t = z.tray
+            if t is None:
+                fitted = ", ".join(f"{f.label}: {f.describe()}" for f in z.fitted if not f.empty)
+                state = f"holds slot {z.loaded_slot} which the report does not list" if z.unlisted else "nothing loaded"
+                out.append(f"nozzle {z.nozzle} ({z.name}): {state}" + (f"; fitted {fitted}" if fitted else ""))
+                continue
+            out.append(
+                f"nozzle {z.nozzle} ({z.name}): {t.label}: {t.material or '?'}, {t.colour or 'colour unknown'} ({colour_name(t.colour)}), "
+                f"preset id {t.preset_id or 'none'} -> {t.preset or 'no installed preset matches'}"
+            )
+        for t in self.trays:
+            if any(z.tray is t for z in self.nozzles):
+                continue
+            out.append(
+                f"slot {t.label}: "
+                + ("empty" if t.empty else f"{t.describe()}, {t.colour or 'colour unknown'} -> {t.preset or 'no preset'}")
+            )
+        return out
+
+
+class FilamentDecoder:
+    """Trays and per-nozzle loads from a report. With a preset resolver and the machine preset name, each tray gets the
+    installed filament preset name: by `filament_id` = `tray_info_idx`, else the Generic preset of its material."""
+
+    def __init__(self, resolver=None, printer_preset: str | None = None):
+        self.resolver = resolver
+        self.printer_preset = printer_preset
+
+    def tray(self, d: dict, ams: int, slot: int, label: str, extruder: int | None) -> Tray:
+        def num(v, cast):
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                return None
+
+        return Tray(
+            ams,
+            slot,
+            label,
+            str(d.get("tray_type") or ""),
+            hex_colour(d.get("tray_color")),
+            str(d.get("tray_info_idx") or ""),
+            str(d.get("tray_sub_brands") or ""),
+            num(d.get("remain"), int),
+            num(d.get("k"), float),
+            extruder,
+        )
+
+    def resolve(self, t: Tray) -> None:
+        if self.resolver is None or t.empty:
+            return
+        if t.preset_id:
+            t.preset = self.resolver.find_by_filament_id(t.preset_id, self.printer_preset)
+        if t.preset is None and t.material:
+            t.preset = self.resolver.generic_for_material(t.material, self.printer_preset)
+
+    def decode(self, report: dict, serial: str, ip: str) -> LoadedFilaments:
+        p = report.get("print", {}) or {}
+        trays: list[Tray] = []
+        for d in p.get("vir_slot") or []:
+            try:
+                vid = int(d.get("id"))
+            except (TypeError, ValueError):
+                continue
+            trays.append(self.tray(d, vid, 0, EXTERNAL_TRAY_LABELS.get(vid, f"external spool {vid}"), EXTERNAL_TRAY_EXTRUDER.get(vid)))
+        vt = p.get("vt_tray")
+        if isinstance(vt, dict) and not any(t.ams == 254 for t in trays):
+            trays.append(self.tray(vt, 254, 0, "external spool", 0))
+        for unit in (p.get("ams") or {}).get("ams") or []:
+            try:
+                uid = int(unit.get("id"))
+            except (TypeError, ValueError):
+                continue
+            for s in unit.get("tray") or []:
+                try:
+                    sid = int(s.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                trays.append(self.tray(s, uid, sid, f"AMS {uid + 1} slot {sid + 1}", None))
+        for t in trays:
+            self.resolve(t)
+        by_key = {t.key: t for t in trays}
+        dev = p.get("device", {}) or {}
+        infos = (dev.get("extruder") or {}).get("info") or []
+        nozzles: list[NozzleLoad] = []
+        tray_now = decode_tray_now((p.get("ams") or {}).get("tray_now"))
+        infos = [e for e in infos if e.get("id") is not None]
+        if len(infos) > 1:  # dual nozzle: each extruder's `snow` names its slot; ids 0/1 map to the spec's 2/1
+            for e in infos:
+                eid = e["id"]
+                slot = decode_slot(e.get("snow"))
+                fitted = [t for t in trays if t.extruder == eid]
+                nozzles.append(
+                    NozzleLoad(
+                        NOZZLE_OF_EXTRUDER.get(eid, 1), eid, EXTRUDER_NAMES.get(eid, "?"), by_key.get(slot) if slot else None, fitted, slot
+                    )
+                )
+        else:  # one extruder, whatever id it reports: nozzle 1; `snow` when present, else the classic `ams.tray_now`
+            eid = infos[0]["id"] if infos else 0
+            slot = decode_slot(infos[0].get("snow")) if infos and "snow" in infos[0] else tray_now
+            nozzles.append(NozzleLoad(1, eid, "nozzle", by_key.get(slot) if slot else None, [t for t in trays if t.ams == 254], slot))
+        nozzles.sort(key=lambda z: z.nozzle)
+        now = time.time()
+        return LoadedFilaments(
+            conf.mask(serial),
+            ip,
+            time.strftime("%H:%M", time.localtime(now)),
+            now,
+            report.get("_tls_verified"),
+            nozzles,
+            trays,
+            self.printer_preset,
+        )
+
+
 # ---------------------------------------------------------------------------------- service
 @dataclass
 class PrinterService:
@@ -603,6 +887,12 @@ class PrinterService:
         ip, serial, code = self.resolve()
         report = self._read(ip, serial, code)
         return StatusDecoder(conf.hms_table(serial[:3])).decode(report, serial, ip)
+
+    def filaments(self, resolver=None, printer_preset: str | None = None) -> LoadedFilaments:
+        """The spools in each nozzle and slot, from the same single `pushall` as `status()`. Read-only."""
+        ip, serial, code = self.resolve()
+        report = self._read(ip, serial, code)
+        return FilamentDecoder(resolver, printer_preset).decode(report, serial, ip)
 
     def watch(self, every_s: int = 300, until_idle: bool = True, max_polls: int = 200):
         """Generator of Status every `every_s` seconds; stops on a final state (idle, finished, failed) or after

@@ -6,6 +6,35 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-16
+
+### Added
+- `shambu printer filaments [--json]`: the spool in each nozzle (1 = left, 2 = right) and in each slot, with material,
+  colour, Bambu preset id and the installed preset name it resolves to, from the same single read-only `pushall` as
+  `printer status`. Live X2D capture under `tests/fixtures/`: the external spools are `vir_slot` ids 254 (left) and
+  255 (right); each extruder's `snow` names the tray it holds.
+- `shambu check` and `shambu build` read the printer before resolving a spec. A filament written as
+  `{"preset": "loaded"}` (or with `preset` omitted) takes the spool in that nozzle, with its colour; a nozzle with
+  nothing loaded, or one that names a slot the report does not list, is a problem that names the fitted spool, never
+  a guess. A pinned preset that differs from the spool, or cannot be compared with it, is a FAIL (exit 1) naming
+  both, unless `--allow-filament-mismatch`, which the report records (the override waives the preset check, not the
+  colour rule). A pinned colour gives way to the spool colour unless the spec has a `colour_note`; a colour that is
+  not `#RRGGBB` is a spec problem. The nozzle a filament is compared against follows `filament_map` and the machine
+  preset's extruder count, never the report. The report's `Filaments:` line and each filament line state the source
+  (the printer at HH:MM, the spec, or the GUI); the sweep table and JSON carry the same line and the fallback WARNING.
+  A printer error in the report has its IP address redacted.
+- Printer unreachable (or `--no-printer`): a WARNING on the first lines of the report, then the GUI's last-used
+  presets from `BambuStudio.conf` stand in for `"loaded"` and pinned presets are kept and compared with the GUI.
+- `shambu doctor` gains a `loaded on the printer` section next to the GUI presets, with a `MISMATCH` line per slot
+  that differs; `--no-printer` and `--ip` on doctor, check, build and sweep.
+- The skill runs `shambu doctor` before every build and writes filaments as `"loaded"` unless the owner names a
+  spool; the hand-back carries the `Filaments:` line.
+
+### Fixed
+- A spec written for one spool passed every check after the owner changed spools, and the project opened in Studio
+  with a filament that was not loaded; Studio's swap then reset the process preset without a word
+  (`docs/errors/2026-10-16-loaded-filament-not-used.md`).
+
 ## [0.2.1] - 2026-10-13
 
 ### Fixed

@@ -80,7 +80,12 @@ def test_chained_source_first_hit_wins(tmp_path, profiles):
 
 def test_list_filters_instantiable_and_printer(resolver):
     names = [r["name"] for r in resolver.list("filament", printer=MACHINE)]
-    assert names == ["Test PLA", "Test TPU"]  # PETG lists another printer; common is not instantiable
+    assert names == [
+        "Generic PETG @Test X2D",
+        "Test PETG Basic",
+        "Test PLA",
+        "Test TPU",
+    ]  # PETG lists another printer; common is not instantiable
 
 
 def test_check_compatible_passes_for_matching_set(resolver):
