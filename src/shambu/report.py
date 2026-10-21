@@ -65,6 +65,20 @@ def estimate_lines(sl: dict) -> list[str]:
     return out
 
 
+def check_line(c: L.Check) -> str:
+    """One check as a report line, its kind first so a reader (and the skill) can sort them: `PLACEMENT NOT DONE:`
+    (the packer gave up, no position exists), `FAIL body overlap:` (the parts themselves meet), `FAIL margin rule:`
+    (a measured or spec margin, the bodies are apart), `WARN margin rule:` (an estimate; the slice decides),
+    `FAIL:` and `OK:` for the rest."""
+    if c.kind == "placement" and not c.ok:
+        return "PLACEMENT NOT DONE: " + c.text
+    if c.kind == "margin":
+        return ("WARN margin rule: " if c.ok else "FAIL margin rule: ") + c.text
+    if c.kind == "body" and not c.ok:
+        return "FAIL body overlap: " + c.text
+    return ("OK: " if c.ok else "FAIL: ") + c.text
+
+
 def _vec(v) -> str:
     return "[" + ", ".join(f"{x:g}" for x in v) + "]"
 
@@ -164,7 +178,7 @@ def render(r: BuildResult) -> str:
                         f"    - {m.key}: filament {m.placed.filament}, {sx:.1f} x {sy:.1f} x {sz:.1f} mm, "
                         f"at x {dx:.1f} y {dy:.1f} in the group (bed x {m.placed.x0:.1f} y {m.placed.y0:.1f}){turned}"
                     )
-        out += [("- OK: " if c.ok else "- FAIL: ") + c.text for c in p.checks]
+        out += ["- " + check_line(c) for c in p.checks]
     if pl.problems:
         out += ["", "## Problems"] + ["- " + x for x in pl.problems]
     if pl.warnings:
@@ -174,6 +188,7 @@ def render(r: BuildResult) -> str:
         ep = r.export_problem()
         if ep:
             out.append("- " + ep)
+        out += ["- FAIL: " + x for x in r.export_fails()]
         for w in r.slicer_warnings():
             out.append(f"- slicer warning: {w}")
         out += ["- patched: " + x for x in r.patches]

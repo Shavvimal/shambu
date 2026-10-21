@@ -27,7 +27,10 @@ JSON shape:
                          "lay_on_face": [0, 0, 1], "rotate": [0, 0, 45],   # optional: turn the STL before placing it
                          # or "orientation": "auto": Studio's auto-orient picks the face (single-file parts; a merged
                          # part uses shambu's own best candidate). Not together with lay_on_face or rotate.
-                         "at": [10, 10]},
+                         "at": [10, 10],                    # optional: the bbox min corner on the bed
+                         "support_spread": [21, 0.5, 0.5, 3]},  # optional: mm of support past the box on -x, +x, -y, +y
+                                            # (else a solo slice with --probe-supports, else an estimate); "brim_margin": 5.2
+                                            # replaces brim and support margin on every side
                         {"name": "label", "parts": [{"path": "/abs/label.stl", "filament": 1},
                                                     {"path": "/abs/text.stl", "filament": 2}]}],
               "pause_at_z": [4.2],
@@ -60,6 +63,19 @@ def recipe_ranges(name: str) -> list[HeightRangeSpec]:
 
     r = by_name().get(name)
     return [HeightRangeSpec(float(h["min_z"]), float(h["max_z"]), _strs(h["set"])) for h in (r.height_ranges if r else ())]
+
+
+def _support_spread(v) -> tuple[float, float, float, float] | None:
+    """A part's `support_spread`: four non-negative numbers [mx, px, my, py] (mm past the box on -x, +x, -y, +y)."""
+    if v is None:
+        return None
+    try:
+        out = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        out = ()
+    if len(out) != 4 or any(x < 0 for x in out) or isinstance(v, (str, dict)):
+        raise BuildError(f"support_spread must be four non-negative numbers [mx, px, my, py] in mm, got {v!r}")
+    return (out[0], out[1], out[2], out[3])
 
 
 @dataclass(frozen=True)
@@ -99,6 +115,7 @@ class PartSpec:
     at: tuple[float, float] | None = None
     brim_margin: float | None = None
     orientation: Orientation = field(default_factory=Orientation)
+    support_spread: tuple[float, float, float, float] | None = None  # mm past the box on -x, +x, -y, +y (layout.Spread)
 
     def files(self) -> list[FileRef]:
         if self.parts:
@@ -138,6 +155,7 @@ class PartSpec:
             (float(d["at"][0]), float(d["at"][1])) if d.get("at") else None,
             float(d["brim_margin"]) if d.get("brim_margin") is not None else None,
             Orientation.from_json(d),
+            _support_spread(d.get("support_spread")),
         )
 
     def to_json(self) -> dict:
@@ -161,6 +179,8 @@ class PartSpec:
         if self.brim_margin is not None:
             d["brim_margin"] = self.brim_margin
         d.update(self.orientation.to_json())
+        if self.support_spread is not None:
+            d["support_spread"] = list(self.support_spread)
         return d
 
 

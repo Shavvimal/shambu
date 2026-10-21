@@ -149,7 +149,7 @@ def test_failed_checks_report_says_nothing_was_exported(tmp_path, stls, resolver
     r = pipeline(resolver, studio).build(make_spec(tmp_path, stls, plates=[{"name": "p", "parts": parts}]), export=True)
     assert not r.plan.ok and r.run is None
     assert [k for k, _ in studio.calls if k == "run"] == []
-    assert "FAIL: a and b overlap" in r.report
+    assert "FAIL body overlap: a (x 20.0..40.0, y 20.0..40.0) and b (x 20.0..40.0, y 20.0..40.0) intersect by 20.0 x 20.0 mm" in r.report
     assert "## Next" in r.report and "nothing was exported" in r.report and "Fix the spec and build again" in r.report
     assert "Owner steps" not in r.report and "Open the project" not in r.report
 
@@ -256,6 +256,9 @@ def test_failed_export_without_result_json_keeps_the_old_shape(tmp_path, stls, r
 def test_supported_part_gets_the_support_margin(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (20.0, 20.0, 40.0)})
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], recipes=["tree-supports"]))
-    assert plan.plates[0].parts[0].placed.margin == pytest.approx(10.0)  # 0.25 x 40, above the 5.2 mm brim
+    p = plan.plates[0].parts[0].placed
+    assert p.margin == pytest.approx(5.2)  # the brim, kept apart from the support spread
+    assert p.spread.sides() == pytest.approx((8.0,) * 4) and p.spread.source == "estimate" and p.spread.tree  # 0.10 x 40 < 8 floor
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"]))
-    assert plan.plates[0].parts[0].placed.margin == pytest.approx(5.2)  # no supports: the brim only
+    p = plan.plates[0].parts[0].placed
+    assert p.margin == pytest.approx(5.2) and p.spread.source == "none"  # no supports: the brim only

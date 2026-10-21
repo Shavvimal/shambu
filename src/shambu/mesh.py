@@ -1,5 +1,6 @@
 """Triangle meshes without a dependency: read and write STL, rotate, lay a face on the bed, split bodies,
-and score an orientation the way a printer cares about (bed contact, overhang, height).
+score an orientation the way a printer cares about (bed contact, overhang, height), and project a mesh onto the
+bed (`silhouette`, the layout's footprint; `hull_2d`).
 
 Why here: Bambu Studio's CLI rotates every object at once (`--rotate*`) and the assemble list carries no
 transform (reference 01), so a per-part orientation has to be baked into the STL before the CLI sees it.
@@ -12,7 +13,7 @@ of the mesh, and `overhang` counts facets that face down more than `threshold` d
 vertical wall, 90 = a flat ceiling). The default 60 is what Studio supports by default (`support_threshold_angle`
 30 counts from horizontal: convert with 90 - angle); 45 is the conservative "45 degree rule" for a clean print.
 
-Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), convex hulls, painted supports, and
+Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), 3D convex hulls, painted supports, and
 anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those.
 """
 
@@ -630,3 +631,128 @@ class Summary:
 
     def to_json(self) -> dict:
         return {"path": str(self.path), "facets": self.facets, "bodies": self.bodies, "candidates": [c.to_json() for c in self.candidates]}
+
+
+# ---------------------------------------------------------------------------- footprints
+SILHOUETTE_CELL = 0.5  # mm; the plate-14 housing (11k facets) rasterises in 0.015 s at this cell (see silhouette)
+
+
+@dataclass(frozen=True)
+class Silhouette:
+    """The XY projection of a mesh as row runs, for the layout's footprint gap (layout.RasterFootprint).
+
+    Row r covers y from `y0 + r * cell` to `y0 + (r + 1) * cell` (the last row ends at `y1`). Each run `(a, b)` is an
+    x interval in mm, in the mesh's own coordinates. A cell counts as soon as any triangle touches it, and every run
+    is clipped to the mesh's bounding box, so the silhouette never shrinks the part and never grows past its box.
+    Why not the box or the convex hull: on the printed plate-14 the feeler's convex hull covers the cradle that sits
+    between its two end blocks (hull gap 0.0 mm, real gap 4.95 mm, reference 08 section 11)."""
+
+    cell: float
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    rows: tuple[tuple[tuple[float, float], ...], ...]
+
+    def row_span(self, r: int) -> tuple[float, float]:
+        lo = self.y0 + r * self.cell
+        return lo, min(self.y1, lo + self.cell)
+
+    def area(self) -> float:
+        total = 0.0
+        for r, runs in enumerate(self.rows):
+            lo, hi = self.row_span(r)
+            total += (hi - lo) * sum(b - a for a, b in runs)
+        return total
+
+
+def _strip_extent(tri: Facet, s0: float, s1: float) -> tuple[float, float] | None:
+    """The x extent of a triangle's XY projection inside the strip s0 <= y <= s1 (the strip cuts a convex polygon,
+    so the extent is one interval): vertices inside the strip plus the edge crossings of both strip lines."""
+    xs = [v[0] for v in tri if s0 <= v[1] <= s1]
+    for i in range(3):
+        p, q = tri[i], tri[(i + 1) % 3]
+        if p[1] == q[1]:
+            continue
+        lo, hi = (p[1], q[1]) if p[1] < q[1] else (q[1], p[1])
+        for yy in (s0, s1):
+            if lo <= yy <= hi:
+                xs.append(p[0] + (yy - p[1]) * (q[0] - p[0]) / (q[1] - p[1]))
+    return (min(xs), max(xs)) if xs else None
+
+
+def silhouette(facets: Sequence[Facet], cell: float = SILHOUETTE_CELL) -> Silhouette:
+    """Scan-fill every triangle's XY projection into row runs (pure Python). Call it on the facets AFTER the
+    orientation transform: a raster is never rotated, so a part turned 45 degrees keeps its real outline.
+
+    Only up-facing triangles are filled: every point of a closed solid's projection lies under one of them, and the
+    vertical walls add nothing. A mesh with no up-facing triangle (an open sheet) fills every triangle.
+    Measured (Python 3.14, Apple silicon, 0.5 mm cell): the plate-14 housing, 11,084 facets, 0.015 s; the feeler,
+    1,660 facets, 0.016 s; a 1.0 mm cell saves nothing that matters (reference 08 section 11). Raises BuildError for
+    an empty mesh."""
+    if cell <= 0:
+        raise BuildError("silhouette cell must be positive")
+    (lx, ly, _), (hx, hy, _) = bbox(facets)
+    nrows = max(1, math.ceil((hy - ly) / cell - 1e-9))
+    ncols = max(1, math.ceil((hx - lx) / cell - 1e-9))
+    up = [f for f in facets if (f[1][0] - f[0][0]) * (f[2][1] - f[0][1]) - (f[1][1] - f[0][1]) * (f[2][0] - f[0][0]) > 0]
+    tris = up or list(facets)
+    buckets: list[list[tuple[int, int]]] = [[] for _ in range(nrows)]
+    inv = 1.0 / cell
+
+    def lo(v: float, origin: float, n: int) -> int:  # the cell that holds v (a value on a cell edge: the upper cell)
+        return min(n - 1, max(0, math.floor((v - origin) * inv + 1e-9)))
+
+    def hi(v: float, origin: float, n: int, first: int) -> int:  # the last cell v reaches (on a cell edge: the lower cell)
+        return min(n - 1, max(first, math.ceil((v - origin) * inv - 1e-9) - 1))
+
+    for t in tris:
+        tmin = min(t[0][1], t[1][1], t[2][1])
+        tmax = max(t[0][1], t[1][1], t[2][1])
+        r0 = lo(tmin, ly, nrows)
+        r1 = hi(tmax, ly, nrows, r0)
+        if r0 == r1:
+            c0 = lo(min(t[0][0], t[1][0], t[2][0]), lx, ncols)
+            buckets[r0].append((c0, hi(max(t[0][0], t[1][0], t[2][0]), lx, ncols, c0)))
+            continue
+        for r in range(r0, r1 + 1):
+            s0 = max(tmin, ly + r * cell)
+            s1 = min(tmax, ly + (r + 1) * cell)
+            ext = _strip_extent(t, s0, s1)
+            if ext is not None:
+                c0 = lo(ext[0], lx, ncols)
+                buckets[r].append((c0, hi(ext[1], lx, ncols, c0)))
+    rows: list[tuple[tuple[float, float], ...]] = []
+    for b in buckets:
+        b.sort()
+        merged: list[list[int]] = []
+        for c0, c1 in b:
+            if merged and c0 <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], c1)
+            else:
+                merged.append([c0, c1])
+        rows.append(tuple((lx + c0 * cell, min(hx, lx + (c1 + 1) * cell)) for c0, c1 in merged))
+    return Silhouette(cell, lx, ly, hx, hy, tuple(rows))
+
+
+def hull_2d(points: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Convex hull of XY points (Andrew's monotone chain), counter-clockwise, no repeated first point. For a report or
+    a quick area; the layout's gap uses `silhouette`, because a hull fills notches that other parts sit in."""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def turn(o, a, b) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and turn(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and turn(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]

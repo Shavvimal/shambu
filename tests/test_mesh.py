@@ -246,3 +246,43 @@ def test_oriented_copies_same_stem_members_get_two_files(tmp_path):
     ta, tb = M.oriented_copies([a, b], M.Orientation(rotate=(90, 0, 0)), tmp_path / "o")
     assert ta != tb and ta.is_file() and tb.is_file()
     assert M.volume(M.read_stl(ta)) == pytest.approx(1000) and M.volume(M.read_stl(tb)) == pytest.approx(16)
+
+
+# ---------------------------------------------------------------------------- silhouette and hull (layout footprints)
+def test_silhouette_of_a_box_is_its_rectangle():
+    s = M.silhouette(box((3, 4, 0), (23, 34, 10)))
+    assert (s.x0, s.y0, s.x1, s.y1) == (3, 4, 23, 34)
+    assert len(s.rows) == 60 and all(r == ((3.0, 23.0),) for r in s.rows)
+    assert s.area() == pytest.approx(600.0)
+
+
+def test_silhouette_keeps_a_notch_open():
+    u = [f for r in ((0, 0, 10, 100), (10, 0, 40, 10), (10, 90, 40, 100)) for f in box((r[0], r[1], 0), (r[2], r[3], 10))]
+    s = M.silhouette(u, cell=1.0)
+    assert s.rows[50] == ((0.0, 10.0),)  # the middle row holds only the U's back
+    assert s.rows[5] == ((0.0, 40.0),)
+    assert s.area() == pytest.approx(1600.0)
+
+
+def test_silhouette_runs_stay_inside_the_bbox_on_an_odd_size():
+    s = M.silhouette(box((0, 0, 0), (10.3, 7.7, 5)))
+    assert max(b for r in s.rows for _, b in r) == pytest.approx(10.3)
+    assert s.row_span(len(s.rows) - 1)[1] == pytest.approx(7.7)
+
+
+def test_silhouette_of_an_open_sheet_fills_every_triangle():
+    sheet = [((0, 0, 0), (0, 10, 0), (10, 0, 0))]  # faces down: no up-facing triangle at all
+    assert M.silhouette(sheet).area() > 40
+
+
+def test_silhouette_rejects_an_empty_mesh_and_a_bad_cell():
+    with pytest.raises(BuildError):
+        M.silhouette([])
+    with pytest.raises(BuildError):
+        M.silhouette(box((0, 0, 0), (1, 1, 1)), cell=0)
+
+
+def test_hull_2d_drops_inner_points():
+    pts = [(0, 0), (10, 0), (10, 10), (0, 10), (5, 5), (5, 0)]
+    assert set(M.hull_2d(pts)) == {(0, 0), (10, 0), (10, 10), (0, 10)}
+    assert M.hull_2d([(1, 1)]) == [(1, 1)]

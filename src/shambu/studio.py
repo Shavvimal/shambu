@@ -60,7 +60,7 @@ RETURN_CODES = {
     -17: "process preset not compatible with the printer (compatible_printers)",
     -18: "invalid values in config (validate failed)",
     -19: "post_process not supported",
-    -21: "arrange failed: an object spilled off the plate",
+    -21: "arrange failed: Studio's arrange could not fit the parts on a plate (it keeps 24 mm between objects when any part has tree supports)",
     -22: "orient failed",
     -24: "3MF version not supported (try --allow-newer-file)",
     -50: "no object fully inside the plate",
@@ -102,6 +102,23 @@ _ACTIONS = {
     "--help",
     *_PRE_SLICE_ACTIONS,
 }
+
+
+# Log lines of a failed slice (Print.cpp:2434 and BambuStudio.cpp:5477-5485, v02.08.02.61). The names are the CLI's
+# object names (<stem>_<n>, assemble_<k>), before shambu renames them. The conflict line carries no z.
+_CONFLICT = re.compile(r"gcode path conflicts found between (\S+) and (\S+)")
+_ARRANGE_FAILED = re.compile(r"arrange failed:.*?plate index (\d+)")
+
+
+def conflicts_in_log(text: str) -> list[tuple[str, str]]:
+    """Every object pair of an exit -101 (`gcode path conflicts found between A and B`), in log order, once each."""
+    return list(dict.fromkeys(m.groups() for m in _CONFLICT.finditer(text)))  # type: ignore[misc]
+
+
+def arrange_failed_plate(text: str) -> int | None:
+    """The 1-based plate of an exit -21 (`run:arrange failed: ... plate index 0`), or None when the log does not say."""
+    m = _ARRANGE_FAILED.search(text)
+    return int(m.group(1)) + 1 if m else None
 
 
 def signed(status: int) -> int:

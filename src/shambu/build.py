@@ -24,8 +24,9 @@ from . import recipes as R
 from .errors import BambuError, BuildError
 from .loaded import FilamentResolution
 from .patches import AddCustomGcode, PatchSet, RenameObject, SetBedTypeEverywhere, SetFilamentColours, SetFilamentMap
+from .probe import ProbeRequest, SpreadProbe, StudioProbe
 from .spec import FileRef, LayoutSpec, PartSpec, Spec
-from .studio import CliCommand, MeshInfo, OrientResult, RunResult, SlicedPlate, StudioCLI
+from .studio import CliCommand, MeshInfo, OrientResult, RunResult, SlicedPlate, StudioCLI, arrange_failed_plate, conflicts_in_log
 from .threemf import Project
 
 log = logging.getLogger(__name__)
@@ -279,6 +280,41 @@ class BuildResult:
         err = (self.run.result or {}).get("error_string") or ""
         return f"export failed: {self.run.summary()}" + (f"; Studio: {err}" if err else "")
 
+    def export_fails(self) -> list[str]:
+        """What a failed slice means for the plate, from Studio's log. Exit -101 names the two objects whose paths
+        cross (Print.cpp:2434; the log has no z, so none is given). Exit -21 is Studio's own arrange giving up
+        (BambuStudio.cpp:5477-5485). The pre-slice WARN lines are estimates: this is the measured answer."""
+        if self.run is None or self.run.ok or self.run.code not in (-101, -21):
+            return []
+        try:
+            text = self.run.log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if self.run.code == -21:
+            n = arrange_failed_plate(text)
+            return [
+                f"Studio's arrange could not fit the parts on plate {n if n is not None else '(the log does not say which)'} "
+                "(it keeps 24 mm between objects when any part has tree supports)"
+            ]
+        by_cli = {x.cli_name: x for x in self.plan.parts if x.cli_name}
+        pairs = conflicts_in_log(text)
+        if not pairs:
+            return ["Studio found crossing G-code paths (exit -101), and its log names no objects. Move the parts apart and build again."]
+        out = []
+        for a, b in pairs:
+            pa, pb = by_cli.get(a), by_cli.get(b)
+            ka, kb = (pa.key if pa else a), (pb.key if pb else b)
+            reach = ""
+            if pa and pb:
+                _, (dx, dy) = L.rect_gap(pa.placed.rect(with_margin=False), pb.placed.rect(with_margin=False))
+                fa, sa = pa.placed.spread.facing(dx, dy)
+                fb, sb = pb.placed.spread.facing(-dx, -dy)
+                who, f, side, src = (pa, fa, sa, pa.placed.spread.source) if fa >= fb else (pb, fb, sb, pb.placed.spread.source)
+                if f > 0:
+                    reach = f" ({who.key}'s support reaches {f:.1f} mm on {side}" + (", estimated)" if src == "estimate" else ")")
+            out.append(f"Studio found crossing G-code paths between {ka} and {kb} (exit -101). Move them apart{reach} and build again.")
+        return out
+
     def slicer_warnings(self) -> list[str]:
         """Studio's own slicing warnings from result.json (floating cantilevers, regions), not a failure."""
         w = (self.run.result or {}).get("warning_message") if self.run else None
@@ -295,7 +331,7 @@ class BuildResult:
         return [_estimate(p, by_id.get(p["id"])) for p in (self.summary or {}).get("plates", []) if p.get("slice")]
 
     def to_json(self) -> dict:
-        problems = list(self.plan.problems) + ([self.export_problem()] if self.export_problem() else [])
+        problems = list(self.plan.problems) + ([self.export_problem()] if self.export_problem() else []) + self.export_fails()
         return {
             "name": self.plan.spec.name,
             "project": str(self.project) if self.exported else None,
@@ -330,6 +366,7 @@ class BuildResult:
                         if x.grouped
                     ],
                     "checks": [[c.ok, c.text] for c in p.checks],
+                    "check_kinds": [("warn" if c.warn else c.kind) for c in p.checks],
                 }
                 for p in self.plan.plates
             ],
@@ -351,12 +388,14 @@ class Pipeline:
         placer: L.Placer | None = None,
         checker: L.LimitChecker | None = None,
         listeners: list[Listener] | None = None,
+        probe: SpreadProbe | None = None,
     ):
         self.studio = studio or StudioCLI()
         self.resolver = resolver or P.resolver()
         self.placer = placer
         self.checker = checker or L.LimitChecker()
         self.listeners = listeners or []
+        self.probe = probe  # None: a StudioProbe under <outdir>/.probe when a build asks for probe_supports
 
     def emit(self, event: str, **data) -> None:
         for fn in self.listeners:
@@ -372,13 +411,15 @@ class Pipeline:
         keep_going: bool = False,
         do_slice: bool = False,
         filaments: FilamentResolution | None = None,
+        probe_supports: bool = False,
     ) -> BuildResult:
         """`filaments` is the spec reconciled with the printer (loaded.reconcile): its spec replaces `spec`, and its
-        problems and warnings lead the plan's. Without it a `"loaded"` filament is a problem."""
+        problems and warnings lead the plan's. Without it a `"loaded"` filament is a problem. `probe_supports`: slice
+        each supported single-file part alone to measure its support spread (probe.py), in place of the estimate."""
         if filaments is not None:
             spec = filaments.spec
         self.emit("plan", name=spec.name)
-        plan = self.plan(spec, filaments)
+        plan = self.plan(spec, filaments, probe_supports=probe_supports)
         result = BuildResult(plan, plan.outdir / (f"{spec.name}.gcode.3mf" if do_slice else f"{spec.name}.3mf"), sliced=do_slice)
         result.inputs = self.write_inputs(plan)
         self.emit("planned", ok=plan.ok, problems=plan.problems)
@@ -396,7 +437,7 @@ class Pipeline:
         return result
 
     # ---------------------------------------------------------------- steps
-    def plan(self, spec: Spec, resolution: FilamentResolution | None = None) -> Plan:
+    def plan(self, spec: Spec, resolution: FilamentResolution | None = None, *, probe_supports: bool = False) -> Plan:
         outdir = spec.outdir.expanduser().resolve()
         workdir = outdir / "shambu"
         workdir.mkdir(parents=True, exist_ok=True)
@@ -440,7 +481,9 @@ class Pipeline:
         tpu = {i for i, f in enumerate(filaments, 1) if "TPU" in str(f.get("filament_type", ""))}
         ctx = L.Context(facts, {i + 1: fmap[i] for i in range(len(fmap))}, tpu, spec.aux_x_limit)
         bed = facts["bed"]
-        placer = self.placer or L.ShelfPacker(
+        # By layer: candidate points with the max-not-sum pair rule (layout.BottomLeftPacker). By object: rows in print
+        # order (ShelfPacker below).
+        placer = self.placer or L.BottomLeftPacker(
             (spec.layout.edge, bed["x"][1] - spec.layout.edge), (spec.layout.edge, bed["y"][1] - spec.layout.edge), spec.layout.gap
         )
         map_applies = bool(spec.filament_map) or len(filaments) > 1
@@ -473,8 +516,11 @@ class Pipeline:
             if any(ps.orientation.auto for pl in spec.plates for ps in pl.parts)
             else None
         )
+        probe: SpreadProbe | None = None
+        if probe_supports:
+            probe = self.probe or StudioProbe(self.studio, outdir / ".probe", machine, process, filaments, spec.bed_type, fmap)
         for pi, (pspec, seq) in enumerate(zip(spec.plates, sequences, strict=True), 1):
-            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir, orient_settings)
+            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir, orient_settings, probe, warnings)
             by_object = seq == "by object"
             if pspec.group_by_filament:
                 if by_object:
@@ -496,11 +542,14 @@ class Pipeline:
                     )
             multi = len({f for p in parts for f in p.placed.filaments}) > 1 and not sequential
             pctx = replace(ctx, reserve=WIPE_TOWER_RESERVE if multi else None, by_object=sequential)
-            fixed = [p for p in parts if p.placed.fixed]
+            fixed = [p.placed for p in parts if p.placed.fixed]
             free = [p.placed for p in parts if not p.placed.fixed]
-            obstacles = [p.rect() for p in (x.placed for x in fixed)] + ([WIPE_TOWER_RESERVE] if multi else [])
+            obstacles = [WIPE_TOWER_RESERVE] if multi else []
+            placement_checks: list[L.Check] = []
+            overflow = False
             if free:
                 x_min_of = {p.key: max(ctx.extruder_of(f)["x"][0] for f in p.filaments) for p in free}
+                x_max_of = {p.key: self._x_max(p, ctx) for p in free}
                 plate_placer = placer
                 if sequential and self.placer is None:
                     all_short = all(p.placed.info.size[2] < clr["nozzle_height"] for p in parts)
@@ -511,25 +560,19 @@ class Pipeline:
                         keep_order=True,
                         solo_row_above=clr["height_to_rod"],
                     )
-                try:
-                    packed = plate_placer.place(free, obstacles, x_min_of)
-                except BambuError as e:
-                    problems.append(f"plate {pi} '{pspec.name}': {e}")
-                    packed = [free]
+                packed = plate_placer.place(free, obstacles, x_min_of, fixed=fixed, x_max_of=x_max_of)
+                if not isinstance(packed, L.Placement):  # a placer written against the old protocol returns plates only
+                    packed = L.Placement(list(packed))
+                placement_checks = self._placement_checks(packed, free, plate_placer)
                 overflow = len(packed) > 1
                 if overflow:
                     problems.append(
                         f"plate {pi} '{pspec.name}': the parts need {len(packed)} plates; move some to another plate in the spec"
                     )
-            else:
-                overflow = False
             for p in parts:
                 p.place_members()
-            if overflow:  # the overflow parts sit on a second virtual plate: overlap and reach checks would only repeat the problem
-                checks = [L.Check(False, f"the parts need {len(packed)} plates (see Problems); no further placement checks")]
-            else:
-                checks = self.checker.check([p.placed for p in parts], pctx)
-                checks += self._subpart_checks(parts, pctx)
+            checks = placement_checks + self.checker.check([p.placed for p in parts], pctx)
+            checks += self._subpart_checks([p for p in parts if p.placed.placed], pctx)
             plate = A.Plate(
                 name=pspec.name or f"plate {pi}",
                 need_arrange=False,
@@ -611,6 +654,8 @@ class Pipeline:
         used_keys: set[str],
         workdir: Path | None = None,
         orient_settings: list[Path] | None = None,
+        probe: SpreadProbe | None = None,
+        warnings: list[str] | None = None,
     ) -> list[PlannedPart]:
         out: list[PlannedPart] = []
         for si, ps in enumerate(part_specs, 1):
@@ -684,17 +729,105 @@ class Pipeline:
             main = files[0][1] if not eff or files[0][1] in eff else min(eff)
             body = L.union_info(ok_infos)  # merged sub-parts share one translation: pack their union bbox
             eff_settings = {**process, **ps.set}
-            margin = (
-                ps.brim_margin
-                if ps.brim_margin is not None
-                else max(L.brim_margin(eff_settings), L.support_margin(eff_settings, body.size[2]))
-            )
+            margin, spread = self._margins(ps, eff_settings, body, files, main, probe, warnings, where)
+            footprint = self._footprint(files, body)
             for copy in range(ps.count):
                 key = _unique_key(ps.key(), used_keys)
-                placed = L.Placed(key, body, main, margin=margin, also_filaments=frozenset(eff - {main}))
+                placed = L.Placed(
+                    key, body, main, margin=margin, also_filaments=frozenset(eff - {main}), spread=spread, footprint=footprint
+                )
                 if ps.at is not None and copy == 0:
                     placed.x0, placed.y0, placed.fixed = float(ps.at[0]), float(ps.at[1]), True
                 out.append(PlannedPart(ps, key, files, ok_infos, placed, orient=orient_res, auto_face=auto_face))
+        return out
+
+    @staticmethod
+    def _margins(
+        ps: PartSpec,
+        eff_settings: dict,
+        body: MeshInfo,
+        files: list[tuple[Path, int, str]],
+        main: int,
+        probe: SpreadProbe | None,
+        warnings: list[str] | None,
+        where: str,
+    ) -> tuple[float, L.Spread]:
+        """Brim and support spread of one part (reference 08 section 11). The spec's `brim_margin` replaces both, on
+        every side. The spec's `support_spread` [mx, px, my, py] replaces the support part. A probe (a solo slice,
+        single-file supported parts only) replaces the estimate. Otherwise `layout.support_spread` estimates it."""
+        if ps.brim_margin is not None:
+            return 0.0, L.spec_spread(ps.brim_margin)
+        brim = L.brim_margin(eff_settings)
+        if ps.support_spread is not None:
+            mx, px, my, py = ps.support_spread
+            return brim, L.Spread(mx, px, my, py, "spec", L.is_tree(eff_settings), "spec support_spread")
+        measured: L.Spread | None = None
+        if probe is not None and str(eff_settings.get("enable_support", "0")) in ("1", "true") and len(files) == 1:
+            try:
+                tag = ps.orientation.tag() if not ps.orientation.is_identity else "as-is"
+                measured = probe.measure(ProbeRequest(ps.key(), files[0][0], body, main, dict(ps.set), tag))
+            except BambuError as e:
+                if warnings is not None:
+                    warnings.append(f"{where} ({ps.key()}): support probe failed ({e}); the estimate applies")
+        return brim, L.support_spread(eff_settings, body.size[2], measured)
+
+    @staticmethod
+    def _footprint(files: list[tuple[Path, int, str]], body: MeshInfo) -> L.Footprint | None:
+        """The XY silhouette of the part's printing bodies in the frame the CLI loads (after the orientation), as a
+        RasterFootprint. None (the bounding box) when an STL cannot be read or its box differs from Studio's by more
+        than 0.5 mm (a unit conversion, a 3MF input): the box is then the safe outline."""
+        facets: list[M.Facet] = []
+        for fp, _, sub in files:
+            if sub != "normal_part":
+                continue
+            try:
+                facets += M.read_stl(fp)
+            except BambuError:
+                return None
+        if not facets:
+            return None
+        sil = M.silhouette(facets)
+        if max(abs(a - b) for a, b in zip((sil.x0, sil.y0, sil.x1, sil.y1), (*body.min[:2], *body.max[:2]), strict=True)) > 0.5:
+            return None
+        return L.RasterFootprint.from_silhouette(sil)
+
+    @staticmethod
+    def _x_max(p: L.Placed, ctx: L.Context) -> float:
+        """The strictest right-hand x limit of the extruders a part uses (aux_x_limit for extruder 2)."""
+        hi = min(ctx.extruder_of(f)["x"][1] for f in p.filaments)
+        if ctx.aux_x_limit is not None and any(ctx.extruder_of(f)["index"] == 2 for f in p.filaments):
+            hi = min(hi, ctx.aux_x_limit)
+        return hi
+
+    @staticmethod
+    def _placement_checks(packed: L.Placement, free: list[L.Placed], placer: L.Placer) -> list[L.Check]:
+        """The PLACEMENT NOT DONE lines (fix 9 of the plate-14 post-mortem): one per part the placer could not place,
+        with its arithmetic, and one naming which parts went to which plate when they need more than one. Parts past
+        plate 1 are marked not placed, so no rule checks them at positions on a virtual plate."""
+        out = []
+        for key, why in packed.unplaced.items():
+            out.append(
+                L.Check(
+                    False,
+                    f"{why}. No position was computed for {key}, so no overlap, bed-edge or reach check ran for it. "
+                    f"Give {key} an `at` [x, y] (min corner), a `support_spread` or its own plate.",
+                    "placement",
+                )
+            )
+        if len(packed) > 1:
+            for n, plate in enumerate(packed.plates[1:], 2):
+                for p in plate:
+                    p.placed, p.why_not = False, f"would need plate {n}"
+            split = "; ".join(f"plate {n}: " + ", ".join(p.key for p in plate) for n, plate in enumerate(packed.plates, 1))
+            kind = "row packer, no rotation" if isinstance(placer, L.ShelfPacker) else "bottom-left packer, no rotation"
+            out.append(
+                L.Check(
+                    False,
+                    f"the parts need {len(packed)} plates with their support spreads ({split}). This is the {kind}, not "
+                    f"Studio's arrange. Move the parts of plate 2 and later to another plate in the spec.",
+                    "placement",
+                )
+            )
         return out
 
     @staticmethod
@@ -747,12 +880,14 @@ class Pipeline:
             y_hi = min([bed["y"][1] - layout.edge] + [e["y"][1] for e in exts])
             local = L.ShelfPacker((0.0, x_hi - x_lo), (0.0, y_hi - y_lo), layout.gap)
             why = f"its {len(members)} parts do not fit together in the reach of extruder(s) {sorted({e['index'] for e in exts})}"
-            try:
-                fits = len(local.place([m.placed for m in members])) == 1
-            except BambuError as e:
-                fits, why = False, str(e)
+            got = local.place([m.placed for m in members])
+            fits = len(got) == 1 and not got.unplaced
+            if got.unplaced:
+                why = next(iter(got.unplaced.values()))
+            for m in members:  # a member the local packer left out is still a part to place on the plate
+                m.placed.placed, m.placed.why_not = True, ""
             if fits:  # the cluster's rect grows by the largest member margin on every side: it must still fit
-                gm = max(m.placed.margin for m in members)
+                gm = max(m.placed.reserve for m in members)
                 gw = max(m.placed.x1 for m in members) - min(m.placed.x0 for m in members) + 2 * gm
                 gh = max(m.placed.y1 for m in members) - min(m.placed.y0 for m in members) + 2 * gm
                 fits = gw <= x_hi - x_lo and gh <= y_hi - y_lo
@@ -787,7 +922,14 @@ class Pipeline:
                 dict(first.spec.set),
                 first.spec.height_ranges,
             )
-            placed = L.Placed(key, info, fil, margin=max(m.placed.margin for m in members), also_filaments=first.placed.also_filaments)
+            placed = L.Placed(
+                key,
+                info,
+                fil,
+                margin=max(m.placed.margin for m in members),
+                also_filaments=first.placed.also_filaments,
+                spread=max((m.placed.spread for m in members), key=lambda sp: sp.most()),
+            )
             offsets = [(m.placed.x0 - x0, m.placed.y0 - y0) for m in members]
             out.append(PlannedPart(gspec, key, files, [m.infos[0] for m in members], placed, members=members, offsets=offsets))
         return out, notes
