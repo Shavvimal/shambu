@@ -102,6 +102,20 @@ _ACTIONS = {
     "--help",
     *_PRE_SLICE_ACTIONS,
 }
+# `CliCommand.parse` (the `shambu studio --` escape hatch): flags that never take a value (reference 02 recommendation 6),
+# options whose value is a path or a ';' list of paths, options shambu refuses, and the input file types.
+_BARE = {"--no-check", "--help", "--skip-useless-pick", "--allow-mix-temp", "--load-defaultfila", "--allow-newer-file"}
+_PATH_VALUE = {
+    "--load-settings",
+    "--load-filaments",
+    "--load-assemble-list",
+    "--load-custom-gcodes",
+    "--export-settings",
+    "--export-slicedata",
+    "--load-slicedata",
+}
+_REFUSED = ("--pipe", "--datadir", "--uptodate", "--downward")
+_MODEL_EXT = (".3mf", ".stl", ".obj", ".step", ".stp", ".amf")
 
 
 def signed(status: int) -> int:
@@ -121,6 +135,52 @@ class CliCommand:
     _opts: list[tuple[str, str | None]] = field(default_factory=list)
     _pre: list[tuple[str, str | None]] = field(default_factory=list)
     _slice: int | None = None
+
+    @classmethod
+    def parse(cls, argv: list[str], cwd: str | Path | None = None) -> CliCommand:
+        """A raw Studio argument list as a checked command, for `shambu studio --`. The builder rules apply: `--flag 1`
+        becomes `--flag=1`, pre-slice actions move before `--slice`, no action is refused (the GUI would open), and
+        `--export-3mf` takes a bare name. Refused: `--pipe`, `--datadir` (shambu owns it), `--uptodate*`,
+        `--downward*`, short options, and an input outside the working tree `cwd`. Relative paths in `--load-*`
+        values resolve against `cwd`, because the binary runs in its private datadir."""
+        root = Path(cwd or os.getcwd()).resolve()
+        cmd = cls()
+        i = 0
+        while i < len(argv):
+            tok = argv[i]
+            if tok.startswith("--"):
+                raw_name, eq, val = tok.partition("=")
+                name = "--" + raw_name[2:].replace("_", "-")
+                if any(name == r or name.startswith(r) for r in _REFUSED):
+                    raise StudioError(
+                        f"{name} is refused by `shambu studio` (shambu owns the datadir; --pipe, --uptodate* and --downward* change files or block)"
+                    )
+                if name == "--outputdir":
+                    raise StudioError("--outputdir is set by `shambu studio` (the run folder); use --out DIR before --")
+                value: str | None = None
+                if eq:
+                    value = val
+                elif name not in _BARE and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                    nxt = argv[i + 1]
+                    if name in _PATH_VALUE or name == "--export-3mf" or not nxt.lower().endswith(_MODEL_EXT):
+                        value = nxt
+                        i += 1
+                if name == "--export-3mf" and (not value or "/" in value):
+                    raise StudioError("--export-3mf wants a bare file name; the CLI joins it to --outputdir (the run folder)")
+                if name in _PATH_VALUE and value:
+                    value = ";".join(str((root / v).resolve()) if v and not Path(v).is_absolute() else v for v in value.split(";"))
+                cmd.option(name, value)
+            elif tok.startswith("-") and tok != "-":
+                raise StudioError(f"{tok}: short options are not passed through; use the --long form")
+            else:
+                full = (root / tok).resolve()
+                if not full.is_relative_to(root):
+                    raise StudioError(f"input {tok} is outside the working tree {root}")
+                cmd.inputs.append(str(full))
+            i += 1
+        if not cmd.has_action():
+            raise StudioError("no action option: the CLI would open the GUI. Add --export-3mf NAME, --slice N, --info, ...")
+        return cmd
 
     def option(self, name: str, value: str | int | float | None = None) -> CliCommand:
         name = "--" + name.lstrip("-").replace("_", "-")

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import shutil
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -264,6 +266,7 @@ class BuildResult:
     report_path: Path | None = None
     report: str = ""
     sliced: bool = False
+    checks_skipped: dict | None = None  # the --no-check second pass: first exit, the pair, the report line
 
     @property
     def ok(self) -> bool:
@@ -338,7 +341,152 @@ class BuildResult:
             "verify_problems": self.verify_problems,
             "inputs": {k: str(v) for k, v in self.inputs.items()},
             "report": str(self.report_path) if self.report_path else None,
+            "checks_skipped": self.checks_skipped,
         }
+
+
+# `--no-check` (BambuStudio.cpp:6192, 6418, 6974): it skips the G-code path conflict check (exit -101), the
+# support-necessity check, and the exit -100 on empty-layer or overlap warnings. It does not skip -102..-105 or any
+# other validate error. With it Studio reports nothing about a conflict, so the flag is only ever a second pass after
+# checked passes, and the report line comes from the checked logs (Print.cpp:2434). Studio exits on the FIRST plate
+# that conflicts (BambuStudio.cpp:7105-7109), so a project with several plates gets one checked pass per plate. Exit
+# -100 is also the generic exception exit (BambuStudio.cpp:7413-7418): only a -100 whose log shows Studio's
+# `found slicing warnings:` line (BambuStudio.cpp:7126) is overridable; any other -100 stays a failure.
+NO_CHECK_SKIPPED = (
+    "G-code path conflict check (exit -101)",
+    "support-necessity check (floating cantilevers and regions)",
+    "exit -100 on empty-layer or overlap warnings",
+)
+_CONFLICT = re.compile(r"gcode path conflicts found between (.+?) and (.+?)\s*$", re.M)
+_SLICING_WARNINGS = re.compile(r"found slicing warnings: (.+?)(?:, no_check=\d)?\s*$", re.M)
+_ERROR_LINE = re.compile(r"\[error\]\s+(.+?)\s*$", re.M)
+
+
+def conflict_pair(log_text: str) -> tuple[str, str] | None:
+    """The two objects of Studio's 'gcode path conflicts found between A and B' log line (exit -101), or None."""
+    m = _CONFLICT.search(log_text)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _log_text(rr: RunResult) -> str:
+    try:
+        return Path(rr.log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def checked_outcome(rr: RunResult, plate: int) -> dict:
+    """One checked pass: `ok`, `override` (-101, or -100 with Studio's slicing-warning line) or `fail`, with what the log
+    says. The record keeps the pass's own log and result.json paths."""
+    text = _log_text(rr)
+    rec: dict = {
+        "plate": plate,
+        "exit": rr.code,
+        "meaning": rr.meaning(),
+        "log": str(rr.log),
+        "result": str(Path(rr.log).parent / "result.json"),
+    }
+    if rr.code == 0 and rr.ok:
+        rec.update(kind="ok", reason="passed the checks")
+    elif rr.code == -101:
+        pair = conflict_pair(text)
+        rec.update(
+            kind="override",
+            pair=list(pair) if pair else None,
+            reason=f"G-code path conflicts between {pair[0]} and {pair[1]}"
+            if pair
+            else f"G-code path conflicts (pair not found in the log {rr.log})",
+        )
+    elif rr.code == -100 and _SLICING_WARNINGS.search(text):
+        m = _SLICING_WARNINGS.search(text)
+        rec.update(kind="override", pair=None, reason=f"empty layers or overlap: {m.group(1) if m else ''}")
+    else:
+        errs = _ERROR_LINE.findall(text)
+        rec.update(kind="fail", reason=errs[-1] if errs else rr.meaning())
+    return rec
+
+
+def _moved(rr: RunResult, src: Path, dest: Path) -> RunResult:
+    if src.exists():
+        shutil.move(str(src), str(dest))
+    return replace(rr, output=dest)
+
+
+def two_pass_slice(
+    studio: StudioCLI,
+    make_cmd: Callable[[bool, int, Path], CliCommand],
+    *,
+    name: str,
+    outputdir: Path,
+    timeout: int,
+    expect_output: Path,
+    no_check: bool,
+    plates: Sequence[int] = (0,),
+) -> tuple[RunResult, dict | None]:
+    """Without `no_check`: one checked slice of every plate (or of `plates[0]`). With it: one checked pass per plate in
+    `plates` (`(0,)` = all at once, for a one-plate project), each in its own folder under `<outputdir>/<name>.passes/`
+    so no pass overwrites another's log or result.json; then a --no-check pass only when every failing plate failed in
+    an overridable way. `make_cmd(no_check, plate, outdir)` builds a command that exports `expect_output.name` into
+    `outdir`. Returns the run that produced `expect_output` and the `checks_skipped` record (None when no plate needed
+    the override)."""
+    whole = plates[0] if len(plates) == 1 else 0
+    if not no_check:
+        return studio.run(
+            make_cmd(False, whole, outputdir), name=name, outputdir=outputdir, timeout=timeout, expect_output=expect_output
+        ), None
+    passes = Path(outputdir) / f"{name}.passes"
+    runs: list[tuple[RunResult, dict]] = []
+    for pl in plates:
+        d = passes / ("checked" if len(plates) == 1 else f"checked-plate-{pl}")
+        rr = studio.run(make_cmd(False, pl, d), name=f"{name}-checked", outputdir=d, timeout=timeout, expect_output=d / expect_output.name)
+        runs.append((rr, checked_outcome(rr, pl)))
+    records = [rec for _, rec in runs]
+    fails = [(rr, rec) for rr, rec in runs if rec["kind"] == "fail"]
+    overrides = [rec for rec in records if rec["kind"] == "override"]
+    if fails:
+        rr, rec = fails[0]
+        where = f"plate {rec['plate']}" if rec["plate"] else "the plate"
+        return rr, {
+            "overridden": False,
+            "plates": records,
+            "report_line": f"slice: {where} failed the checked pass with exit {rec['exit']} ({rec['meaning']}: {rec['reason']}); "
+            "--no-check does not bypass that, so no unchecked pass ran",
+        }
+    if not overrides:
+        if len(plates) == 1:
+            rr = runs[0][0]
+            return _moved(rr, Path(rr.log).parent / expect_output.name, expect_output), None
+        rr = studio.run(make_cmd(False, 0, outputdir), name=name, outputdir=outputdir, timeout=timeout, expect_output=expect_output)
+        return rr, None
+    d2 = passes / "nocheck"
+    second = studio.run(
+        make_cmd(True, whole, d2), name=f"{name}-nocheck", outputdir=d2, timeout=timeout, expect_output=d2 / expect_output.name
+    )
+    if second.ok:
+        second = _moved(second, d2 / expect_output.name, expect_output)
+    found = "; ".join((f"plate {r['plate']}: " if r["plate"] else "") + f"{r['reason']} (exit {r['exit']})" for r in overrides)
+    look = "at that pair" if all(r.get("pair") for r in overrides) and len(overrides) == 1 else "at each of these"
+    line = (
+        f"slice: Studio's checks found {found}; exported with --no-check as the GUI would, with a serious warning. Check the "
+        f"preview {look} before printing. The conflict check and the support-necessity check did not run on this G-code."
+    )
+    if not second.ok:
+        line = f"slice: the checked pass found {found}, and the --no-check pass exited {second.code} ({second.meaning()}); nothing exported"
+    first = overrides[0]
+    return second, {
+        "overridden": second.ok,
+        "plates": records,
+        "first_exit": first["exit"],
+        "first_meaning": first["meaning"],
+        "first_log": first["log"],
+        "pair": first.get("pair"),
+        "reason": found,
+        "skipped": list(NO_CHECK_SKIPPED),
+        "second_exit": second.code,
+        "second_log": str(second.log),
+        "second_result": str(Path(second.log).parent / "result.json"),
+        "report_line": line,
+    }
 
 
 class Pipeline:
@@ -357,6 +505,8 @@ class Pipeline:
         self.placer = placer
         self.checker = checker or L.LimitChecker()
         self.listeners = listeners or []
+        self.no_check = False  # build(no_check=True): a second --no-check pass after exit -101 or -100
+        self.checks_skipped: dict | None = None
 
     def emit(self, event: str, **data) -> None:
         for fn in self.listeners:
@@ -372,9 +522,14 @@ class Pipeline:
         keep_going: bool = False,
         do_slice: bool = False,
         filaments: FilamentResolution | None = None,
+        no_check: bool = False,
     ) -> BuildResult:
         """`filaments` is the spec reconciled with the printer (loaded.reconcile): its spec replaces `spec`, and its
-        problems and warnings lead the plan's. Without it a `"loaded"` filament is a problem."""
+        problems and warnings lead the plan's. Without it a `"loaded"` filament is a problem. `no_check` (with
+        `do_slice`) slices again with --no-check when the checked slice exits -101 or -100 (`two_pass_slice`)."""
+        if no_check and not do_slice:
+            raise BuildError("--no-check needs --slice")
+        self.no_check, self.checks_skipped = no_check, None
         if filaments is not None:
             spec = filaments.spec
         self.emit("plan", name=spec.name)
@@ -385,6 +540,9 @@ class Pipeline:
         if plan.ok or (keep_going and not plan.unresolved_filaments):  # a placeholder filament can never export
             if export:
                 result.run = self.export(plan, result.inputs, result.project, timeout, do_slice)
+                result.checks_skipped = self.checks_skipped
+                if result.checks_skipped and result.checks_skipped.get("overridden") and result.run.ok:
+                    plan.warnings.append("sliced with --no-check: " + result.checks_skipped["report_line"].removeprefix("slice: "))
                 if result.run.ok:
                     result.patches = self.patch(plan, result.project, do_slice)
                     result.verify_problems = self.verify(plan, result.project, do_slice)
@@ -873,7 +1031,16 @@ class Pipeline:
         paths["spec"].write_text(json.dumps(plan.spec.to_json(), indent=1), encoding="utf-8")
         return paths
 
-    def command(self, plan: Plan, paths: dict[str, Path], name: str, do_slice: bool = False) -> CliCommand:
+    def command(
+        self,
+        plan: Plan,
+        paths: dict[str, Path],
+        name: str,
+        do_slice: bool = False,
+        no_check: bool = False,
+        plate: int = 0,
+        outdir: Path | None = None,
+    ) -> CliCommand:
         cmd = (
             CliCommand()
             .load_settings(paths["machine"], paths["process"])
@@ -894,20 +1061,32 @@ class Pipeline:
         if do_slice:
             if "custom_gcodes" in paths:
                 cmd.option("load-custom-gcodes", str(paths["custom_gcodes"]))
-            cmd.slice(0, no_check=False, max_seconds=600)
-        return cmd.export_3mf(f"{name}.gcode.3mf" if do_slice else f"{name}.3mf", plan.outdir)
+            cmd.slice(plate, no_check=no_check, max_seconds=600)
+        return cmd.export_3mf(f"{name}.gcode.3mf" if do_slice else f"{name}.3mf", outdir or plan.outdir)
 
     def export(self, plan: Plan, paths: dict[str, Path], project: Path, timeout: int, do_slice: bool = False) -> RunResult:
         project.unlink(missing_ok=True)
         self.emit("export", project=str(project), slice=do_slice)
         t0 = time.time()
-        rr = self.studio.run(
-            self.command(plan, paths, plan.spec.name, do_slice),
-            name=plan.spec.name,
-            outputdir=plan.outdir,
-            timeout=timeout,
-            expect_output=project,
-        )
+        if do_slice:
+            rr, self.checks_skipped = two_pass_slice(
+                self.studio,
+                lambda nc, plate, d: self.command(plan, paths, plan.spec.name, do_slice, no_check=nc, plate=plate, outdir=d),
+                name=plan.spec.name,
+                outputdir=plan.outdir,
+                timeout=timeout,
+                expect_output=project,
+                no_check=self.no_check,
+                plates=tuple(range(1, len(plan.plates) + 1)) if len(plan.plates) > 1 else (0,),
+            )
+        else:
+            rr = self.studio.run(
+                self.command(plan, paths, plan.spec.name, do_slice),
+                name=plan.spec.name,
+                outputdir=plan.outdir,
+                timeout=timeout,
+                expect_output=project,
+            )
         self.emit("exported", ok=rr.ok, seconds=round(time.time() - t0, 1), summary=rr.summary())
         return rr
 
