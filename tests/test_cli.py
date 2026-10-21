@@ -1005,3 +1005,16 @@ def test_inspect_prints_the_effective_nozzle_stats_per_filament(capsys, tmp_path
     code, out, _ = run(capsys, "--json", "inspect", str(make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[])))
     doc = one_json(out)
     assert doc["nozzle_stats"] == {"key": "extruder_nozzle_stats", "value": []} and doc["filaments"][0]["nozzle_stats"] is None
+
+
+def test_slice_verb_tower_takes_the_planned_tower_size(capsys, tmp_path, monkeypatch, resolver):
+    """`slice --tower` sizes the tower as `check` does: a 20 mm tower without rib wall fits at x 230."""
+    from test_edits import SequenceStudio
+
+    src = _geo(tmp_path, prime_tower_width="20", prime_tower_rib_wall="0", prime_tower_brim_width="2")
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True, wipe_tower_x=["230"], wipe_tower_y=["180"]), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "--tower", "230,180", "-o", str(tmp_path / "o.gcode.3mf"))
+    doc = one_json(out)
+    assert code == 0, doc
+    assert any("x 228.0..252.0 y 178.0..215.8" in n for n in doc["notes"])

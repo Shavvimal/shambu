@@ -1,6 +1,7 @@
 """`shambu sweep --write-spec`: the chosen variant written as a full spec. Offline: a fake builder, no Studio."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -324,3 +325,24 @@ def test_write_spec_refuses_the_variants_file_and_links_of_the_input(capsys, swe
     code, out, _ = sweep(capsys, str(sp), "--variants", str(vp), "--write-spec", str(target))
     assert code == 2 and ("the --variants file" if how == "variants" else "the input spec") in out
     assert calls == [] and (sp.read_bytes(), vp.read_bytes()) == before
+
+
+def test_relocate_meshes_keeps_two_different_meshes_of_one_name_apart(tmp_path):
+    """Two changed meshes with one basename and an absolute --write-spec path: each spec path gets its own copy with
+    its own bytes (the second used to overwrite the first)."""
+    from shambu.sweep import relocate_meshes
+
+    a, b = tmp_path / "v1" / "body.stl", tmp_path / "v2" / "body.stl"
+    for p, data in ((a, b"solid a\n"), (b, b"solid b\n")):
+        p.parent.mkdir()
+        p.write_bytes(data)
+    spec = {
+        "plates": [{"parts": [{"path": str(a)}, {"path": str(b)}]}],
+        "_sweep": {"paths_changed": [str(a), str(b)]},
+    }
+    out = (tmp_path / "out" / "best.json").resolve()
+    out.parent.mkdir()
+    got = relocate_meshes(spec, out)
+    pa, pb = (p["path"] for p in got["plates"][0]["parts"])
+    assert pa != pb
+    assert Path(pa).read_bytes() == b"solid a\n" and Path(pb).read_bytes() == b"solid b\n"

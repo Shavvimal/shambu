@@ -596,10 +596,15 @@ def relocate_meshes(spec: dict, out_path: str | Path) -> dict:
         dest.mkdir(parents=True, exist_ok=True)
         for i, old in enumerate(changed):
             src = Path(old).expanduser()
+            data = src.read_bytes()
             target = dest / src.name
-            if target.exists() and str(target) not in moved.values() and target.read_bytes() != src.read_bytes():
-                target = dest / f"{i}-{src.name}"  # two different files of one name
-            shutil.copyfile(src, target)
+            k = 0
+            # A name another mesh of this call took, or a file already there, is free only when it holds the same bytes
+            while target.exists() and target.read_bytes() != data:
+                k += 1
+                target = dest / (f"{i}-{src.name}" if k == 1 else f"{i}-{k}-{src.name}")
+            if not target.exists():
+                shutil.copyfile(src, target)
             moved[old] = str(target.resolve())
     except OSError as e:
         raise BuildError(f"cannot copy the variant's mesh into {dest}: {e.strerror or e}") from e

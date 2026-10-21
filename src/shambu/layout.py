@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
@@ -147,6 +147,72 @@ def needs_support(params: Mapping | None) -> bool:
         or _int(p.get("enforce_support_layers", 0)) > 0
         or _int(p.get("raft_layers", 0)) > 0
     )
+
+
+# Object and region keys that choose a filament slot (0: the object's own filament). One classification for a spec
+# part (build.effective_filaments) and an object of a saved project (edits), so `check` and `patch` agree.
+FILAMENT_KEYS = (
+    "extruder",
+    "wall_filament",
+    "sparse_infill_filament",
+    "solid_infill_filament",
+    "support_filament",
+    "support_interface_filament",
+)
+SUPPORT_FILAMENT_KEYS = ("support_filament", "support_interface_filament")
+WALL_INFILL_KEYS = ("wall_filament", "sparse_infill_filament", "solid_infill_filament")
+INTERFACE_KEY = "support_interface_filament"
+SlotParser = Callable[[object, str], int]
+
+
+def filament_slots(
+    base: Iterable[int],
+    settings: Mapping,
+    ranges: Iterable[tuple[str, Mapping]],
+    process: Mapping | None,
+    slot: SlotParser,
+    *,
+    skip: Sequence[str] = (),
+    set_label: str = "set.",
+) -> set[int]:
+    """Every filament slot an object prints with: `base` (its own filament or its sub-parts'), the wall, infill,
+    support and interface keys of its `settings`, every key of each height range (`(label, settings)`), and the
+    process's wall and infill keys, and its support keys when Studio prints support for the object (`needs_support`
+    on process plus settings: a support slot of an object without support is unused). The object's own value of a key
+    wins over the process's. `skip` leaves out those keys of `settings` and the process. `slot(value, where)` parses one
+    value (0: none) and raises its caller's error type."""
+    out = set(base)
+    support = needs_support({**(process or {}), **settings})
+    for k in FILAMENT_KEYS[1:]:
+        if k in skip or (k in SUPPORT_FILAMENT_KEYS and not support):
+            continue
+        if k in settings and (v := slot(settings[k], f"{set_label}{k}")):
+            out.add(v)
+    for label, r in ranges:
+        for k in FILAMENT_KEYS:
+            if k in r and (v := slot(r[k], f"{label} {k}")):
+                out.add(v)
+    if process is not None:
+        for k in WALL_INFILL_KEYS + (SUPPORT_FILAMENT_KEYS if support else ()):
+            if k not in skip and k not in settings and k in process and (v := slot(process[k], f"process {k}")):
+                out.add(v)
+    return out
+
+
+def interface_only(
+    settings: Mapping, process: Mapping, others: set[int], spread: float, slot: SlotParser, set_label: str = "set."
+) -> dict[int, tuple[float, str]]:
+    """The slot that prints only the object's support interface, as {slot: (spread, source)} for `Placed.interface`:
+    empty when Studio prints no support for it, the slot is 0, or the object prints with that slot anyway (`others`:
+    `filament_slots` with the interface key skipped)."""
+    if not needs_support({**process, **settings}):
+        return {}
+    src = "part" if INTERFACE_KEY in settings else "process"
+    raw = settings.get(INTERFACE_KEY, process.get(INTERFACE_KEY, "0"))
+    v = slot(str(raw).strip() or "0", f"{set_label}{INTERFACE_KEY}" if src == "part" else f"process {INTERFACE_KEY}")
+    if not v or v in others:
+        return {}
+    return {v: (spread, f"{src} {INTERFACE_KEY}")}
 
 
 def is_tree(p: Mapping) -> bool:
@@ -529,6 +595,37 @@ class Placed:
         return "; ".join(parts) or "no brim or spread"
 
 
+def group_spread(members: Sequence[Placed]) -> Spread:
+    """The support spread of several placed parts as one object (a filament group): per side, how far any member's
+    support reaches past the union box. Each side is its own maximum (a member at the left edge with 20 mm on -x and one
+    at the right edge with 20 mm on +x give 20 on both), not one member's whole spread. An estimate in any member makes
+    the result an estimate; it is tree (clipped at the bed) only when every supported member's is."""
+    if not members:
+        return NO_SPREAD
+    gx0, gy0 = min(m.x0 for m in members), min(m.y0 for m in members)
+    gx1, gy1 = max(m.x1 for m in members), max(m.y1 for m in members)
+    sup = [m for m in members if m.spread.most() > 0]
+    if not sup:
+        return NO_SPREAD
+    mx = max(max(0.0, gx0 - (m.x0 - m.spread.mx)) for m in sup)
+    px = max(max(0.0, m.x1 + m.spread.px - gx1) for m in sup)
+    my = max(max(0.0, gy0 - (m.y0 - m.spread.my)) for m in sup)
+    py = max(max(0.0, m.y1 + m.spread.py - gy1) for m in sup)
+    sources = {m.spread.source for m in sup}
+    source = "estimate" if "estimate" in sources else ("probe" if "probe" in sources else next(iter(sources)))
+    return Spread(mx, px, my, py, source, all(m.spread.tree for m in sup), f"group of {len(members)}: per-side maxima")
+
+
+def group_mask(members: Sequence[Placed], origin: tuple[float, float]) -> Footprint | None:
+    """The members' measured support masks as one mask in the group frame that starts at `origin`, or None when a
+    supported member has no mask (the pair rule then uses the group spread for all of them)."""
+    sup = [m for m in members if m.spread.most() > 0 or m.support_mask is not None]
+    shapes = [m.mask_shape() for m in sup]
+    if not sup or any(s is None for s in shapes):
+        return None
+    return union_footprint([s for s in shapes if s is not None], origin)
+
+
 def union_info(infos: Sequence[MeshInfo]) -> MeshInfo:
     """One MeshInfo for several meshes that share one translation (the sub-parts of a merged object):
     the union bounding box in the shared STL frame, manifold only if every mesh is."""
@@ -695,6 +792,34 @@ class Context:
         return exts.get(self.filament_extruder.get(filament, filament if filament in exts else 1), exts[1])
 
 
+def extruder_x(e: Mapping, aux_x_limit: float | None = None) -> tuple[float, float]:
+    """The x range extruder `e` reaches: its own, narrowed on the right by `aux_x_limit` for extruder 2. The one
+    x-reach rule for ExtruderReach, the packers' bounds, filament groups, sub-parts and the tower area."""
+    lo, hi = e["x"]
+    if e.get("index") == 2 and aux_x_limit is not None:
+        hi = min(hi, aux_x_limit)
+    return lo, hi
+
+
+def reach_bounds(p: Placed, ctx: Context) -> tuple[float, float]:
+    """The smallest box min x (x0) and the largest box max x (x1) that keep every filament's prints inside its
+    extruder's x reach, each filament with its own growth (`Placed.reach_growth`: an interface-only slot grows by the
+    interface spread, not by the support spread). Only a reach narrower than the bed constrains (as ExtruderReach).
+    The brim is not in it: a brim past the reach is clipped (a WARN)."""
+    bed = ctx.facts["bed"]
+    x0_min, x1_max = bed["x"][0], bed["x"][1]
+    for f in p.filaments:
+        if not ctx.known(f):
+            continue
+        lo, hi = extruder_x(ctx.extruder_of(f), ctx.aux_x_limit)
+        g = p.reach_growth(f)[0]
+        if lo > bed["x"][0]:
+            x0_min = max(x0_min, lo + g[0])
+        if hi < bed["x"][1]:
+            x1_max = min(x1_max, hi - g[1])
+    return x0_min, x1_max
+
+
 class Rule(Protocol):
     def check(self, placed: list[Placed], ctx: Context) -> Iterable[Check]: ...
 
@@ -785,9 +910,7 @@ class ExtruderReach:
             yield Check(False, f"{p.key} is {p.info.size[2]:.1f} mm tall; extruder {e['index']} prints up to {e['z_max']:.0f} mm", "height")
         if not p.placed:
             return
-        lo_x, hi_x = e["x"]
-        if e["index"] == 2 and ctx.aux_x_limit is not None:
-            hi_x = min(hi_x, ctx.aux_x_limit)
+        lo_x, hi_x = extruder_x(e, ctx.aux_x_limit)
         box = (p.x0, p.x1, p.y0, p.y1)
         sides = (
             ("-x", "x", 0, box[0], lo_x, lo_x > bed["x"][0], -1),
@@ -970,7 +1093,7 @@ class Placement:
 
 class Placer(Protocol):
     """Sets x0/y0 on each free part and returns them split into plates. `x_min_of` / `x_max_of` give, per part key,
-    stricter x limits (the reach of the extruders the part uses). `fixed` are the parts the spec placed with `at`:
+    the smallest box min x and the largest box max x its extruders allow, growth included (`reach_bounds`). `fixed` are the parts the spec placed with `at`:
     the placer keeps clear of them. A part that fits nowhere comes back in `Placement.unplaced`: a placer never
     raises for it. Two implementations: BottomLeftPacker and ShelfPacker."""
 
@@ -1029,11 +1152,11 @@ class ShelfPacker:
     ) -> Placement:
         x_min, x_max = dict(x_min_of or {}), dict(x_max_of or {})
 
-        def lo(p: Placed) -> float:
-            return max(self.x_range[0], x_min.get(p.key, self.x_range[0]))
+        def lo(p: Placed) -> float:  # the left edge of the keep-out rect: x0 - keep_out
+            return max(self.x_range[0], x_min.get(p.key, -math.inf) - p.keep_out)
 
         def hi(p: Placed) -> float:
-            return min(self.x_range[1], x_max.get(p.key, self.x_range[1]))
+            return min(self.x_range[1], x_max.get(p.key, math.inf) + p.keep_out)
 
         obstacles = list(obstacles) + [f.rect() for f in fixed]
         unplaced: dict[str, str] = {}
@@ -1202,12 +1325,11 @@ class BottomLeftPacker:
         s = p.spread
         m = p.brim if brim else 0.0
         lo_x = self.x_range[0] + bm[0]
-        iface = max((v for v, _ in p.interface.values()), default=0.0)  # ExtruderReach's interface spread
-        if x_lo is not None and x_lo > self.x_range[0]:  # a reach narrower than the bed: all spread inside it
-            lo_x = max(lo_x, x_lo + max(m + s.mx, iface))
+        if x_lo is not None and x_lo > self.x_range[0]:  # reach_bounds: every filament's growth is in it already
+            lo_x = max(lo_x, x_lo + m)
         hi_x = self.x_range[1] - bm[1]
         if x_hi is not None and x_hi < self.x_range[1]:
-            hi_x = min(hi_x, x_hi - max(m + s.px, iface))
+            hi_x = min(hi_x, x_hi - m)
         lo_y, hi_y = self.y_range[0] + bm[2], self.y_range[1] - bm[3]
         xs: set[float] = {lo_x}
         ys: set[float] = {lo_y}

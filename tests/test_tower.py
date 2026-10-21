@@ -757,7 +757,7 @@ def test_unparsable_interface_slot_is_a_build_error(tmp_path):
 
     part = PartSpec.from_json({"path": str(tmp_path / "a.stl")})
     with pytest.raises(BuildError, match="process support_interface_filament = 'two'"):
-        interface_uses(part, {"enable_support": "1", "support_interface_filament": "two"}, "a", 5.2)
+        interface_uses(part, {"enable_support": "1", "support_interface_filament": "two"}, 5.2)
 
 
 def test_part_support_slot_with_support_off_is_not_counted(tmp_path):

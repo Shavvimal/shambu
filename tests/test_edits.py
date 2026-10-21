@@ -527,7 +527,7 @@ def test_tower_per_plate_vector(tmp_path):
 
 def test_tower_off_bed_raises(tmp_path, geo_file):
     with pytest.raises(E.EditError, match="off the bed"):
-        E.EditSet([E.SetTower(215, 30)]).apply(str(geo_file))
+        E.EditSet([E.SetTower(230, 30)]).apply(str(geo_file))  # a 33.2 mm tower at H 10: x 229.2..264
     with pytest.raises(E.EditError, match="extruder 2"):
         E.EditSet([E.SetTower(10, 30)]).apply(str(geo_file))
     with pytest.raises(E.EditError, match="no prime tower"):
@@ -1029,7 +1029,7 @@ def test_replace_mesh_anchor_min_keeps_a_sink(tmp_path):
 
 
 def test_tower_footprint_must_fit_extruder_two(tmp_path, geo_file):
-    with pytest.raises(E.EditError, match=r"x 13\.\.64.*extruder 2"):  # x 21 passes the corner, not the 8 mm brim
+    with pytest.raises(E.EditError, match=r"x 20\.2\.\.53\.4.*extruder 2"):  # x 21 passes the corner, not the 0.8 mm brim
         E.EditSet([E.SetTower(21, 100)]).apply(str(geo_file))
     E.EditSet([E.SetTower(29, 100)]).apply(str(geo_file), str(tmp_path / "ok.3mf"))
 
@@ -1276,3 +1276,69 @@ def test_tower_checks_the_other_objects_outlines(tmp_path):
     es = E.EditSet([E.SetTower(150, 150)])
     es.apply(str(path), str(tmp_path / "o.3mf"))
     assert any("clear of every object" in n for n in es.notes)
+
+
+# ---------------------------------------------------------------------------- one filament classification for check and patch
+def _body_meta(path: Path, *pairs: tuple[str, str]) -> Path:
+    extra = "".join(f'\n    <metadata key="{k}" value="{v}"/>' for k, v in pairs)
+    rewrite(
+        path,
+        "Metadata/model_settings.config",
+        lambda t: t.replace('<metadata key="brim_type" value="no_brim"/>', '<metadata key="brim_type" value="no_brim"/>' + extra, 1),
+    )
+    return path
+
+
+def _reach_fails(es: E.EditSet) -> list[str]:
+    return [n for n in es.notes if n.startswith("  FAIL") and "extruder 2" in n]
+
+
+def test_move_counts_a_height_range_wall_filament(tmp_path):
+    path = make_geo_3mf(tmp_path / "r.3mf", ranges=[(0.0, 5.0)])
+    rewrite(
+        path,
+        "Metadata/layer_config_ranges.xml",
+        lambda t: t.replace(
+            '<option opt_key="layer_height">0.2</option>',
+            '<option opt_key="layer_height">0.2</option>\n   <option opt_key="wall_filament">2</option>',
+        ),
+    )
+    es = E.EditSet([E.MoveObject("body", 5, 50)])
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    assert _reach_fails(es), es.notes  # the right nozzle prints the range's walls inside its dead strip
+
+
+def test_move_ignores_a_support_slot_when_support_is_off(tmp_path):
+    path = _body_meta(make_geo_3mf(tmp_path / "s.3mf"), ("enable_support", "0"), ("support_interface_filament", "2"))
+    es = E.EditSet([E.MoveObject("body", 5, 50)])
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    assert not _reach_fails(es), es.notes
+
+
+def test_move_holds_an_interface_only_slot_to_the_interface_spread(tmp_path):
+    path = _body_meta(make_geo_3mf(tmp_path / "i.3mf"), ("enable_support", "1"), ("support_interface_filament", "2"))
+    es = E.EditSet([E.MoveObject("body", 24, 50)])  # interface growth 0 brim + 3 mm: x 21 is in the right nozzle's reach
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    assert not _reach_fails(es), es.notes
+    es = E.EditSet([E.MoveObject("body", 22, 50)])  # x 19: past it
+    es.apply(str(path), str(tmp_path / "o2.3mf"))
+    assert any("support interface 3.0 mm" in n for n in _reach_fails(es)), es.notes
+
+
+def test_tower_edit_uses_the_tower_model_check_plans_with(tmp_path):
+    """A tower build planned (width 20, no rib wall, brim 2, tallest part 10 mm) at x 230 y 180: tower.footprint gives
+    x 228..252 y 178..215.75; the old edits model (a 35 mm square plus 8 mm) put it at 222..273 and refused it."""
+    from shambu import tower as T
+
+    path = make_geo_3mf(tmp_path / "t.3mf", prime_tower_width="20", prime_tower_rib_wall="0", prime_tower_brim_width="2")
+    es = E.EditSet([E.SetTower(230, 180)])
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    want = T.footprint(T.TowerSettings(width=20.0, rib_wall=False, brim=2.0), 10.0, 230, 180).rect
+    assert want == pytest.approx((228.0, 178.0, 252.0, 215.75), abs=0.01)
+    assert any("x 228.0..252.0 y 178.0..215.8" in n for n in es.notes), es.notes
+
+
+def test_tower_edit_on_one_filament_with_smooth_timelapse(tmp_path):
+    path = make_geo_3mf(tmp_path / "s.3mf", filaments=1, timelapse_type="1")
+    E.EditSet([E.SetTower(90, 100)]).apply(str(path), str(tmp_path / "o.3mf"))
+    assert Project(str(tmp_path / "o.3mf")).project_settings["wipe_tower_x"] == ["90"]

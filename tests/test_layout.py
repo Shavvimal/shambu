@@ -687,5 +687,46 @@ def test_two_sides_of_one_extruder_are_one_line():
 
 def test_bottom_left_packer_holds_the_interface_spread_in_reach():
     p = interface_part(0, 0, spread=9.0)
-    got = L.BottomLeftPacker().place([p], x_min_of={"p": 20.5})
+    lo, hi = L.reach_bounds(p, L.Context(FACTS))
+    got = L.BottomLeftPacker().place([p], x_min_of={"p": lo}, x_max_of={"p": hi})
     assert got.unplaced == {} and p.x0 - 9.0 >= 20.5 - 1e-9
+
+
+def test_packer_takes_the_interface_growth_not_the_support_spread_for_an_interface_nozzle():
+    """A 200 x 20 x 220 body with a 22 mm support spread and slot 2 printing only its interface (3 mm), with
+    aux_x_limit 235.5: LimitChecker accepts x 24..224, so the packer must find a spot too (it reserved 22 mm inside
+    the right nozzle's reach and refused an empty plate)."""
+    ctx = L.Context(FACTS, aux_x_limit=235.5)
+    p = part("body", w=200, h=20, z=220, filament=1, also=(2,), x0=24, y0=30)
+    p.spread = spread(22.0, source="estimate")
+    p.interface = {2: (3.0, "process support_interface_filament")}
+    assert [c.text for c in L.LimitChecker().check([p], ctx) if not c.ok] == []
+    lo, hi = L.reach_bounds(p, ctx)
+    assert (lo, hi) == (23.5, 232.5)
+    got = L.BottomLeftPacker().place([p], x_min_of={"body": lo}, x_max_of={"body": hi})
+    assert got.unplaced == {} and lo <= p.x0 and p.x1 <= hi
+
+
+# ---------------------------------------------------------------------------- a filament group as one object
+def test_group_spread_takes_each_side_from_the_member_that_reaches_farthest():
+    a = part("a", w=20, x0=200, y0=30, filament=2)
+    a.spread = spread(20.0, 0.0, 0.0, 0.0)
+    b = part("b", w=10, x0=225, y0=30, filament=2)  # x 225..235; its +x support reaches 255
+    b.spread = spread(0.0, 20.0, 0.0, 0.0)
+    g = L.group_spread([a, b])
+    assert g.sides() == (20.0, 20.0, 0.0, 0.0) and g.source == "probe"
+    assert any("reaches x 255.0 on +x" in t for t in failures([b], aux_x_limit=235.5))
+    group = part("g", w=35, x0=200, y0=30, filament=2)  # the union box x 200..235
+    group.spread = g
+    assert any("reaches x 255.0 on +x" in t for t in failures([group], aux_x_limit=235.5))  # one member's whole spread passed
+
+
+def test_group_mask_is_the_union_of_the_members_masks():
+    a, b = part("a", x0=0, y0=0), part("b", x0=40, y0=0)
+    a.spread, b.spread = spread(2.0), spread(2.0)
+    a.support_mask = L.mask_from_points([(-1.0, 5.0)])  # left of a
+    b.support_mask = L.mask_from_points([(21.0, 5.0)])  # right of b: x 61 on the bed
+    m = L.group_mask([a, b], (0.0, 0.0))
+    assert m is not None and m.bbox()[0] == pytest.approx(-1.0) and m.bbox()[2] == pytest.approx(61.5)
+    b.support_mask = None
+    assert L.group_mask([a, b], (0.0, 0.0)) is None  # one supported member without a mask: the spread decides

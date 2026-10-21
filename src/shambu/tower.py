@@ -207,10 +207,9 @@ def shared_reach(extruders: Iterable[Mapping], bed: Mapping, aux_x_limit: float 
     the user's stricter right edge for extruder 2."""
     x0, y0, x1, y1 = bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1]
     for e in extruders:
-        x0, x1 = max(x0, e["x"][0]), min(x1, e["x"][1])
+        lo, hi = L.extruder_x(e, aux_x_limit)
+        x0, x1 = max(x0, lo), min(x1, hi)
         y0, y1 = max(y0, e["y"][0]), min(y1, e["y"][1])
-        if e.get("index") == 2 and aux_x_limit is not None:
-            x1 = min(x1, aux_x_limit)
     return (x0, y0, x1, y1)
 
 

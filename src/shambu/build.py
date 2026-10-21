@@ -62,16 +62,6 @@ log = logging.getLogger(__name__)
 Listener = Callable[[str, dict], None]
 DEFAULT_COLOURS = ("#1A1A1A", "#F0F0F0", "#00AE42", "#0A2989")  # used when the spec gives none; slicing needs one per filament
 WIPE_TOWER_XY = (208.0, 208.0)  # plates without a tower of their own: the CLI default (15, 220) runs off the bed (-104)
-# Object/region keys that choose a filament slot. 0 means "the object's own filament". The CLI applies print_params
-# after `filaments`, so `extruder` there overrides the file's filament (01-source-cli.md section 2.4 step 3).
-FILAMENT_KEYS = (
-    "extruder",
-    "wall_filament",
-    "sparse_infill_filament",
-    "solid_infill_filament",
-    "support_filament",
-    "support_interface_filament",
-)
 PRINTING_SUBTYPES = ("normal_part", "modifier_part")
 TOWER_KEYS = (
     "prime_tower_width",
@@ -83,15 +73,11 @@ UNRESOLVED_FILAMENT = "loaded (unresolved)"  # placeholder preset name for a "lo
 FileRefs = Sequence[tuple[Path, int, str]]
 
 
-def _slot(value: str, where: str) -> int:
+def _slot(value: object, where: str) -> int:
     try:
         return int(str(value).strip())
     except ValueError:
         raise BuildError(f"{where} = {value!r} is not a filament slot number") from None
-
-
-SUPPORT_FILAMENT_KEYS = ("support_filament", "support_interface_filament")
-WALL_INFILL_KEYS = ("wall_filament", "sparse_infill_filament", "solid_infill_filament")
 
 
 def effective_filaments(
@@ -112,47 +98,22 @@ def effective_filaments(
     """
     refs = list(files) if files is not None else [(f.path, f.filament, f.subtype) for f in part_spec.files()]
     ext = _slot(part_spec.set["extruder"], "set.extruder") if "extruder" in part_spec.set else 0
-    out: set[int] = set()
+    base: set[int] = set()
     if len(refs) == 1:
-        out.add(ext or refs[0][1])
+        base.add(ext or refs[0][1])
     else:
-        out |= {fil for _, fil, sub in refs if sub in PRINTING_SUBTYPES}
+        base |= {fil for _, fil, sub in refs if sub in PRINTING_SUBTYPES}
         if ext:
-            out.add(ext)
-    support = L.needs_support({**(process or {}), **part_spec.set})
-    for k in FILAMENT_KEYS[1:]:
-        if k in skip:
-            continue
-        if k in SUPPORT_FILAMENT_KEYS and not support:
-            continue  # Studio prints no support (or raft) for this part: its support slots are unused
-        if k in part_spec.set and (v := _slot(part_spec.set[k], f"set.{k}")):
-            out.add(v)
-    for r in part_spec.height_ranges:
-        for k in FILAMENT_KEYS:
-            if k in r.set and (v := _slot(r.set[k], f"height range {r.min_z}..{r.max_z} {k}")):
-                out.add(v)
-    if process is not None:
-        keys = WALL_INFILL_KEYS + (SUPPORT_FILAMENT_KEYS if support else ())
-        for k in keys:
-            if k not in skip and k not in part_spec.set and k in process and (v := _slot(process[k], f"process {k}")):
-                out.add(v)
-    return out
+            base.add(ext)
+    ranges = [(f"height range {r.min_z}..{r.max_z}", r.set) for r in part_spec.height_ranges]
+    return L.filament_slots(base, part_spec.set, ranges, process, _slot, skip=skip)
 
 
 def interface_uses(part_spec: PartSpec, process: Mapping, spread: float, files: FileRefs | None = None) -> dict[int, tuple[float, str]]:
-    """The slot that prints only this supported part's support interface (part `set` first, then the process), as
-    {slot: (spread, source)} for `Placed.interface`, where `layout.ExtruderReach` holds that slot's extruder to
-    `spread` (brim margin plus `layout.INTERFACE_SPREAD`). Empty when Studio prints no support, the slot is 0 (the
-    part's own filament), or the part prints with that slot anyway (then its support spread counts in full).
-    Raises BuildError for a value that is not a slot number."""
-    if not L.needs_support({**process, **part_spec.set}):
-        return {}
-    k = "support_interface_filament"
-    src = "part" if k in part_spec.set else "process"
-    slot = _slot(str(part_spec.set.get(k, process.get(k, "0"))).strip() or "0", f"{src} {k}")
-    if not slot or slot in effective_filaments(part_spec, files, process, skip=(k,)):
-        return {}
-    return {slot: (spread, f"{src} {k}")}
+    """The slot that prints only this supported part's support interface, {slot: (spread, source)} for
+    `Placed.interface` (`layout.interface_only`). Raises BuildError for a value that is not a slot number."""
+    others = effective_filaments(part_spec, files, process, skip=(L.INTERFACE_KEY,))
+    return L.interface_only(part_spec.set, process, others, spread, _slot)
 
 
 def _num(v, default: float) -> float:
@@ -860,8 +821,9 @@ class Pipeline:
             placement_checks: list[L.Check] = []
             overflow = False
             if free:
-                x_min_of = {p.key: max(ctx.extruder_of(f)["x"][0] for f in p.filaments) for p in free}
-                x_max_of = {p.key: self._x_max(p, ctx) for p in free}
+                bounds = {p.key: L.reach_bounds(p, ctx) for p in free}  # per filament, each with its own growth
+                x_min_of = {k: b[0] for k, b in bounds.items()}
+                x_max_of = {k: b[1] for k, b in bounds.items()}
                 plate_placer = placer
                 if sequential and self.placer is None:
                     all_short = all(p.placed.info.size[2] < clr["nozzle_height"] for p in parts)
@@ -1217,14 +1179,6 @@ class Pipeline:
         return L.RasterFootprint.from_silhouette(sil), ""
 
     @staticmethod
-    def _x_max(p: L.Placed, ctx: L.Context) -> float:
-        """The strictest right-hand x limit of the extruders a part uses (aux_x_limit for extruder 2)."""
-        hi = min(ctx.extruder_of(f)["x"][1] for f in p.filaments)
-        if ctx.aux_x_limit is not None and any(ctx.extruder_of(f)["index"] == 2 for f in p.filaments):
-            hi = min(hi, ctx.aux_x_limit)
-        return hi
-
-    @staticmethod
     def _placement_checks(packed: L.Placement, free: list[L.Placed], placer: L.Placer) -> list[L.Check]:
         """The PLACEMENT NOT DONE lines (fix 9 of the plate-14 post-mortem): one per part the placer could not place,
         with its arithmetic, and one naming which parts went to which plate when they need more than one. Parts past
@@ -1299,10 +1253,8 @@ class Pipeline:
             seen[fil] += 1
             base = f"group-f{fil}" if per_fil[fil] == 1 else f"group-f{fil}-{seen[fil]}"
             exts = [ctx.extruder_of(f) for f in sorted(members[0].placed.filaments)]
-            x_lo = max([bed["x"][0] + layout.edge] + [e["x"][0] for e in exts])
-            x_hi = min([bed["x"][1] - layout.edge] + [e["x"][1] for e in exts])
-            if ctx.aux_x_limit is not None and any(e["index"] == 2 for e in exts):
-                x_hi = min(x_hi, ctx.aux_x_limit)
+            x_lo = max([bed["x"][0] + layout.edge] + [L.extruder_x(e, ctx.aux_x_limit)[0] for e in exts])
+            x_hi = min([bed["x"][1] - layout.edge] + [L.extruder_x(e, ctx.aux_x_limit)[1] for e in exts])
             y_lo = max([bed["y"][0] + layout.edge] + [e["y"][0] for e in exts])
             y_hi = min([bed["y"][1] - layout.edge] + [e["y"][1] for e in exts])
             local = L.ShelfPacker((0.0, x_hi - x_lo), (0.0, y_hi - y_lo), layout.gap)
@@ -1362,9 +1314,10 @@ class Pipeline:
                 brim=max(m.placed.brim for m in members),
                 also_filaments=frozenset().union(*(m.placed.also_filaments for m in members)) - {fil},
                 interface={s: v for s, v in iface.items() if s not in normal},  # a slot any member prints with: full spread
-                spread=max((m.placed.spread for m in members), key=lambda sp: sp.most()),
+                spread=L.group_spread([m.placed for m in members]),  # per side, past the group box
                 # the members' own outlines, not the group's box: a part beside a concave member keeps its room
                 footprint=L.union_footprint([m.placed.shape() for m in members], (x0, y0)),
+                support_mask=L.group_mask([m.placed for m in members], (x0, y0)),
             )
             offsets = [(m.placed.x0 - x0, m.placed.y0 - y0) for m in members]
             out.append(PlannedPart(gspec, key, files, [m.infos[0] for m in members], placed, members=members, offsets=offsets))
@@ -1389,7 +1342,8 @@ class Pipeline:
                     continue
                 e = ctx.extruder_of(fil)
                 x0, x1 = i.min[0] + pos[0], i.max[0] + pos[0]
-                if x0 < e["x"][0] or x1 > e["x"][1] or (e["index"] == 2 and ctx.aux_x_limit and x1 > ctx.aux_x_limit):
+                lo, hi = L.extruder_x(e, ctx.aux_x_limit)
+                if x0 < lo or x1 > hi:
                     out.append(
                         L.Check(
                             False,
