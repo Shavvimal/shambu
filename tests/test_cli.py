@@ -363,3 +363,107 @@ def test_threshold_and_top_defaults_and_help(capsys):
     help_text = " ".join(capsys.readouterr().out.split())
     assert "default 60, Studio's own; 45 is the cautious rule" in help_text
     assert "largest flat faces to try, on top of as-is and the six axis faces (default 12)" in help_text
+
+
+# ---------------------------------------------------------------------------- doctor: version, timings, exit codes
+@pytest.mark.parametrize(
+    "direct_url, install, commit",
+    [
+        (
+            {"url": "https://github.com/x/shambu", "vcs_info": {"vcs": "git", "requested_revision": "v0.4.0", "commit_id": "69519ac0123"}},
+            "uv tool, git tag v0.4.0",
+            "69519ac",
+        ),
+        ({"url": "file:///src/shambu", "dir_info": {"editable": True}}, "editable checkout", None),
+        ({"url": "file:///src/shambu", "dir_info": {}}, "uv tool, local folder (snapshot)", None),
+        ({"url": "https://example.org/shambu.whl", "archive_info": {}}, "other", None),
+        (None, "other", None),
+    ],
+)
+def test_install_kind_from_direct_url(direct_url, install, commit):
+    from shambu.facade import install_kind
+
+    assert install_kind(direct_url) == (install, commit)
+
+
+def test_shambu_section_takes_the_package_version_and_compares():
+    import shambu
+    from shambu.facade import shambu_section
+
+    d = shambu_section("9.9.9", {"url": "file:///x", "dir_info": {}})
+    assert d["version"] == shambu.__version__
+    assert (d["install"], d["expected"], d["match"]) == ("uv tool, local folder (snapshot)", "9.9.9", False)
+    assert shambu_section(None, {})["match"] is None
+    assert shambu_section(shambu.__version__, {})["match"] is True
+
+
+def test_doctor_json_starts_with_the_shambu_section(capsys):
+    import shambu
+
+    code, out, err = run(capsys, "--json", "doctor", "--no-printer", "--expect-version", shambu.__version__)
+    j = one_json(out)
+    assert code == 0
+    assert list(j)[:2] == ["shambu", "studio"]
+    assert set(j["shambu"]) == {"version", "package_path", "install", "commit", "expected", "match"}
+    assert j["shambu"]["match"] is True and j["shambu"]["version"] == shambu.__version__
+    assert j["studio"]["tested"] == "02.08.02.61" and j["studio"]["match"] is True
+    assert set(j["timings_s"]) == {"studio", "profiles", "config", "machine"}
+    assert "doctor: studio" in err and "doctor: machine" in err  # one progress line per step, on stderr
+
+
+def test_doctor_version_mismatch_is_exit_3_after_every_section(capsys):
+    code, out, _ = run(capsys, "doctor", "--no-printer", "--expect-version", "9.9.9")
+    lines = out.splitlines()
+    assert code == 3
+    assert lines[0].endswith("; skill expects 9.9.9: MISMATCH")
+    assert (
+        lines[1] == 'Fix: uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@v9.9.9"   (or /shambu:setup update)'
+    )
+    assert lines[2].startswith("Bambu Studio 02.08.02.61 (tested 02.08.02.61) at ")
+    assert any(ln.startswith("recipes: ") for ln in lines)  # the rest still printed
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer", "--expect-version", "9.9.9")
+    assert code == 3 and one_json(out)["shambu"]["match"] is False
+
+
+def test_doctor_ok_line_and_no_expectation(capsys):
+    import shambu
+
+    code, out, _ = run(capsys, "doctor", "--no-printer", "--expect-version", shambu.__version__)
+    assert code == 0 and out.splitlines()[0].endswith(f"; skill expects {shambu.__version__}: OK")
+    code, out, _ = run(capsys, "doctor", "--no-printer")
+    assert code == 0 and out.splitlines()[0].startswith(f"shambu {shambu.__version__} (")
+
+
+@pytest.mark.parametrize("bad", ["0.4", "v0.4.0", "0.4.0-rc1", "latest"])
+def test_doctor_malformed_expect_version_is_exit_2(capsys, bad):
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer", "--expect-version", bad)
+    assert code == 2 and "X.Y.Z" in one_json(out)["error"]
+
+
+def test_doctor_redacts_the_ip_and_passes_the_budget(capsys, monkeypatch):
+    from shambu.errors import PrinterError
+
+    seen = {}
+
+    def unreachable(self, *a, **k):
+        seen["timeout"] = self.printer_timeout
+        raise PrinterError("cannot connect to 10.1.2.3:8883: timed out")
+
+    monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
+    code, out, err = run(capsys, "--json", "doctor", "--ip", "10.1.2.3", "--printer-timeout", "4")
+    j = one_json(out)
+    assert code == 0  # an unread printer is a WARN, not an environment error
+    assert j["printer"]["error"] == "PrinterError: cannot connect to <ip>:8883: timed out"
+    assert "10.1.2.3" not in out
+    assert seen["timeout"] == 4.0 and "printer" in j["timings_s"] and "doctor: printer" in err
+
+
+def test_doctor_without_the_binary_still_prints_and_exits_3(capsys, monkeypatch, resolver):
+    def missing(self):
+        raise StudioError("Bambu Studio binary not found")
+
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(resolver=resolver))
+    monkeypatch.setattr(studio_mod.StudioCLI, "__post_init__", missing)
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer")
+    j = one_json(out)
+    assert code == 3 and "binary not found" in j["studio"]["error"] and j["shambu"]["version"]

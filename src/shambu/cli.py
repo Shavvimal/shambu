@@ -156,18 +156,66 @@ def printer_lines(d: dict, config: dict) -> list[str]:
     return lines
 
 
-@command("doctor", "Check the Studio install, profiles, config, the X2D machine facts and the spools loaded on the printer")
+def shambu_lines(d: dict) -> list[str]:
+    """doctor's first line: this copy's version and install, against the version the skill text expects."""
+    from .facade import install_command
+
+    head = f"shambu {d['version']} ({d['install']}) at {d['package_path']}"
+    if d.get("expected") is None:
+        return [f"{head}; no expected version given (--expect-version)"]
+    if d.get("match"):
+        return [f"{head}; skill expects {d['expected']}: OK"]
+    return [
+        f"{head}; skill expects {d['expected']}: MISMATCH",
+        f"Fix: {install_command(d['expected'])}   (or /shambu:setup update)",
+    ]
+
+
+def studio_lines(st: dict) -> list[str]:
+    if "error" in st:
+        return [f"Bambu Studio: {st['error']} (tested {st['tested']})"]
+    lines = [f"Bambu Studio {st['version']} (tested {st['tested']}) at {st['binary']} (running pids: {st['running_pids'] or 'none'})"]
+    if not st["match"]:
+        lines.append(f"WARN: Bambu Studio {st['version']} is not the tested {st['tested']}; other 02.08.x builds work but are untested")
+    return lines
+
+
+@command(
+    "doctor", "Check the shambu version, the Studio install, profiles, config, the X2D machine facts and the spools loaded on the printer"
+)
 class Doctor(Command):
     def configure(self, p):
         _printer_flags(p)
+        p.add_argument(
+            "--expect-version",
+            metavar="X.Y.Z",
+            help="the shambu version the skill text expects; a different installed version is exit 3 (after every section prints)",
+        )
+        p.add_argument(
+            "--printer-timeout",
+            type=float,
+            default=15.0,
+            metavar="S",
+            help="seconds for the whole printer read: discovery, connect and report (default 15)",
+        )
 
     def run(self, a, app, out):
+        from .facade import VERSION_RE
+
+        if a.expect_version is not None and not VERSION_RE.match(a.expect_version):
+            return usage(out, f"--expect-version {a.expect_version!r}: give X.Y.Z, for example 0.4.0")
+        if a.printer_timeout <= 0:
+            return usage(out, f"--printer-timeout {a.printer_timeout:g}: give a number of seconds above 0")
         app.printer_ip = a.printer_ip
-        d = app.doctor(printer=not a.no_printer)
-        lines = [
-            f"Bambu Studio {d['studio']['version']} at {d['studio']['binary']} (running pids: {d['studio']['running_pids'] or 'none'})",
-            "profile sources: " + "; ".join(d["profiles"]),
-        ]
+        app.printer_timeout = a.printer_timeout
+        d = app.doctor(
+            printer=not a.no_printer,
+            expected=a.expect_version,
+            progress=lambda name, dt: print(f"doctor: {name} {dt:.1f} s", file=sys.stderr, flush=True),
+        )
+        lines = shambu_lines(d["shambu"]) + studio_lines(d["studio"])
+        prof = d["profiles"]
+        lines.append("profile sources: " + ("; ".join(prof) if isinstance(prof, list) else prof.get("error", "?")))
         c = d.get("config", {})
         lines.append(
             f"GUI presets: machine {c.get('gui_machine_preset')}, process {c.get('gui_process_preset')}, filaments {c.get('gui_filament_presets')}, bed {c.get('gui_bed_type')}"
@@ -184,9 +232,14 @@ class Doctor(Command):
                 lines.append(
                     f"  extruder {e['index']} ({e['type']}, {e['nozzle']} mm): x {e['x'][0]}..{e['x'][1]}, z up to {e['z_max']:.0f}"
                 )
+        elif "error" in m:
+            lines.append(f"machine: {m['error']}")
         lines += printer_lines(d.get("printer", {}), c)
         lines.append("recipes: " + ", ".join(d["recipes"]))
+        lines.append("timings: " + ", ".join(f"{k} {v:.1f} s" for k, v in d["timings_s"].items()))
         out.emit(d, lines)
+        if d["shambu"]["match"] is False or "error" in d["studio"]:
+            return 3  # a version mismatch or no Studio binary: the environment, after every section printed
         return 0
 
 
@@ -517,6 +570,12 @@ class Sweep(Command):
         p.add_argument("--no-slice", action="store_true", help="only plan and export; no time or filament numbers")
         p.add_argument("--no-baseline", action="store_true")
         p.add_argument("--timeout", type=int, default=1200)
+        p.add_argument(
+            "--write-spec",
+            metavar="OUT.json",
+            help="write the chosen variant as a full spec (the input's outdir, a `_sweep` provenance key); build that file",
+        )
+        p.add_argument("--pick", metavar="NAME", help="with --write-spec: the variant to write (default: the table's first row)")
         _printer_flags(p)
         _mismatch_flag(p)
 
@@ -547,6 +606,16 @@ class Sweep(Command):
             msg = f"BuildError: {a.spec}: bad spec ({type(e).__name__}: {e})"
             out.emit({"error": msg}, [msg])
             return 1
+        names = ([S.BASELINE] if not a.no_baseline else []) + [str(v["name"]) for v in variants]
+        if a.pick is not None and not a.write_spec:
+            return usage(out, "--pick needs --write-spec OUT.json")
+        if a.write_spec:
+            if Path(a.write_spec).expanduser().resolve() == Path(a.spec).expanduser().resolve():
+                return usage(out, f"--write-spec {a.write_spec}: that is the input spec; write the result to another file")
+            if a.pick is not None and a.pick not in names:
+                return usage(out, f"--pick {a.pick!r}: no such variant (variants: {', '.join(names)})")
+            if a.no_slice and a.pick is None:
+                return usage(out, "--write-spec with --no-slice needs --pick NAME: without a slice there are no numbers to rank")
         results = S.run(
             spec_json,
             variants,
@@ -556,8 +625,27 @@ class Sweep(Command):
             do_slice=not a.no_slice,
             baseline=not a.no_baseline,
         )
-        out.emit([r.to_json() for r in results], S.table(results))
-        return 0 if all(r.ok for r in results) else 1  # one failed variant is a failed check (exit 1), as for `build`
+        all_ok = all(r.ok for r in results)
+        if not a.write_spec:
+            out.emit([r.to_json() for r in results], S.table(results))
+            return 0 if all_ok else 1  # one failed variant is a failed check (exit 1), as for `build`
+        failed = [r.name for r in results if not r.ok]
+        chosen = S.choose(results, a.pick)
+        written = None
+        if chosen is None:
+            last = "nothing written: no variant passed"
+        elif not chosen.ok:
+            why = chosen.problems[0] if chosen.problems else "failed"
+            last = f"nothing written: variant {chosen.name} failed ({why})"
+        else:
+            by_name = {S.BASELINE: {"name": S.BASELINE}, **{str(v["name"]): v for v in variants}}
+            base = next((r for r in results if r.name == S.BASELINE), None)
+            spec_out = S.written_spec(spec_json, by_name[chosen.name], chosen, str(Path(a.spec).expanduser().resolve()), base)
+            path = S.write_spec(a.write_spec, spec_out)
+            written = {"path": str(path), **{k: v for k, v in spec_out["_sweep"].items() if k != "from"}}
+            last = S.written_line(a.write_spec, spec_out["_sweep"], failed)
+        out.emit({"results": [r.to_json() for r in results], "written": written}, S.table(results) + [last])
+        return 0 if all_ok and written is not None else 1
 
 
 @command("check", "Plan a spec: read the printer's spools, resolve presets, measure STLs, place parts, check limits. No export.")
@@ -769,8 +857,10 @@ class Printer(Command):
         )
 
     def run(self, a, app, out):
-        from .printer import ArpProbe, SsdpListen
+        from .printer import BUDGET_S, ArpProbe, SsdpListen
 
+        # one read's budget: 15 s, or the report wait plus the connect and handshake bounds when --wait asks for more
+        app.printer_timeout = max(BUDGET_S, a.wait + 8)
         svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "discover":
             hits = ArpProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])
