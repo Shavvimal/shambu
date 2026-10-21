@@ -54,17 +54,17 @@ As a Claude Code plugin:
 /shambu:setup
 ```
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu"`) and runs
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.4.0"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu"
-shambu doctor
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.4.0"
+shambu doctor --expect-version 0.4.0
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu" shambu doctor
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.4.0" shambu doctor --expect-version 0.4.0
 ```
 
 ## Usage
@@ -89,12 +89,15 @@ the CLI inputs under `<outdir>/shambu/`.
 ```
 shambu orient bracket.stl                       # bed contact, support shadow, height per candidate face
 shambu sweep plate.json --orientations bracket --by-object   # slices each variant: time, grams, support, waste, swaps
+shambu sweep plate.json --orientations bracket --write-spec plate-best.json   # writes the fastest variant as a spec
 shambu rotate part.stl -o out --lay-on-face 0,0,1          # write a turned copy; shambu split a.stl -o out
 ```
 
 A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`
 (one object after another: on a two-filament plate that drops the prime tower and the per-layer nozzle changes,
 40 min instead of 1 h 24 on the measured plate). The sweep writes each variant to `<outdir>/sweep/<name>/`.
+`--write-spec OUT.json` writes the fastest variant that passed (or `--pick NAME`) as a full spec with the original
+`outdir` and a `_sweep` key that records the variant and its Studio estimate; build that file.
 
 **3. Inspect or patch an existing project.**
 
@@ -180,7 +183,7 @@ make install     # uv sync --group dev
 make check       # ruff, mypy, pytest
 claude plugin validate --strict .
 claude --plugin-dir .            # try the skills from this checkout
-uv tool install --reinstall .    # install the CLI from this checkout
+uv tool install --reinstall .    # development only: a snapshot that does not follow the plugin; users install the tag (/shambu:setup)
 ```
 
 Before a release, run the real-CAD loop in `data/README.md` (the folder is gitignored; copy your own STLs in).

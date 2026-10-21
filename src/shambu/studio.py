@@ -360,11 +360,29 @@ class StudioCLI:
 
     # -- facts ------------------------------------------------------------------------------
     def version(self) -> str:
-        with open(self.binary.parents[1] / "Info.plist", "rb") as f:
-            return plistlib.load(f)["CFBundleShortVersionString"]
+        plist = self.binary.parents[1] / "Info.plist"
+        try:
+            with open(plist, "rb") as f:
+                v = plistlib.load(f)["CFBundleShortVersionString"]
+        except (OSError, plistlib.InvalidFileException, ValueError, KeyError, TypeError) as e:
+            raise StudioError(f"cannot read the Studio version from {plist}: {type(e).__name__}: {e}") from e
+        if not isinstance(v, str) or not v:
+            raise StudioError(f"cannot read the Studio version from {plist}: CFBundleShortVersionString is {v!r}")
+        return v
 
-    def running_pids(self) -> list[int]:
-        r = subprocess.run(["pgrep", "-f", str(self.binary)], capture_output=True, text=True)
+    def running_pids(self) -> list[int] | None:
+        """PIDs of running Studio processes; [] when none run (pgrep exit 1); None when pgrep failed or timed out."""
+        try:  # doctor calls this; a stuck process table must not stall it
+            r = subprocess.run(["pgrep", "-f", str(self.binary)], capture_output=True, text=True, timeout=2)
+        except subprocess.TimeoutExpired:
+            log.warning("pgrep gave no answer within 2 s; running Studio processes unknown")
+            return None
+        except OSError as e:
+            log.warning("pgrep failed (%s); running Studio processes unknown", e)
+            return None
+        if r.returncode not in (0, 1):
+            log.warning("pgrep exited with status %s (%s); running Studio processes unknown", r.returncode, (r.stderr or "").strip()[:200])
+            return None
         return [int(p) for p in r.stdout.split() if p.isdigit()]
 
     def datadir(self, name: str) -> Path:

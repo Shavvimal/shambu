@@ -445,9 +445,14 @@ def _hms(s: int) -> str:
     return f"{m // 60}h{m % 60:02d}"
 
 
+def ranked(results: Sequence[VariantResult]) -> list[VariantResult]:
+    """The variants that passed and sliced, fastest first, then fewest grams: the table's order."""
+    return sorted((r for r in results if r.ok and r.plates), key=lambda r: (r.total_s, r.total_g))
+
+
 def table(results: Sequence[VariantResult]) -> list[str]:
     """Sorted by time, fastest first; variants that failed sink to the bottom with their first problem."""
-    ok = sorted((r for r in results if r.ok and r.plates), key=lambda r: (r.total_s, r.total_g))
+    ok = ranked(results)
     rest = [r for r in results if not (r.ok and r.plates)]
     best = ok[0] if ok else None
     mins = "".join(f" {h:>10}" for h in _TIME_HEADS)
@@ -477,3 +482,81 @@ def _cell(v: float | None, width: int, fmt: str = "") -> str:
     if v is None:
         return f"{'-':>{width}}"
     return f"{int(v):{fmt}}" if fmt else f"{v:{width}.1f}"
+
+
+# ---------------------------------------------------------------------------- --write-spec
+def choose(results: Sequence[VariantResult], pick: str | None = None) -> VariantResult | None:
+    """The variant to write: `pick` by name (passed or not; the caller refuses a failed one), else the table's first row."""
+    if pick is not None:
+        return next((r for r in results if r.name == pick), None)
+    best = ranked(results)
+    return best[0] if best else None
+
+
+def _paths(d: dict) -> list[str]:
+    out = []
+    for pl in d.get("plates", []):
+        for p in pl.get("parts", []):
+            out += [str(q["path"]) for q in [p, *(p.get("parts") or [])] if isinstance(q, dict) and q.get("path")]
+    return out
+
+
+def written_spec(spec_json: dict, variant: dict, result: VariantResult, source: str, baseline: VariantResult | None = None) -> dict:
+    """The chosen variant applied to the input spec as a full spec, with the input's own `outdir` (not
+    `<outdir>/sweep/<name>`), so `shambu build` on it writes beside the original project. `_sweep` records where it came
+    from and the numbers that chose it; `Spec.from_json` ignores the key. A part path the variant changed (a mm copy
+    under `sweep/_units/`) stays as the variant set it, and `_sweep.paths_changed` lists it."""
+    d = apply_variant(spec_json, variant)
+    if "outdir" in spec_json:
+        d["outdir"] = spec_json["outdir"]
+    sliced = result.sliced and bool(result.plates)
+    prov: dict[str, Any] = {
+        "from": source,
+        "variant": result.name,
+        "studio_estimate_s": result.total_s if sliced else None,
+        "grams": round(result.total_g, 1) if sliced else None,
+        "baseline_s": baseline.total_s if baseline is not None and baseline.ok and baseline.sliced and baseline.plates else None,
+    }
+    before = set(_paths(spec_json))
+    changed = [p for p in _paths(d) if p not in before]
+    if changed:
+        prov["paths_changed"] = changed
+    if variant.get("orientation"):
+        prov["orientation"] = variant["orientation"]
+    d["_sweep"] = prov
+    return d
+
+
+def _hm(s: int) -> str:
+    m = _mins(s)
+    return f"{m // 60} h {m % 60} min"
+
+
+def written_line(path: str, prov: dict, failed: Sequence[str] = ()) -> str:
+    """`wrote OUT.json: variant <name> (Studio estimate H h M min, G g; baseline H h M min)`, plus the failed variants."""
+    if prov.get("studio_estimate_s") is not None:
+        nums = f"Studio estimate {_hm(prov['studio_estimate_s'])}, {prov['grams']:.1f} g"
+    else:
+        nums = "not sliced"
+    base = f"baseline {_hm(prov['baseline_s'])}" if prov.get("baseline_s") is not None else "no baseline numbers"
+    tail = f"; failed: {', '.join(failed)}" if failed else ""
+    return f"wrote {path}: variant {prov['variant']} ({nums}; {base}){tail}"
+
+
+def write_spec(path: str | Path, spec: dict) -> Path:
+    """Writes through a new, uniquely named temporary file in the same folder (created exclusively, so it can never be
+    an existing file such as the input spec), then renames it over `path`. A crash never leaves half a spec. A failed
+    write or rename removes the temporary file and raises BuildError naming the destination and the reason."""
+    p = Path(path).expanduser()
+    tmp: Path | None = None
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=p.parent, prefix=f".{p.name}.", suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            f.write(json.dumps(spec, indent=2) + "\n")
+        tmp.replace(p)
+    except OSError as e:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise BuildError(f"cannot write the spec to {p}: {e.strerror or e}") from e
+    return p
