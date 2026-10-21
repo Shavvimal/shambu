@@ -38,6 +38,7 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1071,7 +1072,12 @@ def open_text_entry(path: str, name: str) -> Iterator[io.TextIOWrapper]:
             raw = z.open(name)
         except KeyError as e:
             raise ProjectError(f"{path}: no entry {name!r} in the zip") from e
-        with io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="") as f:
-            yield f
+        except (zipfile.BadZipFile, zlib.error, OSError, EOFError, NotImplementedError) as e:
+            raise ProjectError(f"{path}: entry {name!r} cannot be opened ({e})") from e
+        try:
+            with io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="") as f:
+                yield f
+        except (zipfile.BadZipFile, zlib.error, EOFError) as e:  # a corrupt member fails while it is read
+            raise ProjectError(f"{path}: entry {name!r} is corrupt ({e})") from e
     finally:
         z.close()

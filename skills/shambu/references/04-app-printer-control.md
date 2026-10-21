@@ -465,4 +465,5 @@ the start by the first RUNNING poll and the end by the first FINISH poll.
   --json` shows the IP as `<ip>`, only the masked serial, and `ends_at` as a dated UTC time. `printer raw` drops
   `_topic` (it names the full serial), `net`, `wifi_signal`, `ipcam` (its URL holds the IP) and serial keys. It
   redacts secret-looking keys and any text that names the IP or the serial.
-- **Errors.** A log that cannot be opened or written is exit 3.
+- **Errors.** A log that cannot be opened, written or closed is exit 3. A Studio config problem (no printer
+  selected, no access code) is one `setup` line, and the watch stops at once with exit 3.

@@ -397,3 +397,76 @@ def test_cli_watch_log_write_failure_is_exit_3(stream, tmp_path, capsys, monkeyp
 def test_cli_watch_limits_below_1_are_usage_errors(stream, flag, capsys):
     assert cli.main(["printer", "watch", flag, "0"]) == 2
     assert "must be 1 or more" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------- review round 2 (2026-10-21)
+class DiskFull:
+    """A buffered log that fails on flush (disk full) and then again on close."""
+
+    def __init__(self, f, fail_close=True):
+        self.f, self.fail_close, self.writes = f, fail_close, 0
+
+    def write(self, s):
+        self.writes += 1
+        return self.f.write(s)
+
+    def flush(self):
+        if self.writes > 1:
+            raise OSError(28, "No space left on device")
+        self.f.flush()
+
+    def close(self):
+        self.f.close()
+        if self.fail_close:
+            raise OSError(5, "Input/output error on close")
+
+
+def _patch_log_open(monkeypatch, fail_close=True, name="w.jsonl"):
+    real_open = open
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda p, *a, **k: DiskFull(real_open(p, *a, **k), fail_close) if str(p).endswith(name) else real_open(p, *a, **k),
+    )
+
+
+def test_cli_watch_disk_full_keeps_the_first_error_when_close_fails_too(stream, tmp_path, capsys, monkeypatch, caplog):
+    stream.script = [timed_report(), timed_report("FINISH", layer=3, remaining=0)]
+    _patch_log_open(monkeypatch)
+    assert cli.main(["--json", "printer", "watch", "--ip", SENTINEL_IP, "--log", str(tmp_path / "w.jsonl")]) == 3
+    err = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert err.startswith("DataFileError") and "No space left" in err  # not the close failure
+    assert "closing --log after an error failed too" in caplog.text
+
+
+def test_cli_watch_a_close_failure_alone_is_a_data_file_error(stream, tmp_path, capsys, monkeypatch):
+    stream.script = [timed_report("FINISH", layer=3, remaining=0)]
+    real_open = open
+
+    class CloseFails(DiskFull):
+        def flush(self):
+            self.f.flush()
+
+    monkeypatch.setattr(
+        "builtins.open", lambda p, *a, **k: CloseFails(real_open(p, *a, **k)) if str(p).endswith("w.jsonl") else real_open(p, *a, **k)
+    )
+    assert cli.main(["--json", "printer", "watch", "--ip", SENTINEL_IP, "--log", str(tmp_path / "w.jsonl")]) == 3
+    err = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert err.startswith("DataFileError") and "Input/output error" in err
+
+
+def test_cli_watch_without_an_access_code_is_a_setup_record(tmp_path, monkeypatch, capsys, resolver):
+    """The real path: conf.access_code() raises ConfError naming the masked serial; the watch reports `setup`."""
+    p = tmp_path / "BambuStudio.conf"
+    p.write_text(json.dumps({"app": {"user_last_selected_machine": SERIAL}, "access_code": {}}))
+    monkeypatch.setattr(conf, "CONF", p)
+    monkeypatch.setattr(conf, "APPSUPPORT", tmp_path)
+    monkeypatch.setattr(printer.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=FakeStudio(), resolver=resolver))
+    log = tmp_path / "watch.jsonl"
+    assert cli.main(["--json", "printer", "watch", "--ip", SENTINEL_IP, "--log", str(log)]) == 3
+    out = capsys.readouterr().out
+    lines = read_polls(log.read_text())
+    assert [x["kind"] for x in lines] == ["header", "error"]
+    assert lines[1]["category"] == "setup" and lines[1]["gave_up"] is True
+    for s in (MASKED, SERIAL, SENTINEL_IP):
+        assert s not in out and s not in log.read_text(encoding="utf-8")

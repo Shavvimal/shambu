@@ -100,7 +100,12 @@ def fit_log(polls, t=None):
 
 
 def stored(rate=0.8, **kw):
-    return fit_log(print_log(rate=rate, **kw)).to_print("w.jsonl")
+    return fit_log(print_log(rate=rate, **kw)).to_print(sid("w"))
+
+
+def sid(tag) -> str:
+    """A session fingerprint for a test print: 16 hex digits."""
+    return f"{abs(hash(str(tag))) % 16**16:016x}"
 
 
 def fixture(name: str):
@@ -180,7 +185,7 @@ def test_two_prints_give_a_range_and_no_point_estimate():
     prints = []
     for name in ("d7", "e7a"):
         t, s = fixture(name)
-        prints.append(C.fit(C.polls_from_session(s, t), s, t).to_print(f"{name}.jsonl"))
+        prints.append(C.fit(C.polls_from_session(s, t), s, t).to_print(sid(name)))
     f = C.combine(prints, X2D, "petg")
     assert (f.n, f.min_rate, f.max_rate, f.rate, f.n_eligible) == (2, 0.751, 1.054, None, 0)
     assert C.handback(prints, X2D, "PETG", 6 * 3600) == "; measured prints ran at 0.75 to 1.05 x Studio (n=2)"
@@ -259,9 +264,9 @@ def test_a_spoiled_poll_flags_the_print_and_blocks_a_point_estimate(change, flag
     def spoiled(i):
         log = print_log()
         log[4] = {**log[4], **change}  # layer 11
-        return fit_log(log).to_print(f"w{i}.jsonl")
+        return fit_log(log).to_print(sid(f"w{i}"))
 
-    prints = [stored() | {"log": "a.jsonl"}, stored() | {"log": "b.jsonl"}, spoiled(0)]
+    prints = [stored() | {"session": sid("a")}, stored() | {"session": sid("b")}, spoiled(0)]
     assert flag in prints[2]["flags"]
     f = C.combine(prints, X2D, "PETG")
     assert f.rate is None and f.n_eligible == 2
@@ -276,7 +281,7 @@ def test_a_speed_change_on_a_poll_off_the_track_is_still_seen():
 def test_a_failed_print_is_flagged_and_blocks_a_point_estimate():
     f = fit_log(print_log(end="FAILED"))
     assert C.FLAG_FAILED in f.flags and C.FLAG_END in f.flags and f.final_state == "FAILED"
-    prints = [stored() | {"log": "a.jsonl"}, stored() | {"log": "b.jsonl"}, f.to_print("c.jsonl")]
+    prints = [stored() | {"session": sid("a")}, stored() | {"session": sid("b")}, f.to_print(sid("c"))]
     assert C.combine(prints, X2D, "PETG").rate is None
 
 
@@ -289,9 +294,9 @@ def test_thresholds_at_their_boundaries():
     assert C.FLAG_DISAGREE not in C.fit(agree, s, t).flags
     over = [*agree, C.Poll("layer", at(18), 13, 18, 18, 50.0, 53, 2, 100)]  # +6 %
     assert C.FLAG_DISAGREE in C.fit(over, s, t).flags
-    edge = [stored(r) | {"log": f"{i}.jsonl"} for i, r in enumerate((0.8, 0.9, 0.95))]
+    edge = [stored(r) | {"session": sid(i)} for i, r in enumerate((0.8, 0.9, 0.95))]
     assert C.combine(edge, X2D, "PETG").rate is None
-    inside = [stored(r) | {"log": f"{i}.jsonl"} for i, r in enumerate((0.8, 0.9, 0.94))]
+    inside = [stored(r) | {"session": sid(i)} for i, r in enumerate((0.8, 0.9, 0.94))]
     assert C.combine(inside, X2D, "PETG").rate is not None
 
 
@@ -348,7 +353,8 @@ def test_calibration_file_round_trip(tmp_path, monkeypatch):
         {"material": "fe80::1"},
         {"printer_model": "X2D 00X…999"},  # a masked serial
         {"printer_model": "printer.local"},  # a host name
-        {"log": "/home/someone/w.jsonl"},  # a path, not a file name
+        {"log": "w.jsonl"},  # a file name is not stored
+        {"material": "::1"},
         {"rate": float("nan")},
         {"rate": -0.5},
         {"studio_total_min": float("inf")},
@@ -388,19 +394,19 @@ def test_concurrent_additions_both_land(tmp_path):
     def slow(prints):
         inside.set()
         release.wait(5)
-        return [*prints, stored() | {"log": "a.jsonl"}]
+        return [*prints, stored() | {"session": sid("a")}]
 
     a = threading.Thread(target=conf.update_calibration, args=(slow, p))
     a.start()
     assert inside.wait(5)
-    b = threading.Thread(target=conf.update_calibration, args=(lambda prints: [*prints, stored() | {"log": "b.jsonl"}], p))
+    b = threading.Thread(target=conf.update_calibration, args=(lambda prints: [*prints, stored() | {"session": sid("b")}], p))
     b.start()
     b.join(0.3)
     assert b.is_alive()  # B waits on the lock
     release.set()
     a.join(5)
     b.join(5)
-    assert sorted(x["log"] for x in conf.load_calibration(p)) == ["a.jsonl", "b.jsonl"]
+    assert sorted(x["session"] for x in conf.load_calibration(p)) == sorted([sid("a"), sid("b")])
 
 
 def test_a_write_failure_is_a_data_file_error(tmp_path, monkeypatch):
@@ -433,13 +439,13 @@ def test_report_wording_with_two_prints_gives_the_range():
     prints = []
     for name in ("d7", "e7a"):
         t, s = fixture(name)
-        prints.append(C.fit(C.polls_from_session(s, t), s, t).to_print(f"{name}.jsonl"))
+        prints.append(C.fit(C.polls_from_session(s, t), s, t).to_print(sid(name)))
     line = estimate_lines(SL, prints, X2D)[0]
     assert line.startswith("- plate 1: Studio estimate 6 h 50 min; measured prints ran at 0.75 to 1.05 x Studio (n=2), 179.6 g")
 
 
 def test_report_wording_with_three_standard_prints_gives_a_point():
-    prints = [stored() | {"log": f"{i}.jsonl"} for i in range(3)]
+    prints = [stored() | {"session": sid(i)} for i in range(3)]
     line = estimate_lines(SL, prints, X2D)[0]
     assert "Studio estimate 6 h 50 min; calibrated about 5 h 38 min (n=3)" in line  # 9.5 + 0.8 x 410
 
@@ -451,7 +457,7 @@ def test_render_reads_the_calibration_file_and_survives_a_corrupt_one(tmp_path, 
 
     model = resolver.for_cli("machine", "Test X2D 0.4 nozzle")["printer_model"]
     monkeypatch.setattr(conf, "CALIBRATION", tmp_path / "calibration.json")
-    conf.save_calibration([stored() | {"printer_model": model, "material": "PLA", "log": f"{i}.jsonl"} for i in range(2)])
+    conf.save_calibration([stored() | {"printer_model": model, "material": "PLA", "session": sid(i)} for i in range(2)])
     r = build(tmp_path, stls, resolver)
     assert "Studio estimate" in r.report and "measured prints ran at 0.80 x Studio (n=2)" in r.report
     conf.CALIBRATION.write_text("{broken")
@@ -481,7 +487,7 @@ def test_cli_calibrate_add_then_show(tmp_path, monkeypatch, capsys):
     log = write_log(tmp_path / "w.jsonl", print_log())
     assert cli.main(["--json", "calibrate", "--log", str(log), "--add"]) == 0
     d = json.loads(capsys.readouterr().out)
-    assert d["added"] == 1 and d["prints"][0]["kind"] == "whole" and d["prints"][0]["log"] == "w.jsonl"
+    assert d["added"] == 1 and d["prints"][0]["kind"] == "whole" and "log" not in d["prints"][0]
     assert str(tmp_path) not in json.dumps(d["prints"])
     assert cli.main(["--json", "calibrate", "--log", str(log), "--add"]) == 0  # the same log again replaces its print
     capsys.readouterr()
@@ -510,7 +516,7 @@ def test_cli_calibrate_exit_1_for_an_untied_log_no_running_poll_or_bad_line(tmp_
     assert cli.main(args) == 1
     d = json.loads(capsys.readouterr().out)
     assert len(d["errors"]) == 4 and d["added"] == 0
-    assert "not tied" in d["errors"][0] and "no RUNNING poll" in d["errors"][1] and "UTC timestamp" in d["errors"][2]
+    assert "not tied" in d["errors"][0] and "no session with a RUNNING poll" in d["errors"][1] and "UTC timestamp" in d["errors"][2]
     assert "cannot read it" in d["errors"][3]
     assert not conf.CALIBRATION.exists()
 
@@ -550,3 +556,125 @@ def test_gcode_track_streams_only_the_chosen_plate(tmp_path, monkeypatch):
     with pytest.raises(ProjectError, match="pass --plate"):
         cli._gcode_track(str(path), None)
     assert threemf.plate_gcode_names(str(path)) == ["Metadata/plate_1.gcode", "Metadata/plate_2.gcode"]
+
+
+# ---------------------------------------------------------------------------- review round 2 (2026-10-21)
+SERIAL = "00X0TEST0000999"
+CODE = "SENTINEL-CODE-8812"
+
+
+def test_a_missing_countdown_blocks_agreement_and_a_point_estimate():
+    log = [{**p, "remaining_min": None} if p["state"] == "RUNNING" else p for p in print_log()]
+    f = fit_log(log)
+    assert C.FLAG_COUNTDOWN in f.flags and C.FLAG_DISAGREE not in f.flags and f.printer_vs_studio is None
+    prints = [stored() | {"session": sid("a")}, stored() | {"session": sid("b")}, f.to_print(sid("c"))]
+    assert C.combine(prints, X2D, "PETG").rate is None
+
+
+def test_a_first_running_poll_without_a_layer_is_not_a_start():
+    log = print_log(start=False)
+    log.insert(0, poll(0, "RUNNING", None, 100))  # the layer is missing, not 0
+    f = fit_log(log)
+    assert C.FLAG_START in f.flags and f.kind == "span" and f.startup_offset_min is None
+    log[0]["layer"] = 0  # observed layer 0 as the first poll: the start is seen
+    assert C.FLAG_START not in fit_log(log).flags
+
+
+def test_a_zero_countdown_on_the_last_layer_is_storable():
+    log = print_log()
+    log[-2]["remaining_min"] = 0  # the last RUNNING poll: the printer says 0 min left
+    f = fit_log(log)
+    assert f.printer_vs_studio[0] == 0.0
+    C.validate_print(f.to_print(sid("z")))
+
+
+@pytest.mark.parametrize("name", ["Bracket [final]", "PA6/66", "Polymaker PolyLite™ PLA", "木材 PLA"])
+def test_legitimate_names_are_stored(name):
+    C.validate_print(stored() | {"material": name})
+
+
+def test_a_name_that_cannot_be_stored_is_dropped_not_fatal():
+    t = track()
+    t.printer_model = "X2D at 10.0.0.9"
+    (s,) = C.read_log([header(t), *print_log()])
+    rec = C.fit(C.polls_from_session(s, t), s, t).to_print(sid("n"))
+    assert rec["printer_model"] is None and rec["rate"] == 0.8
+    C.validate_print(rec)
+
+
+@pytest.mark.parametrize("text", ["::1", "fe80::1%en0", "10.0.0.9:8883", "[fd00::42]:8883", "2001:db8::7"])
+def test_ip_addresses_are_found_by_ipaddress(text):
+    assert C.identifying(f"printer {text} here")
+    assert not C.identifying("0.20mm Standard @BBL X2D 0.4 nozzle v02.08.02.61")
+
+
+def test_huge_integers_are_not_finite():
+    assert not C._finite(10**400)
+    with pytest.raises(C.CalibrationError):
+        C.M73Track.from_json({"total_min": 10**400, "layers": {"1": [0, 1]}})
+    with pytest.raises(ConfError):
+        conf.save_calibration([stored() | {"studio_total_min": 10**400}], Path("/nonexistent/c.json"))
+
+
+def test_the_same_session_under_three_names_is_one_print(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(conf, "CALIBRATION", tmp_path / "calibration.json")
+    logs = [write_log(tmp_path / f"{n}.jsonl", print_log()) for n in ("a", "b", "c")]
+    assert cli.main(["--json", "calibrate", *[x for p in logs for x in ("--log", str(p))], "--add"]) == 0
+    capsys.readouterr()
+    assert len(conf.load_calibration()) == 1
+    assert C.combine(conf.load_calibration(), X2D, "PETG").n == 1
+
+
+def test_a_log_named_after_the_serial_stores_and_prints_no_serial(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "BambuStudio.conf"
+    cfg.write_text(json.dumps({"app": {"user_last_selected_machine": SERIAL}, "access_code": {SERIAL: CODE}}))
+    monkeypatch.setattr(conf, "CONF", cfg)
+    monkeypatch.setattr(conf, "CALIBRATION", tmp_path / "calibration.json")
+    t = track()
+    t.material = f"PETG {SERIAL}"
+    log = write_log(tmp_path / f"{SERIAL}-{CODE}.jsonl", print_log(), t=t)
+    bad = write_log(tmp_path / f"{SERIAL}.jsonl", [{**poll(0), "read_at": "bad"}])
+    for args in (["--json", "calibrate", "--log", str(log), "--add"], ["calibrate", "--log", str(bad), "--show"]):
+        cli.main(args)
+        out = capsys.readouterr().out
+        assert SERIAL not in out and CODE not in out and "00X…999" not in out
+    text = conf.CALIBRATION.read_text()
+    assert SERIAL not in text and CODE not in text and "jsonl" not in text
+    assert conf.load_calibration()[0]["material"] is None  # the label named the serial: dropped
+
+
+@pytest.mark.parametrize("order", ["idle_first", "idle_last"])
+def test_a_session_without_a_print_is_skipped_and_the_others_count(tmp_path, monkeypatch, capsys, order):
+    monkeypatch.setattr(conf, "CALIBRATION", tmp_path / "calibration.json")
+    idle = [header(), poll(-30, "IDLE", 0, 0), poll(-29, "IDLE", 0, 0)]
+    real = [header(), *print_log()]
+    lines = (
+        idle + real
+        if order == "idle_first"
+        else real + [{**p, "read_at": at(300 + i)} if "read_at" in p else p for i, p in enumerate(idle)]
+    )
+    log = tmp_path / "w.jsonl"
+    log.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    assert cli.main(["--json", "calibrate", "--log", str(log), "--add"]) == 0
+    d = json.loads(capsys.readouterr().out)
+    assert len(d["prints"]) == 1 and d["added"] == 1 and "no RUNNING poll" in d["notes"][0]
+
+
+def test_a_corrupt_member_is_a_project_error(tmp_path):
+    path = gcode3mf(tmp_path / "p.gcode.3mf")
+    data = bytearray(path.read_bytes())
+    with zipfile.ZipFile(path) as z:
+        info = z.getinfo("Metadata/plate_1.gcode")
+    start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    data[start + 50] ^= 0xFF  # one byte of the member's data: its CRC no longer matches
+    path.write_bytes(bytes(data))
+    with pytest.raises(ProjectError, match=r"corrupt|cannot be opened"):
+        cli._gcode_track(str(path), 1)
+
+
+def test_a_parser_error_passes_through_the_stream(tmp_path):
+    path = tmp_path / "p.gcode.3mf"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("Metadata/plate_1.gcode", gcode(m73=False))
+    with pytest.raises(C.CalibrationError, match="no 'M73"):
+        cli._gcode_track(str(path), None)

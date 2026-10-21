@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import Protocol, TypeVar
 
 from . import conf
-from .errors import PrinterError
+from .errors import ConfError, PrinterError
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -1284,11 +1284,11 @@ class PrinterService:
             remaining = n + 1 < max_polls
             try:
                 st = self.status()
-            except PrinterError as e:
+            except (PrinterError, ConfError) as e:
                 if max_errors is None:
                     raise
                 errors += 1
-                gave_up = errors >= max_errors
+                gave_up = errors >= max_errors or isinstance(e, ConfError)  # a config problem does not heal by waiting
                 yield WatchError(utc_iso(now()), *error_category(e), consecutive=errors, gave_up=gave_up)
                 if gave_up:
                     return
@@ -1331,6 +1331,8 @@ ERROR_CATEGORIES = (  # (category, words in the PrinterError text, the fixed mes
 def error_category(e: BaseException) -> tuple[str, str]:
     """(category, fixed message) for a failed read. The message never quotes the exception: the lower layers put the
     IP, the host name, the masked serial and the TLS names in their text, and a watch log must hold none of them."""
+    if isinstance(e, ConfError):  # Studio's config: no printer selected, no access code (its text names the serial)
+        return "setup", "shambu or Bambu Studio is not set up for the printer"
     text = str(e)
     for cat, words, msg in ERROR_CATEGORIES:
         if any(w in text for w in words):

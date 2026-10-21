@@ -29,6 +29,8 @@ with the printer agreeing with Studio and no pause, whose rates span less than 0
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -57,7 +59,8 @@ FLAG_END = "end_not_logged"
 FLAG_START = "start_not_logged"
 FLAG_FAILED = "print_failed"
 FLAG_PAUSED = "paused"
-FLAGS = (FLAG_SPEED, FLAG_SPEED_UNKNOWN, FLAG_DISAGREE, FLAG_END, FLAG_START, FLAG_FAILED, FLAG_PAUSED)
+FLAG_COUNTDOWN = "countdown_not_logged"  # a layer poll without the printer's remaining time: agreement unknown
+FLAGS = (FLAG_SPEED, FLAG_SPEED_UNKNOWN, FLAG_DISAGREE, FLAG_END, FLAG_START, FLAG_FAILED, FLAG_PAUSED, FLAG_COUNTDOWN)
 # Any of these keeps a print out of a point estimate (start and end must both be logged: a finished whole print).
 BLOCKS_POINT = frozenset(FLAGS)
 
@@ -75,8 +78,16 @@ class CalibrationError(BambuError):
     """A log, a track or a stored print cannot be used: not JSON, a bad field, no RUNNING poll, no M73 track."""
 
 
-def _finite(x, positive: bool = False) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and (x > 0 or not positive)
+def _finite(x, positive: bool = False, nonneg: bool = False) -> bool:
+    """A real, finite number (an int too large for a float is not); `positive` > 0, `nonneg` >= 0."""
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        if not math.isfinite(x):
+            return False
+    except OverflowError:
+        return False
+    return (x > 0) if positive else (x >= 0 if nonneg else True)
 
 
 # ------------------------------------------------------------------------------------------------ the M73 track
@@ -337,7 +348,10 @@ def _session_facts(polls: list[tuple[int, dict]]) -> tuple[int | None, _Facts]:
         return None, f
     head = polls[first][1]
     before = [r["state"] for _, r in polls[:first]]
-    f.started = "PREPARE" in before or ((head.get("layer") or 0) < 1 and (not before or before[-1] in WAITING_STATES))
+    # start evidence must be observed: a PREPARE poll, or a first RUNNING poll that reports layer 0 (not a missing
+    # layer) and is the session's first poll or follows an idle or final state
+    early = isinstance(head.get("layer"), int) and head["layer"] < 1
+    f.started = "PREPARE" in before or (early and (not before or before[-1] in WAITING_STATES))
     task, layer = None, 0
     for k, (i, r) in enumerate(polls[first:], first):
         st = r["state"]
@@ -449,15 +463,15 @@ class PrintFit:
     filament_settings_id: str | None = None
     print_settings_id: str | None = None
 
-    def to_print(self, log_name: str | None = None) -> dict:
-        """The calibration-file entry: fixed fields only (see `validate_print`). `log_name` is the log file's name,
-        never its path."""
-        d = {
+    def to_print(self, session: str) -> dict:
+        """The calibration-file entry: the schema's fixed fields (see `validate_print`), `session` the fingerprint of
+        the log session (`session_fingerprint`). It stores no file name and no preset label: the grouping values
+        (printer model, material) are kept only when `storable_name` accepts them, else they are None."""
+        return {
+            "session": session,
             "date": self.first_read_at[:10],
-            "printer_model": self.printer_model,
-            "material": self.material,
-            "filament_settings_id": self.filament_settings_id,
-            "print_settings_id": self.print_settings_id,
+            "printer_model": self.printer_model if storable_name(self.printer_model) else None,
+            "material": self.material if storable_name(self.material) else None,
             "studio_total_min": self.studio_total_min,
             "kind": self.kind,
             "rate": self.rate,
@@ -474,10 +488,7 @@ class PrintFit:
             "speed_percents": self.speed_percents,
             "printer_vs_studio": list(self.printer_vs_studio) if self.printer_vs_studio else None,
             "flags": self.flags,
-            "log": log_name,
         }
-        validate_print(d)
-        return d
 
     def lines(self) -> list[str]:
         head = f"{self.printer_model or 'printer ?'}, {self.material or 'material ?'}, {self.first_read_at[:10]}: "
@@ -536,6 +547,8 @@ def fit(polls: list[Poll], session: Session, track: M73Track) -> PrintFit:
     ]
     if any(round(abs(x - 1), 9) > DISAGREE + EPS for x in rel):
         flags.append(FLAG_DISAGREE)
+    if not layers or any(p.printer_remaining_min is None for p in layers):
+        flags.append(FLAG_COUNTDOWN)
     if start is None:
         flags.append(FLAG_START)
     if facts.final == "FAILED":
@@ -569,18 +582,15 @@ def fit(polls: list[Poll], session: Session, track: M73Track) -> PrintFit:
 
 
 # ------------------------------------------------------------------------------------------------ the stored print
-_SAFE_TEXT = re.compile(r"[A-Za-z0-9 .,@+_()#%:/;-]{0,120}")
-_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
-_IPV6 = re.compile(r"(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b")
 _MASKED = re.compile("\\w{2,}\u2026\\w{2,}|\\w{3}\\.\\.\\.\\w{3}")
 _HOST = re.compile(r"(?i)\b[a-z0-9-]+\.(?:local|lan|home|internal|com|net|org|io)\b")
-_NAME_FIELDS = ("printer_model", "material", "filament_settings_id", "print_settings_id")
+_TOKEN_SPLIT = re.compile(r"[\s,;()\[\]{}<>\"'=/\\]+")
+_NAME_FIELDS = ("printer_model", "material")
 _SCHEMA: dict[str, tuple] = {
+    "session": ("session",),
     "date": ("date",),
-    "printer_model": ("name",),
-    "material": ("name",),
-    "filament_settings_id": ("name",),
-    "print_settings_id": ("name",),
+    "printer_model": ("name", None),
+    "material": ("name", None),
     "studio_total_min": ("pos",),
     "kind": ("kind",),
     "rate": ("pos", None),
@@ -597,16 +607,43 @@ _SCHEMA: dict[str, tuple] = {
     "speed_percents": ("ints",),
     "printer_vs_studio": ("pair", None),
     "flags": ("flags",),
-    "log": ("filename", None),
 }
-REFUSAL = "a calibration print must match the schema: fixed fields, numbers that are finite, no identifier, no path"
+REFUSAL = "a calibration print must match the schema: fixed fields, numbers that are finite, no identifier"
+
+
+def session_fingerprint(header: dict | None, first_poll: dict, last_poll: dict) -> str:
+    """A stable id of one log session, from its content only (the header and the first and last poll), so the same
+    session imported under several file names is one print."""
+    blob = json.dumps([header, first_poll, last_poll], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def identifying(s: str) -> bool:
+    """True when the text holds an IP address (v4 or v6, by `ipaddress`, with or without a port), a masked serial or
+    a LAN host name. Known secrets (the serial, the access code) are the caller's to scrub: `conf.sensitive_values`."""
+    if _MASKED.search(s) or _HOST.search(s):
+        return True
+    for tok in _TOKEN_SPLIT.split(s):
+        for cand in (tok, tok.rsplit(":", 1)[0] if tok.count(":") == 1 else tok, tok.split("%", 1)[0]):
+            try:
+                ipaddress.ip_address(cand)
+                return True
+            except ValueError:
+                continue
+    return False
+
+
+def storable_name(v) -> bool:
+    """A display name the file may keep: printable text of 1 to 120 characters (any script, slashes and brackets
+    allowed) that names no identifier."""
+    return isinstance(v, str) and 0 < len(v) <= 120 and v.isprintable() and not identifying(v)
 
 
 def _ok(kind: str, v) -> bool:
     if kind == "name":
-        return isinstance(v, str) and bool(_SAFE_TEXT.fullmatch(v)) and "/" not in v and not _identifying(v)
-    if kind == "filename":
-        return isinstance(v, str) and bool(re.fullmatch(r"[A-Za-z0-9._-]{1,120}", v)) and not v.startswith(".") and not _identifying(v)
+        return storable_name(v)
+    if kind == "session":
+        return isinstance(v, str) and bool(re.fullmatch(r"[0-9a-f]{16}", v))
     if kind == "date":
         return isinstance(v, str) and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", v))
     if kind == "iso":
@@ -616,7 +653,7 @@ def _ok(kind: str, v) -> bool:
     if kind == "num":
         return _finite(v)
     if kind == "nonneg":
-        return _finite(v) and v >= 0
+        return _finite(v, nonneg=True)
     if kind == "count":
         return isinstance(v, int) and not isinstance(v, bool) and v > 0
     if kind == "kind":
@@ -627,27 +664,21 @@ def _ok(kind: str, v) -> bool:
         return isinstance(v, list) and all(isinstance(x, int) and not isinstance(x, bool) for x in v)
     if kind == "layers":
         return isinstance(v, list) and len(v) == 2 and all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in v)
-    if kind == "pair":
-        return isinstance(v, list) and len(v) == 2 and all(_finite(x, positive=True) for x in v)
+    if kind == "pair":  # the printer's countdown over Studio's: 0 when the printer says 0 min left
+        return isinstance(v, list) and len(v) == 2 and all(_finite(x, nonneg=True) for x in v)
     if kind == "flags":
         return isinstance(v, list) and all(x in FLAGS for x in v)
     return False
 
 
-def _identifying(s: str) -> bool:
-    return bool(_IPV4.search(s) or _IPV6.search(s) or _MASKED.search(s) or _HOST.search(s))
-
-
 def validate_print(d) -> None:
     """Raises CalibrationError(REFUSAL) unless `d` holds exactly the schema's fields with valid values: no other key
-    (so nothing nested), no IP, host name or masked serial in a name, a file name and not a path for `log`."""
+    (so nothing nested), no identifier in a name, finite numbers. Called when the file is written and read."""
     if not isinstance(d, dict) or set(d) != set(_SCHEMA):
         raise CalibrationError(REFUSAL)
     for k, kinds in _SCHEMA.items():
         v = d[k]
         if v is None and None in kinds:
-            continue
-        if v is None and k in _NAME_FIELDS:
             continue
         if not _ok(str(kinds[0]), v):
             raise CalibrationError(f"{REFUSAL} (field {k})")
