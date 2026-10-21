@@ -12,7 +12,7 @@ send a job. Request: $ARGUMENTS
 
 ## Before you start
 
-1. Run `shambu doctor --json` before EVERY build, not once per session. It gives the printer preset, both nozzles'
+1. Run `shambu doctor --json --expect-version 0.4.0` before EVERY build, not once per session. It gives the printer preset, both nozzles'
    reach and height, the bed, the GUI's current presets and bed type, the recipe list, and under `printer` the
    spools loaded on the printer right now: per nozzle the material, colour, preset id and the resolved preset
    name. Use those values, not assumptions, and not a spec from an earlier day. If `shambu` is missing, tell the
