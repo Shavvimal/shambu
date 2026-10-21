@@ -17,6 +17,7 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
 8. Machine limits the tool checks (X2D)
 9. Out of scope for the tool
 10. Prime tower on a two-filament plate
+11. Studio's time estimate versus the printer
 
 ## 1. Process presets and strength
 
