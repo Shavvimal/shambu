@@ -204,7 +204,7 @@ def footprint(settings: TowerSettings, height: float, x: float, y: float) -> Tow
 
 def shared_reach(extruders: Iterable[Mapping], bed: Mapping, aux_x_limit: float | None = None) -> Rect:
     """The area every given extruder reaches, inside the bed. Both extruders print the tower. `aux_x_limit` is
-    the user's stricter right edge for extruder 2."""
+    a stricter right edge for extruder 2, when the user sets one."""
     x0, y0, x1, y1 = bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1]
     for e in extruders:
         lo, hi = L.extruder_x(e, aux_x_limit)

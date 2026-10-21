@@ -549,7 +549,7 @@ them. Box gap -3.7 mm (overlap), convex-hull gap 0.0, real gap 4.95 mm (brim to 
 ### 11.3 The rules now
 
 - Pair (`Clearance`): footprint gap g (silhouette). g under the 1.0 mm line allowance (`layout.LINE`, shambu's choice,
-  about two line widths) is a FAIL body ("footprints touch" or "intersect by w x d mm"). Otherwise each part's
+  about two line widths) is a FAIL body ("outlines touch" or "intersect by w x d mm"). Otherwise each part's
   outline is swept by one side's spread at a time and tested against the whole of the other part: the larger of the
   two spreads counts, not their sum, because support-on-support crossings do not fail Studio. A probed part uses its
   measured support mask instead. Short against an estimate: WARN "the slice decides". Short against a probe or a spec
@@ -580,7 +580,7 @@ check, and on exit -101 the report names the two spec keys from the log line.
 ### 11.5 Packer
 
 The five parts (124.2 x 135 x 218, 40.6 x 58.8 x 32.1, 58.6 x 60.7 x 47.8, 50 x 226.4 x 64, 22.1 x 99 x 28.9): the row
-packer needs 2 plates even at zero margin (the 226 mm feeler opens a row, the bed above the housing stays empty).
+packer put them on 2 plates even at zero margin (a heuristic answer) (the 226 mm feeler opens a row, the bed above the housing stays empty).
 `BottomLeftPacker` (candidate points at placed parts' edges plus spread + 1 + gap, lowest top edge then lowest right
 edge, first fit, 0 degrees only) fits them on 1 plate with the estimates and with the measured spreads (unit tests).
 Studio's arrange on the same five parts exits -21 with and without rotations. The row packer stays for print-by-object
