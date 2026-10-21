@@ -544,7 +544,13 @@ With section 3.6's bracket (170 mm tall, 15.6 mm) the first estimate was tree `m
 one line), normal support 5 mm (11.4). The mesh does not tell the side or where along it: the housing's -y and +y
 overhangs had 0.3 and 2.9 mm, its -x overhang 20.9 mm. So the estimate goes on all four sides and is swept from the
 bounding box (plate 14b: the housing's outline was 28.8 mm from the feeler, its box 8.8 mm, and the slice exited
--101). `--probe-supports` measures per side and keeps a support mask (11.6).
+-101). The four measured parts: the coupon 24.8 mm on a 116 mm part, the housing 20.9 on 218, the cradle 7.1 on
+29, the bracket 15.6 on 170. Packing with the estimate may split a plate the printer holds (the five plate-14 parts
+take two plates by estimate, one by measurement) or leave no tower spot clear of it. The plan then measures before it
+answers: the supported parts of that plate get the cached solo-slice probe, packing and the tower run again with the
+measured spreads and masks, and the report says so (`Spreads measured: ...`); a part whose probe fails keeps its
+estimate, named in that line. `--probe-supports` measures every plate from the start (11.6); `--no-probe` keeps the
+estimate's answer.
 
 Footprints on the printed plate: the feeler's wide part exists only in two end blocks, and the cradle sits between
 them. Box gap -3.7 mm (overlap), convex-hull gap 0.0, real gap 4.95 mm (brim to support), model to model about

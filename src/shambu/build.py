@@ -195,6 +195,7 @@ class PlannedPlate:
     checks: list[L.Check] = field(default_factory=list)
     print_sequence: str = "by layer"
     tower: T.TowerPlan | None = None  # the prime tower of a plate that prints two or more filaments by layer
+    packed_plates: int = 1  # how many plates the packer needed for this plate's free parts
 
 
 @dataclass
@@ -693,19 +694,20 @@ class Pipeline:
         filaments: FilamentResolution | None = None,
         probe_supports: bool = False,
         no_check: bool = False,
+        no_probe: bool = False,
     ) -> BuildResult:
         """`filaments` is the spec reconciled with the printer (loaded.reconcile): its spec replaces `spec`, and its
         problems and warnings lead the plan's. Without it a `"loaded"` filament is a problem. `probe_supports`: slice
         each supported single-file part alone to measure its support spread (probe.py), in place of the estimate.
         `no_check` (with `do_slice`) slices again with --no-check when the checked slice exits -101 or -100
-        (`two_pass_slice`)."""
+        (`two_pass_slice`). `no_probe` turns off the measuring fallback of `plan`."""
         if no_check and not do_slice:
             raise BuildError("--no-check needs --slice")
         self.checks_skipped = None
         if filaments is not None:
             spec = filaments.spec
         self.emit("plan", name=spec.name)
-        plan = self.plan(spec, filaments, probe_supports=probe_supports)
+        plan = self.plan(spec, filaments, probe_supports=probe_supports, no_probe=no_probe)
         result = BuildResult(plan, plan.outdir / (f"{spec.name}.gcode.3mf" if do_slice else f"{spec.name}.3mf"), sliced=do_slice)
         result.inputs = self.write_inputs(plan)
         self.emit("planned", ok=plan.ok, problems=plan.problems)
@@ -728,7 +730,56 @@ class Pipeline:
         return result
 
     # ---------------------------------------------------------------- steps
-    def plan(self, spec: Spec, resolution: FilamentResolution | None = None, *, probe_supports: bool = False) -> Plan:
+    def plan(
+        self, spec: Spec, resolution: FilamentResolution | None = None, *, probe_supports: bool = False, no_probe: bool = False
+    ) -> Plan:
+        """Measure, place and check every plate. The support spread is an estimate unless `probe_supports` measures it.
+        The estimate is advisory, so the plan does not fail closed on it: when packing with the estimates needs more
+        plates than the spec declares, or the auto tower finds no spot clear of them, the plates concerned are planned
+        again with the support probe (a cached solo slice per supported part) and say so in a `Spreads measured:` line.
+        `no_probe` keeps the estimates' answer."""
+        plan = self._plan_once(spec, resolution, None if probe_supports else set())
+        if probe_supports or no_probe:
+            return plan
+        why = {i: w for i, p in enumerate(plan.plates, 1) if (w := self._estimate_failure(p))}
+        if not why:
+            return plan
+        measured = self._plan_once(spec, resolution, set(why))
+        for i, cause in why.items():
+            plate = measured.plates[i - 1]
+            plate.checks.insert(0, L.Check(True, self._measured_line(plate, cause, measured.warnings), "measured"))
+        return measured
+
+    @staticmethod
+    def _estimate_failure(p: PlannedPlate) -> str | None:
+        """Why the estimates failed this plate, or None: more plates than declared, or no tower spot clear of them."""
+        if not any(x.placed.spread.source == "estimate" for x in p.parts):
+            return None
+        if p.packed_plates > 1:
+            return f"the estimated support spread needed {p.packed_plates} plates"
+        t = p.tower
+        if t is not None and t.mode == "auto" and (t.problem or t.warning):
+            return "the estimated support spread left no tower spot"
+        return None
+
+    @staticmethod
+    def _measured_line(p: PlannedPlate, cause: str, warnings: list[str]) -> str:
+        bits = []
+        for x in p.parts:
+            sp = x.placed.spread
+            if sp.source == "probe":
+                bits.append(f"{x.key}: " + "/".join(f"{v:.1f}" for v in sp.sides()))
+            elif sp.source == "estimate":
+                failed = any(f"({x.spec.key()}): support probe failed" in w for w in warnings)
+                bits.append(f"{x.key}: estimate kept ({'the probe failed' if failed else 'not probed: several files'})")
+        return (
+            f"Spreads measured: {cause}; a solo slice per supported part measured (mm on -x/+x/-y/+y) "
+            + "; ".join(bits)
+            + "; placement uses the measurements"
+        )
+
+    def _plan_once(self, spec: Spec, resolution: FilamentResolution | None, probe_plates: set[int] | None) -> Plan:
+        """One planning pass. `probe_plates`: the plates whose supported parts the probe measures (None: every plate)."""
         outdir = spec.outdir.expanduser().resolve()
         workdir = outdir / "shambu"
         workdir.mkdir(parents=True, exist_ok=True)
@@ -810,10 +861,11 @@ class Pipeline:
             else None
         )
         probe: SpreadProbe | None = None
-        if probe_supports:
+        if probe_plates is None or probe_plates:
             probe = self.probe or StudioProbe(self.studio, outdir / ".probe", machine, process, filaments, spec.bed_type, fmap)
         for pi, (pspec, seq) in enumerate(zip(spec.plates, sequences, strict=True), 1):
-            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir, orient_settings, probe, warnings)
+            on = probe if probe_plates is None or pi in probe_plates else None
+            parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir, orient_settings, on, warnings)
             by_object = seq == "by object"
             if pspec.group_by_filament:
                 if by_object:
@@ -938,7 +990,7 @@ class Pipeline:
                     + " (Studio's default 0 prints support with whichever filament is loaded; the right nozzle cannot reach x < 20.5)"
                 )
             alist.plates.append(plate)
-            plates.append(PlannedPlate(plate.name, parts, checks, seq))
+            plates.append(PlannedPlate(plate.name, parts, checks, seq, packed_plates=len(packed) if free else 1))
         self._plan_towers(plates, requests, spec)
         problems += self._tower_globals(plates, process)
         warnings += self._name_objects([x for p in plates for x in p.parts])

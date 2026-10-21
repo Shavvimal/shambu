@@ -243,13 +243,16 @@ class Bambu:
         allow_filament_mismatch: bool = False,
         probe_supports: bool = False,
         no_check: bool = False,
+        no_probe: bool = False,
     ) -> BuildResult:
         """`no_check` (with `do_slice`): a --no-check pass after a checked slice exits -101 or -100 (build.two_pass_slice)."""
         if not isinstance(spec, Spec):
             spec = load_spec(spec)
         pipeline = self.pipeline()  # a missing Studio binary is the environment error to report first
         res = self.resolve_filaments(spec, printer=printer, allow_mismatch=allow_filament_mismatch)
-        kw = {"no_check": True} if no_check else {}
+        kw: dict = {"no_check": True} if no_check else {}
+        if no_probe:
+            kw["no_probe"] = True
         return pipeline.build(
             spec,
             export=export,

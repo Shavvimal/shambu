@@ -63,6 +63,9 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
   off the bed says `at` is the min corner; a two-filament estimate shows the tower minutes and the measured options.
   The tower is sized per plate from the filaments its objects use; per-volume and height-range filament keys follow
   Studio's scope; the watch header is scrubbed as a structure; `slice` refuses an export missing a requested plate.
+- The spread estimate is advisory: when packing with it splits a plate or leaves no tower spot, `check`, `build` and
+  `sweep` measure that plate's supported parts with the cached solo-slice probe, place again with the measurements
+  and report a `Spreads measured:` line; `--no-probe` keeps the estimate's answer.
 
 ### Added
 - `shambu patch --replace-mesh OBJECT[/PART]=STL` (anchors frame|centre|min, `--rotate-mesh`, `--lay-on-face`, a no-op

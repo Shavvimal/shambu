@@ -114,6 +114,8 @@ def check_line(c: L.Check) -> str:
     `WARN brim:` (a brim Studio will clip at the bed edge or a nozzle's reach), `WARN outline:` (the box stands in for
     a mesh that did not rasterise),
     `FAIL:` and `OK:` for the rest."""
+    if c.kind == "measured":
+        return c.text  # "Spreads measured: ...": the plan re-ran with the support probe
     if c.kind == "placement" and not c.ok:
         return "PLACEMENT NOT DONE: " + c.text
     if c.kind == "margin":

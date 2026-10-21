@@ -1179,3 +1179,9 @@ def test_the_ip_redactor_works_on_whole_tokens():
 
     assert conf.redact_ip("BambuStudio v2.8.2.61") == "BambuStudio v2.8.2.61"
     assert conf.redact_ip("a 10.23.45.67-plate.gcode.3mf") == "a <ip>-plate.gcode.3mf"
+
+
+def test_no_probe_flag_on_check_build_and_sweep():
+    p = cli.build_parser()
+    for argv in (["check", "s.json", "--no-probe"], ["build", "s.json", "--no-probe"], ["sweep", "s.json", "--no-probe"]):
+        assert p.parse_args(argv).no_probe is True

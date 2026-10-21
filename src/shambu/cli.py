@@ -155,6 +155,15 @@ def _probe_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _no_probe_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="keep the estimated support spread even when packing with it splits a plate or leaves no tower spot "
+        "(by default shambu then measures the supported parts with a cached solo slice)",
+    )
+
+
 def printer_lines(d: dict, config: dict) -> list[str]:
     """Doctor's 'loaded on the printer' section next to the GUI presets, with a MISMATCH line per differing slot."""
     if "error" in d:
@@ -600,7 +609,7 @@ def _sweep_command(a: argparse.Namespace) -> list[str]:
         cmd += ["--orientations", key]
     if a.orientations:
         cmd += ["--top", str(a.top), "--source", a.source, "--threshold", f"{a.threshold:g}"]
-    for flag in ("by_object", "no_slice", "no_baseline", "probe_supports", "allow_filament_mismatch"):
+    for flag in ("by_object", "no_slice", "no_baseline", "probe_supports", "no_probe", "allow_filament_mismatch"):
         if getattr(a, flag, False):
             cmd.append("--" + flag.replace("_", "-"))
     return cmd
@@ -632,6 +641,7 @@ class Sweep(Command):
         p.add_argument("--pick", metavar="NAME", help="with --write-spec: the variant to write (default: the table's first row)")
         _printer_flags(p)
         _mismatch_flag(p)
+        _no_probe_flag(p)
 
     def run(self, a, app, out):
         from . import sweep as S
@@ -678,7 +688,12 @@ class Sweep(Command):
             spec_json,
             variants,
             lambda spec, do_slice: app.build(
-                spec, timeout=a.timeout, do_slice=do_slice, printer=not a.no_printer, allow_filament_mismatch=a.allow_filament_mismatch
+                spec,
+                timeout=a.timeout,
+                do_slice=do_slice,
+                printer=not a.no_printer,
+                allow_filament_mismatch=a.allow_filament_mismatch,
+                **({"no_probe": True} if a.no_probe else {}),
             ),
             do_slice=not a.no_slice,
             baseline=not a.no_baseline,
@@ -727,6 +742,7 @@ class Check(Command):
         _printer_flags(p)
         _mismatch_flag(p)
         _probe_flag(p)
+        _no_probe_flag(p)
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.spec, out)
@@ -739,6 +755,7 @@ class Check(Command):
             printer=not a.no_printer,
             allow_filament_mismatch=a.allow_filament_mismatch,
             probe_supports=a.probe_supports,
+            **({"no_probe": True} if a.no_probe else {}),
         )
         out.emit(r.to_json(), r.report.splitlines())
         return 0 if r.plan.ok else 1
@@ -758,6 +775,7 @@ class Build(Command):
         _printer_flags(p)
         _mismatch_flag(p)
         _probe_flag(p)
+        _no_probe_flag(p)
 
     def run(self, a, app, out):
         if a.no_check and not a.slice:
@@ -777,6 +795,7 @@ class Build(Command):
             allow_filament_mismatch=a.allow_filament_mismatch,
             probe_supports=a.probe_supports,
             **kw,
+            **({"no_probe": True} if a.no_probe else {}),
         )
         doc, lines = r.to_json(), r.report.splitlines()
         if a.open and r.run and r.run.ok:

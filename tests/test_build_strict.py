@@ -950,3 +950,61 @@ def test_probe_io_error_becomes_a_warning_not_a_traceback(tmp_path, resolver):
         boxes_spec(tmp_path, [{"path": str(a), "name": "a", "recipes": ["tree-supports"]}]), probe_supports=True
     )
     assert any("(a): support probe failed (the support probe of a:" in w for w in plan.warnings)
+
+
+# ---------------------------------------------------------------------------- the measuring fallback (estimates are advisory)
+class _Measured:
+    """A SpreadProbe fake: 1 mm on every side, or a failure for the parts named in `fail`."""
+
+    def __init__(self, fail=()):
+        self.fail, self.seen = set(fail), []
+
+    def measure(self, req):
+        from shambu.errors import StudioError
+        from shambu.probe import ProbeResult
+
+        self.seen.append(req.key)
+        if req.key in self.fail:
+            raise StudioError("no G-code")
+        return ProbeResult(L.Spread(1.0, 1.0, 1.0, 1.0, "probe", True))
+
+
+def _four_tall(tmp_path):
+    """Four 115 x 115 x 200 parts with tree supports: the 26 mm estimate puts one per plate, 1 mm fits all four."""
+    names = ["a", "b", "c", "d"]
+    studio = FakeStudio(sizes={f"{n}.stl": (115.0, 115.0, 200.0) for n in names})
+    parts = [{"path": str(stl_named(tmp_path, n)), "name": n, "recipes": ["tree-supports"]} for n in names]
+    return studio, boxes_spec(tmp_path, parts)
+
+
+def test_estimates_that_split_the_plate_are_measured_before_the_answer(tmp_path, resolver):
+    studio, sp = _four_tall(tmp_path)
+    probe = _Measured()
+    plan = Pipeline(studio, resolver, probe=probe).plan(sp)
+    assert sorted(probe.seen) == ["a", "b", "c", "d"] and plan.ok, plan.problems
+    p = plan.plates[0]
+    assert p.packed_plates == 1 and all(x.placed.spread.source == "probe" for x in p.parts)
+    (line,) = [c.text for c in p.checks if c.kind == "measured"]
+    assert line.startswith("Spreads measured: the estimated support spread needed 4 plates; a solo slice per supported part measured")
+    assert "a: 1.0/1.0/1.0/1.0" in line and line.endswith("placement uses the measurements")
+    from shambu.report import check_line
+
+    assert check_line(next(c for c in p.checks if c.kind == "measured")).startswith("Spreads measured: ")
+
+
+def test_no_probe_keeps_the_estimates_answer(tmp_path, resolver):
+    studio, sp = _four_tall(tmp_path)
+    probe = _Measured()
+    plan = Pipeline(studio, resolver, probe=probe).plan(sp, no_probe=True)
+    assert probe.seen == [] and plan.plates[0].packed_plates == 4 and not plan.ok
+    assert any("the packer put the parts on 4 plates (a heuristic" in x for x in plan.problems)
+
+
+def test_a_failing_probe_keeps_that_parts_estimate_and_says_so(tmp_path, resolver):
+    studio, sp = _four_tall(tmp_path)
+    plan = Pipeline(studio, resolver, probe=_Measured(fail={"d"})).plan(sp)
+    p = plan.plates[0]
+    (line,) = [c.text for c in p.checks if c.kind == "measured"]
+    assert "d: estimate kept (the probe failed)" in line
+    assert next(x for x in p.parts if x.key == "d").placed.spread.source == "estimate"
+    assert any("(d): support probe failed (no G-code); the estimate applies" in w for w in plan.warnings)

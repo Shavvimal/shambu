@@ -45,8 +45,11 @@ send a job. Request: $ARGUMENTS
       move the part, or lower the spec `support_spread`, then check again; it is never a plate count.
       `WARN margin rule`: an estimated spread; the slice decides. `WARN brim`: Studio will clip that brim.
       `WARN outline`: the box stands in for a mesh outline. `PLACEMENT NOT DONE`: the packer (a heuristic, no
-      rotation) found no spot; quote it and give that part an `at`. `--probe-supports` measures each supported
-      part's spread with a cached solo slice.
+      rotation) found no spot; quote it and give that part an `at`. The spread estimate is
+      `min(26, max(8, 0.22 x height))`, from four measured parts (coupon 24.8 mm on 116 mm, housing 20.9 on 218,
+      cradle 7.1 on 29, bracket 15.6 on 170). Packing with it may split a plate or leave no tower spot. shambu then
+      measures the supported parts with a cached solo slice before it answers (a `Spreads measured:` line); quote
+      that line. `--probe-supports` measures always, `--no-probe` never.
 - [ ] 4. Compare when the answer is not obvious: `shambu sweep plate.json --orientations PART [--by-object]
       [--variants v.json] --write-spec plate-best.json [--pick NAME]`. Then build the written spec. Never copy a
       variant by hand. A further change (4 walls) goes in a `--variants` entry or the written spec's
@@ -126,7 +129,7 @@ user sets one.
 shambu --version | doctor [--expect-version X.Y.Z] [--no-printer] [--ip IP] [--printer-timeout S]
 shambu info FILE... | inspect project.3mf | presets list filament --contains PETG | recipes | spec [plate.json]
 shambu orient PART.stl [--native] [--write DIR] | rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] | split PART.stl -o DIR
-shambu check plate.json | build plate.json [--slice] [--no-check] [--open] [--probe-supports]   # both read the spools first
+shambu check plate.json | build plate.json [--slice] [--no-check] [--open] [--probe-supports | --no-probe]   # both read the spools first
        [--allow-filament-mismatch] [--no-printer] [--ip IP] [--keep-going: only with the user's yes]
 shambu sweep plate.json [--orientations PART]... [--source own|studio] [--by-object] [--variants v.json] [--write-spec OUT.json [--pick NAME]]
 shambu patch project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 --print-sequence "1:by object"
