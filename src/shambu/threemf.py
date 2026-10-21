@@ -5,7 +5,10 @@ survives a CLI load and re-export. Format facts come from those files and from b
 Higher-level code uses `patches.PatchSet` (Command objects) rather than calling these methods.
 
 Rules the code follows:
-- Never rewrite 3D/3dmodel.model or the mesh files. Patches touch only Metadata/*.
+- A patch touches only the entries it declares (`touches`, default `Metadata/*`). save() compares every entry
+  with the bytes it loaded and raises when an undeclared entry changed, when a `3D/*` entry was added, removed
+  or reordered, or when a `_rels` entry changed. Only the geometry edits in `edits.py` declare `3D/*` entries:
+  the one named object's sub-model and the transform attributes in 3D/3dmodel.model.
 - Keep the zip entry order and each entry's compression. model_settings.config must stay
   before slice_info.config and filament_sequence.json (the loader applies those to plates
   that model_settings already created).
@@ -26,6 +29,7 @@ Rules the code follows:
 from __future__ import annotations
 
 import copy
+import fnmatch
 import io
 import json
 import math
@@ -34,7 +38,7 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -109,6 +113,8 @@ _FEATURE_CLASS = {
     "Prime tower": "tower",
     "Custom": "other",
 }
+# What a patch may change when it declares nothing (every patch in patches.py): metadata entries only.
+DEFAULT_TOUCHES = frozenset({"Metadata/*"})
 _SLICE_ENTRY = re.compile(r"^Metadata/plate_\d+\.(gcode|gcode\.md5|json)$|^Metadata/plate_\d+\.gcode\.md5$")
 # plate metadata keys that only make sense for a sliced plate (bbs_3mf.cpp _handle_start_config_metadata)
 _SLICE_PLATE_KEYS = {
@@ -181,6 +187,8 @@ class Project:
             raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
         if not self.has(PROJECT_SETTINGS) or not self.has(MODEL_SETTINGS):
             raise ProjectError(f"{path}: no Metadata/project_settings.config or model_settings.config: not a Bambu Studio project")
+        self._loaded = [(e.info.filename, e.data) for e in self._entries]  # the bytes save() compares against
+        self.notes: list[str] = []  # report lines that edits (edits.py) leave for the caller: box reports, WARN lines
         self._dirty: set[str] = set()
         self._changed = False  # an entry was put or removed (slices invalidated, a new entry): save() must write
         self._ms: ET.Element | None = None  # parsed model_settings root
@@ -220,6 +228,46 @@ class Project:
             if idx:
                 pos = min(pos, idx[0])
         self._entries.insert(pos, _Entry(info, data))
+
+    def write_entry(self, name: str, data: bytes) -> None:
+        """Replace the bytes of an existing entry (its position, compression and date stay). Raises for a new name:
+        an edit never adds a `3D/*` entry."""
+        if not self.has(name):
+            raise ProjectError(f"{self.path}: no entry {name!r} to rewrite")
+        self._put(name, data)
+
+    def touch_model_settings(self, invalidate: bool = True) -> None:
+        """Mark model_settings.config for writing (after a change to `model_settings`); drops the slice by default."""
+        self._touch_ms(invalidate)
+
+    def touch_project_settings(self) -> None:
+        """Mark project_settings.config for writing (after a change to `project_settings`); drops the slice."""
+        self._touch_ps()
+
+    def changed_entries(self) -> list[str]:
+        """Entry names whose bytes differ from the loaded file, plus added and removed names."""
+        before = dict(self._loaded)
+        now = {e.info.filename: e.data for e in self._entries}
+        changed = [n for n, d in now.items() if n not in before or before[n] != d]
+        return changed + [n for n in before if n not in now]
+
+    def check_touches(self, touches: Iterable[str] | None = None) -> None:
+        """Raise ProjectError when an entry outside `touches` (fnmatch patterns; default DEFAULT_TOUCHES) changed,
+        when a `3D/*` entry was added, removed or reordered, or when a `_rels` entry changed."""
+        allowed = DEFAULT_TOUCHES if touches is None else frozenset(touches)
+        changed = self.changed_entries()
+        bad = [n for n in changed if not any(fnmatch.fnmatchcase(n, pat) for pat in allowed)]
+        if bad:
+            raise ProjectError(
+                f"{self.path}: a patch changed entries it did not declare: {bad} (declared {sorted(allowed)}); nothing written"
+            )
+        rels = [n for n in changed if "_rels/" in n or n.startswith("_rels")]
+        if rels:
+            raise ProjectError(f"{self.path}: a patch changed relationship entries {rels}; nothing written")
+        old3d = [n for n, _ in self._loaded if n.startswith("3D/")]
+        new3d = [n for n in self.names() if n.startswith("3D/")]
+        if old3d != new3d:
+            raise ProjectError(f"{self.path}: a patch added, removed or reordered a 3D/* entry ({old3d} -> {new3d}); nothing written")
 
     def _remove(self, name: str) -> bool:
         n = len(self._entries)
@@ -923,30 +971,41 @@ class Project:
         return removed
 
     # ------------------------------------------------------------------ (c) write
-    def save(self, out_path: str) -> None:
-        raw: bytes | None = None
-        if not self._dirty and not self._changed:
-            # Nothing changed: keep the original bytes (a rewrite recompresses every entry). The same path needs no
-            # write; another path gets those bytes through the same temp-file-and-replace path as a real save.
-            if os.path.abspath(out_path) == os.path.abspath(self.path):
-                return
-            with open(self.path, "rb") as src:
-                raw = src.read()
+    def materialise(self) -> None:
+        """Serialise the parsed settings that patches changed into their entries, without writing a file. save() and
+        a dry run share it, so both compare the same bytes."""
         if MODEL_SETTINGS in self._dirty:
             self._put(MODEL_SETTINGS, _xml_bytes(self.model_settings, "  "))
         if PROJECT_SETTINGS in self._dirty:
             s = json.dumps(self.project_settings, indent=4, ensure_ascii=False)
             self._put(PROJECT_SETTINGS, (s + ("\n" if self._ps_trailing_nl else "")).encode("utf-8"))
+
+    def save(self, out_path: str, touches: Iterable[str] | None = None, verify: Callable[[str], None] | None = None) -> None:
+        """Write the project atomically. `touches` are the entry patterns the applied patches declared (default
+        `Metadata/*`); check_touches() runs first, so an undeclared change raises before anything is written.
+        `verify(tmp_path)` runs on the written temporary archive before it replaces `out_path`: when it raises, the
+        destination stays as it was. Nothing changed: the original bytes are kept (a rewrite recompresses every
+        entry); the same path needs no write, another path gets those bytes through the same temp-file path."""
+        raw: bytes | None = None
+        if not self._dirty and not self._changed:
+            if os.path.abspath(out_path) == os.path.abspath(self.path):
+                return
+            with open(self.path, "rb") as src:
+                raw = src.read()
+        self.materialise()
         names = self.names()
         if MODEL_SETTINGS in names:
             ms = names.index(MODEL_SETTINGS)
             for late in (SLICE_INFO, "Metadata/filament_sequence.json"):
                 if late in names and names.index(late) < ms:
                     raise ProjectError(f"{late} must come after {MODEL_SETTINGS} in the zip")
+        self.check_touches(touches)
         # Atomic: write a temporary file in the destination directory (same filesystem), check it,
         # then rename it over out_path. On any failure the original stays as it was.
         out_dir = os.path.dirname(os.path.abspath(out_path))
-        fd, tmp = tempfile.mkstemp(dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(
+            dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp.3mf"
+        )  # Studio reads it by extension (verify)
         try:
             with os.fdopen(fd, "wb") as f:
                 if raw is not None:
@@ -964,6 +1023,8 @@ class Project:
                 bad = z.testzip()
             if bad is not None:
                 raise ProjectError(f"{out_path}: the written zip fails its CRC check at {bad}; original kept")
+            if verify is not None:
+                verify(tmp)
             # mkstemp creates 0600: keep the original's mode, or give a new file the umask default.
             if os.path.exists(out_path):
                 os.chmod(tmp, os.stat(out_path).st_mode & 0o7777)

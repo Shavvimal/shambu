@@ -675,3 +675,57 @@ Classified against `<project>/plates/config/{process-gridfinity,filament-pla,mac
 
 **other (defaults or derived): 155 keys.** `accel_to_decel_enable`, `accel_to_decel_factor`, `alternate_extra_wall`, `ams_filament_load_time_ams`, `ams_filament_load_time_ams_lite`, `ams_filament_load_time_n3f_s`, `ams_filament_unload_time_ams`, `ams_filament_unload_time_ams_lite`, `ams_filament_unload_time_n3f_s`, `apply_scarf_seam_on_circles`, `bed_custom_model`, `bed_custom_texture`, `bed_heat_soak_area`, `before_layer_change_gcode`, `bridge_angle`, `counterbore_hole_bridging`, `curr_bed_type`, `default_ams_type`, `default_filament_colour`, `default_jerk`, `detect_narrow_internal_solid_infill`, `different_settings_to_system`, `embedding_wall_into_infill`, `enable_filament_dynamic_map`, `enable_mixed_color_sublayer`, `enable_order_independent_overlap_carving`, `enable_overhang_bridge_fan`, `enable_pressure_advance`, `enforce_support_layers`, `ensure_vertical_shell_thickness`, `exclude_object`, `extruder_ams_count`, `extruder_nozzle_stats`, `filament_change_length_nc`, `filament_colour`, `filament_ids`, `filament_is_mixed`, `filament_map`, `filament_map_2`, `filament_map_mode`, `filament_mixed_components`, `filament_mixed_gradient`, `filament_mixed_gradient_curve`, `filament_mixed_gradient_per_part`, `filament_mixed_gradient_range`, `filament_mixed_sublayer_ratios`, `filament_notes`, `filament_nozzle_map`, `filament_self_index`, `filament_volume_map`, `filter_out_gap_fill`, `first_layer_print_sequence`, `first_x_layer_part_fan_speed`, `flush_into_infill`, `flush_into_objects`, `flush_into_support`, `flush_multiplier`, `flush_multiplier_fast`, `flush_volumes_matrix`, `flush_volumes_vector`, `gcode_add_line_number`, `has_filament_switcher`, `has_scarf_joint_seam`, `independent_support_layer_height`, `infill_jerk`, `inherits_group`, `initial_layer_flow_ratio`, `initial_layer_jerk`, `inner_wall_jerk`, `interlocking_beam`, `interlocking_beam_layer_count`, `interlocking_beam_width`, `interlocking_boundary_avoidance`, `interlocking_depth`, `interlocking_orientation`, `internal_solid_infill_pattern`, `ironing_direction`, `ironing_fan_speed`, `ironing_pattern`, `is_infill_first`, `min_bead_width`, `min_feature_size`, `mmu_segmented_region_interlocking_depth`, `mmu_segmented_region_max_width`, `nozzle_volume_type`, `only_one_wall_first_layer`, `ooze_prevention`, `other_layers_print_sequence`, `other_layers_print_sequence_nums`, `outer_wall_jerk`, `overhang_threshold_participating_cooling`, `post_process`, `precise_outer_wall`, `precise_z_height`, `pressure_advance`, `prime_tower_extra_rib_length`, `prime_tower_fillet_wall`, `prime_tower_infill_gap`, `prime_tower_rib_wall`, `prime_tower_rib_width`, `prime_tower_skip_points`, `prime_volume_mode`, `print_compatible_printers`, `print_flow_ratio`, `printer_notes`, `printing_by_object_gcode`, `process_notes`, `raft_contact_distance`, `raft_expansion`, `raft_first_layer_density`, `raft_first_layer_expansion`, `role_base_wipe_speed`, `seam_gap`, `seam_slope_conditional`, `seam_slope_entire_loop`, `seam_slope_inner_walls`, `seam_slope_steps`, `slice_closing_radius`, `slicing_mode`, `smooth_speed_discontinuity_area`, `sparse_infill_anchor`, `sparse_infill_anchor_max`, `spiral_mode_max_xy_smoothing`, `spiral_mode_smooth`, `start_end_points`, `support_angle`, `support_bottom_interface_spacing`, `support_critical_regions_only`, `support_interface_not_for_body`, `support_object_first_layer_gap`, `support_remove_small_overhang`, `template_custom_gcode`, `thick_bridges`, `thumbnail_size`, `timelapse_type`, `top_area_threshold`, `top_one_wall_type`, `top_surface_jerk`, `top_z_overrides_xy_distance`, `travel_jerk`, `tree_support_branch_diameter_angle`, `tree_support_branch_distance`, `use_firmware_retraction`, `use_relative_e_distances`, `version`, `wall_distribution_count`, `wall_sequence`, `wall_transition_angle`, `wall_transition_filter_deviation`, `wall_transition_length`, `wipe_speed`, `wipe_tower_rotation_angle`, `wipe_tower_x`, `wipe_tower_y`, `wrapping_detection_layers`
 
+
+
+## Project edits: replace a mesh, add a filament, move an object or the tower (shambu 0.3.x, `edits.py`)
+
+Verified against Studio 02.08.02.61 (source at tag v02.08.02.61) and live CLI runs on copies of real projects.
+
+**Placement.** An object's world position is `<build><item transform>` composed with `<component transform>`
+(bbs_3mf.cpp:4396, 4439). The 12 numbers are in column order `r00 r10 r20 r01 r11 r21 r02 r12 r22 tx ty tz`, in mm.
+A GUI save puts the placement on the item (component identity); a shambu build puts it on the component (item
+identity); a CLI re-export folds a one-part object into the item. The part `matrix`, `source_offset_*`,
+`<assemble_item>` and `plate_N.json` are not authoritative: moving an object changes the item translation only.
+Plates after the first sit at world offsets `(col * W * 1.2, -row * D * 1.2)`, `cols = compute_colum_count(n)`
+(PartPlate.cpp:4536-4548, PartPlate.hpp:38-50); `--move X,Y@PLATE` gives plate-local min-corner coordinates.
+
+**Meshes.** Each sub-mesh is written re-centred on its bbox centre (bbs_3mf.cpp:5366); `source_offset_*` of the part is
+that centre in the STL's own frame. The GUI's "replace with STL" keeps the volume transform and shifts it by
+`R * (c_new - c_old)` so the two STL frames coincide (Plater.cpp:11302-11411), then calls `ensure_on_bed` only when the
+object is not sinking (Plater.cpp:11375, 11397). `face_count` and `mesh_stat face_count` are written, never read
+(bbs_3mf.cpp:8218, 8306). Studio shares one mesh resource between identical volumes (bbs_3mf.cpp:7353-7367; loaded at
+5271-5313): two components (of two objects, or of one object) name the same `p:path` and `objectid`, or a part carries the
+`mesh_shared` metadata the reader follows (bbs_3mf.cpp:5282-5313), and `--replace-mesh` refuses such an
+object. A raw STL and a shambu-oriented copy of it are in different frames (the oriented copy sits on its min corner):
+with `--anchor frame` the raw STL turned by `--rotate-mesh 0,0,90` moves the housing 91.74 mm, so the patch refuses
+it and names `--anchor centre`.
+
+**Filaments.** `--load-filaments` on a 3MF replaces slots and keeps the project's filament count
+(BambuStudio.cpp:2036). An export loaded with N+1 filaments writes the per-filament keys in slot order but the loaded
+preset's variant block FIRST and `filament_self_index` all `"1"` (live: `nozzle_temperature` 220 x 6 then 255 x 6 for
+a PETG slot 1 and a PLA slot 2). So `--add-filament` reads the new slot's normalised values from a scratch export
+loaded with the new preset ALONE (slot 1 there), the flush matrix from a second scratch export with every slot and
+colour, and appends slot N+1 itself. The per-variant keys are Studio's `filament_options_with_variant`
+(PrintConfig.cpp:7464); a block's length comes from its preset's `filament_extruder_variant`. A one-entry vector means
+"every slot uses entry 0" (Config.hpp:681-685) and is written out before the append. The verify step slices plate 1:
+the variant lookup (`could not found extruder_type`, PrintConfig.cpp:8935) runs when a slice applies the config, not on
+a plain export.
+
+**Prime tower.** `wipe_tower_x/y` are per-plate vectors of the tower's MIN corner, plate-local (BambuStudio.cpp:4481-4486,
+Print.cpp:2423). The CLI estimates the footprint as `x - brim .. x + width + brim`; `--tower` checks
+`x - 8 .. x + max(prime_tower_width, 35) + 8` against the bed and x against extruder 2's reach when a filament maps to it.
+
+**`--no-check`.** It skips the conflict check (-101), the support-necessity check and the -100 exit on empty-layer or
+overlap warnings; -102..-105 and validate errors still exit (BambuStudio.cpp:6192, 6418, 6974, 7185-7212). Studio exits
+on the first conflicting plate (BambuStudio.cpp:7105-7109), and -100 is also the generic exception exit
+(BambuStudio.cpp:7413-7418): only a -100 whose log has `found slicing warnings:` is skippable. A checked slice of a BBL
+3MF without `--load-filaments` resets `filament_prime_volume` to 45, a `--no-check` one does not
+(BambuStudio.cpp:6886-6894); `shambu slice` pins the project's values in every pass. Each pass writes its log and
+`result.json` into its own folder `<name>.slice-<random>/<name>.passes/{checked[-plate-N],checked-all,nocheck}/` next to
+the output (a fresh folder per run, never an existing one); the export replaces the output only after it reads back, and
+an output that is the input is refused.
+
+**The touches contract.** Every patch declares the entries it changes, including what `invalidate_slices` removes
+(`Metadata/plate_N.gcode`, `.md5`, `plate_N.json`, the `slice_info.config` plates) and rewrites
+(`model_settings.config`). `Project.save()` refuses an undeclared change, addition or deletion, a `3D/*` entry added,
+removed or reordered, and any `_rels` change.

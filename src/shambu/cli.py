@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -19,13 +20,19 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from . import __version__, recipes
+from .edits import (
+    EditError,
+    EditSet,
+    MoveObject,
+    ReplaceMesh,
+    SetTower,
+)
 from .errors import BambuError, BuildError, StudioError
 from .facade import Bambu
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
     AddCustomGcode,
     ClearObjectSetting,
-    PatchSet,
     RenameObject,
     RenamePlate,
     RepairNozzleStats,
@@ -38,7 +45,9 @@ from .patches import (
     SetObjectSetting,
     SetPrintSequence,
 )
+from .report import estimate_lines
 from .spec import Spec
+from .studio import CliCommand
 
 log = logging.getLogger("shambu")
 _REGISTRY: dict[str, Command] = {}
@@ -414,7 +423,6 @@ class Orient(Command):
 
     @staticmethod
     def _native(a, app, out) -> int:
-        import tempfile
 
         from . import mesh as M
         from .sweep import unit_scale
@@ -736,16 +744,20 @@ class Build(Command):
         p.add_argument(
             "--slice", action="store_true", help="also slice headless: writes <name>.gcode.3mf with G-code and time/filament estimates"
         )
+        p.add_argument("--no-check", action="store_true", help=NO_CHECK_HELP)
         _printer_flags(p)
         _mismatch_flag(p)
         _probe_flag(p)
 
     def run(self, a, app, out):
+        if a.no_check and not a.slice:
+            return usage(out, "--no-check needs --slice: it is a second slicing pass")
         spec = load_spec_or_error(a.spec, out)
         if isinstance(spec, int):
             return spec
         app.listeners.append(lambda ev, d: log.info("%s %s", ev, {k: v for k, v in d.items() if k != "argv"}))
         app.printer_ip = a.printer_ip
+        kw = {"no_check": True} if a.no_check else {}
         r = app.build(
             spec,
             timeout=a.timeout,
@@ -754,6 +766,7 @@ class Build(Command):
             printer=not a.no_printer,
             allow_filament_mismatch=a.allow_filament_mismatch,
             probe_supports=a.probe_supports,
+            **kw,
         )
         out.emit(r.to_json(), r.report.splitlines())
         if a.open and r.run and r.run.ok:
@@ -832,27 +845,82 @@ class PatchCmd(Command):
             action="store_true",
             help="make an unsliced CLI export re-sliceable: extruder_nozzle_stats, filament_extruder_variant blocks, filament maps",
         )
+        g = p.add_argument_group("project edits (geometry and filaments)")
+        g.add_argument(
+            "--replace-mesh",
+            action="append",
+            default=[],
+            metavar="OBJECT[/PART]=STL",
+            help="swap a part's mesh; keeps the name, settings and plate, checks the box (refuses a size change, a no-op, paint)",
+        )
+        g.add_argument("--rotate-mesh", metavar="X,Y,Z", help="turn the new STL first (degrees, as `shambu rotate`)")
+        g.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="lay this face of the new STL on the bed first")
+        g.add_argument(
+            "--anchor",
+            choices=("frame", "centre", "min"),
+            default="frame",
+            help="frame: the STL frames coincide (Studio's GUI rule, default); centre: keep the old bbox centre; min: keep the min corner",
+        )
+        g.add_argument("--allow-size-change", action="store_true", help="accept a new mesh whose box differs by more than 0.05 mm")
+        g.add_argument("--drop-paint", action="store_true", help="replace a painted mesh and lose its paint")
+        g.add_argument(
+            "--move",
+            action="append",
+            default=[],
+            metavar="OBJECT=X,Y[@PLATE]",
+            help="put the object's bbox MIN corner at X,Y (plate-local mm, as spec `at`), or +DX,+DY to nudge; @PLATE moves it there",
+        )
+        g.add_argument("--strict", action="store_true", help="a --move that breaks a bed, reach or overlap rule fails (default: FAIL line)")
+        g.add_argument("--tower", action="append", default=[], metavar="X,Y[@PLATE]", help="prime tower MIN corner, every plate or one")
+        g.add_argument(
+            "--add-filament",
+            action="append",
+            default=[],
+            metavar="PRESET[:#RRGGBB][@EXTRUDER]",
+            help="append filament slot N+1 (slots 1..N unchanged); colour defaults to the preset's, extruder to 1",
+        )
+        g.add_argument("--allow-duplicate", action="store_true", help="--add-filament may add a preset and colour that a slot already has")
+        g.add_argument("--no-verify", action="store_true", help="skip the verify slice after --add-filament (about 20 s on a full plate)")
         p.add_argument("--dry-run", action="store_true")
 
     def run(self, a, app, out):
         try:
-            ps = self._parse(a)
+            ps = self._parse(a, app)
         except ValueError as e:
             out.emit({"error": f"bad patch option: {e}"}, [f"bad patch option: {e}; see --help for the formats"])
             return 2
+        except EditError as e:
+            out.emit({"error": f"EditError: {e}"}, [f"EditError: {e}"])
+            return 1
         if not ps.patches:
             out.emit({"patched": []}, ["nothing to do: give at least one patch option"])
             return 2
-        if a.dry_run:
-            out.emit({"would_patch": ps.describe()}, ["would patch:"] + ["- " + d for d in ps.describe()])
-            return 0
-        done = app.patch(a.file, ps, a.out)
-        out.emit({"file": a.out or a.file, "patched": done}, [f"patched {a.out or a.file}:"] + ["- " + d for d in done])
+        try:
+            if a.dry_run:
+                notes = ps.preview(a.file)
+                out.emit(
+                    {"would_patch": ps.describe(), "notes": notes},
+                    ["would patch:"] + ["- " + d for d in ps.describe()] + notes,
+                )
+                return 0
+            done = app.edit(a.file, ps, a.out, verify=not a.no_verify)
+        except EditError as e:
+            out.emit({"error": f"EditError: {e}"}, [f"EditError: {e} (the input file is unchanged)"])
+            return 1
+        dest = a.out or a.file
+        out.emit(
+            {"file": dest, "patched": done, "notes": ps.notes},
+            [f"patched {dest}:"] + ["- " + d for d in done] + ps.notes,
+        )
         return 0
 
     @staticmethod
-    def _parse(a) -> PatchSet:
-        ps = PatchSet()
+    def _parse(a, app=None) -> EditSet:
+        ps = EditSet()
+        if len(a.add_filament) > 1:
+            raise ValueError("one --add-filament per call (each new slot is normalised against the project that holds the slots before it)")
+        for x in a.add_filament:  # first, so --extruder, --set and --tower in the same call can use the new slot
+            ps.add(app.add_filament_patch(a.file, x, a.allow_duplicate))
         if a.bed_type:
             ps.add(SetBedTypeEverywhere(a.bed_type))
         for x in a.plate_bed_type:
@@ -897,7 +965,129 @@ class PatchCmd(Command):
             ps.add(RenameObject(old, new))
         if a.repair_nozzle_stats:
             ps.add(RepairNozzleStats())
+        rot: tuple[float, float, float] = _floats(a.rotate_mesh, 3, "--rotate-mesh") if a.rotate_mesh else (0.0, 0.0, 0.0)
+        face: tuple[float, float, float] | None = _floats(a.lay_on_face, 3, "--lay-on-face") if a.lay_on_face else None
+        for x in a.replace_mesh:
+            target, eq, stl = x.partition("=")
+            if not eq or not stl or not target:
+                raise ValueError(f"--replace-mesh {x!r}: use OBJECT[/PART]=PATH.stl")
+            obj, _, part = target.partition("/")
+            ps.add(ReplaceMesh(obj, stl, part or None, rot, face, a.anchor, a.allow_size_change, a.drop_paint))
+        for x in a.move:
+            obj, eq, rest = x.rpartition("=")
+            if not eq or not obj:
+                raise ValueError(f"--move {x!r}: use OBJECT=X,Y[@PLATE] or OBJECT=+DX,+DY")
+            pos, _, plate = rest.partition("@")
+            xs, ys = (v.strip() for v in pos.split(",")) if pos.count(",") == 1 else ("", "")
+            signed = [v[:1] in ("+", "-") for v in (xs, ys)]
+            if any(signed) and not all(signed):
+                raise ValueError(f"--move {x!r}: a relative move needs a sign on both values (+5,-5); absolute values are the min corner")
+            mx, my = _floats(f"{xs},{ys}", 2, "--move")
+            ps.add(MoveObject(obj, mx, my, all(signed), _plate_arg(plate, "--move"), a.strict))
+        for x in a.tower:
+            ps.add(SetTower(*_tower_arg(x)))
         return ps
+
+
+NO_CHECK_HELP = (
+    "with --slice: when the checked slice exits -101 (G-code path conflicts) or -100 (empty layers, overlap), slice again with "
+    "Studio's --no-check, as the GUI accepts the plate with a serious warning; the report names what the check found"
+)
+
+
+def _floats(text: str, n: int, flag: str) -> tuple:
+    """`n` finite comma-separated numbers, else ValueError (a usage error, exit 2)."""
+    vals = [v.strip() for v in text.split(",")]
+    if len(vals) != n:
+        raise ValueError(f"{flag} {text!r}: needs {n} comma-separated numbers")
+    try:
+        out = tuple(float(v) for v in vals)
+    except ValueError as e:
+        raise ValueError(f"{flag} {text!r}: {e}") from e
+    if not all(math.isfinite(v) for v in out):
+        raise ValueError(f"{flag} {text!r}: the values must be finite numbers")
+    return out
+
+
+def _plate_arg(text: str, flag: str) -> int | None:
+    if not text:
+        return None
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(f"{flag} @{text}: the plate must be a whole number from 1")
+    return int(text)
+
+
+def _tower_arg(text: str) -> tuple[float, float, int | None]:
+    pos, _, plate = text.partition("@")
+    x, y = _floats(pos, 2, "--tower")
+    return (x, y, _plate_arg(plate, "--tower"))
+
+
+@command("slice", "Slice a saved .3mf headless (Studio's CLI) and report time and filament; --no-check as a second pass")
+class Slice(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("-o", "--out", help="the .gcode.3mf to write (default: <name>.gcode.3mf next to the input)")
+        p.add_argument("--plate", type=int, default=0, help="plate to slice (default 0: every plate)")
+        p.add_argument("--no-check", action="store_true", help=NO_CHECK_HELP.removeprefix("with --slice: "))
+        p.add_argument("--tower", metavar="X,Y[@PLATE]", help="prime tower min corner for this slice (the input file is not changed)")
+        p.add_argument(
+            "--settings-from",
+            metavar="SPEC.json",
+            help="re-apply the spec's resolved machine and process presets (--load-settings); the project's filaments stay",
+        )
+        p.add_argument("--timeout", type=int, default=1200)
+
+    def run(self, a, app, out):
+        try:
+            tower = _tower_arg(a.tower) if a.tower else None
+        except ValueError as e:
+            return usage(out, str(e))
+        spec = None
+        if a.settings_from:
+            spec = load_spec_or_error(a.settings_from, out)
+            if isinstance(spec, int):
+                return spec
+        try:
+            r = app.slice_project(a.file, a.out, plate=a.plate, no_check=a.no_check, tower=tower, settings_from=spec, timeout=a.timeout)
+        except ValueError as e:
+            return usage(out, str(e))
+        except EditError as e:
+            out.emit({"error": f"EditError: {e}"}, [f"EditError: {e}"])
+            return 1
+        lines = [f"slice {r.file.name}: {r.run.summary()}"]
+        if r.checks_skipped:
+            lines.append("- " + r.checks_skipped["report_line"])
+        for est in r.estimates:
+            lines += estimate_lines(est)
+        lines += ["- " + n.strip() for n in r.notes]
+        if r.ok:
+            lines.append(f"- output {r.output}")
+        out.emit(r.to_json(), lines)
+        return 0 if r.ok else 1
+
+
+@command("studio", "Last resort: run Bambu Studio's CLI with raw arguments (`shambu studio -- ARGS`), ruled, logged, unverified")
+class StudioHatch(Command):
+    def configure(self, p):
+        p.add_argument("--out", default=".", help="the run folder goes under DIR/studio-runs/<UTC stamp>/ (default: .)")
+        p.add_argument("--timeout", type=int, default=1200)
+        p.add_argument("raw", nargs=argparse.REMAINDER, help="Studio arguments after --; --export-3mf takes a bare name")
+
+    def run(self, a, app, out):
+        raw = list(a.raw)
+        if raw and raw[0] == "--":
+            raw = raw[1:]
+        if not raw:
+            return usage(out, "give Studio's arguments after --, e.g. shambu studio -- --slice 1 --export-3mf out.3mf in.3mf")
+        try:
+            CliCommand.parse(raw, Path.cwd())  # the rules first: a refusal is a usage error before Studio is needed
+        except StudioError as e:
+            return usage(out, f"refused: {e}")
+        d = app.studio_raw(raw, a.out, a.timeout)  # a missing binary stays an environment error (exit 3)
+        line = f"studio: exit {d['exit']} ({d['meaning']}); run folder {d['run_dir']}; unverified: run `shambu inspect` on the output"
+        out.emit(d, [line])
+        return 0 if d["exit"] == 0 else 1
 
 
 @command("open", "Open a project in Bambu Studio for the user")

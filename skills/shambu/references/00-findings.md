@@ -17,6 +17,7 @@ file:line citations. Read this before changing `studio.py`, `build.py`, `assembl
 9. Where the evidence lives
 10. The layout checker
 11. Two-filament plates and CLI re-slicing
+12. Project edits, `shambu slice` and the escape hatch
 
 ## 1. The "five-minute export"
 
@@ -192,3 +193,28 @@ v02.08.02.61. Details and the run table: `03-3mf-format.md` section 8 and `06-sl
   (`"auto"`, a spot, or `false`) and `tower.py` replace it; width, rib wall and brim are one value per project.
   The spot search tests the part silhouettes and support spreads (`FootprintClearance`), so the T8 strip beside
   the feeler's 10 mm beam is free; an estimated spread is a WARN there, as between two parts.
+
+## 12. Project edits, `shambu slice` and the escape hatch (live, 2026-10-21)
+
+`shambu patch` now edits geometry and filaments, each edit checked and declared (reference 03, "Project edits"):
+
+- `--replace-mesh housing_print=housing_print-E7a.stl --rotate-mesh 0,0,90 --anchor centre` on a copy of the plate-14
+  project: size 124.25 x 135 x 218 mm before and after, triangles 10 450 -> 11 084, world min corner (44.211, 26.532)
+  unchanged, translation unchanged. Without the rotation the patch refuses a 90-degree turn; with `--anchor frame` it
+  refuses the different STL frame (old source_offset 62.125, 67.5, 109; new 0, 0, 109). Only the sub-model and
+  `model_settings.config` changed in the zip; a Studio export of the result exits 0 with the new mesh.
+- `--add-filament "Bambu PLA Matte @BBL X2D 0.4 nozzle:#FCECD6@2"` on a copy of the one-filament cradle project: slot 1
+  byte-identical in all 580 keys, `filament_self_index` 6 x 1 + 6 x 2, flush matrix 0/609/182/0 from Studio, plate
+  `filament_maps` "1 2". The slice exits 0 with no `could not found extruder_type` line and the same 18 h 0 min,
+  480.7 g as the untouched file (a `--load-filaments` reload had given 16 h 29, 509.0 g).
+- `--move camera_housing_v2_print=+5,+5` and back: only `3D/3dmodel.model` changed, and the round trip is byte-identical
+  apart from the dropped `plate_1.json`. At the original position the move check prints the FAIL line
+  "camera_housing_v2_print and housing_print overlap", the pair of the -101 below.
+- `shambu slice FILE --no-check` slices checked first (per plate) and adds a `--no-check` pass only after a skippable
+  -101 or -100. On the plate-14 project with the E7a housing the checked pass exited -101 ("conflicts between
+  camera_housing_v2_print and housing_print"), the second pass exported 16 h 58 min, 457.8 g, and the report says what
+  the check found. The same file and argv also exited 0 in 2 of 4 checked slices: at a 0.25 mm gap Studio's conflict
+  check is not deterministic, so a -101 on a near-touching pair is a warning to look at the preview, not proof of a
+  collision, and a clean exit is not proof of clearance.
+- `shambu studio -- ARGS` runs a raw Studio command under the builder rules and logs it in `studio-runs/<UTC stamp>/`
+  (command.json, the log, result.json, exit.txt). Its output is unverified until `shambu inspect` reads it.

@@ -3,6 +3,7 @@
 import json
 import subprocess
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -618,3 +619,328 @@ def test_spec_lists_unknown_keys_as_warnings(capsys, tmp_path, stls):
     f.write_text(json.dumps(spec))
     code, out, _ = run(capsys, "--json", "spec", str(f))
     assert code == 0 and one_json(out)["warnings"][0].startswith("plate 1 part 1: unknown key 'brim_margn'")
+
+
+# ---------------------------------------------------------------------------- project edits, slice, studio (edits.py)
+def _geo(tmp_path, **kw):
+    from conftest import make_geo_3mf
+
+    return make_geo_3mf(tmp_path / "geo.3mf", **kw)
+
+
+def test_patch_replace_mesh_prints_the_box_report(capsys, tmp_path):
+    from conftest import write_box_stl
+
+    path = _geo(tmp_path)
+    stl = write_box_stl(tmp_path / "body-v2.stl", (0, 0, 0), (30, 20, 10), fine=True)
+    code, out, _ = run(capsys, "patch", str(path), "-o", str(tmp_path / "o.3mf"), "--replace-mesh", f"body={stl}")
+    assert code == 0
+    assert "size (30.000, 20.000, 10.000) -> (30.000, 20.000, 10.000) mm" in out and "triangles 12 -> 24" in out
+    assert "world min corner (40.000, 50.000, 0.000) -> (40.000, 50.000, 0.000)" in out
+
+
+def test_patch_replace_mesh_size_change_is_exit_1_and_keeps_the_file(capsys, tmp_path):
+    from conftest import write_box_stl
+
+    path = _geo(tmp_path)
+    raw = path.read_bytes()
+    stl = write_box_stl(tmp_path / "wide.stl", (0, 0, 0), (32, 20, 10))
+    code, out, _ = run(capsys, "--json", "patch", str(path), "--replace-mesh", f"body={stl}")
+    assert code == 1 and "delta (2.000" in one_json(out)["error"]
+    assert path.read_bytes() == raw
+
+
+def test_patch_move_dry_run_shows_corner_and_centre(capsys, tmp_path):
+    path = _geo(tmp_path)
+    raw = path.read_bytes()
+    code, out, _ = run(capsys, "--json", "patch", str(path), "--dry-run", "--move", "body=+5,-5")
+    doc = one_json(out)
+    assert code == 0 and path.read_bytes() == raw
+    assert any("(45.000, 45.000) plate 1" in n and "centre (55.000, 60.000) -> (60.000, 55.000)" in n for n in doc["notes"])
+
+
+def test_patch_move_needs_both_signs(capsys, tmp_path):
+    code, out, _ = run(capsys, "patch", str(_geo(tmp_path)), "--move", "body=+5,5")
+    assert code == 2 and "sign on both values" in out
+
+
+def test_patch_tower_one_plate(capsys, tmp_path):
+    path = _geo(tmp_path, plates=3)
+    code, _out, _ = run(capsys, "--json", "patch", str(path), "--tower", "120,30@2")
+    assert code == 0
+    from shambu.threemf import Project
+
+    assert Project(str(path)).project_settings["wipe_tower_x"] == ["208", "120", "208"]
+
+
+def _with_settings(src, dest, ps):
+    with zipfile.ZipFile(src) as z, zipfile.ZipFile(dest, "w") as w:
+        for i in z.infolist():
+            data = z.read(i.filename)
+            if i.filename == "Metadata/project_settings.config":
+                data = json.dumps(ps, indent=4).encode()
+            w.writestr(i, data)
+    return dest
+
+
+def _scratch_3mf(tmp_path, src=None):
+    """The canned scratch exports of a one-filament project: the new preset alone (normalised), then all slots."""
+    from shambu.threemf import Project
+    from test_edits import normalised_settings, scratch_settings
+
+    src = src or _geo(tmp_path, filaments=1)
+    ps = Project(str(src)).project_settings
+    norm = _with_settings(src, tmp_path / "normalised.3mf", normalised_settings(ps))
+    flush = _with_settings(src, tmp_path / "flush.3mf", scratch_settings(ps, 1))
+    return src, [norm, flush, norm]
+
+
+@dataclass
+class FixturesStudio(FakeStudio):
+    """FakeStudio that copies fixtures[i] on call i."""
+
+    fixtures: list = field(default_factory=list)
+
+    def run(self, cmd, **kw):
+        i = len([c for c in self.calls if c[0] == "run"])
+        self.fixture = self.fixtures[min(i, len(self.fixtures) - 1)]
+        return super().run(cmd, **kw)
+
+
+def test_patch_add_filament_with_studio(capsys, tmp_path, monkeypatch, resolver):
+    src, scratch = _scratch_3mf(tmp_path)
+    studio = FixturesStudio(fixtures=scratch)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    out_path = tmp_path / "two.3mf"
+    code, out, _ = run(capsys, "--json", "patch", str(src), "-o", str(out_path), "--add-filament", "Test PETG Basic:#FCECD6@2")
+    doc = one_json(out)
+    assert code == 0, doc
+    from shambu.threemf import Project
+
+    ps = Project(str(out_path)).project_settings
+    assert ps["filament_settings_id"] == ["Test PLA", "Test PETG Basic"] and ps["filament_map"] == ["1", "2"]
+    assert ps["filament_self_index"] == ["1"] * 6 + ["2"] * 6
+    assert any(n.startswith("verify slice: Studio sliced plate 1") for n in doc["notes"])
+    runs = [c[1] for c in studio.calls if c[0] == "run"]
+    assert len(runs) == 3 and all("--load-filaments" in r for r in runs[:2]) and "--slice=1" in runs[2]
+    assert runs[0][runs[0].index("--load-filaments") + 1].endswith("filament-new.json")  # the new preset alone
+
+
+def test_patch_add_filament_without_studio_warns(capsys, tmp_path, monkeypatch, resolver):
+    src = _geo(tmp_path, filaments=1)
+
+    def no_studio(self):
+        raise StudioError("Bambu Studio binary not found")
+
+    monkeypatch.setattr(Bambu, "studio_cli", no_studio)
+    code, out, _ = run(capsys, "--json", "patch", str(src), "--add-filament", "Test PETG Basic:#FCECD6@2")
+    doc = one_json(out)
+    assert code == 0
+    assert any("values not normalised by Studio" in n for n in doc["notes"])
+
+
+def test_patch_add_filament_one_per_call(capsys, tmp_path):
+    code, out, _ = run(capsys, "patch", str(_geo(tmp_path)), "--add-filament", "Test PLA", "--add-filament", "Test PLA")
+    assert code == 2 and "one --add-filament per call" in out
+
+
+def test_patch_add_filament_unknown_preset_is_exit_1(capsys, tmp_path):
+    code, out, _ = run(capsys, "patch", str(_geo(tmp_path)), "--add-filament", "No Such Filament:#FFFFFF")
+    assert code == 1 and "not found" in out
+
+
+def test_build_no_check_without_slice_is_exit_2(capsys, tmp_path):
+    code, out, _ = run(capsys, "build", str(write_spec(tmp_path)), "--no-check")
+    assert code == 2 and "--no-check needs --slice" in out
+
+
+def test_slice_verb_two_pass(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import CONFLICT_LOG, SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    sliced = make_3mf(tmp_path / "fixture.gcode.3mf", sliced=True)
+    studio = SequenceStudio(sliced, codes=[-101, 0], logs=[CONFLICT_LOG, ""])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "--no-check")
+    doc = one_json(out)
+    assert code == 0 and doc["ok"]
+    assert doc["output"] == str(tmp_path / "in.gcode.3mf")
+    assert doc["checks_skipped"]["pair"] == ["a", "b"]
+    assert "G-code path conflict check (exit -101)" in doc["checks_skipped"]["checks"]
+    runs = [c[1] for c in studio.calls if c[0] == "run"]
+    assert "--no-check" not in runs[0] and runs[1].index("--no-check") < runs[1].index("--slice=0")
+
+
+def test_slice_verb_without_no_check_fails_on_a_conflict(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import CONFLICT_LOG, SequenceStudio
+
+    studio = SequenceStudio(None, codes=[-101], logs=[CONFLICT_LOG])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "slice", str(make_3mf(tmp_path / "in.3mf")), "--plate", "1")
+    assert code == 1 and "exit -101 (G-code path conflicts)" in out
+    assert len(studio.calls) == 1
+
+
+def test_slice_verb_tower_leaves_the_input(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = _geo(tmp_path)
+    raw = src.read_bytes()
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "--tower", "120,30", "-o", str(tmp_path / "o.gcode.3mf"))
+    assert code == 0 and src.read_bytes() == raw
+    assert any("wipe_tower_x ['120']" in n for n in one_json(out)["notes"])
+    assert not list(tmp_path.glob(".o.gcode.3mf.shambu"))
+
+
+def test_slice_verb_pins_prime_volume_in_both_passes(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import CONFLICT_LOG, SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf", filament_prime_volume=["90", "120"])
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[-101, 0], logs=[CONFLICT_LOG, ""])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, _, _ = run(capsys, "slice", str(src), "--no-check")
+    assert code == 0
+    runs = [c[1] for c in studio.calls if c[0] == "run"]
+    assert len(runs) == 2
+    for argv in runs:
+        assert "--filament-prime-volume=90,120" in argv
+
+
+def test_patch_add_filament_with_an_absent_old_preset(capsys, tmp_path, monkeypatch, resolver):
+    from conftest import make_geo_3mf
+
+    src = make_geo_3mf(tmp_path / "gone.3mf", filaments=1, filament_settings_id=["My Deleted PLA"])
+    _, scratch = _scratch_3mf(tmp_path, src)
+    studio = FixturesStudio(fixtures=scratch)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "patch", str(src), "-o", str(tmp_path / "o.3mf"), "--add-filament", "Test PETG Basic:#FCECD6@2")
+    assert code == 0, out
+    argv = studio.calls[1][1]
+    loads = argv[argv.index("--load-filaments") + 1]
+    assert loads.endswith("filament-1.json;" + loads.split(";")[1]) and loads.split(";")[1].endswith("filament-new.json")
+
+
+def test_slice_refuses_the_input_as_output(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    raw = src.read_bytes()
+    (tmp_path / "alias.3mf").symlink_to(src)
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    for out_arg in (str(src), str(tmp_path / "alias.3mf")):
+        code, out, _ = run(capsys, "--json", "slice", str(src), "-o", out_arg)
+        assert code == 2 and "is the input file" in one_json(out)["error"]
+    assert src.read_bytes() == raw and studio.calls == []
+
+
+def test_slice_replaces_the_output_only_after_success(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    old = tmp_path / "out.gcode.3mf"
+    old.write_bytes(b"previous output")
+    studio = SequenceStudio(None, codes=[-102])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, _, _ = run(capsys, "slice", str(src), "-o", str(old))
+    assert code == 1 and old.read_bytes() == b"previous output"
+
+
+def _verify_studio(tmp_path, code: int, log: str | None):
+    """FixturesStudio whose third call (the verify slice) exits `code` and leaves `log` (None: no log file)."""
+    _, fixtures = _scratch_3mf(tmp_path)
+
+    @dataclass
+    class VerifyStudio(FixturesStudio):
+        def run(self, cmd, **kw):
+            rr = super().run(cmd, **kw)
+            if len(self.calls) == 3:
+                if log is None:
+                    rr.log.unlink()
+                else:
+                    rr.log.write_text(log)
+                rr = type(rr)(rr.cmd, code % 256, code, rr.seconds, rr.log, {"return_code": code}, rr.output)
+            return rr
+
+    return VerifyStudio(fixtures=fixtures)
+
+
+@pytest.mark.parametrize("code, log", [(124, "$ fake\n[timeout after 1200 s]\n"), (0, None)], ids=["timeout", "no-log"])
+def test_verify_slice_failure_leaves_the_destination(capsys, tmp_path, monkeypatch, resolver, code, log):
+    src = _geo(tmp_path, filaments=1)
+    raw = src.read_bytes()
+    studio = _verify_studio(tmp_path, code, log)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    rc, out, _ = run(capsys, "--json", "patch", str(src), "--add-filament", "Test PETG Basic:#FCECD6@2")
+    assert rc == 1 and "verify slice" in one_json(out)["error"]
+    assert src.read_bytes() == raw
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--move", "nope=1,1"],
+        ["--move", "body=1,1@5"],
+        ["--replace-mesh", "nope=x.stl"],
+        ["--add-filament", "No Such Filament"],
+        ["--add-filament", "Test PETG Basic:#FCECD6@5"],
+        ["--tower", "120,30@9"],
+    ],
+    ids=["unknown-object", "plate-range", "replace-unknown", "unknown-preset", "bad-extruder", "tower-plate"],
+)
+def test_refused_edits_exit_1(capsys, tmp_path, argv):
+    code, out, _ = run(capsys, "--json", "patch", str(_geo(tmp_path)), *argv)
+    assert code == 1, out
+    assert one_json(out)["error"].startswith("EditError")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["patch", "{f}", "--tower", "nan,30"],
+        ["patch", "{f}", "--tower", "120,30@oops"],
+        ["patch", "{f}", "--move", "body=inf,3"],
+        ["slice", "{f}", "--tower", "1,2@x"],
+        ["studio", "--", "--slice", "oops", "x.3mf"],
+    ],
+    ids=["tower-nan", "tower-plate", "move-inf", "slice-tower", "studio-slice"],
+)
+def test_malformed_numbers_are_usage_errors(capsys, tmp_path, monkeypatch, argv):
+    monkeypatch.chdir(tmp_path)
+    f = str(_geo(tmp_path))
+    code, out, _ = run(capsys, "--json", *[a.replace("{f}", f) for a in argv])
+    assert code == 2
+    assert "error" in one_json(out)
+
+
+def test_slice_never_removes_a_folder_by_name(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    job = tmp_path / "job.slice"
+    job.mkdir()
+    src = make_3mf(job / "source.3mf")
+    (job / "notes.txt").write_text("mine")
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, _, _ = run(capsys, "slice", str(src), "-o", str(tmp_path / "job.gcode.3mf"))
+    assert code == 0
+    assert src.is_file() and (job / "notes.txt").read_text() == "mine"
+    assert (tmp_path / "job.gcode.3mf").is_file()
+
+
+def test_slice_keeps_the_old_output_when_the_export_does_not_read_back(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    old = tmp_path / "out.gcode.3mf"
+    old.write_bytes(b"previous good output")
+    junk = tmp_path / "junk.3mf"
+    junk.write_bytes(b"not a zip")
+    studio = SequenceStudio(junk, codes=[0])  # exit 0, but the export is unreadable
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(old))
+    assert code == 1 and "does not read back" in one_json(out)["error"]
+    assert old.read_bytes() == b"previous good output"

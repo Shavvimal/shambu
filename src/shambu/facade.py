@@ -12,9 +12,10 @@ from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 
-from . import conf, presets, recipes
+from . import conf, presets, recipes, runs
 from .build import BuildResult, Listener, Pipeline, load_spec
-from .errors import BambuError
+from .edits import AddFilament, EditSet
+from .errors import BambuError, StudioError
 from .loaded import FilamentResolution, reconcile
 from .patches import PatchSet
 from .printer import LoadedFilaments, PrinterService, Status
@@ -244,13 +245,23 @@ class Bambu:
         printer: bool = True,
         allow_filament_mismatch: bool = False,
         probe_supports: bool = False,
+        no_check: bool = False,
     ) -> BuildResult:
+        """`no_check` (with `do_slice`): a --no-check pass after a checked slice exits -101 or -100 (build.two_pass_slice)."""
         if not isinstance(spec, Spec):
             spec = load_spec(spec)
         pipeline = self.pipeline()  # a missing Studio binary is the environment error to report first
         res = self.resolve_filaments(spec, printer=printer, allow_mismatch=allow_filament_mismatch)
+        kw = {"no_check": True} if no_check else {}
         return pipeline.build(
-            spec, export=export, timeout=timeout, keep_going=keep_going, do_slice=do_slice, filaments=res, probe_supports=probe_supports
+            spec,
+            export=export,
+            timeout=timeout,
+            keep_going=keep_going,
+            do_slice=do_slice,
+            filaments=res,
+            probe_supports=probe_supports,
+            **kw,
         )
 
     def inspect(self, path: str | Path, features: bool = True) -> dict:
@@ -259,6 +270,27 @@ class Bambu:
 
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)
+
+    # ---- project edits, slice and the escape hatch (runs.py does the Studio runs)
+    def studio_or_none(self) -> StudioCLI | None:
+        """The Studio adapter, or None when the binary is absent (the edits then work without its normalisation)."""
+        try:
+            return self.studio_cli()
+        except StudioError:
+            return None
+
+    def add_filament_patch(self, path: str | Path, arg: str, allow_duplicate: bool = False) -> AddFilament:
+        return runs.add_filament_patch(self.studio_or_none(), self.presets(), str(path), arg, allow_duplicate)
+
+    def edit(self, path: str | Path, edits: EditSet, out: str | Path | None = None, verify: bool = True) -> list[str]:
+        """Apply an EditSet; an added filament gets the verify slice on the temporary archive when Studio is present."""
+        return runs.apply_edits(self.studio_or_none() if verify else None, str(path), edits, str(out) if out else None, verify)
+
+    def slice_project(self, path: str | Path, out: str | Path | None = None, **kw) -> runs.SliceResult:
+        return runs.slice_project(self.studio_cli(), self.presets(), str(path), str(out) if out else None, **kw)
+
+    def studio_raw(self, raw: list[str], out_dir: str | Path = ".", timeout: int = 1200) -> dict:
+        return runs.studio_raw(self.studio_cli(), raw, Path.cwd(), Path(out_dir), timeout)
 
     def open_in_studio(self, path: str | Path) -> None:
         """Opens the project for the user. With single_instance off this starts a second Studio process."""

@@ -559,3 +559,308 @@ def stls(tmp_path) -> dict[str, Path]:
         p.write_bytes(b"solid x\nendsolid x\n")
         out[n] = p
     return out
+
+
+# ---------------------------------------------------------------------------- geometry 3MF fixture (project edits)
+# A Bambu project with real meshes: two objects, transforms, source offsets, face counts, plates, and the per-filament
+# vectors in Studio's block form (six extruder variants per filament, as the X2D presets carry). `layout="gui"` puts the
+# placement on the build item (component identity, as a GUI save does); `layout="component"` puts it on the component
+# (item identity, as a shambu build exports it).
+VARIANTS = (
+    "Direct Drive Standard",
+    "Direct Drive High Flow",
+    "Direct Drive E3D High Flow",
+    "Bowden Standard",
+    "Bowden High Flow",
+    "Bowden E3D High Flow",
+)
+GEO_BODY = (30.0, 20.0, 10.0)  # body: size; STL frame x 0..30, y 0..20, z 0..10 (source_offset 15, 10, 5)
+GEO_BODY_AT = (40.0, 50.0)  # plate-local min corner
+GEO_LABEL = (10.0, 10.0, 2.0)  # label: STL frame x -5..5, y -5..5, z 0..2 (source_offset 0, 0, 1)
+GEO_LABEL_AT = (150.0, 50.0)
+
+
+def box_facets(lo, hi) -> list:
+    """12 outward-wound triangles of an axis-aligned box."""
+    x0, y0, z0 = lo
+    x1, y1, z1 = hi
+    v = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    tris = [
+        (0, 2, 1),
+        (0, 3, 2),
+        (4, 5, 6),
+        (4, 6, 7),
+        (0, 1, 5),
+        (0, 5, 4),
+        (1, 2, 6),
+        (1, 6, 5),
+        (2, 3, 7),
+        (2, 7, 6),
+        (3, 0, 4),
+        (3, 4, 7),
+    ]
+    return [(v[a], v[b], v[c]) for a, b, c in tris]
+
+
+def fine_box_facets(lo, hi) -> list:
+    """The same box with each side split into 4 triangles around its centre: 24 triangles, 14 vertices."""
+    x0, y0, z0 = lo
+    x1, y1, z1 = hi
+    quads = [
+        [(x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (x1, y0, z0)],
+        [(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)],
+        [(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)],
+        [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)],
+        [(x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)],
+        [(x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)],
+    ]
+    out = []
+    for q in quads:
+        c = tuple(sum(p[i] for p in q) / 4 for i in range(3))
+        for i in range(4):
+            out.append((q[i], q[(i + 1) % 4], c))
+    return out
+
+
+def write_box_stl(path: Path, lo, hi, fine: bool = False) -> Path:
+    from shambu import mesh as M
+
+    return M.write_stl(path, fine_box_facets(lo, hi) if fine else box_facets(lo, hi))
+
+
+def _mesh_model(sub_id: str, size, paint: bool = False) -> str:
+    hx, hy, hz = (s / 2 for s in size)
+    index: dict = {}
+    verts: list = []
+    tris = []
+    for f in box_facets((-hx, -hy, -hz), (hx, hy, hz)):
+        t = []
+        for v in f:
+            if v not in index:
+                index[v] = len(verts)
+                verts.append(v)
+            t.append(index[v])
+        tris.append(t)
+    vx = "".join(f'     <vertex x="{x:g}" y="{y:g}" z="{z:g}"/>\n' for x, y, z in verts)
+    tx = "".join(
+        f'     <triangle v1="{a}" v2="{b}" v3="{c}"' + (' paint_supports="4"' if paint and i == 0 else "") + "/>\n"
+        for i, (a, b, c) in enumerate(tris)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+        'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">\n'
+        ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n <resources>\n'
+        f'  <object id="{sub_id}" p:UUID="0000000{sub_id}-81cb-4c03-9d28-80fed5dfa1dc" type="model">\n'
+        f"   <mesh>\n    <vertices>\n{vx}    </vertices>\n    <triangles>\n{tx}    </triangles>\n   </mesh>\n"
+        "  </object>\n </resources>\n <build/>\n</model>\n"
+    )
+
+
+def geo_project_settings(filaments: int = 2, **over) -> dict:
+    n = filaments
+    d = project_settings(
+        filament_settings_id=["Test PLA"] * n,
+        filament_colour=["#00AE42", "#FFFFFF", "#0A2989"][:n],
+        filament_multi_colour=["#00AE42", "#FFFFFF", "#0A2989"][:n],
+        filament_map=[str(min(i, 2)) for i in range(1, n + 1)],
+        filament_map_mode="Manual",
+        filament_type=["PLA"] * n,
+        filament_ids=["GFA00"] * n,
+        filament_density=["1.24"] * n,
+        filament_nozzle_map=[str(min(i, 2)) for i in range(1, n + 1)],
+        filament_volume_map=["0"] * n,
+        filament_colour_type=["1"] * n,
+        pressure_advance=["0.02"] * n,
+        filament_extruder_variant=list(VARIANTS) * n,
+        filament_self_index=[str(i) for i in range(1, n + 1) for _ in VARIANTS],
+        nozzle_temperature=[str(220 + 5 * i) for _ in range(n) for i in range(6)],
+        filament_flush_temp_fast=["0"],
+        bridge_speed=["50", "50", "50", "50", "200", "200"],  # a per-process-variant key: never extended by a filament
+        different_settings_to_system=[""] * (n + 2),
+        inherits_group=["0.20mm Test"] + [""] * (n + 1),
+        flush_volumes_matrix={1: ["0", "0"], 2: ["0", "300", "200", "0"] * 2}.get(n, ["0"] * (2 * n * n)),
+        flush_volumes_vector=["140"] * 8,
+        printable_area=["0x0", "256x0", "256x256", "0x256"],
+        printable_height="325",
+        extruder_printable_area=["0x0,256x0,256x256,0x256", "20.5x0,256x0,256x256,20.5x256"],
+        extruder_printable_height=["320", "325"],
+        enable_prime_tower="1",
+        prime_tower_width="35",
+        wipe_tower_x=["208"],
+        wipe_tower_y=["208"],
+    )
+    d.update(over)
+    return d
+
+
+def geo_plate_origin(plate: int, plates: int) -> tuple[float, float]:
+    """PartPlate.cpp: (col * 256 * 1.2, -row * 256 * 1.2), cols = compute_colum_count(plates)."""
+    import math
+
+    v = math.sqrt(plates)
+    cols = round(v) + 1 if v > round(v) else round(v)
+    row, col = divmod(plate - 1, cols)
+    return (col * 256 * 1.2, -row * 256 * 1.2)
+
+
+def make_geo_3mf(
+    path: Path,
+    *,
+    layout: str = "gui",
+    plates: int = 1,
+    filaments: int = 2,
+    paint: bool = False,
+    sliced: bool = False,
+    ranges: list[tuple[float, float]] | None = None,
+    **ps_over,
+) -> Path:
+    """Body (object id 2, sub-object 1, 30 x 20 x 10, filament 1, plate 1) and label (object id 4, sub-object 3,
+    10 x 10 x 2, filament 2 when there are two, on the last plate). `ranges` are height ranges on the body. Entry
+    order and compression mimic a CLI export."""
+    bw, bh, bz = GEO_BODY
+    lw, lh, lz = GEO_LABEL
+    ox, oy = geo_plate_origin(plates, plates)
+    body_c = (GEO_BODY_AT[0] + bw / 2, GEO_BODY_AT[1] + bh / 2, bz / 2)
+    label_c = (GEO_LABEL_AT[0] + lw / 2 + ox, GEO_LABEL_AT[1] + lh / 2 + oy, lz / 2)
+
+    def tf(c=None) -> str:
+        c = c or (0, 0, 0)
+        return f"1 0 0 0 1 0 0 0 1 {c[0]:g} {c[1]:g} {c[2]:g}"
+
+    gui = layout == "gui"
+    model = f"""<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">
+ <metadata name="Application">BambuStudio-02.08.02.61</metadata>
+ <metadata name="BambuStudio:3mfVersion">1</metadata>
+ <resources>
+  <object id="2" p:UUID="00000001-61cb-4c03-9d28-80fed5dfa1dc" type="model">
+   <components>
+    <component p:path="/3D/Objects/object_1.model" objectid="1" p:UUID="00010000-b206-40ff-9872-83e8017abed1" transform="{tf(None if gui else body_c)}"/>
+   </components>
+  </object>
+  <object id="4" p:UUID="00000002-61cb-4c03-9d28-80fed5dfa1dc" type="model">
+   <components>
+    <component p:path="/3D/Objects/object_2.model" objectid="3" p:UUID="00020000-b206-40ff-9872-83e8017abed1" transform="{tf(None if gui else label_c)}"/>
+   </components>
+  </object>
+ </resources>
+ <build p:UUID="2c7c17d8-22b5-4d84-8835-1976022ea369">
+  <item objectid="2" p:UUID="00000002-b1ec-4553-aec9-835e5b724bb4" transform="{tf(body_c if gui else None)}" printable="1"/>
+  <item objectid="4" p:UUID="00000004-b1ec-4553-aec9-835e5b724bb4" transform="{tf(label_c if gui else None)}" printable="1"/>
+ </build>
+</model>
+"""
+
+    def part(pid, name, stl, off, faces):
+        return f"""    <part id="{pid}" subtype="normal_part">
+      <metadata key="name" value="{name}"/>
+      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+      <metadata key="source_file" value="{stl}"/>
+      <metadata key="source_object_id" value="0"/>
+      <metadata key="source_volume_id" value="0"/>
+      <metadata key="source_offset_x" value="{off[0]:g}"/>
+      <metadata key="source_offset_y" value="{off[1]:g}"/>
+      <metadata key="source_offset_z" value="{off[2]:g}"/>
+      <mesh_stat face_count="{faces}" edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+    </part>"""
+
+    label_ext = 2 if filaments > 1 else 1
+    fmaps = " ".join(str(min(i, 2)) for i in range(1, filaments + 1))
+    plate_xml = []
+    for k in range(1, plates + 1):
+        inst = (["2"] if k == 1 else []) + (["4"] if k == plates else [])
+        gm = '\n    <metadata key="gcode_file" value="Metadata/plate_1.gcode"/>' if sliced and k == 1 else ""
+        mis = "".join(
+            f"""
+    <model_instance>
+      <metadata key="object_id" value="{o}"/>
+      <metadata key="instance_id" value="0"/>
+    </model_instance>"""
+            for o in inst
+        )
+        plate_xml.append(
+            f"""  <plate>
+    <metadata key="plater_id" value="{k}"/>
+    <metadata key="plater_name" value=""/>
+    <metadata key="locked" value="false"/>
+    <metadata key="filament_map_mode" value="Manual"/>
+    <metadata key="filament_maps" value="{fmaps}"/>{gm}{mis}
+  </plate>"""
+        )
+    nl = "\n"
+    ms = f"""<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="2">
+    <metadata key="name" value="body"/>
+    <metadata key="extruder" value="1"/>
+    <metadata key="brim_type" value="no_brim"/>
+    <metadata face_count="12"/>
+{part(1, "body_1", "body.stl", (bw / 2, bh / 2, bz / 2), 12)}
+  </object>
+  <object id="4">
+    <metadata key="name" value="label"/>
+    <metadata key="extruder" value="{label_ext}"/>
+    <metadata key="brim_type" value="no_brim"/>
+    <metadata face_count="12"/>
+{part(3, "label_1", "label.stl", (0, 0, lz / 2), 12)}
+  </object>
+{nl.join(plate_xml)}
+</config>
+"""
+    entries: list[tuple[str, bytes, int]] = [
+        ("[Content_Types].xml", b'<?xml version="1.0"?><Types/>', zipfile.ZIP_DEFLATED),
+        ("_rels/.rels", b"<Relationships/>", zipfile.ZIP_DEFLATED),
+        ("3D/3dmodel.model", model.encode(), zipfile.ZIP_DEFLATED),
+        (
+            "3D/_rels/3dmodel.model.rels",
+            b'<?xml version="1.0" encoding="UTF-8"?>\n<Relationships><Relationship Target="/3D/Objects/object_1.model" Id="rel-1"/>'
+            b'<Relationship Target="/3D/Objects/object_2.model" Id="rel-2"/></Relationships>\n',
+            zipfile.ZIP_DEFLATED,
+        ),
+        ("3D/Objects/object_1.model", _mesh_model("1", GEO_BODY, paint).encode(), zipfile.ZIP_DEFLATED),
+        ("3D/Objects/object_2.model", _mesh_model("3", GEO_LABEL).encode(), zipfile.ZIP_DEFLATED),
+        ("Metadata/plate_1.png", b"\x89PNG fake", zipfile.ZIP_STORED),
+        ("Metadata/plate_1.json", b'{"bbox_objects":[]}', zipfile.ZIP_DEFLATED),
+        (
+            "Metadata/project_settings.config",
+            (json.dumps(geo_project_settings(filaments, **ps_over), indent=4) + "\n").encode(),
+            zipfile.ZIP_DEFLATED,
+        ),
+    ]
+    if ranges:
+        rx = "".join(
+            f'  <range min_z="{lo!r}" max_z="{hi!r}">\n   <option opt_key="layer_height">0.2</option>\n  </range>\n' for lo, hi in ranges
+        )
+        entries.append(
+            (
+                "Metadata/layer_config_ranges.xml",
+                f'<?xml version="1.0" encoding="UTF-8"?>\n<objects>\n <object id="1">\n{rx} </object>\n</objects>\n'.encode(),
+                zipfile.ZIP_DEFLATED,
+            )
+        )
+    entries += [
+        ("Metadata/model_settings.config", ms.encode(), zipfile.ZIP_DEFLATED),
+        (
+            "Metadata/slice_info.config",
+            b'<?xml version="1.0"?>\n<config>\n  <header/>\n' + (b'  <plate id="1"/>\n' if sliced else b"") + b"</config>\n",
+            zipfile.ZIP_DEFLATED,
+        ),
+        ("Metadata/filament_sequence.json", b'{"plate_1":{"sequence":[]}}', zipfile.ZIP_DEFLATED),
+    ]
+    if sliced:
+        entries += [
+            ("Metadata/plate_1.gcode", b"G28\n", zipfile.ZIP_DEFLATED),
+            ("Metadata/plate_1.gcode.md5", b"abc", zipfile.ZIP_DEFLATED),
+        ]
+    with zipfile.ZipFile(path, "w") as z:
+        for name, data, comp in entries:
+            info = zipfile.ZipInfo(name, date_time=(2026, 10, 12, 0, 0, 0))
+            info.compress_type = comp
+            z.writestr(info, data)
+    return path
+
+
+@pytest.fixture
+def geo_file(tmp_path) -> Path:
+    return make_geo_3mf(tmp_path / "geo.3mf")
