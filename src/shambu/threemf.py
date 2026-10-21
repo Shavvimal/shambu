@@ -100,6 +100,24 @@ def effective_stats(ps: dict) -> tuple[str, list] | None:
     return STATS_OLD, old if isinstance(old, list) else []
 
 
+def _stats_json(eff: tuple[str, list] | None) -> dict | None:
+    return {"key": eff[0], "value": eff[1]} if eff else None
+
+
+def _slot_stats(ps: dict, i: int) -> dict:
+    """Filament slot i's extruder (the project `filament_map`) and the effective nozzle stat of that extruder, for
+    `inspect`: {"extruder": 1, "nozzle_stats": "Standard#1"}; the stat is None when the file has no stats key (the
+    CLI derives it) or the list is shorter than the extruder index."""
+    fmap = ps.get("filament_map") or []
+    try:
+        ext = int(fmap[i]) if i < len(fmap) else 1
+    except (TypeError, ValueError):
+        ext = 1
+    eff = effective_stats(ps)
+    stat = eff[1][ext - 1] if eff and 0 < ext <= len(eff[1]) else None
+    return {"extruder": ext, "nozzle_stats": stat}
+
+
 def _float_or(text: str, default: float) -> float:
     try:
         return float(text)
@@ -599,9 +617,11 @@ class Project:
                     "preset": ps["filament_settings_id"][i],
                     "type": (ps.get("filament_type") or [None] * n_fil)[i] if i < len(ps.get("filament_type", [])) else None,
                     "colour": ps["filament_colour"][i] if i < len(ps.get("filament_colour", [])) else None,
+                    **_slot_stats(ps, i),
                 }
                 for i in range(n_fil)
             ],
+            "nozzle_stats": _stats_json(effective_stats(ps)),
             "filament_map_mode": ps.get("filament_map_mode"),
             "filament_map": ps.get("filament_map"),
             "extruders": {

@@ -787,8 +787,15 @@ class Inspect(Command):
             f"print sequence {s.get('print_sequence') or 'not set (by layer)'}",
         ]
         lines += [f"not re-sliceable by the CLI: {x}" for x in s.get("reslice_problems") or []]
+        ns = s.get("nozzle_stats")
         for f in s["filaments"]:
-            lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}")
+            if ns is None:
+                stat = "nozzle stats from extruder_max_nozzle_count (the file has no stats key)"
+            elif f.get("nozzle_stats") is None:
+                stat = f"{ns['key']} {ns['value']!r} has no entry for extruder {f.get('extruder')}"
+            else:
+                stat = f"{ns['key']} {f['nozzle_stats']}"
+            lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}, extruder {f.get('extruder')}, {stat}")
         for p in s["plates"]:
             lines.append(
                 f"plate {p['id']} '{p['name']}': bed {p['bed_type'] or 'project default'}, map {p['filament_maps'] or 'project default'}, "
@@ -877,7 +884,7 @@ class PatchCmd(Command):
             action="append",
             default=[],
             metavar="PRESET[:#RRGGBB][@EXTRUDER]",
-            help="append filament slot N+1 (slots 1..N unchanged); colour defaults to the preset's, extruder to 1",
+            help="append filament slot N+1 (slots 1..N unchanged); colour: the preset's, else the next unused default colour (WARN); extruder 1",
         )
         g.add_argument("--allow-duplicate", action="store_true", help="--add-filament may add a preset and colour that a slot already has")
         g.add_argument("--no-verify", action="store_true", help="skip the verify slice after --add-filament (about 20 s on a full plate)")

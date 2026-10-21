@@ -977,3 +977,31 @@ def test_slice_keeps_the_old_output_when_the_export_does_not_read_back(capsys, t
     code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(old))
     assert code == 1 and "does not read back" in one_json(out)["error"]
     assert old.read_bytes() == b"previous good output"
+
+
+def test_patch_add_filament_without_a_preset_colour_takes_the_next_default(capsys, tmp_path, monkeypatch):
+    """BBL system presets carry no filament_colour: the next build.DEFAULT_COLOURS entry the slots do not use, and a WARN."""
+    from shambu.build import DEFAULT_COLOURS
+    from shambu.threemf import Project
+
+    src = _geo(tmp_path, filaments=1, filament_colour=[DEFAULT_COLOURS[0]])
+
+    def no_studio(self):
+        raise StudioError("Bambu Studio binary not found")
+
+    monkeypatch.setattr(Bambu, "studio_cli", no_studio)
+    code, out, _ = run(capsys, "--json", "patch", str(src), "--add-filament", "Test PETG Basic@2")
+    doc = one_json(out)
+    assert code == 0, doc
+    want = DEFAULT_COLOURS[1]  # DEFAULT_COLOURS[0] is slot 1's colour
+    assert f"WARN: colour not in preset Test PETG Basic; using {want} (pass :#RRGGBB to choose)" in " ".join(doc["notes"])
+    assert [c.upper() for c in Project(str(src)).project_settings["filament_colour"]] == [DEFAULT_COLOURS[0].upper(), want.upper()]
+
+
+def test_inspect_prints_the_effective_nozzle_stats_per_filament(capsys, tmp_path):
+    f = make_3mf(tmp_path / "s.3mf", extruder_nozzle_stats=["Standard#1", "Standard#1"])
+    code, out, _ = run(capsys, "inspect", str(f))
+    assert code == 0 and "extruder 1, extruder_nozzle_stats Standard#1" in out
+    code, out, _ = run(capsys, "--json", "inspect", str(make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[])))
+    doc = one_json(out)
+    assert doc["nozzle_stats"] == {"key": "extruder_nozzle_stats", "value": []} and doc["filaments"][0]["nozzle_stats"] is None

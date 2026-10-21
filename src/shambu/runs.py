@@ -16,6 +16,7 @@ Not here: building a project from a spec (`build.py`), the edits themselves (`ed
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -26,8 +27,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import presets as P
-from .build import _estimate, summarise, two_pass_slice, verify_tower
-from .edits import AddFilament, EditError, EditSet, SetTower, check_preset, slot_from_export, slot_from_preset, slot_presets
+from .build import DEFAULT_COLOURS, _estimate, summarise, two_pass_slice, verify_tower
+from .edits import AddFilament, EditError, EditSet, FilamentSlot, SetTower, check_preset, slot_from_export, slot_from_preset, slot_presets
 from .errors import BambuError, StudioError
 from .patches import PatchSet, RepairNozzleStats
 from .spec import Spec
@@ -55,13 +56,16 @@ def add_filament_patch(
         raise EditError(f"--add-filament: {e}") from e
     preset_colour = preset.get("filament_colour") or preset.get("default_filament_colour") or [""]
     colour = (m["colour"] or (preset_colour[0] if isinstance(preset_colour, list) else str(preset_colour)) or "").upper()
-    if not colour:
-        raise EditError(f"--add-filament {arg!r}: the preset has no filament_colour; give one as PRESET:#RRGGBB")
     extruder = int(m["ext"] or 1)
     ps = Project(file).project_settings
+    warn = ""
+    if not colour:  # BBL system presets carry no filament_colour: the next default the project's slots do not use
+        used = {str(c).upper() for c in ps.get("filament_colour") or []}
+        colour = next((c for c in DEFAULT_COLOURS if c.upper() not in used), DEFAULT_COLOURS[len(used) % len(DEFAULT_COLOURS)])
+        warn = f"WARN: colour not in preset {m['preset'].strip()}; using {colour} (pass :#RRGGBB to choose)"
     check_preset(ps, preset, colour, extruder)
     if studio is None:
-        return AddFilament(slot_from_preset(ps, preset), colour, extruder, allow_duplicate)
+        return AddFilament(_noted(slot_from_preset(ps, preset), warn), colour, extruder, allow_duplicate)
     with tempfile.TemporaryDirectory(prefix="shambu-add-filament-") as td:
         work = Path(td)
         src = work / "in.3mf"
@@ -88,7 +92,11 @@ def add_filament_patch(
         old = slot_presets(ps, preset)
         paths = [P.write(f, work / f"filament-{i}.json") for i, f in enumerate(old, 1)] + [new_json]
         flush = export("add-filament-flush", paths, [f["filament_colour"][0].upper() for f in old] + [colour])
-    return AddFilament(slot_from_export(ps, normalised, preset, flush), colour, extruder, allow_duplicate)
+    return AddFilament(_noted(slot_from_export(ps, normalised, preset, flush), warn), colour, extruder, allow_duplicate)
+
+
+def _noted(slot: FilamentSlot, warn: str) -> FilamentSlot:
+    return dataclasses.replace(slot, notes=(warn, *slot.notes)) if warn else slot
 
 
 def verify_filaments(studio: StudioCLI, path: str) -> str:
