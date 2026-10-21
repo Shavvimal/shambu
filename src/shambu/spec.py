@@ -66,7 +66,7 @@ KNOWN_KEYS = {
     "layout": {"gap", "edge"},
     "plate": {"name", "parts", "pause_at_z", "colour_changes", "colour_change", "print_sequence", "group_by_filament", "wipe_tower"},
     "part": {
-        "path", "parts", "name", "filament", "count", "subtype", "recipes", "set", "height_ranges", "at", "brim_margin",
+        "path", "parts", "name", "filament", "count", "subtype", "recipes", "set", "height_ranges", "at", "brim_margin", "support_spread",
         "lay_on_face", "rotate", "orientation",
     },
     "file": {"path", "filament", "subtype"},

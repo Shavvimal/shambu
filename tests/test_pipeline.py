@@ -254,7 +254,7 @@ def test_failed_export_without_result_json_keeps_the_old_shape(tmp_path, stls, r
     assert r.export_problem().startswith("export failed: exit -17") and "Studio:" not in r.export_problem()
 
 
-def test_supported_part_gets_the_support_margin(tmp_path, stls, resolver):
+def test_supported_part_gets_the_support_spread(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (20.0, 20.0, 40.0)})
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], recipes=["tree-supports"]))
     p = plan.plates[0].parts[0].placed

@@ -185,8 +185,10 @@ v02.08.02.61. Details and the run table: `03-3mf-format.md` section 8 and `06-sl
 - **A process-level interface filament makes the plate two-filament.** `dual-material-interface` sets
   `support_interface_filament 2` in the process. The checker read only part keys, so it passed a cradle at x 9.2
   that Studio refused with -102 (right-nozzle interface at x 14.3). `effective_filaments` now counts the process
-  keys, and `InterfaceReach` grows a supported part by its interface spread (brim margin plus 3 mm) for the
-  interface extruder.
+  keys, and `ExtruderReach` holds the interface extruder to the interface spread (brim margin plus 3 mm): one FAIL
+  line per part and extruder.
 - **The tower is sized by the tallest part.** 41.39 mm square plus an 8 mm brim at H 218 with the rib wall
   (Studio's own log). The fixed (208, 208) spot overlapped a part and left the bed (-101). The `wipe_tower` spec key
   (`"auto"`, a spot, or `false`) and `tower.py` replace it; width, rib wall and brim are one value per project.
+  The spot search tests the part silhouettes and support spreads (`FootprintClearance`), so the T8 strip beside
+  the feeler's 10 mm beam is free; an estimated spread is a WARN there, as between two parts.

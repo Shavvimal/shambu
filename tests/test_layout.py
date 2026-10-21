@@ -529,6 +529,7 @@ U_RECTS = [(0, 0, 10, 100), (10, 0, 40, 10), (10, 90, 40, 100)]  # a U open to +
         ({"enable_support": "true"}, True),
         ({"enforce_support_layers": "3"}, True),
         ({"raft_layers": "2"}, True),
+        ({"enable_support": "0", "raft_layers": "2"}, True),  # a raft-only part prints with the support filaments
         ({"enable_support": "0", "enforce_support_layers": "0", "raft_layers": "0"}, False),
         ({}, False),
         (None, False),
@@ -634,3 +635,57 @@ def test_shelf_packer_unplaces_a_part_pushed_past_its_reach_by_an_obstacle():
     p = part("p", 100, 20)
     got = L.ShelfPacker().place([p], [(2.0, 2.0, 120.0, 40.0)], x_max_of={"p": 200.0})
     assert "no room" in got.unplaced["p"] and not p.placed
+
+
+# ---------------------------------------------------------------------------- the support interface on extruder 2
+def interface_part(x0, y0, spread=8.2):
+    p = part("p", filament=1, also=(2,), x0=x0, y0=y0)
+    p.interface = {2: (spread, "process support_interface_filament")}
+    return p
+
+
+def test_interface_slot_reaches_the_dead_strip_one_line_per_extruder():
+    """The seed cradle at x 9.2 (reference 06 section 5): the interface slot's extruder gets the interface spread,
+    and the part gets one FAIL line for extruder 2, whatever the number of sides and slots."""
+    cs = L.LimitChecker().check([interface_part(9.2, 40)], L.Context(FACTS))
+    fails = [c for c in cs if not c.ok]
+    assert [c.kind for c in fails] == ["reach"]
+    assert fails[0].text == (
+        "p uses filament 2 as the process support_interface_filament (extruder 2, Bowden) and reaches x 1.0 on -x "
+        "with its support interface 8.2 mm; that extruder reaches x 20.5..256.0"
+    )
+    assert failures([interface_part(29.0, 40)]) == []  # 29 - 8.2 = 20.8
+
+
+def test_interface_spread_replaces_the_support_spread_for_an_interface_only_slot():
+    p = interface_part(25.0, 40, spread=3.0)
+    p.spread = spread(10.0, source="probe")
+    assert failures([p]) == []  # 25 - 3 = 22: the interface stays in reach, the support base prints with filament 1
+    p.interface = {}
+    assert any("reaches x 15.0 on -x with its support 10.0 mm" in t for t in failures([p]))
+
+
+def test_interface_spread_at_the_bed_edge_is_no_reach_line():
+    """Extruder 2 reaches the whole y range of the bed: the bed rule owns that edge, not the reach rule."""
+    assert failures([interface_part(60, 3)]) == []
+
+
+def test_interface_reach_takes_the_aux_x_limit():
+    t = failures([interface_part(210, 60)], aux_x_limit=235.5)
+    assert len(t) == 1 and "reaches x 238.2 on +x with its support interface 8.2 mm" in t[0]
+    assert "the configured aux_x_limit for the auxiliary nozzle is 235.5 mm" in t[0]
+    assert failures([interface_part(100, 60)], aux_x_limit=235.5) == []
+
+
+def test_two_sides_of_one_extruder_are_one_line():
+    narrow = {**FACTS, "extruders": [FACTS["extruders"][0], {**FACTS["extruders"][1], "x": (20.5, 200.0)}]}
+    p = part("wide", w=190, filament=2, x0=15, y0=30)
+    cs = L.LimitChecker().check([p], L.Context(narrow))
+    fails = [c.text for c in cs if not c.ok]
+    assert len(fails) == 1 and "x 15.0 on -x" in fails[0] and "x 205.0 on +x" in fails[0]
+
+
+def test_bottom_left_packer_holds_the_interface_spread_in_reach():
+    p = interface_part(0, 0, spread=9.0)
+    got = L.BottomLeftPacker().place([p], x_min_of={"p": 20.5})
+    assert got.unplaced == {} and p.x0 - 9.0 >= 20.5 - 1e-9

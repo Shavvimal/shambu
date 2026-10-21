@@ -1,8 +1,8 @@
 """The prime tower of a two-filament plate: Studio's footprint estimate, a free spot both extruders reach, the rules.
 
 Pure planning core: no subprocess, no zip, no network. `build.py` asks this module for a footprint per plate,
-reserves it during packing, writes the chosen `wipe_tower_x/y` per plate, and runs `TowerClear` and
-`InterfaceReach` with the other limit rules. It does not slice and cannot see Studio's real tower path: the
+reserves it during packing, writes the chosen `wipe_tower_x/y` per plate, and adds each plate's `TowerClear` lines
+to the other limit checks. It does not slice and cannot see Studio's real tower path: the
 footprint is the estimate Studio itself uses before slicing, and the binding check is still the post-slice G-code
 conflict test (exit -101).
 
@@ -20,10 +20,11 @@ then plans an "auto" tower on a one-filament plate too.
 
 Design: pure functions for the estimate (`min_depth`, `auto_brim`, `TowerSettings.size`, `footprint`), a grid search
 for a free spot (`find_spot`, `auto_place`) whose obstacle test is a parameter (the `Clearance` protocol:
-`BoxClearance` over part rects here, a silhouette test can bind in its place), `plan_project` for ONE tower size per
-project over every plate, and two `Rule` implementations for the limit checker (`TowerClear`, `InterfaceReach`). It
-handles the tower's size, spot and the interface extruder's reach. It does not handle the post-slice tower, purge
-volumes, or the part layout itself (layout.py).
+`FootprintClearance` over the layout's part silhouettes and support spreads, strict first and then relaxed, or
+`BoxClearance` over part rects), `plan_project` for ONE tower size per project over every plate, and one `Rule` for the
+limit checker (`TowerClear`). It handles the tower's size and spot. It does not handle the post-slice tower, purge
+volumes, the part layout, the support predicate or the extruder reach of the interface (layout.py: `needs_support`,
+`ExtruderReach`).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Protocol
 
+from . import layout as L
 from .errors import BuildError
 from .layout import Check
 
@@ -42,7 +44,7 @@ Rect = tuple[float, float, float, float]  # x0, y0, x1, y1
 MIN_DEPTH_BY_HEIGHT = ((5.0, 5.0), (100.0, 20.0), (250.0, 40.0), (350.0, 60.0))  # WipeTower.cpp:1587-1589
 FALLBACK_WIDTHS = (35.0, 30.0, 25.0, 22.0, 20.0)  # tried with the rib wall off and a 2 mm brim when the default does not fit
 FALLBACK_BRIM = 2.0
-PART_CLEARANCE = 3.0  # mm between the tower footprint and a part's margin-grown rect
+PART_CLEARANCE = 3.0  # mm between the tower footprint and the rect (with brim and spread) of a part known by its box only
 CLEARANCE_CAP = 10.0  # more clearance than this scores the same, so the tie-breakers (high y, then high x) decide
 WIDTH_RANGE = (10.0, 60.0)
 FILAMENT_DIAMETER = 1.75
@@ -234,8 +236,8 @@ def _area(a: Rect, b: Rect) -> float:
 
 
 class Clearance(Protocol):
-    """The obstacle test of the placement, as a parameter: `BoxClearance` tests part rects here; a silhouette test
-    (the layout checker's raster footprints) binds in its place without a change to the search."""
+    """The obstacle test of the placement, as a parameter: `FootprintClearance` tests the parts' silhouettes and
+    support spreads (build.py binds it when the parts have outlines), `BoxClearance` tests part rects."""
 
     def clear(self, rect: Rect) -> bool:
         """True when a tower footprint `rect` may stand there."""
@@ -249,12 +251,20 @@ class Clearance(Protocol):
         """For a blocked `rect`: (how much it is blocked, the name of the worst obstacle)."""
         ...
 
+    def blocking(self, rect: Rect) -> list[tuple[str, Rect]]:
+        """Every obstacle that blocks `rect`, with its box, for a FAIL line."""
+        ...
+
+    def describe(self) -> str:
+        """What the test keeps clear, for a FAIL line: "3 mm clearance to every part's box"."""
+        ...
+
 
 @dataclass(frozen=True)
 class BoxClearance:
-    """Part rects (margin-grown, `Placed.rect()`) plus `margin` mm on every side. The grown rects are computed once;
-    `narrow()` keeps only the rects within the scoring radius of one x band, so the grid scan stays fast with many
-    parts and the clearance score (up to CLEARANCE_CAP) still sees every rect that can lower it."""
+    """Part rects (grown by brim and support spread, `Placed.rect()`) plus `margin` mm on every side. The grown rects
+    are computed once; `narrow()` keeps only the rects within the scoring radius of one x band, so the grid scan stays
+    fast with many parts and the clearance score (up to CLEARANCE_CAP) still sees every rect that can lower it."""
 
     obstacles: tuple[tuple[str, Rect], ...]
     margin: float = PART_CLEARANCE
@@ -279,6 +289,107 @@ class BoxClearance:
         hits = [(_area(rect, g), n) for n, _, g in self.grown]
         hits = [h for h in hits if h[0] > 0]
         return (sum(a for a, _ in hits), max(hits)[1]) if hits else (0.0, None)
+
+    def blocking(self, rect: Rect) -> list[tuple[str, Rect]]:
+        return [(n, o) for n, o, g in self.grown if _overlaps(rect, g) and (_overlaps(rect, o) or _gap(rect, o) < self.margin - 1e-9)]
+
+    def describe(self) -> str:
+        return f"{self.margin:g} mm clearance to every part's box (with brim and support spread)"
+
+
+@dataclass(frozen=True)
+class _Keep:
+    """One area a tower must keep `need` mm from: a part's outline, its swept support spread or its probe mask."""
+
+    name: str
+    shape: L.Footprint
+    need: float
+    estimate: bool  # an estimated spread: the strict test only
+
+
+@dataclass(frozen=True)
+class FootprintClearance:
+    """The tower against the parts' silhouettes (`layout.RasterFootprint`), as the pair rule tests two parts
+    (`layout.pair_check`): the tower rect must stay `layout.LINE` (1 mm) from each part's outline and from that outline
+    swept by the part's support spread per side (toward the tower, whichever side faces it), or from the probe's
+    support mask when the part has one. Brims do not count: the T8 tower at (172, 150) sliced 2.4 mm from the motor
+    cradle's box with its 5.2 mm brim (reference 06 section 10). A part with only a `BoxFootprint` falls back to the
+    box test: its rect with brim and spread, plus PART_CLEARANCE.
+
+    `strict` also holds the estimated spreads. The relaxed test (`relaxed()`) holds only outlines, probe masks and
+    probe or spec spreads: on plate 14 T8 sliced inside the cradle's estimated 8 mm spread (measured: 0 mm on +y), so
+    an estimate is a WARN for the tower, as between two parts. `plan_project` tries every size strict first."""
+
+    keeps: tuple[_Keep, ...]
+    strict: bool = True
+    parts: tuple[L.Placed, ...] = ()
+
+    @classmethod
+    def of(cls, parts: Iterable[L.Placed], strict: bool = True) -> FootprintClearance:
+        keeps: list[_Keep] = []
+        ps = tuple(p for p in parts if p.placed)
+        for p in ps:
+            if p.footprint is None:
+                keeps.append(_Keep(p.key, L.BoxFootprint.of(*_wh(p.rect())).translated(*p.rect()[:2]), PART_CLEARANCE, False))
+                continue
+            body = p.shape()
+            keeps.append(_Keep(p.key, body, L.LINE, False))
+            mask = p.mask_shape()
+            if mask is not None:
+                keeps.append(_Keep(p.key, mask, L.LINE, False))
+            elif p.spread.most() > 0 and (strict or p.spread.hard):
+                keeps.append(_Keep(p.key, body.grown(*p.spread.sides()), L.LINE, not p.spread.hard))
+        return cls(tuple(keeps), strict, ps)
+
+    def relaxed(self) -> FootprintClearance:
+        return FootprintClearance.of(self.parts, strict=False)
+
+    def narrow(self, x0: float, x1: float) -> FootprintClearance:
+        r = CLEARANCE_CAP + PART_CLEARANCE
+        return replace(self, keeps=tuple(k for k in self.keeps if k.shape.bbox()[2] + r > x0 and k.shape.bbox()[0] - r < x1))
+
+    @staticmethod
+    def _tower(rect: Rect) -> L.Footprint:
+        return L.BoxFootprint.of(*_wh(rect)).translated(rect[0], rect[1])
+
+    def _hits(self, rect: Rect) -> list[tuple[_Keep, float]]:
+        t = self._tower(rect)
+        out = []
+        for k in self.keeps:
+            g, _ = t.gap(k.shape, limit=k.need + 0.01)
+            if g < k.need - 1e-9:
+                out.append((k, g))
+        return out
+
+    def clear(self, rect: Rect) -> bool:
+        t = self._tower(rect)
+        return all(t.gap(k.shape, limit=k.need + 0.01)[0] >= k.need - 1e-9 for k in self.keeps)
+
+    def gap(self, rect: Rect) -> float:
+        t = self._tower(rect)
+        return min((t.gap(k.shape, limit=CLEARANCE_CAP + k.need)[0] - (k.need - L.LINE) for k in self.keeps), default=CLEARANCE_CAP)
+
+    def blocker(self, rect: Rect) -> tuple[float, str | None]:
+        hits = [(_area(rect, k.shape.bbox()) + k.need - g, k.name) for k, g in self._hits(rect)]
+        return (sum(a for a, _ in hits), max(hits)[1]) if hits else (0.0, None)
+
+    def blocking(self, rect: Rect) -> list[tuple[str, Rect]]:
+        out: dict[str, Rect] = {}
+        for k, _ in self._hits(rect):
+            out.setdefault(k.name, k.shape.bbox())
+        return list(out.items())
+
+    def estimates_within(self, rect: Rect) -> list[str]:
+        """The parts whose estimated support spread `rect` comes within the line allowance of (WARN text)."""
+        return list(dict.fromkeys(k.name for k, _ in self._hits(rect) if k.estimate))
+
+    def describe(self) -> str:
+        what = "outline and support spread" if self.strict else "outline and measured or spec support spread"
+        return f"{L.LINE:g} mm (the line allowance) to every part's {what}"
+
+
+def _wh(r: Rect) -> tuple[float, float]:
+    return (r[2] - r[0], r[3] - r[1])
 
 
 def as_clearance(obstacles: Sequence[tuple[str, Rect]] | Clearance, margin: float = PART_CLEARANCE) -> Clearance:
@@ -413,8 +524,8 @@ def _fmt_rect(r: Rect) -> str:
     return f"x {r[0]:.1f}..{r[2]:.1f} y {r[1]:.1f}..{r[3]:.1f}"
 
 
-def _alternative(settings: TowerSettings, height: float, obstacles: Sequence[tuple[str, Rect]], area: Rect, first_w: float) -> str:
-    p = auto_place(settings, height, obstacles, area)
+def _alternative(settings: TowerSettings, height: float, test: Clearance, area: Rect, first_w: float) -> str:
+    p = auto_place(settings, height, test, area)
     if p.footprint is None:
         return f'Free spots {BOTH} reach: none down to width {FALLBACK_WIDTHS[-1]:g}; set "wipe_tower": false or move parts'
     fp = p.footprint
@@ -422,12 +533,13 @@ def _alternative(settings: TowerSettings, height: float, obstacles: Sequence[tup
     return f"Free spots {BOTH} reach: {lead}x {fp.x:.0f} y {fp.y:.0f} with {fp.settings.describe()}"
 
 
-def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]], area: Rect, bed: Rect) -> str | None:
-    """The FAIL line for a tower at a fixed spot, or None when it is clear (no overlap with a margin-grown part rect,
-    inside the bed and inside the shared reach)."""
+def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]] | Clearance, area: Rect, bed: Rect) -> str | None:
+    """The FAIL line for a tower at a fixed spot, or None when it is clear (the obstacle test clears it, inside the
+    bed and inside the shared reach)."""
+    test = as_clearance(obstacles)
     r = fp.rect
     why: list[str] = []
-    hits = [(name, o) for name, o in obstacles if _overlaps(r, o)]
+    hits = test.blocking(r)
     if hits:
         why.append("it overlaps " + ", ".join(f"{n} ({_fmt_rect(o)})" for n, o in hits))
     if not inside(r, bed):
@@ -446,11 +558,11 @@ def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]]
     if not why:
         return None
     first_w = fp.outer[0] - 2 * fp.brim
-    alt = _alternative(fp.settings, fp.height, obstacles, area, first_w)
-    return f"plate {plate} {fp.describe()}: {' and '.join(why)}. {alt}. Set plates[{plate - 1}].wipe_tower."
+    alt = _alternative(fp.settings, fp.height, test, area, first_w)
+    return f"plate {plate} {fp.describe()}: {' and '.join(why)} ({test.describe()}). {alt}. Set plates[{plate - 1}].wipe_tower."
 
 
-def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | None, blocker: str | None, why: str = "") -> str:
+def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | None, blocker: str | None, how: str, why: str = "") -> str:
     where = ""
     if best is not None:
         where = f"; the best spot ({best.x:.0f}, {best.y:.0f}) at {best.settings.describe()}" + (
@@ -459,27 +571,29 @@ def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | N
     return (
         f"plate {plate}: no free prime tower spot {BOTH} reach ({_fmt_rect(area)}), tried "
         + ", ".join(tried)
-        + f" with {PART_CLEARANCE:g} mm clearance to every part{where}{why}. Move parts, set plates[{plate - 1}].wipe_tower "
+        + f" with {how}{where}{why}. Move parts, set plates[{plate - 1}].wipe_tower "
         '{"x", "y", "width", "rib_wall", "brim"}, or set "wipe_tower": false'
     )
 
 
 def plan_auto(
-    plate: int, settings: TowerSettings, height: float, obstacles: Sequence[tuple[str, Rect]], area: Rect, fallback: bool = True
+    plate: int, settings: TowerSettings, height: float, obstacles: Sequence[tuple[str, Rect]] | Clearance, area: Rect, fallback: bool = True
 ) -> TowerPlan:
     """The "auto" tower of one plate on its own: the first free spot (`auto_place`), or a FAIL line naming the best
     blocked spot."""
     p = auto_place(settings, height, obstacles, area, fallback=fallback)
     if p.footprint is not None:
         return TowerPlan(plate, "auto", p.footprint)
-    return TowerPlan(plate, "auto", None, problem=_fail_auto(plate, area, p.tried, p.best, p.blocker))
+    how = as_clearance(obstacles).describe()
+    return TowerPlan(plate, "auto", None, problem=_fail_auto(plate, area, p.tried, p.best, p.blocker, how))
 
 
 # ---------------------------------------------------------------------------- every plate together
 @dataclass(frozen=True)
 class TowerRequest:
     """One plate's tower question. `settings` is the process tower with the plate's own filament count (the volume
-    term); `obstacles` the plate's part rects; `clearance` overrides the box test (a silhouette binding)."""
+    term); `obstacles` the plate's part rects (with brim and spread); `clearance` overrides the box test
+    (`FootprintClearance`, the silhouettes)."""
 
     plate: int
     mode: str  # auto | fixed | off
@@ -492,8 +606,13 @@ class TowerRequest:
     y: float | None = None
     clearance: Clearance | None = None
 
-    def test(self) -> Sequence[tuple[str, Rect]] | Clearance:
-        return self.clearance if self.clearance is not None else self.obstacles
+    def test(self) -> Clearance:
+        return self.clearance if self.clearance is not None else as_clearance(self.obstacles)
+
+    def relaxed(self) -> Clearance | None:
+        """The test without estimated spreads (None: the test has no relaxed form)."""
+        rel = getattr(self.test(), "relaxed", None)
+        return rel() if rel is not None else None
 
 
 def _size_key(s: TowerSettings) -> tuple[float, bool, float]:
@@ -504,18 +623,39 @@ def _with_size(s: TowerSettings, key: tuple[float, bool, float]) -> TowerSetting
     return replace(s, width=key[0], rib_wall=key[1], brim=key[2])
 
 
+Found = dict[int, tuple[Footprint | None, Footprint | None, str | None]]
+
+
+def _search(
+    autos: Sequence[TowerRequest], keys: Sequence[tuple[float, bool, float]], tests: Mapping[int, Clearance]
+) -> tuple[Found, list[str]]:
+    """The first size key every plate finds a spot for, with each plate's own test; else the last key's results."""
+    tried: list[str] = []
+    found: Found = {}
+    for key in keys:
+        found = {r.plate: find_spot(_with_size(r.settings, key), r.height, tests[r.plate], r.area) for r in autos}
+        tried.append(_tried(_with_size(autos[0].settings, key), max(r.height for r in autos)))
+        if all(f[0] is not None for f in found.values()):
+            break
+    return found, tried
+
+
 def plan_project(requests: Sequence[TowerRequest], fallback: bool = True) -> list[TowerPlan]:
     """The towers of every plate with ONE size configuration (width, rib wall and brim are process-global in Studio).
     A fixed tower pins the size. Otherwise the configurations of `candidates()` are tried in order, and the first one
     every "auto" plate finds a spot for wins; each step recomputes the footprint per plate (its height and filament
-    count). When none fits every plate, the plates that block the last configuration FAIL and say so."""
+    count). Every size is tried with the strict test first, then (when no size fits) with the relaxed one: a tower
+    placed inside an estimated support spread gets a WARN. When none fits every plate, the plates that block the last
+    configuration FAIL and say so."""
     out: dict[int, TowerPlan] = {}
     for r in requests:
         if r.mode == "off":
             out[r.plate] = TowerPlan(r.plate, "off")
         elif r.mode == "fixed" and r.x is not None and r.y is not None:
             fp = footprint(r.settings, r.height, r.x, r.y)
-            out[r.plate] = TowerPlan(r.plate, "fixed", fp, check_fixed(r.plate, fp, r.obstacles, r.area, r.bed))
+            # The user's spot: the outlines and measured spreads decide (FAIL), an estimated spread is a WARN
+            problem = check_fixed(r.plate, fp, r.relaxed() or r.test(), r.area, r.bed)
+            out[r.plate] = TowerPlan(r.plate, "fixed", fp, problem, None if problem else _estimate_warning(r, fp))
     autos = [r for r in requests if r.plate not in out]
     if autos:
         fixed = [r for r in requests if r.mode == "fixed"]
@@ -525,26 +665,40 @@ def plan_project(requests: Sequence[TowerRequest], fallback: bool = True) -> lis
             keys = [_size_key(s) for s in candidates(autos[0].settings)]
         else:
             keys = [_size_key(autos[0].settings)]
-        tried: list[str] = []
-        found: dict[int, tuple[Footprint | None, Footprint | None, str | None]] = {}
-        for key in keys:
-            found = {r.plate: find_spot(_with_size(r.settings, key), r.height, r.test(), r.area) for r in autos}
-            tried.append(_tried(_with_size(autos[0].settings, key), max(r.height for r in autos)))
-            if all(f[0] is not None for f in found.values()):
-                break
+        strict = {r.plate: r.test() for r in autos}
+        found, tried = _search(autos, keys, strict)
+        tests = strict
+        if not all(f[0] is not None for f in found.values()):
+            relaxed = {r.plate: r.relaxed() or strict[r.plate] for r in autos}
+            if any(relaxed[n] is not strict[n] for n in relaxed):
+                found, tried = _search(autos, keys, relaxed)
+                tests = relaxed
         ok = [n for n, f in found.items() if f[0] is not None]
         for r in autos:
             spot, best, who = found[r.plate]
             if spot is not None:
-                out[r.plate] = TowerPlan(r.plate, "auto", spot)
+                out[r.plate] = TowerPlan(r.plate, "auto", spot, warning=_estimate_warning(r, spot))
                 continue
             why = ""
             if fixed:
                 why = f" (the size is pinned by plate {fixed[0].plate}'s wipe_tower: one size per project)"
             elif ok:
                 why = f" (one tower size per project: plates {ok} fit, plate {r.plate} blocks every size)"
-            out[r.plate] = TowerPlan(r.plate, "auto", None, problem=_fail_auto(r.plate, r.area, tried, best, who, why))
+            how = tests[r.plate].describe()
+            out[r.plate] = TowerPlan(r.plate, "auto", None, problem=_fail_auto(r.plate, r.area, tried, best, who, how, why))
     return [out[r.plate] for r in requests]
+
+
+def _estimate_warning(r: TowerRequest, fp: Footprint) -> str | None:
+    """The WARN line for a tower inside an estimated support spread (the strict test blocks it, the relaxed one not)."""
+    within = getattr(r.test(), "estimates_within", None)
+    names = within(fp.rect) if within is not None else []
+    if not names:
+        return None
+    return (
+        f"plate {r.plate} prime tower at ({fp.x:.1f}, {fp.y:.1f}): within the estimated support spread of {', '.join(names)}, "
+        "clear of the outlines; the slice decides (`--probe-supports` measures the spread)"
+    )
 
 
 def off_warning(plate: int) -> str:
@@ -557,7 +711,8 @@ def off_warning(plate: int) -> str:
 @dataclass(frozen=True)
 class TowerClear:
     """Rule: the plate's tower plan has no problem. One instance per plate (it carries that plate's plan); build.py
-    runs it after the limit checker. Kind "tower"."""
+    runs it after the limit checker. Kind "tower"; a tower inside an estimated support spread adds a WARN line (kind
+    "margin")."""
 
     plan: TowerPlan
     kind: str = "tower"
@@ -568,69 +723,10 @@ class TowerClear:
         elif self.plan.footprint is not None:
             fp = self.plan.footprint
             yield Check(True, f"plate {self.plan.plate} {fp.describe()}, clear of every part ({self.plan.mode})", self.kind)
-
-
-def _num(v) -> float:
-    try:
-        return float(v[0] if isinstance(v, list) else v)
-    except (TypeError, ValueError, IndexError):
-        return 0.0
-
-
-def needs_support(params: Mapping) -> bool:
-    """Studio's "has support material": `enable_support`, or `enforce_support_layers > 0`, or `raft_layers > 0`
-    (`PrintObject::has_support_material`, Print.hpp:492-494). A raft-only part prints its raft and raft interface
-    with the support filaments too. (The layout checker carries the same predicate; one copy at merge.)"""
-    return _on(params.get("enable_support"), False) or _num(params.get("enforce_support_layers")) > 0 or _num(params.get("raft_layers")) > 0
+            if self.plan.warning:
+                yield Check(True, self.plan.warning, "margin")  # an estimate: a WARN, as between two parts
 
 
 def smooth_timelapse(process: Mapping) -> bool:
     """`timelapse_type` 1 (Smooth) needs a prime tower even on a one-filament plate (PartPlate.cpp:2222-2223)."""
     return str(process.get("timelapse_type", "0")).strip().lower() in ("1", "smooth")
-
-
-@dataclass(frozen=True)
-class InterfaceUse:
-    """A supported part whose support or support interface prints with another slot set at process level."""
-
-    key: str
-    key_name: str  # support_interface_filament | support_filament
-    slot: int
-    interface_spread: float  # how far the interface prints past the part box: brim margin + INTERFACE_SPREAD
-    source: str = "process"
-
-
-INTERFACE_SPREAD = 3.0  # mm past the brim margin (2.2 mm measured on the seed cradle, -0.2 mm on the housing; n=1 each)
-
-
-@dataclass(frozen=True)
-class InterfaceReach:
-    """Rule: the extruder that prints a part's support interface (or support) reaches the part's box grown by its
-    interface spread (brim margin plus INTERFACE_SPREAD) on all four sides. The seed build exited -102 with the right nozzle's interface at x 14.3 (reference
-    06-slicer-rules.md section 5). One instance per plate."""
-
-    uses: tuple[InterfaceUse, ...]
-
-    def check(self, placed, ctx) -> Iterable:
-        by_key = {p.key: p for p in placed}
-        for u in self.uses:
-            p = by_key.get(u.key)
-            if p is None or not ctx.known(u.slot):
-                continue
-            e = ctx.extruder_of(u.slot)
-            m = u.interface_spread
-            x0, y0, x1, y1 = p.x0 - m, p.y0 - m, p.x1 + m, p.y1 + m
-            lim_x1 = min(e["x"][1], ctx.aux_x_limit) if (e["index"] == 2 and ctx.aux_x_limit is not None) else e["x"][1]
-            bad_x = x0 < e["x"][0] or x1 > lim_x1
-            bad_y = y0 < e["y"][0] or y1 > e["y"][1]
-            if bad_x or bad_y:
-                span = " ".join(([f"x {x0:.1f}..{x1:.1f}"] if bad_x else []) + ([f"y {y0:.1f}..{y1:.1f}"] if bad_y else []))
-                reach = " ".join(
-                    ([f"x {e['x'][0]:.1f}..{lim_x1:.1f}"] if bad_x else []) + ([f"y {e['y'][0]:.1f}..{e['y'][1]:.1f}"] if bad_y else [])
-                )
-                yield Check(
-                    False,
-                    f"{p.key} has support with the {u.source} {u.key_name} {u.slot} ({side(e['index'])}, {e['type']}) and spans "
-                    f"{span} with its interface spread ({m:.1f} mm); extruder {e['index']} reaches {reach}",
-                    "reach",
-                )

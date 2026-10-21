@@ -247,9 +247,9 @@ The planner used to measure only the model footprint. A gripper bracket (95 x 17
 path conflicts). In the bracket-alone G-code, Support extrusions below z 10 reach x 110.1 and y 107.4 against an outer
 wall at x 96.8, y 91.8: 13 to 15.6 mm past the box. With `layout.gap` 15 it still conflicted; with gap 20 it sliced
 (8 h 25 min, 231.7 g). On a two-filament SO-101 plate the jaw on filament 2 (bbox from x 25.7) put T1 support at x 15.0,
-inside the right nozzle's dead strip, and Studio refused it with -102. Rule now: a part with supports gets a margin of
-0.25 x its height, clamped to 5..25 mm (the bracket, 170 mm tall on its cheek face, gets the 25 mm cap), and the
-extruder-reach check uses the rect with the margin (`layout.support_margin`).
+inside the right nozzle's dead strip, and Studio refused it with -102. The rule then (section 11 replaced it): a part with supports got a margin of
+0.25 x its height, clamped to 5..25 mm (the bracket, 170 mm tall on its cheek face, got the 25 mm cap), and the
+extruder-reach check used the rect with the margin.
 
 ---
 

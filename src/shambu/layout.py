@@ -8,7 +8,9 @@ Design: `Placer` is a Strategy (`BottomLeftPacker` for by-layer plates, `ShelfPa
 filament groups). A placer never raises for a part that does not fit: it returns that part in `Placement.unplaced`
 with the arithmetic, and the geometric rules skip it. `Footprint` is a Strategy too: `RasterFootprint` (the mesh's XY
 silhouette after the orientation) or `BoxFootprint` (the bounding box). Limit checks are a list of `Rule`
-strategies run by `LimitChecker`, so a new printer fact is one more rule.
+strategies run by `LimitChecker`, so a new printer fact is one more rule. `ExtruderReach` is the one reach rule: it
+also holds a slot that prints only the support interface to the interface spread (`Placed.interface`). The prime tower
+is placed by `tower.py` against these footprints and spreads (`tower.FootprintClearance`).
 
 What Studio enforces, by layer (Bambu Studio 02.08.02.61 source, reference 08 section 11):
 - no clearance between objects before slicing (`Print.cpp:944-1050` checks hulls against the bed exclude area only);
@@ -61,6 +63,10 @@ TREE_SPREAD_CAP = 22.0  # the largest measured spread, 20.9 mm, plus one line
 # Normal (auto) support: 4.4 mm at z 0..5 and 2.5 mm above on the live clash test (reference 08 section 11.4). Studio's
 # own arrange assumes 6 (ModelArrange.cpp:172-173).
 NORMAL_SPREAD = 5.0
+# The support interface on another extruder (`dual-material-interface`): it prints past the part box by the brim
+# margin plus this, on every side (2.2 mm measured on the seed cradle, -0.2 mm on the housing; n=1 each). The seed
+# cradle at x 9.2 exited -102 with the right nozzle's interface at x 14.3 (reference 06 section 5).
+INTERFACE_SPREAD = 3.0
 SIDES = ("-x", "+x", "-y", "+y")
 
 Rect = tuple[float, float, float, float]  # x0, y0, x1, y1
@@ -433,7 +439,9 @@ class Placed:
     extruder reach, never between two parts (Studio clips brims against neighbours, Brim.cpp:258-365). `spread` is the
     support reach past the box per side. `footprint` is the outline in the part's own frame (bbox minimum at 0, 0);
     None means the box. `placed` is False when the placer found no position: no geometric rule runs on the part, and
-    `why_not` says why."""
+    `why_not` says why. `interface` holds the slots that print only the part's support interface, each with how far
+    that interface reaches past the box on every side and where the slot comes from: `ExtruderReach` holds that slot's
+    extruder to this spread instead of the support spread."""
 
     key: str
     info: MeshInfo
@@ -448,6 +456,7 @@ class Placed:
     placed: bool = True
     why_not: str = ""
     support_mask: Footprint | None = None  # measured support centrelines (probe), same frame as `footprint`
+    interface: Mapping[int, tuple[float, str]] = field(default_factory=dict)  # slot -> (spread mm, "process support_interface_filament")
 
     @property
     def filaments(self) -> set[int]:
@@ -468,6 +477,14 @@ class Placed:
     @property
     def y1(self) -> float:
         return self.y0 + self.h
+
+    def reach_growth(self, filament: int) -> tuple[tuple[float, float, float, float], str]:
+        """How far the prints of `filament` reach past the box (-x, +x, -y, +y) and what reaches that far: the support
+        spread, or the interface spread for a slot that prints only the support interface (it holds the brim)."""
+        if filament in self.interface:
+            v, _ = self.interface[filament]
+            return (v, v, v, v), "support interface"
+        return self.spread.sides(), "support"
 
     @property
     def keep_out(self) -> float:
@@ -740,60 +757,84 @@ class InsideBed:
 
 
 class ExtruderReach:
-    """Every extruder a part uses (its filament, height ranges, sub-parts) must reach the whole part and its support.
-    Only the sides where the extruder's reach is narrower than the bed are checked (InsideBed covers the rest). On
-    those sides the support spread counts in full, trees too: a jaw's support reached 5.5 mm into the right nozzle's
-    dead strip, exit -102 (reference 08 section 3.3b). A brim that crosses the reach is a WARN: Studio clips brims to
-    each nozzle's printable area (Brim.cpp:1079-1095, 1129-1138)."""
+    """Every extruder a part uses (its filament, height ranges, sub-parts, the process support and interface slots)
+    must reach the whole part and its support. Only the sides where the extruder's reach is narrower than the bed are
+    checked (InsideBed covers the rest). On those sides the support spread counts in full, trees too: a jaw's support
+    reached 5.5 mm into the right nozzle's dead strip, exit -102 (reference 08 section 3.3b). A slot that prints only
+    the support interface counts with the interface spread instead (`Placed.reach_growth`): the seed cradle at x 9.2
+    exited -102 with the right nozzle's interface at x 14.3 (reference 06 section 5). One FAIL line per part and
+    extruder, naming every side it crosses. A brim that crosses the reach is a WARN: Studio clips brims to each
+    nozzle's printable area (Brim.cpp:1079-1095, 1129-1138)."""
 
     def check(self, placed, ctx):
         bed = ctx.facts["bed"]
         for p in placed:
+            by_ext: dict[int, list[int]] = {}
             for fil in sorted(p.filaments):
                 if not ctx.known(fil):
                     yield Check(False, f"{p.key} uses filament {fil}, which is not a loaded filament slot", "spool")
                     continue
-                e = ctx.extruder_of(fil)
-                if p.info.size[2] > e["z_max"]:
-                    yield Check(
-                        False, f"{p.key} is {p.info.size[2]:.1f} mm tall; extruder {e['index']} prints up to {e['z_max']:.0f} mm", "height"
-                    )
-                if not p.placed:
-                    continue
-                s, m = p.spread, p.brim
-                sup = (p.x0 - s.mx, p.y0 - s.my, p.x1 + s.px, p.y1 + s.py)
-                lo_x, hi_x = e["x"]
-                if e["index"] == 2 and ctx.aux_x_limit is not None:
-                    hi_x = min(hi_x, ctx.aux_x_limit)
-                limits = (
-                    ("-x", "x", sup[0], sup[0] - m, lo_x, lo_x > bed["x"][0], -1, s.mx),
-                    ("+x", "x", sup[2], sup[2] + m, hi_x, hi_x < bed["x"][1], 1, s.px),
-                    ("-y", "y", sup[1], sup[1] - m, e["y"][0], e["y"][0] > bed["y"][0], -1, s.my),
-                    ("+y", "y", sup[3], sup[3] + m, e["y"][1], e["y"][1] < bed["y"][1], 1, s.py),
+                by_ext.setdefault(ctx.extruder_of(fil)["index"], []).append(fil)
+            for fils in by_ext.values():
+                yield from self._one(p, fils, ctx.extruder_of(fils[0]), ctx, bed)
+
+    @staticmethod
+    def _one(p: Placed, fils: list[int], e: dict, ctx: Context, bed: dict) -> Iterator[Check]:
+        names = " and ".join(f"{f} as the {p.interface[f][1]}" if f in p.interface else str(f) for f in fils)
+        if p.info.size[2] > e["z_max"]:
+            yield Check(False, f"{p.key} is {p.info.size[2]:.1f} mm tall; extruder {e['index']} prints up to {e['z_max']:.0f} mm", "height")
+        if not p.placed:
+            return
+        lo_x, hi_x = e["x"]
+        if e["index"] == 2 and ctx.aux_x_limit is not None:
+            hi_x = min(hi_x, ctx.aux_x_limit)
+        box = (p.x0, p.x1, p.y0, p.y1)
+        sides = (
+            ("-x", "x", 0, box[0], lo_x, lo_x > bed["x"][0], -1),
+            ("+x", "x", 1, box[1], hi_x, hi_x < bed["x"][1], 1),
+            ("-y", "y", 2, box[2], e["y"][0], e["y"][0] > bed["y"][0], -1),
+            ("+y", "y", 3, box[3], e["y"][1], e["y"][1] < bed["y"][1], 1),
+        )
+        fails, limits, brims = [], [], []
+        for side, axis, i, edge, limit, narrower, sign in sides:
+            if not narrower:
+                continue
+            # The filament of this extruder whose prints reach farthest on this side
+            grow, what = max((p.reach_growth(f) for f in fils), key=lambda r: r[0][i])
+            at = edge + sign * grow[i]
+            if sign * (at - limit) > 1e-9:
+                fails.append(f"{axis} {at:.1f} on {side} with its {what} {grow[i]:.1f} mm")
+                aux = side == "+x" and limit != e["x"][1]
+                limits.append(
+                    f"the configured aux_x_limit for the auxiliary nozzle is {limit} mm"
+                    if aux
+                    else f"that extruder reaches {axis} {e[axis][0]:.1f}..{e[axis][1]:.1f}"
                 )
-                for side, axis, at, at_brim, limit, narrower, sign, sv in limits:
-                    if not narrower:
-                        continue
-                    what = (
-                        "the configured aux_x_limit for the auxiliary nozzle is"
-                        if (side == "+x" and limit != e["x"][1])
-                        else "that extruder reaches"
-                    )
-                    reach = f"{limit} mm" if what.startswith("the configured") else f"{axis} {e[axis][0]:.1f}..{e[axis][1]:.1f}"
-                    if sign * (at - limit) > 1e-9:
-                        yield Check(
-                            False,
-                            f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and reaches {axis} {at:.1f} on {side} "
-                            f"with its support {sv:.1f} mm; {what} {reach}",
-                            "reach",
-                        )
-                    elif m > 0 and sign * (at_brim - limit) > 1e-9:
-                        yield Check(
-                            True,
-                            f"{p.key}: the {m:.1f} mm brim on filament {fil} reaches {axis} {at_brim:.1f} on {side} and will be clipped at "
-                            f"{axis} {limit:.1f} (extruder {e['index']} reach)",
-                            "brim",
-                        )
+                continue
+            m = max((p.brim for f in fils if f not in p.interface), default=0.0)  # the interface spread holds its brim
+            s = max((p.reach_growth(f)[0][i] for f in fils if f not in p.interface), default=0.0)
+            at_brim = edge + sign * (s + m)
+            if m > 0 and sign * (at_brim - limit) > 1e-9:
+                brims.append((axis, at_brim, side, limit))
+        if fails:
+            yield Check(
+                False,
+                f"{p.key} uses filament {names} (extruder {e['index']}, {e['type']}) and reaches "
+                + " and ".join(fails)
+                + "; "
+                + "; ".join(dict.fromkeys(limits)),
+                "reach",
+            )
+        elif brims:
+            yield Check(
+                True,
+                f"{p.key}: the {p.brim:.1f} mm brim on filament {names} reaches "
+                + " and ".join(f"{a} {at:.1f} on {sd}" for a, at, sd, _ in brims)
+                + " and will be clipped at "
+                + " and ".join(f"{a} {lim:.1f}" for a, _, _, lim in brims)
+                + f" (extruder {e['index']} reach)",
+                "brim",
+            )
 
 
 class TpuOnMain:
@@ -1161,11 +1202,12 @@ class BottomLeftPacker:
         s = p.spread
         m = p.brim if brim else 0.0
         lo_x = self.x_range[0] + bm[0]
+        iface = max((v for v, _ in p.interface.values()), default=0.0)  # ExtruderReach's interface spread
         if x_lo is not None and x_lo > self.x_range[0]:  # a reach narrower than the bed: all spread inside it
-            lo_x = max(lo_x, x_lo + m + s.mx)
+            lo_x = max(lo_x, x_lo + max(m + s.mx, iface))
         hi_x = self.x_range[1] - bm[1]
         if x_hi is not None and x_hi < self.x_range[1]:
-            hi_x = min(hi_x, x_hi - m - s.px)
+            hi_x = min(hi_x, x_hi - max(m + s.px, iface))
         lo_y, hi_y = self.y_range[0] + bm[2], self.y_range[1] - bm[3]
         xs: set[float] = {lo_x}
         ys: set[float] = {lo_y}

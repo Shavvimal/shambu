@@ -272,3 +272,10 @@ def test_unknown_keys_are_warnings_not_errors(tmp_path):
     assert any(w.startswith("plate 1 wipe_tower: unknown key 'widht' ignored") for w in s.warnings)
     assert any(w.startswith("spec: unknown key 'colour' ignored") for w in s.warnings)
     assert Spec.from_json(spec_json(tmp_path)).warnings == ()
+
+
+def test_support_spread_is_a_known_part_key(tmp_path):
+    d = spec_json(tmp_path)
+    d["plates"][0]["parts"][0]["support_spread"] = [21, 0.5, 0.5, 3]
+    s = Spec.from_json(d)
+    assert s.warnings == () and s.plates[0].parts[0].support_spread == (21.0, 0.5, 0.5, 3.0)

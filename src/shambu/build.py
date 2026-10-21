@@ -4,6 +4,12 @@ A spec is one JSON document the calling agent writes (see `spec.py`). The pipeli
 sequence plan -> write inputs -> export -> patch -> verify -> report. Each step is a method, so a
 subclass can replace one (a dry run skips export; a test injects a fake StudioCLI). Listeners
 (Observer) get an event per step for progress output.
+
+Design: the adapters (StudioCLI, PresetResolver, Placer, LimitChecker, SpreadProbe) are injected. `plan` measures and
+places the parts per plate with layout.py (footprints, spreads, the limit rules) and plans the prime towers with
+tower.py after every plate is packed (one tower size per project, the spot tested against the parts' silhouettes).
+"Has support" is `layout.needs_support` everywhere (filament accounting, support pinning, the probe). It does not
+place parts itself, model the tower, or decide what Studio's slice will accept: the export and verify steps report it.
 """
 
 from __future__ import annotations
@@ -75,12 +81,9 @@ SUPPORT_FILAMENT_KEYS = ("support_filament", "support_interface_filament")
 WALL_INFILL_KEYS = ("wall_filament", "sparse_infill_filament", "solid_infill_filament")
 
 
-def _support_on(settings: Mapping) -> bool:
-    """Studio's "has support material" (support, enforced support layers or a raft): `tower.needs_support`."""
-    return T.needs_support(settings)
-
-
-def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, process: Mapping | None = None) -> set[int]:
+def effective_filaments(
+    part_spec: PartSpec, files: FileRefs | None = None, process: Mapping | None = None, skip: Sequence[str] = ()
+) -> set[int]:
     """Every filament slot an object prints with, after all overrides.
 
     A single file prints with its `filament` unless `set.extruder` replaces it. A merged object prints with
@@ -89,7 +92,9 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, proc
     With `process` (the resolved process: recipes and process.set included), its wall and infill filament keys
     add their slot for every part, and its support and support-interface filament keys for every part with
     `enable_support` on: the `dual-material-interface` recipe sets support_interface_filament 2 at process level,
-    and a checker that missed it passed a plate that exited -102 (reference 06 section 5).
+    and a checker that missed it passed a plate that exited -102 (reference 06 section 5). "Has support" is
+    `layout.needs_support` (a raft prints with the support filaments too). `skip` leaves out those keys of the part
+    `set` and the process (`interface_uses` asks which slots the rest uses).
     Raises BuildError for a value that is not an integer. Slots are not range-checked here.
     """
     refs = list(files) if files is not None else [(f.path, f.filament, f.subtype) for f in part_spec.files()]
@@ -101,8 +106,10 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, proc
         out |= {fil for _, fil, sub in refs if sub in PRINTING_SUBTYPES}
         if ext:
             out.add(ext)
-    support = _support_on({**(process or {}), **part_spec.set})
+    support = L.needs_support({**(process or {}), **part_spec.set})
     for k in FILAMENT_KEYS[1:]:
+        if k in skip:
+            continue
         if k in SUPPORT_FILAMENT_KEYS and not support:
             continue  # Studio prints no support (or raft) for this part: its support slots are unused
         if k in part_spec.set and (v := _slot(part_spec.set[k], f"set.{k}")):
@@ -114,25 +121,25 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, proc
     if process is not None:
         keys = WALL_INFILL_KEYS + (SUPPORT_FILAMENT_KEYS if support else ())
         for k in keys:
-            if k not in part_spec.set and k in process and (v := _slot(process[k], f"process {k}")):
+            if k not in skip and k not in part_spec.set and k in process and (v := _slot(process[k], f"process {k}")):
                 out.add(v)
     return out
 
 
-def interface_uses(part_spec: PartSpec, process: Mapping, key: str, brim_margin: float, own: int = 0) -> list[T.InterfaceUse]:
-    """The support and support-interface slots a supported part prints with (part `set` first, then the process),
-    for `tower.InterfaceReach`. A slot 0 (the part's own filament) and `own` (the part's main slot) are left out.
+def interface_uses(part_spec: PartSpec, process: Mapping, spread: float, files: FileRefs | None = None) -> dict[int, tuple[float, str]]:
+    """The slot that prints only this supported part's support interface (part `set` first, then the process), as
+    {slot: (spread, source)} for `Placed.interface`, where `layout.ExtruderReach` holds that slot's extruder to
+    `spread` (brim margin plus `layout.INTERFACE_SPREAD`). Empty when Studio prints no support, the slot is 0 (the
+    part's own filament), or the part prints with that slot anyway (then its support spread counts in full).
     Raises BuildError for a value that is not a slot number."""
-    if not _support_on({**process, **part_spec.set}):
-        return []
-    out = []
-    for k in SUPPORT_FILAMENT_KEYS:
-        src = "part" if k in part_spec.set else "process"
-        raw = part_spec.set.get(k, process.get(k, "0"))
-        slot = _slot(str(raw).strip() or "0", f"{src} {k}")
-        if slot and slot != own:
-            out.append(T.InterfaceUse(key, k, slot, brim_margin + T.INTERFACE_SPREAD, src))
-    return out
+    if not L.needs_support({**process, **part_spec.set}):
+        return {}
+    k = "support_interface_filament"
+    src = "part" if k in part_spec.set else "process"
+    slot = _slot(str(part_spec.set.get(k, process.get(k, "0"))).strip() or "0", f"{src} {k}")
+    if not slot or slot in effective_filaments(part_spec, files, process, skip=(k,)):
+        return {}
+    return {slot: (spread, f"{src} {k}")}
 
 
 def _num(v, default: float) -> float:
@@ -632,19 +639,6 @@ class Pipeline:
             multi = len({f for p in parts for f in p.placed.filaments}) > 1 and not sequential
             # Smooth timelapse needs a tower on a one-filament plate too (PartPlate.cpp:2222-2223)
             multi = multi or (T.smooth_timelapse(process) and not sequential)
-            try:
-                uses = tuple(
-                    u
-                    for p in parts
-                    for u in interface_uses(p.spec, process, p.key, L.brim_margin({**process, **p.spec.set}), p.placed.filament)
-                )
-            except BuildError as e:
-                problems.append(f"plate {pi} '{pspec.name}': {e}")
-                uses = ()
-            spread = {u.key: u.interface_spread for u in uses}
-            for p in parts:  # the interface prints past the part box on every side: pack and check with that margin
-                if p.key in spread:
-                    p.placed.brim = max(p.placed.brim, spread[p.key])
             fixed = [p.placed for p in parts if p.placed.fixed]
             free = [p.placed for p in parts if not p.placed.fixed]
             # The tower footprint (fixed spot, or a provisional back-right corner for "auto") keeps packed parts out;
@@ -679,9 +673,7 @@ class Pipeline:
             for p in parts:
                 p.place_members()
             requests.append(self._tower_request(pspec, pi, multi, parts, tower_base, facts, spec) if not overflow else None)
-            extra: tuple = (T.InterfaceReach(uses),) if uses else ()  # TowerClear runs after every plate is planned
-            checker = replace(self.checker, rules=self.checker.rules + extra) if isinstance(self.checker, L.LimitChecker) else self.checker
-            checks = placement_checks + checker.check([p.placed for p in parts], pctx)
+            checks = placement_checks + self.checker.check([p.placed for p in parts], pctx)  # TowerClear: after every plate
             checks += self._subpart_checks([p for p in parts if p.placed.placed], pctx)
             plate = A.Plate(
                 name=pspec.name or f"plate {pi}",
@@ -785,19 +777,24 @@ class Pipeline:
     def _tower_request(
         pspec, pi: int, multi: bool, parts: list[PlannedPart], base: T.TowerSettings | None, facts: dict, spec: Spec
     ) -> T.TowerRequest | None:
-        """The plate's tower question after packing (None: the plate needs no tower)."""
+        """The plate's tower question after packing (None: the plate needs no tower). Its obstacle test is
+        `tower.FootprintClearance` over the placed parts' silhouettes and spreads when they have outlines, else the
+        box test."""
         if not multi:
             return None
         bed = facts["bed"]
         bed_r = (bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1])
         area = T.shared_reach(facts["extruders"], bed, spec.aux_x_limit)
         height = max((p.placed.info.size[2] for p in parts), default=0.0)
-        obstacles = tuple((p.key, p.placed.rect()) for p in parts if p.placed.placed)
+        on_bed = [p.placed for p in parts if p.placed.placed]
+        obstacles = tuple((p.key, p.rect()) for p in on_bed)
+        # The silhouettes when any part has one (a part known by its box only keeps the box test inside it)
+        test = T.FootprintClearance.of(on_bed) if any(p.footprint is not None for p in on_bed) else None
         wt = pspec.wipe_tower
         if base is None:
             return T.TowerRequest(pi, "off", T.TowerSettings(), height, obstacles, area, bed_r)
         mode = "fixed" if wt.mode == "fixed" and wt.x is not None and wt.y is not None else "auto"
-        return T.TowerRequest(pi, mode, base, height, obstacles, area, bed_r, wt.x, wt.y)
+        return T.TowerRequest(pi, mode, base, height, obstacles, area, bed_r, wt.x, wt.y, clearance=test)
 
     @staticmethod
     def _plan_towers(plates: list[PlannedPlate], requests: list[T.TowerRequest | None], spec: Spec) -> None:
@@ -932,6 +929,12 @@ class Pipeline:
             footprint, why_box = self._footprint(files, body)
             if why_box and warnings is not None:
                 warnings.append(f"{where} ({ps.key()}): the layout uses the bounding box, not the outline: {why_box}")
+            try:
+                iface_spread = ps.brim_margin if ps.brim_margin is not None else L.brim_margin(eff_settings) + L.INTERFACE_SPREAD
+                iface = interface_uses(ps, process, iface_spread, files)
+            except BuildError as e:
+                problems.append(f"{where} ({ps.key()}): {e}")
+                continue
             for copy in range(ps.count):
                 key = _unique_key(ps.key(), used_keys)
                 placed = L.Placed(
@@ -943,6 +946,7 @@ class Pipeline:
                     spread=spread,
                     footprint=footprint,
                     support_mask=mask,
+                    interface=iface,
                 )
                 if ps.at is not None and copy == 0:
                     placed.x0, placed.y0, placed.fixed = float(ps.at[0]), float(ps.at[1]), True
@@ -1136,12 +1140,19 @@ class Pipeline:
                 dict(first.spec.set),
                 first.spec.height_ranges,
             )
+            iface: dict[int, tuple[float, str]] = {}
+            for m in members:
+                for slot, v in m.placed.interface.items():
+                    if slot not in iface or v[0] > iface[slot][0]:
+                        iface[slot] = v
+            normal = {f for m in members for f in m.placed.filaments if f not in m.placed.interface}
             placed = L.Placed(
                 key,
                 info,
                 fil,
                 brim=max(m.placed.brim for m in members),
-                also_filaments=first.placed.also_filaments,
+                also_filaments=frozenset().union(*(m.placed.also_filaments for m in members)) - {fil},
+                interface={s: v for s, v in iface.items() if s not in normal},  # a slot any member prints with: full spread
                 spread=max((m.placed.spread for m in members), key=lambda sp: sp.most()),
                 # the members' own outlines, not the group's box: a part beside a concave member keeps its room
                 footprint=L.union_footprint([m.placed.shape() for m in members], (x0, y0)),

@@ -84,9 +84,11 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
   extrusions under x 20.5, the first at z 1.8, x 14.3). Studio makes the same mistake in its own count
   (`construct_assemble_list: Plate 1, used filaments 1`, BambuStudio.cpp:1338-1343).
 - The interface spread: the interface prints past the part box, 2.2 mm on the cradle and -0.2 mm on the housing
-  (measured once each). shambu takes the interface spread as the brim margin plus 3 mm (`tower.INTERFACE_SPREAD`) on
-  all four sides: the packer uses it as the part's margin, and the `InterfaceReach` rule (`tower.py`) checks the
-  interface extruder against it. "Has support" is Studio's own predicate (support, enforced layers or a raft).
+  (measured once each). shambu takes the interface spread as the brim margin plus 3 mm (`layout.INTERFACE_SPREAD`)
+  on all four sides, for a slot that prints only the support interface. `ExtruderReach` (`layout.py`), the one reach
+  rule, holds that slot's extruder to it, and the packer keeps it inside that extruder's reach: one FAIL line per
+  part and extruder. A slot the part also prints with (support, walls) gets the full support spread. "Has support"
+  is Studio's own predicate (`layout.needs_support`: support, enforced layers or a raft).
 
 ## 6. Colour, text and time
 
@@ -122,7 +124,7 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
 - External spool: upper buffer inlet feeds the left (main) hotend, lower inlet feeds the right.
 - USB export: File, Export, Export Plate Sliced File gives `.gcode.3mf`; a known bug doubles the extension.
   Cloud send needs the same account in Studio and on the printer.
-- Time: the slicer estimate wins (`--slice` gives it). Real plates ran 86 g in 3 h 11 min and 242 g in 9 h 31.
+- Time: show the Studio estimate (`--slice` gives it). Show a measured rate or a calibrated time only from `shambu calibrate` data, with n.
 
 ## 9. Out of scope for the tool
 
@@ -133,8 +135,8 @@ chamfer, a bore that wants a coupon, a show face that wants matte filament.
 ## 10. Prime tower on a two-filament plate
 
 Source: Bambu Studio v02.08.02.61 and the plate-14 runs of 2026-10-21 (X2D, PETG part, PLA matte interface).
-`tower.py` ports the estimate; `build.py` keeps packed parts off a provisional footprint (grown by the 3 mm
-clearance), picks the spot after packing and writes it per plate.
+`tower.py` ports the estimate; `build.py` keeps packed parts off a provisional footprint (a back-right corner
+rect, grown by 3 mm), picks the spot after packing and writes it per plate.
 
 Studio sizes the tower from the tallest object on the plate, not from the interface volume
 (`PartPlate::estimate_wipe_tower_size`, PartPlate.cpp:2191-2265; WipeTower.cpp:1587-1630):
@@ -167,15 +169,27 @@ What shambu does:
   ("prime tower size is per project"). The chosen values go into the process JSON.
 - `wipe_tower_x/y` are per-plate vectors: each plate gets its own spot, a plate without a tower keeps (208, 208).
 - Auto placement: a 1 mm grid, the footprint inside the area extruders 1 and 2 (left and right nozzle) reach
-  (x 20.5..256 on the X2D, and
-  `aux_x_limit`) and the bed, 3 mm clear of every part's margin-grown rect. Score: the clearance (capped at 10 mm),
+  (x 20.5..256 on the X2D, and `aux_x_limit`) and the bed, clear of every part (`tower.FootprintClearance`, next
+  item). Score: the clearance (capped at 10 mm),
   then high y (Studio's own default sits at y 250, PartPlate.cpp:69-70), then high x. If nothing fits, it tries the
   rib wall off at widths 35, 30, 25, 22 and 20 with a 2 mm brim. Then a FAIL names the best spot, the part that
   blocks it, and offers `"wipe_tower": false`. A size set in `process.set` is kept (no fallback).
-- The model is the part bounding box. On plate 14 the 26.6 mm strip between the housing (x <= 168.5) and the
-  feeler box (x >= 195.1) is too narrow for the T8 tower with 3 mm clearance, yet T8 sliced: the feeler is narrower
-  than its box there (the G-code tower reached x 195.8). Towers at (161, 226), (167, 216) and (167, 205) conflicted
-  with the feeler or the mount although they were clear of the boxes: tree supports and brims spread past the box.
+- The model is the part silhouette, as in the pair rule (`layout.pair_check`): the tower rect keeps the 1 mm line
+  allowance from each part's outline swept by its support spread per side, or from its probe mask. Brims do not
+  count. A part known only by its box keeps the old test: its rect with brim and spread, plus 3 mm. Every size is
+  tried with the estimated spreads first; when none fits, the outlines and the measured or spec spreads alone
+  decide, and a tower inside an estimated spread gets a WARN line ("the slice decides"). A fixed `wipe_tower` spot
+  gets the same: a FAIL only from an outline or a measured or spec spread, a WARN from an estimate.
+- Why: by boxes, the 26.6 mm strip between the housing (x <= 168.5) and the feeler box (x >= 195.1) is too narrow
+  for the T8 tower with 3 mm clearance, yet T8 sliced: the feeler is a 10 mm beam there (x 215..225), and the
+  G-code tower reached x 195.8. T8 also sat 2.4 mm from the cradle box: inside its estimated 8 mm spread (measured:
+  0 mm on +y) and, by the box, inside its 5.2 mm brim. Towers at (161, 226), (167, 216) and (167, 205) conflicted with the
+  feeler or the mount although they were clear of the boxes: their support spread past the box.
+- On the plate-14 parts the silhouettes also free the front: the housing's box starts at y 25.9, its outline right of
+  x 95 starts at y 63.4. Auto then takes a 35 mm tower without rib wall at (132, 2) (estimates) or (128, 2) (probe),
+  clear of every spread. Sliced with the probe (2026-10-21, n=1 per spot): (128, 2) exit 0, 24 h 13 min, 635.1 g;
+  T8 at (172, 150) exit 0, 22 h 30 min, 603.1 g. The wider tower costs 1 h 43 min and 32 g here. One of four slices
+  at (128, 2) crashed (-139, in tree support) and the three re-runs passed.
 - One size for the project: the fallback runs over every plate together, and the first size every "auto" plate
   accepts wins (a narrower tower is deeper, so each step recomputes the footprint per plate). A fixed `wipe_tower`
   pins the size. If one plate blocks every size, that plate FAILs and the message names it.
@@ -183,10 +197,11 @@ What shambu does:
   (WipeTower.cpp:4520-4585), so the sliced tower can be a little different.
 - Smooth timelapse (`timelapse_type 1`) needs a tower with one filament too (PartPlate.cpp:2222-2223): shambu plans an
   "auto" tower on such a plate.
-- "Has support" is Studio's own predicate: `enable_support`, `enforce_support_layers > 0` or `raft_layers > 0`
-  (Print.hpp:492-494). A raft-only part prints its raft interface with the process interface filament too.
-- The obstacle test of the placement is a parameter (`tower.Clearance`): the box test is the default, and a
-  silhouette test can replace it.
+- "Has support" is Studio's own predicate, `layout.needs_support`: `enable_support`, `enforce_support_layers > 0`
+  or `raft_layers > 0` (Print.hpp:492-494). A raft-only part prints its raft interface with the process interface
+  filament too.
+- The obstacle test of the placement is a parameter (`tower.Clearance`): `FootprintClearance` when the parts have
+  outlines, `BoxClearance` when none has.
 - Studio's own "Prime Tower is too close to others" is a warning, not a headless exit (Print.cpp:1003-1045). The
   binding check is the post-slice conflict test (-101).
 

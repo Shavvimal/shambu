@@ -89,12 +89,12 @@ def seed_spec(tmp_path, stls, cradle_at=(9.2, 40.0), mount_at=(60.0, 40.0)) -> S
 def test_seed_spec_fails_the_right_nozzle_reach_without_a_studio_run(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (40.0, 58.0, 30.0), "base.stl": (22.1, 99.0, 25.0)})
     plan = Pipeline(studio, resolver).plan(seed_spec(tmp_path, stls))
-    fails = [c.text for c in plan.plates[0].checks if not c.ok]
-    assert any(
-        t.startswith("motor_cradle_print has support with the process support_interface_filament 2 (extruder 2 (right nozzle), Bowden)")
-        and "extruder 2 reaches x 20.5..256.0" in t
-        for t in fails
-    ), fails
+    fails = [c for c in plan.plates[0].checks if not c.ok]
+    assert [c.kind for c in fails] == ["reach"], [c.text for c in fails]  # one line per part and extruder (ExtruderReach)
+    assert fails[0].text == (
+        "motor_cradle_print uses filament 2 as the process support_interface_filament (extruder 2, Bowden) and reaches "
+        "x 1.0 on -x with its support interface 8.2 mm; that extruder reaches x 20.5..256.0"
+    )
     assert not plan.ok
     assert not [c for c in studio.calls if c[0] == "run"]  # planning never runs the export
 
@@ -114,7 +114,7 @@ def test_packed_seed_starts_far_enough_right_for_the_interface(tmp_path, stls, r
     plan = Pipeline(studio, resolver).plan(seed_spec(tmp_path, stls, cradle_at=None, mount_at=None))
     assert plan.ok, (plan.problems, [c.text for c in plan.plates[0].checks if not c.ok])
     for x in plan.plates[0].parts:
-        assert x.placed.x0 - (L.brim_margin({**plan.process, **x.spec.set}) + T.INTERFACE_SPREAD) >= 20.5 - 1e-9
+        assert x.placed.x0 - (L.brim_margin({**plan.process, **x.spec.set}) + L.INTERFACE_SPREAD) >= 20.5 - 1e-9
 
 
 # ---------------------------------------------------------------------------- 3. the footprint estimate
@@ -166,20 +166,112 @@ def test_auto_placement_on_plate_14_drops_the_rib_wall():
     assert all(T._gap(r, o) >= T.PART_CLEARANCE - 1e-9 and not T._overlaps(r, o) for _, o in PLATE14)
 
 
-def test_plate_14_t8_strip_is_narrower_than_a_22_mm_tower_with_3_mm_clearance():
-    """T8 sliced a 22 mm tower without rib wall at (172, 150) in the strip between the housing (x <= 168.5) and the
-    feeler (x >= 195.1). By bounding boxes the strip is 26.6 mm wide and the footprint 26 mm, so the box model with
-    3 mm clearance rejects it: the real feeler is narrower than its box there (the T8 G-code tower reached x 195.8).
+def _shape(key, rects, z=10.0, filament=1, spread=None):
+    """A placed part whose outline is the union of `rects` (bed coordinates), as a silhouette footprint."""
+    from conftest import mesh
 
-    KNOWN MISMATCH: the fix is the silhouette binding. At merge, bind `TowerRequest.clearance` to the layout
-    checker's raster `Footprint.gap` instead of `BoxClearance`; then auto placement should accept this strip."""
-    t8 = T.TowerSettings.from_config(
-        {"prime_tower_width": "22", "prime_tower_rib_wall": "0", "prime_tower_brim_width": "2"}, PLATE14_PRESETS
-    )
-    fp = T.footprint(t8, H14, 172, 150)
+    x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)
+    x1, y1 = max(r[2] for r in rects), max(r[3] for r in rects)
+    boxes = [L.BoxFootprint.of(r[2] - r[0], r[3] - r[1]).translated(r[0], r[1]) for r in rects]
+    fp = L.union_footprint(boxes, (x0, y0))
+    p = L.Placed(key, mesh(f"{key}.stl", (x1 - x0, y1 - y0, z)), filament, x0, y0, footprint=fp)
+    if spread is not None:
+        p.spread = spread
+    return p
+
+
+def plate14_outlines(probe: bool) -> list[L.Placed]:
+    """The plate-14 silhouettes near the T8 strip, simplified to rects (from the parts' own STLs): the housing is an
+    L (x <= 95 up to y 63.4, then x <= 169 to y 105 and x <= 132 above), the feeler two end blocks on a 10 mm beam at
+    x 215..225, the cradle a 22 mm body. `probe`: the measured spreads (n=1 solo slices), else the estimates."""
+
+    def sp(*v):
+        return L.Spread(*v, "probe", True) if probe else L.Spread(v[4], v[4], v[4], v[4], "estimate", True)
+
+    return [
+        _shape(
+            "housing",
+            [(44.3, 25.9, 95.0, 63.4), (64.0, 63.4, 168.5, 105.0), (64.0, 105.0, 132.0, 141.9)],
+            218,
+            spread=sp(13.8, 4.4, 1.3, 1.3, 21.8),
+        ),
+        _shape("camera_mount", [(32.7, 181.0, 73.3, 239.8)], 32.1, spread=sp(0.0, 4.6, 0.0, 0.0, 8.0)),
+        _shape("camera_housing", [(105.7, 161.8, 164.3, 222.5)], 47.8, spread=sp(10.6, 0.0, 0.0, 8.1, 8.0)),
+        _shape(
+            "feeler",
+            [(195.1, 16.0, 245.1, 28.5), (215.0, 28.5, 225.0, 230.0), (195.1, 230.0, 245.1, 242.4)],
+            64,
+            spread=sp(7.0, 7.0, 5.0, 5.0, 8.0),
+        ),
+        _shape(
+            "cradle",
+            [(176.7, 70.0, 198.8, 136.0), (182.0, 46.6, 190.0, 70.0), (182.0, 136.0, 190.0, 145.6)],
+            28.9,
+            spread=sp(14.9, 8.2, 2.1, 0.0, 8.0),
+        ),
+    ]
+
+
+T8 = T.TowerSettings.from_config({"prime_tower_width": "22", "prime_tower_rib_wall": "0", "prime_tower_brim_width": "2"}, PLATE14_PRESETS)
+
+
+def test_plate_14_t8_strip_takes_the_22_mm_tower_on_the_silhouettes():
+    """T8 sliced a 22 mm tower without rib wall at (172, 150) in the strip between the housing (x <= 168.5) and the
+    feeler (box x >= 195.1). By boxes the strip is 26.6 mm wide and the footprint 26 mm, so the box test with 3 mm
+    rejects it. On the silhouettes (the feeler is a 10 mm beam there) with the measured spreads it is free, and auto
+    placement inside the strip finds width 22: 35, 30 and 25 are deeper than the strip allows beside the cradle."""
+    fp = T.footprint(T8, H14, 172, 150)
     assert fp.rect == pytest.approx((170.0, 148.0, 196.0, 190.88), abs=0.01)
-    assert fp.outer[0] + 2 * T.PART_CLEARANCE > 195.1 - 168.5
-    assert T.find_spot(t8, H14, PLATE14, (168.5, 145.6, 195.1, 256.0), clearance=0.0)[0] is not None  # it fits at 0 mm
+    boxes = T.BoxClearance(tuple((p.key, p.rect()) for p in plate14_outlines(probe=True)))
+    assert not boxes.clear(fp.rect)
+    test = T.FootprintClearance.of(plate14_outlines(probe=True))
+    assert test.clear(fp.rect) and test.estimates_within(fp.rect) == []
+    strip = (168.5, 145.6, 196.0, 256.0)
+    req = T.TowerRequest(1, "auto", DEFAULT, H14, tuple(PLATE14), strip, BED, clearance=test)
+    (plan,) = T.plan_project([req])
+    assert plan.footprint is not None and plan.footprint.settings == replace(DEFAULT, width=22.0, rib_wall=False, brim=2.0)
+    assert T.inside(plan.footprint.rect, strip) and plan.warning is None
+
+
+def test_estimated_spreads_block_strictly_then_warn():
+    """With the estimates the T8 spot is inside the cradle's and the camera housing's 8 mm: the strict test blocks
+    it, the relaxed test (outlines only) takes it, and the plan says so in a WARN line."""
+    test = T.FootprintClearance.of(plate14_outlines(probe=False))
+    r = T.footprint(T8, H14, 172, 150).rect
+    assert not test.clear(r) and test.relaxed().clear(r)
+    assert test.estimates_within(r) == ["camera_housing", "cradle"]
+    req = T.TowerRequest(1, "fixed", T8, H14, (), REACH, BED, 172, 150, clearance=test)
+    (plan,) = T.plan_project([req])
+    assert plan.problem is None and plan.warning is not None and "cradle" in plan.warning  # a fixed spot: WARN too
+    req = T.TowerRequest(1, "fixed", T8, H14, (), REACH, BED, 180, 120, clearance=test)
+    (plan,) = T.plan_project([req])
+    assert plan.problem is not None and "it overlaps cradle" in plan.problem and plan.warning is None
+    req = T.TowerRequest(1, "auto", T8, H14, (), (168.5, 145.6, 196.0, 256.0), BED, clearance=test)
+    (plan,) = T.plan_project([req], fallback=False)
+    assert plan.footprint is not None and plan.warning is not None and "estimated support spread of" in plan.warning
+    checks = list(T.TowerClear(plan).check([], None))
+    assert [c.ok for c in checks] == [True, True] and checks[1].warn
+
+
+def test_silhouettes_open_the_front_of_plate_14():
+    """The housing's box covers x 44..169 from y 25.9, its outline only x 44..95 below y 63.4: the front then holds a
+    35 mm tower clear of every estimated spread, so auto takes it before any narrower size."""
+    (plan,) = T.plan_project(
+        [T.TowerRequest(1, "auto", DEFAULT, H14, (), REACH, BED, clearance=T.FootprintClearance.of(plate14_outlines(False)))]
+    )
+    fp = plan.footprint
+    assert fp is not None and fp.settings.width == 35.0 and fp.rect[3] < 46.6 and plan.warning is None
+
+
+def test_footprint_clearance_keeps_the_box_test_for_a_part_without_an_outline():
+    from conftest import mesh
+
+    boxed = L.Placed("boxed", mesh("boxed.stl", (20, 20, 10)), 1, 100.0, 100.0, brim=5.0)  # footprint None
+    test = T.FootprintClearance.of([boxed])
+    assert not test.clear((122.0, 100.0, 140.0, 120.0))  # 2 mm from the brim rect: inside PART_CLEARANCE
+    assert test.clear((128.5, 100.0, 140.0, 120.0)) and test.blocking((122.0, 100.0, 140.0, 120.0))[0][0] == "boxed"
+    outlined = _shape("outlined", [(100.0, 100.0, 120.0, 120.0)])
+    assert T.FootprintClearance.of([outlined]).clear((121.5, 100.0, 140.0, 120.0))  # the line allowance, no brim
 
 
 def test_auto_placement_failure_names_the_blocking_part():
@@ -474,13 +566,6 @@ def test_smooth_timelapse_plans_a_tower_on_a_one_filament_plate(tmp_path, stls, 
 
 
 # ---------------------------------------------------------------------------- one support predicate
-def test_needs_support_counts_enforced_layers_and_rafts():
-    assert T.needs_support({"enable_support": "1"})
-    assert T.needs_support({"enable_support": "0", "raft_layers": "2"})
-    assert T.needs_support({"enforce_support_layers": "3"})
-    assert not T.needs_support({"enable_support": "0", "raft_layers": "0", "enforce_support_layers": "0"})
-
-
 def test_raft_only_part_counts_the_process_interface_filament(tmp_path, stls, resolver):
     process = {"support_interface_filament": "2", "enable_support": "0"}
     raft = PartSpec.from_json({"path": str(tmp_path / "a.stl"), "set": {"raft_layers": "3"}})
@@ -488,13 +573,13 @@ def test_raft_only_part_counts_the_process_interface_filament(tmp_path, stls, re
     plates = [{"name": "p", "parts": [{"path": str(stls["body"]), "name": "body_1", "at": [5, 40], "set": {"raft_layers": "3"}}]}]
     plan = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, plates, support_interface_filament="2", enable_support="0"))
     fails = [c.text for c in plan.plates[0].checks if not c.ok]
-    assert any(t.startswith("body_1 has support with the process support_interface_filament 2 (extruder 2") for t in fails), fails
+    assert any(t.startswith("body_1 uses filament 2 as the process support_interface_filament (extruder 2") for t in fails), fails
 
 
 # ---------------------------------------------------------------------------- the obstacle test is a parameter
 @dataclass(frozen=True)
 class OpenStrip:
-    """A stand-in for the silhouette binding: only the T8 strip between housing and feeler is free."""
+    """A test fake of `tower.Clearance`: only the T8 strip between housing and feeler is free."""
 
     def clear(self, rect):
         return rect[0] >= 168.5 and rect[2] <= 196.0 and rect[1] >= 145.6
@@ -504,6 +589,12 @@ class OpenStrip:
 
     def blocker(self, rect):
         return (1.0, "feeler_module_print")
+
+    def blocking(self, rect):
+        return [] if self.clear(rect) else [("feeler_module_print", (195.1, 16.0, 245.1, 242.4))]
+
+    def describe(self):
+        return "the T8 strip only"
 
 
 def test_placement_takes_a_clearance_binding():
@@ -529,39 +620,14 @@ def recipe_spec(tmp_path, plates, recipes=("dual-material-interface",), **proces
     )
 
 
-def test_short_supported_part_packs_inside_the_interface_spread_on_every_side(tmp_path, stls, resolver):
+def test_short_supported_part_packs_its_interface_inside_the_right_nozzle_reach(tmp_path, stls, resolver):
     plates = [{"name": "p", "parts": [{"path": str(stls["body"]), "name": "body_1"}]}]
     plan = Pipeline(FakeStudio(sizes={"body.stl": (20, 20, 10)}), resolver).plan(recipe_spec(tmp_path, plates))
     assert plan.ok, (plan.problems, [c.text for c in plan.plates[0].checks if not c.ok])
     (part,) = plan.plates[0].parts
-    spread = L.brim_margin({**plan.process, **part.spec.set}) + T.INTERFACE_SPREAD
-    assert part.placed.brim >= spread  # the packing margin carries the spread on all four sides
-    assert part.placed.y0 - spread >= 0 and part.placed.x0 - spread >= 20.5
-
-
-def _ctx(aux=None):
-    return L.Context({"bed": FACTS["bed"], "extruders": X2D_EXTRUDERS}, {1: 1, 2: 2}, aux_x_limit=aux)
-
-
-def _placed(x0, y0, w=20.0, h=20.0):
-    from conftest import mesh
-
-    return L.Placed("p", mesh("p.stl", (w, h, 10)), 1, x0, y0)
-
-
-def test_interface_reach_reports_the_y_edge():
-    use = T.InterfaceUse("p", "support_interface_filament", 2, 8.2)
-    (c,) = T.InterfaceReach((use,)).check([_placed(60, 3)], _ctx())
-    assert not c.ok and "spans y -5.2..31.2 with its interface spread (8.2 mm)" in c.text and "reaches y 0.0..256.0" in c.text
-    assert " x " not in c.text.split("spans")[1].split("with")[0]  # only the coordinate that fails
-
-
-def test_interface_reach_takes_the_aux_x_limit_and_names_a_part_level_slot():
-    use = T.InterfaceUse("p", "support_filament", 2, 8.2, "part")
-    (c,) = T.InterfaceReach((use,)).check([_placed(210, 60)], _ctx(aux=235.5))
-    assert c.text.startswith("p has support with the part support_filament 2 (extruder 2 (right nozzle), Bowden)")
-    assert "extruder 2 reaches x 20.5..235.5" in c.text
-    assert list(T.InterfaceReach((use,)).check([_placed(100, 60)], _ctx(aux=235.5))) == []
+    spread = L.brim_margin({**plan.process, **part.spec.set}) + L.INTERFACE_SPREAD
+    assert part.placed.interface == {2: (spread, "process support_interface_filament")}
+    assert part.placed.x0 - spread >= 20.5 - 1e-9  # the packer holds the interface spread inside extruder 2's reach
 
 
 def _fixture_for(tmp_path, plan, **over):
