@@ -666,12 +666,14 @@ def test_patch_move_needs_both_signs(capsys, tmp_path):
 
 
 def test_patch_tower_one_plate(capsys, tmp_path):
-    path = _geo(tmp_path, plates=3)
-    code, _out, _ = run(capsys, "--json", "patch", str(path), "--tower", "90,100@2")
-    assert code == 0
+    from test_edits import _body_part_meta
+
+    path = _body_part_meta(_geo(tmp_path, plates=3), "wall_filament", "2")  # plate 1 prints two filaments
+    code, out, _ = run(capsys, "--json", "patch", str(path), "--tower", "90,100@1")
+    assert code == 0, out
     from shambu.threemf import Project
 
-    assert Project(str(path)).project_settings["wipe_tower_x"] == ["208", "90", "208"]
+    assert Project(str(path)).project_settings["wipe_tower_x"] == ["90", "208", "208"]
 
 
 def _with_settings(src, dest, ps):
@@ -1110,3 +1112,70 @@ def test_move_parse_errors_quote_what_was_typed(capsys, tmp_path):
     assert code == 2 and "--move 'body=12'" in out and "','" not in out
     code, out, _ = run(capsys, "patch", str(f), "--move", "body=1x,2")
     assert code == 2 and "--move 'body=1x,2'" in out
+
+
+def test_slice_names_the_conflicting_objects_on_exit_101(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    log = "[error]   gcode path conflicts found between WipeTower and body\n"
+    studio = SequenceStudio(None, codes=[-101], logs=[log])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(tmp_path / "o.gcode.3mf"))
+    doc = one_json(out)
+    assert code == 1
+    assert doc["fails"] == [
+        "Studio found crossing G-code paths between WipeTower and body (exit -101). Move them apart (`--tower X,Y` moves the "
+        "prime tower) and slice again."
+    ]
+
+
+def test_inspect_shows_each_objects_min_corner_and_size(capsys, tmp_path):
+    from conftest import GEO_BODY, GEO_BODY_AT
+
+    f = _geo(tmp_path)
+    code, out, _ = run(capsys, "inspect", str(f))
+    assert code == 0 and f"object body: plate 1 min corner ({GEO_BODY_AT[0]:g}, {GEO_BODY_AT[1]:g}), size 30 x 20 x 10 mm" in out
+    code, out, _ = run(capsys, "--json", "inspect", str(f))
+    body = next(o for o in one_json(out)["objects"] if o["name"] == "body")
+    assert body["position"] == {"plate": 1, "min": [GEO_BODY_AT[0], GEO_BODY_AT[1], 0.0], "size": list(GEO_BODY)}
+
+
+def test_two_filament_estimate_names_the_tower_minutes_and_the_measured_options():
+    from shambu.report import estimate_lines
+
+    sl = {
+        "plate": 1,
+        "prediction_s": 24 * 3600 + 13 * 60,
+        "weight_g": 635.1,
+        "filaments": [{"id": "1", "type": "PETG", "used_g": 613.1}, {"id": "2", "type": "PLA", "used_g": 22.0}],
+        "warnings": [],
+        "feature_times_s": {"Prime tower": 280.9 * 60, "Support": 600.0},
+        "filament_changes": 116,
+    }
+    lines = estimate_lines(sl)
+    (t,) = [x for x in lines if "prime tower:" in x]
+    assert t.startswith("- plate 1 prime tower: 281 min, 116 filament change(s) (result.json)")
+    assert '"width": 22' in t and "19 h 15 min" in t and '"wipe_tower": false' in t and "18 h 48 min" in t
+    assert not any("prime tower:" in x for x in estimate_lines({**sl, "filaments": sl["filaments"][:1]}))
+
+
+@pytest.mark.parametrize("plate_args", [["--plate", "2"], []])
+def test_slice_refuses_an_export_that_dropped_a_requested_plate(capsys, tmp_path, monkeypatch, resolver, plate_args):
+    from test_edits import SequenceStudio
+
+    src = _geo(tmp_path, plates=2)
+    dest = tmp_path / "o.gcode.3mf"
+    studio = SequenceStudio(make_3mf(tmp_path / "one-plate.gcode.3mf", sliced=True), codes=[0, 0, 0])  # plate 1 only
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), *plate_args, "-o", str(dest))
+    doc = one_json(out)
+    assert code == 1 and not dest.exists()
+    assert "plate 2 is missing from the export (the input has it)" in doc["verify_problems"]
+
+
+def test_the_ip_redactor_works_on_whole_tokens():
+    from shambu import conf
+
+    assert conf.redact_ip("BambuStudio v2.8.2.61") == "BambuStudio v2.8.2.61"
+    assert conf.redact_ip("a 10.23.45.67-plate.gcode.3mf") == "a <ip>-plate.gcode.3mf"

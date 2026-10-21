@@ -53,13 +53,16 @@ GAP = 5.0
 # exit 0 (walls 0.42 mm apart, reference 08 section 11.4). 1.0 mm, about two line widths, covers the slicer's own
 # rounding; it is not a measured threshold.
 LINE = 1.0
-# Tree support spread past the model box, per side, as an estimate (reference 08 section 11.2, G-code of the printed
-# plate 14): the housing, 218 mm tall, 20.9 mm on -x at z 0..5 (20.9 / 218 = 0.096); the bracket, 170 mm tall,
-# 15.6 mm (0.092, section 3.6); the cradle, 28.9 mm tall, 7.1 mm. Studio's tree first-layer brim (auto) is 1..10 mm
-# (TreeSupport.cpp:2476-2484, ExPolygon.cpp:416-430), so short parts get the 8 mm floor.
-TREE_SPREAD_PER_MM = 0.10
+# Tree support spread past the model box, per side, as an estimate. Measured (solo slices and the printed plate's
+# G-code, z 0..5; reference 08 section 11.2): the housing, 218 mm tall, 20.9 mm (20.9 / 218 = 0.096); the bracket,
+# 170 mm, 15.6 mm (0.092, section 3.6); the cradle, 28.9 mm, 7.1 mm; the plate-11 motor-bay coupon, 116 mm, 24.8 mm
+# on -x and 24.1 on +x (0.214; empirical replay 2026-10-21, where the old 0.10 x height estimate of 11.6 mm let the
+# packer put the cradle 17.6 mm away and the slice exited -101). The ratio covers the worst of the four (0.22), the
+# cap the largest spread plus one line. Studio's tree first-layer brim (auto) is 1..10 mm (TreeSupport.cpp:2476-2484,
+# ExPolygon.cpp:416-430), so short parts get the 8 mm floor. An estimate only WARNs; `--probe-supports` measures.
+TREE_SPREAD_PER_MM = 0.22
 TREE_SPREAD_FLOOR = 8.0
-TREE_SPREAD_CAP = 22.0  # the largest measured spread, 20.9 mm, plus one line
+TREE_SPREAD_CAP = 26.0  # the largest measured spread, 24.8 mm, plus one line, rounded up
 # Normal (auto) support: 4.4 mm at z 0..5 and 2.5 mm above on the live clash test (reference 08 section 11.4). Studio's
 # own arrange assumes 6 (ModelArrange.cpp:172-173).
 NORMAL_SPREAD = 5.0
@@ -177,21 +180,26 @@ def filament_slots(
     skip: Sequence[str] = (),
     set_label: str = "set.",
 ) -> set[int]:
-    """Every filament slot an object prints with: `base` (its own filament or its sub-parts'), the wall, infill,
-    support and interface keys of its `settings`, every key of each height range (`(label, settings)`), and the
-    process's wall and infill keys, and its support keys when Studio prints support for the object (`needs_support`
-    on process plus settings: a support slot of an object without support is unused). The object's own value of a key
-    wins over the process's. `skip` leaves out those keys of `settings` and the process. `slot(value, where)` parses one
-    value (0: none) and raises its caller's error type."""
+    """Every filament slot an object prints with: `base` (its own filament, its sub-parts' and their per-volume wall
+    and infill overrides), the wall, infill, support and interface keys of its `settings`, the keys of each height
+    range (`(label, settings)`), and the process's wall and infill keys. Support and interface keys count only where
+    Studio prints support (`needs_support` on process, object and range settings: a support slot of an object or a
+    range without support is unused). The object's own value of a key wins over the process's. `skip` leaves out those
+    keys at every level (object, range, process). `slot(value, where)` parses one value (0: none) and raises its
+    caller's error type."""
     out = set(base)
-    support = needs_support({**(process or {}), **settings})
+    proc = dict(process or {})
+    support = needs_support({**proc, **settings})
     for k in FILAMENT_KEYS[1:]:
         if k in skip or (k in SUPPORT_FILAMENT_KEYS and not support):
             continue
         if k in settings and (v := slot(settings[k], f"{set_label}{k}")):
             out.add(v)
     for label, r in ranges:
+        r_support = needs_support({**proc, **settings, **r})
         for k in FILAMENT_KEYS:
+            if k in skip or (k in SUPPORT_FILAMENT_KEYS and not r_support):
+                continue
             if k in r and (v := slot(r[k], f"{label} {k}")):
                 out.add(v)
     if process is not None:
@@ -202,19 +210,32 @@ def filament_slots(
 
 
 def interface_only(
-    settings: Mapping, process: Mapping, others: set[int], spread: float, slot: SlotParser, set_label: str = "set."
+    settings: Mapping,
+    process: Mapping,
+    others: set[int],
+    spread: float,
+    slot: SlotParser,
+    set_label: str = "set.",
+    ranges: Iterable[tuple[str, Mapping]] = (),
 ) -> dict[int, tuple[float, str]]:
-    """The slot that prints only the object's support interface, as {slot: (spread, source)} for `Placed.interface`:
-    empty when Studio prints no support for it, the slot is 0, or the object prints with that slot anyway (`others`:
-    `filament_slots` with the interface key skipped)."""
-    if not needs_support({**process, **settings}):
-        return {}
-    src = "part" if INTERFACE_KEY in settings else "process"
-    raw = settings.get(INTERFACE_KEY, process.get(INTERFACE_KEY, "0"))
-    v = slot(str(raw).strip() or "0", f"{set_label}{INTERFACE_KEY}" if src == "part" else f"process {INTERFACE_KEY}")
-    if not v or v in others:
-        return {}
-    return {v: (spread, f"{src} {INTERFACE_KEY}")}
+    """The slots that print only the object's support interface, as {slot: (spread, source)} for `Placed.interface`:
+    the object's (or the process's) interface slot and each height range's, where Studio prints support there, that
+    is not 0 and not used otherwise (`others`: `filament_slots` with the interface key skipped). A range that repeats
+    the interface slot keeps it interface-only."""
+    out: dict[int, tuple[float, str]] = {}
+    if needs_support({**process, **settings}):
+        src = "part" if INTERFACE_KEY in settings else "process"
+        raw = settings.get(INTERFACE_KEY, process.get(INTERFACE_KEY, "0"))
+        v = slot(str(raw).strip() or "0", f"{set_label}{INTERFACE_KEY}" if src == "part" else f"process {INTERFACE_KEY}")
+        if v and v not in others:
+            out[v] = (spread, f"{src} {INTERFACE_KEY}")
+    for label, r in ranges:
+        if INTERFACE_KEY not in r or not needs_support({**process, **settings, **r}):
+            continue
+        v = slot(str(r[INTERFACE_KEY]).strip() or "0", f"{label} {INTERFACE_KEY}")
+        if v and v not in others and v not in out:
+            out[v] = (spread, f"{label} {INTERFACE_KEY}")
+    return out
 
 
 def is_tree(p: Mapping) -> bool:
@@ -237,7 +258,7 @@ def support_spread(params: Mapping | None, height: float, probe: Spread | None =
     No support: nothing. A probe (a solo slice of the part, measured per side): returned as it is. Otherwise an
     estimate on all four sides, because the mesh does not tell which side the trees grow on (reference 08 section
     11.2: the housing's -y and +y overhangs had 0.3 and 2.9 mm of spread, its -x overhang 20.9 mm):
-    tree `min(22, max(8, 0.10 x height))`, normal 5 mm. A raft without support (raft_layers > 0) grows like normal
+    tree `min(26, max(8, 0.22 x height))`, normal 5 mm. A raft without support (raft_layers > 0) grows like normal
     support: 5 mm, or `raft_first_layer_expansion` when that is larger."""
     p = params or {}
     if not needs_support(p):
@@ -608,7 +629,7 @@ class Placed:
         return (self.x0 - self.info.min[0], self.y0 - self.info.min[1], -self.info.min[2])
 
     def margin_text(self) -> str:
-        """Where the brim and the spread come from, for a report line: `spread 8.0 mm = support 0.10 x 64.0 mm height,
+        """Where the brim and the spread come from, for a report line: `spread 14.1 mm = support 0.22 x 64.0 mm height,
         estimated; brim 5.2 mm`."""
         parts = []
         if self.spread.most() > 0:
@@ -692,12 +713,25 @@ class Check:
         return self.ok and self.kind in ("margin", "brim", "outline")
 
 
+def spread_base(p: Placed) -> Footprint:
+    """Where a part's support spread is swept from. An estimate (`source` "estimate") says how far support reaches past
+    the bounding box, not where along the side: tree branches travel, so it is swept from the box. Swept from the
+    outline, the plate-14b housing sat 28.8 mm (outline) but 8.8 mm (box) from the feeler, checked clear and sliced
+    -101 (empirical replay, 2026-10-21, n=1). A measured or spec spread is swept from the outline: the printed plate 14
+    held the housing 1.4 mm (box) from the shell with 2.9 mm measured on that side and printed (reference 08 section
+    11.2), because the measured support stood where the outline reaches the box edge."""
+    if p.spread.source == "estimate":
+        return BoxFootprint.of(p.w, p.h).translated(p.x0, p.y0)
+    return p.shape()
+
+
 def _side_reaches(src: Placed, dst: Footprint) -> list[tuple[float, str]]:
-    """The sides of src's support spread that reach within the line allowance of dst's model. First src's outline
-    grown by all four spreads at once is tested against the whole of dst (an L-shaped neighbour can be nearest on one
-    side and still be crossed on another); then each side alone, to name the side. When only the corner of two sides
-    reaches, the facing side with the larger spread is named."""
-    base = src.shape()
+    """The sides of src's support spread that reach within the line allowance of dst's model (`spread_base` is where
+    the spread is swept from). First the base grown by all four spreads at once is tested against the whole of dst
+    (an L-shaped neighbour can be nearest on one side and still be crossed on another); then each side alone, to name
+    the side. When only the corner of two sides reaches, the facing side with the larger spread is named. A measured
+    support mask (probe) is exact and is tested by `pair_check` in place of this."""
+    base = spread_base(src)
     if src.spread.most() <= 0:
         return []
     g_all, (dx, dy) = base.grown(*src.spread.sides()).gap(dst, limit=LINE + 0.01)
@@ -881,8 +915,9 @@ class InsideBed:
         for p in _on_bed(placed):
             body = p.rect(with_margin=False)
             where = f"x {body[0]:.1f}..{body[2]:.1f} y {body[1]:.1f}..{body[3]:.1f}"
+            at = " (`at` is the min corner)" if p.fixed else ""  # the spec placed it: say what the numbers mean
             if off(body):
-                yield Check(False, f"{p.key} body {where} leaves the bed {size}", "bed")
+                yield Check(False, f"{p.key} body {where} leaves the bed {size}{at}", "bed")
                 continue
             mx, px, my, py = p.bed_margin(with_brim=False)
             g = (body[0] - mx, body[1] - my, body[2] + px, body[3] + py)

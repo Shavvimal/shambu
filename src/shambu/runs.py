@@ -33,7 +33,7 @@ from .edits import AddFilament, EditError, EditSet, FilamentSlot, SetTower, chec
 from .errors import BambuError, FileError, StudioError
 from .patches import PatchSet, RepairNozzleStats
 from .spec import Spec
-from .studio import CliCommand, RunResult, StudioCLI
+from .studio import NO_PAIR, CliCommand, RunResult, StudioCLI, conflict_phrase, conflicts_in_log
 from .threemf import Project
 
 FILAMENT_ARG = re.compile(r"(?P<preset>.+?)(?::(?P<colour>#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?))?(?:@(?P<ext>\d+))?")
@@ -170,6 +170,7 @@ class SliceResult:
     estimates: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     verify_problems: list[str] = field(default_factory=list)  # the read-back of the export (re-slice and tower)
+    fails: list[str] = field(default_factory=list)  # what a failed slice means, from Studio's log (the -101 pair)
 
     @property
     def ok(self) -> bool:
@@ -185,6 +186,7 @@ class SliceResult:
             "estimates": self.estimates,
             "notes": self.notes,
             "verify_problems": self.verify_problems,
+            "fails": self.fails,
         }
 
 
@@ -282,7 +284,7 @@ def slice_project(
         by_id = {sp.id: sp for sp in rr.plates()}
         estimates = [_estimate(pl, by_id.get(pl["id"])) for pl in s["plates"] if pl.get("slice")]
         back = Project(str(tmp_dest))
-        wanted = {plate} if plate else None
+        wanted = {plate} if plate else set(range(1, max(n_plates, 1) + 1))  # from the input, not the export
         problems = sliced_problems(back, back.summary(features=False), wanted)  # an unsliced "success" never replaces dest
         problems += [f"not re-sliceable by the CLI: {x}" for x in back.reslice_problems(n_ext)]
         spots = {i: (tower[0], tower[1]) for i in range(n_plates) if tower[2] in (None, i + 1)} if tower else {}
@@ -293,11 +295,30 @@ def slice_project(
             return res
         os.replace(tmp_dest, dest)
         rr = RunResult(rr.cmd, rr.status, rr.code, rr.seconds, rr.log, rr.result, dest)
-    res = SliceResult(src, dest, rr, skipped, estimates=estimates, notes=notes)
+    res = SliceResult(src, dest, rr, skipped, estimates=estimates, notes=notes, fails=slice_fails(rr, project))
     if prime:
         notes.append(f"filament_prime_volume pinned to the project's {prime} in every pass (Studio resets it to 45 on a checked slice)")
     notes.append(f"logs and Studio's result.json: {work}")
     return res
+
+
+def slice_fails(rr: RunResult, project: Project) -> list[str]:
+    """A failed slice as `build` reports it: exit -101 names the two objects (or the prime tower) from Studio's log
+    with `studio.conflict_phrase`, split at the project's own object names."""
+    if rr.ok or rr.code != -101:
+        return []
+    try:
+        text = Path(rr.log).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return [
+            f"Studio failed with exit -101, and its log {rr.log} could not be read ({e.strerror or e}): the conflicting objects are unknown."
+        ]
+    known = {*project.object_names(), "WipeTower"}
+    pairs = conflicts_in_log(text, known)
+    if not pairs:
+        return [f"Studio found {NO_PAIR}. Move the parts apart and slice again."]
+    hint = " (`--tower X,Y` moves the prime tower)" if any("WipeTower" in (a, b) for a, b in pairs) else ""
+    return [f"Studio found {conflict_phrase(a, b)}. Move them apart{hint} and slice again." for a, b in pairs]
 
 
 # ---------------------------------------------------------------------------- shambu studio --

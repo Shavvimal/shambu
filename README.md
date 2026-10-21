@@ -183,7 +183,7 @@ Exit codes: 0 ok, 1 a check or verification failed or a patch was refused, 2 usa
   two-filament plate that put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102). The
   planner pins `support_filament` and `support_interface_filament` to the part's own filament when they are unset.
 - Tree support spreads past a part's box and does not avoid a neighbour: 20.9 mm on one side of a 218 mm housing,
-  15.6 mm under a 170 mm bracket. The checker estimates `min(22, max(8, 0.10 x height))` per side (normal support
+  15.6 mm under a 170 mm bracket. The checker estimates `min(26, max(8, 0.22 x height))` per side (normal support
   5 mm), keeps the larger of two facing spreads plus 1 mm between parts, and leaves the verdict to the slice
   (exit -101); `--probe-supports` measures it.
 - An unsliced CLI export writes `extruder_nozzle_stats: []`, and a later CLI slice of it exits -100 "No valid

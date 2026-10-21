@@ -142,7 +142,7 @@ def load_calibration(path: Path | None = None) -> list[dict]:
 _MASKED = re.compile("\\w{2,}\u2026\\w{2,}|\\w{3}\\.\\.\\.\\w{3}")
 _HOST = re.compile(r"(?i)\b[a-z0-9-]+\.(?:local|lan|home|internal|com|net|org|io)\b")
 _TOKEN_SPLIT = re.compile(r"[\s,;()\[\]{}<>\"'=/\\]+")
-_IP_CAND = re.compile(r"\[?[0-9A-Fa-f:.%]*[.:][0-9A-Fa-f:.%]*\]?(?::\d+)?")
+_IP_CAND = re.compile(r"(?<![\w.:%\]])\[?[0-9A-Fa-f:.%]*[.:][0-9A-Fa-f:.%]*\]?(?::\d+)?(?![\w%])")  # whole tokens only
 
 
 def _is_ip(tok: str) -> bool:
@@ -181,6 +181,11 @@ def redact_ip(text: str) -> str:
 
     text = _IP_CAND.sub(one, text)
     return _HOST.sub("<host>", text)
+
+
+def redact_identifiers(text: str) -> str:
+    """`redact_ip` plus every masked serial (`00X…999`) as '<redacted>': the identifier detector applied to free text."""
+    return _MASKED.sub("<redacted>", redact_ip(text))
 
 
 def sensitive_values(conf: dict | None = None) -> list[str]:

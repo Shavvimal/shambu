@@ -516,8 +516,9 @@ def test_post_mortem_plate_checks_clean_with_estimates(tmp_path, resolver, capsy
     assert "FAIL" not in out and "PLACEMENT NOT DONE" not in out
     warns = [line for line in out.splitlines() if line.startswith("- WARN margin rule:")]
     assert warns == [
-        "- WARN margin rule: housing and shell are 10.0 mm apart; support reaches 21.8 mm (estimated); the slice decides",
-        "- WARN margin rule: housing and mount are 10.0 mm apart; support reaches 21.8 mm (estimated); the slice decides",
+        "- WARN margin rule: housing and shell are 10.0 mm apart; support reaches 26.0 mm (estimated); the slice decides",
+        "- WARN margin rule: housing and mount are 10.0 mm apart; support reaches 26.0 mm (estimated); the slice decides",
+        "- WARN margin rule: shell and mount are 10.0 mm apart; support reaches 10.6 mm (estimated); the slice decides",
     ]
 
 

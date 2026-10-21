@@ -43,7 +43,7 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import layout as L
@@ -391,6 +391,31 @@ def world_box(project: Project, name: str) -> tuple[Vec, Vec]:
     return _Geometry(project).world_box(find_object(project, name))
 
 
+def object_positions(project: Project) -> dict[str, dict]:
+    """Each object's plate (1-based), min corner and size in plate-local mm (the convention of spec `at` and
+    `--move`), from its meshes through component and item, for `shambu inspect`. An object whose position cannot be
+    read gets {"error": reason} instead (never a guessed position)."""
+    out: dict[str, dict] = {}
+    geo = _Geometry(project)
+    root = _root(project)
+    for o in project.model_settings.findall("object"):
+        name = _meta(o, "name") or ""
+        try:
+            obj = _object(project, o, root)
+            lo, hi = geo.world_box(obj)
+            plate = _plate_of(project, obj.oid)
+            ox, oy = _origin(project, plate)
+        except BambuError as e:
+            out[name] = {"error": str(e)}
+            continue
+        out[name] = {
+            "plate": plate,
+            "min": [round(lo[0] - ox, 3), round(lo[1] - oy, 3), round(lo[2], 3)],
+            "size": [round(v, 3) for v in _size(lo, hi)],
+        }
+    return out
+
+
 def plate_origin(index: int, count: int, width: float, depth: float) -> tuple[float, float]:
     """World offset of plate `index` (0-based) of `count` (PartPlate.cpp compute_shape_position)."""
     v = math.sqrt(count)
@@ -462,12 +487,22 @@ def _object_filaments(project: Project, obj: _Obj, skip: Sequence[str] = ()) -> 
     base = {main}
     for part in obj.ms.findall("part"):
         if part.get("subtype") in (None, "normal_part", "modifier_part"):
-            e = slot(_meta(part, "extruder"), f"part {_meta(part, 'name')!r} extruder")
-            if e:
-                base.add(e)
-    ranges = [(f"height range {r['min_z']}..{r['max_z']}", r) for r in _ranges(project, _build_index(project, obj.oid))]
-    used = L.filament_slots(base, _object_settings(obj), ranges, _flat(project.project_settings), slot, skip=skip, set_label="")
+            name = _meta(part, "name")
+            # Studio resolves wall and infill filaments per volume (PrintObject.cpp:3105): a volume's own value wins
+            for k in ("extruder", *L.WALL_INFILL_KEYS):
+                if k in skip:
+                    continue
+                e = slot(_meta(part, k), f"part {name!r} {k}")
+                if e:
+                    base.add(e)
+    used = L.filament_slots(
+        base, _object_settings(obj), _obj_ranges(project, obj), _flat(project.project_settings), slot, skip=skip, set_label=""
+    )
     return main, used - {main}
+
+
+def _obj_ranges(project: Project, obj: _Obj) -> list[tuple[str, dict]]:
+    return [(f"height range {r['min_z']}..{r['max_z']}", r) for r in _ranges(project, _build_index(project, obj.oid))]
 
 
 def _flat(ps: Mapping) -> dict:
@@ -477,7 +512,9 @@ def _flat(ps: Mapping) -> dict:
 
 def _interface(project: Project, obj: _Obj, spread: float) -> dict[int, tuple[float, str]]:
     main, others = _object_filaments(project, obj, skip=(L.INTERFACE_KEY,))
-    return L.interface_only(_object_settings(obj), _flat(project.project_settings), others | {main}, spread, _slot_parser(obj), "")
+    return L.interface_only(
+        _object_settings(obj), _flat(project.project_settings), others | {main}, spread, _slot_parser(obj), "", _obj_ranges(project, obj)
+    )
 
 
 def _build_index(project: Project, oid: str) -> int:
@@ -1059,6 +1096,122 @@ class MoveObject(PatchBase):
 
 
 @dataclass(frozen=True)
+class TowerTest:
+    """One plate's prime tower against the bed, the nozzles' reach and the plate's outlines (`tower_test`)."""
+
+    rect: T.Rect
+    fail: str | None  # off the bed, out of a nozzle's reach, or within the line allowance of an outline
+    notes: tuple[str, ...]  # WARN (an estimated spread, a box for an outline) or OK lines
+
+
+def tower_test(p: Project, pl: int, x: float, y: float, settings: T.TowerSettings, extra: frozenset[int] = frozenset()) -> TowerTest:
+    """The tower at min corner (x, y) on plate `pl` as `check` would place it: Studio's footprint (`tower.footprint`,
+    the plate's tallest object), inside the bed and every mapped nozzle's reach, and `tower.FootprintClearance` over
+    the plate's objects (an outline or a measured spread FAILs, an estimated spread WARNs). Never raises: `SetTower`
+    raises on `fail`, an added filament reports it."""
+    facts = _bed(p)
+    bed = facts["bed"]
+    objs, boxed = plate_objects(p, pl)
+    height = max((o.info.size[2] for o in objs), default=0.0)
+    # Studio sizes the tower from the filaments this plate prints with, not the project's loaded slots
+    settings = replace(settings, plate_filaments=max(len(plate_filaments(objs) | extra), 1))
+    fp = T.footprint(settings, height, x, y)
+    x0, y0, x1, y1 = fp.rect
+    foot = f"plate {pl} {fp.describe()} spans x {x0:.1f}..{x1:.1f} y {y0:.1f}..{y1:.1f}"
+    if not T.inside(fp.rect, (bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1])):
+        return TowerTest(fp.rect, f"{foot}, off the bed x {bed['x'][0]:g}..{bed['x'][1]:g} y {bed['y'][0]:g}..{bed['y'][1]:g}", ())
+    for ext in sorted(set(plate_filament_map(p, pl))):
+        if not 1 <= ext <= len(facts["extruders"]):
+            continue
+        r = facts["extruders"][ext - 1]
+        lo, hi = L.extruder_x(r)
+        if x0 < lo or x1 > hi or y0 < r["y"][0] or y1 > r["y"][1]:
+            return TowerTest(
+                fp.rect,
+                f"{foot}, outside extruder {ext}'s reach x {lo:g}..{hi:g} y {r['y'][0]:g}..{r['y'][1]:g}, and a filament on "
+                f"plate {pl} maps to extruder {ext}",
+                (),
+            )
+    test = T.FootprintClearance.of(objs)
+    hits = test.relaxed().blocking(fp.rect)
+    if hits:
+        return TowerTest(
+            fp.rect,
+            f"{foot}, and it comes within the {L.LINE:g} mm line allowance of "
+            + ", ".join(f"{n} (x {r[0]:.1f}..{r[2]:.1f} y {r[1]:.1f}..{r[3]:.1f})" for n, r in hits)
+            + " (its outline or its measured spread)",
+            (),
+        )
+    near = test.estimates_within(fp.rect)
+    notes = [f"  WARN: {b}" for b in boxed]
+    notes.append(
+        f"  WARN: plate {pl}: the tower is within the estimated support spread of {', '.join(near)}; the slice decides"
+        if near
+        else f"  OK: plate {pl}: the tower is clear of every object ({len(objs)}): {test.describe()}"
+    )
+    return TowerTest(fp.rect, None, tuple(notes))
+
+
+def plate_filaments(objs: Iterable[L.Placed]) -> set[int]:
+    """The filament slots the objects of one plate print with (each object's own, its volumes', support and interface)."""
+    return {f for o in objs for f in o.filaments}
+
+
+def plate_needs_tower(p: Project, pl: int) -> bool:
+    """Studio prints a prime tower on a plate that prints with two or more filaments, or with Smooth timelapse
+    (PartPlate.cpp:2222-2223), unless enable_prime_tower is off."""
+    flat = _flat(p.project_settings)
+    if str(flat.get("enable_prime_tower", "1")).strip().lower() in ("0", "false"):
+        return False
+    return T.smooth_timelapse(flat) or len(plate_filaments(plate_objects(p, pl)[0])) >= 2
+
+
+def project_tower_settings(p: Project) -> T.TowerSettings:
+    """Studio's tower estimate inputs from the project's own settings (width, rib wall, brim, prime volumes)."""
+    ps = p.project_settings
+    try:
+        return T.TowerSettings.from_config(_flat(ps), [ps], max(p.n_filaments(), 1), len(_bed(p)["extruders"]))
+    except BambuError as e:
+        raise EditError(f"the prime tower estimate: {e}") from e
+
+
+def tower_notes(p: Project, added: int | None = None) -> list[str]:
+    """The project's own tower position tested as `tower_test` does, for a change that makes it print a tower: a FAIL
+    or WARN line per plate, never a move (`--tower X,Y` moves it). `added`: a new filament slot, counted as used on
+    every plate (it prints there as soon as an object uses it, and the tower with it)."""
+    ps = p.project_settings
+    settings = project_tower_settings(p)
+    extra = frozenset({added}) if added else frozenset()
+    out = []
+    for i in range(max(len(_plates(p)), 1)):
+        objs = plate_objects(p, i + 1)[0]
+        flat = _flat(ps)
+        on = str(flat.get("enable_prime_tower", "1")).strip().lower() not in ("0", "false")
+        if not on or not (T.smooth_timelapse(flat) or len(plate_filaments(objs) | extra) >= 2):
+            continue
+        xs, ys = ps.get("wipe_tower_x"), ps.get("wipe_tower_y")
+
+        def at(v, k: int) -> float | None:
+            vals = v if isinstance(v, list) else [v]
+            raw = vals[k] if k < len(vals) else (vals[0] if vals else None)
+            try:
+                return float(str(raw))
+            except ValueError:  # a missing or malformed position: reported as none, never guessed
+                return None
+
+        x, y = at(xs, i), at(ys, i)
+        if x is None or y is None:
+            out.append(f"  WARN: plate {i + 1}: the project holds no prime tower position; set one with --tower X,Y")
+            continue
+        t = tower_test(p, i + 1, x, y, settings, extra)
+        if t.fail:
+            out.append(f"  FAIL: the project's prime tower: {t.fail}. Move it with --tower X,Y (`shambu check` places one)")
+        else:
+            out += list(t.notes)
+    return out
+
+
+@dataclass(frozen=True)
 class SetTower(PatchBase):
     """The prime tower's min corner (plate-local mm) on one plate, or on every plate when `plate` is None."""
 
@@ -1078,55 +1231,26 @@ class SetTower(PatchBase):
         if self.plate is not None and not 1 <= self.plate <= n_plates:
             raise EditError(f"plate {self.plate} does not exist: the project has {n_plates} plate(s)")
         flat = _flat(ps)
-        off = str(flat.get("enable_prime_tower", "1")).strip().lower() in ("0", "false")
-        if off or (p.n_filaments() < 2 and not T.smooth_timelapse(flat)):
+        plates = [self.plate] if self.plate else list(range(1, n_plates + 1))
+        need = [pl for pl in plates if plate_needs_tower(p, pl)]  # per plate: the filaments its objects print with
+        if not need:
             raise EditError(
                 f"the project uses {p.n_filaments()} filament(s) with enable_prime_tower {ps.get('enable_prime_tower', '1')!r} and "
-                f"timelapse_type {flat.get('timelapse_type', '0')!r}: Studio prints no prime tower, so there is nothing to place"
+                f"timelapse_type {flat.get('timelapse_type', '0')!r}, and no plate here prints with two: Studio prints no prime "
+                "tower, so there is nothing to place"
             )
-        facts = _bed(p)
-        bed = facts["bed"]
-        plates = [self.plate] if self.plate else list(range(1, n_plates + 1))
-        try:  # the tower model `check` plans with (tower.py): Studio's estimate from the project's own settings
-            settings = T.TowerSettings.from_config(flat, [ps], max(p.n_filaments(), 1), len(facts["extruders"]))
-        except BambuError as e:
-            raise EditError(f"--tower: {e}") from e
+        settings = project_tower_settings(p)  # the tower model `check` plans with (tower.py)
         rects: list[tuple[int, T.Rect]] = []
         clear_notes: list[str] = []
-        for pl in plates:  # per plate: the tallest object there sizes the tower (PartPlate.cpp:2191-2265)
-            objs, boxed = plate_objects(p, pl)
-            height = max((o.info.size[2] for o in objs), default=0.0)
-            fp = T.footprint(settings, height, self.x, self.y)
-            x0, y0, x1, y1 = fp.rect
-            foot = f"plate {pl} {fp.describe()} spans x {x0:.1f}..{x1:.1f} y {y0:.1f}..{y1:.1f}"
-            if not T.inside(fp.rect, (bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1])):
-                raise EditError(f"{foot}, off the bed x {bed['x'][0]:g}..{bed['x'][1]:g} y {bed['y'][0]:g}..{bed['y'][1]:g}")
-            for ext in sorted(set(plate_filament_map(p, pl))):
-                if not 1 <= ext <= len(facts["extruders"]):
-                    continue
-                r = facts["extruders"][ext - 1]
-                lo, hi = L.extruder_x(r)
-                if x0 < lo or x1 > hi or y0 < r["y"][0] or y1 > r["y"][1]:
-                    raise EditError(
-                        f"{foot}, outside extruder {ext}'s reach x {lo:g}..{hi:g} y {r['y'][0]:g}..{r['y'][1]:g}, and a "
-                        f"filament on plate {pl} maps to extruder {ext}"
-                    )
-            test = T.FootprintClearance.of(objs)  # the objects on the plate, as `check` places the tower
-            hits = test.relaxed().blocking(fp.rect)
-            if hits:
-                raise EditError(
-                    f"{foot}, and it comes within the {L.LINE:g} mm line allowance of "
-                    + ", ".join(f"{n} (x {r[0]:.1f}..{r[2]:.1f} y {r[1]:.1f}..{r[3]:.1f})" for n, r in hits)
-                    + " (its outline or its measured spread)"
-                )
-            near = test.estimates_within(fp.rect)
-            clear_notes += [f"  WARN: {b}" for b in boxed]
-            clear_notes.append(
-                f"  WARN: plate {pl}: the tower is within the estimated support spread of {', '.join(near)}; the slice decides"
-                if near
-                else f"  OK: plate {pl}: the tower is clear of every object ({len(objs)}): {test.describe()}"
-            )
-            rects.append((pl, fp.rect))
+        for pl in plates:
+            if pl not in need:
+                clear_notes.append(f"  OK: plate {pl} prints with one filament: no prime tower there")
+                continue
+            t = tower_test(p, pl, self.x, self.y, settings)
+            if t.fail:
+                raise EditError(t.fail)
+            clear_notes += t.notes
+            rects.append((pl, t.rect))
         for key, v in (("wipe_tower_x", self.x), ("wipe_tower_y", self.y)):
             old = ps.get(key)
             vals = [str(x) for x in old] if isinstance(old, list) else ([str(old)] if old not in (None, "") else [])
@@ -1618,6 +1742,9 @@ class AddFilament(PatchBase):
                 "value): Studio computes them from the colours when the project is opened or re-exported"
             )
         p.notes.append(f"  slot {n + 1} is unused until --extruder, --set OBJ:support_interface_filament={n + 1} or --range uses it")
+        # Two filaments make Studio print a prime tower at the project's own spot: test it now, not at the first slice
+        # that uses the new slot (the verify slice passes while the slot is unused)
+        p.notes += tower_notes(p, n + 1)
 
     def _check(
         self,

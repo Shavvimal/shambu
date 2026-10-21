@@ -46,6 +46,11 @@ STANDARD_PERCENT = 100  # spd_mag at the standard level
 # "when the printer's remaining time departs from M73 R by more than 5 %"). Exactly 5 % is not flagged.
 DISAGREE = 0.05
 RATE_MIN_LAYER = 11  # the rate uses the polls at this layer and up (research C, B4)
+# A rate needs a span: a one-layer, 48 s log once printed "rate 0.750" (empirical replay, 2026-10-21). The rate's
+# resolution is about +-1 min per end (research C), so 30 minutes keep it near +-0.07; 20 layers keep one slow layer
+# from deciding it.
+RATE_MIN_SPAN_LAYERS = 20
+RATE_MIN_SPAN_MIN = 30.0
 POINT_MIN_N = 3
 POINT_MAX_RANGE = 0.15  # a point estimate needs max rate - min rate < 0.15; exactly 0.15 is refused
 EPS = 1e-9  # float tolerance at both thresholds
@@ -60,7 +65,9 @@ FLAG_START = "start_not_logged"
 FLAG_FAILED = "print_failed"
 FLAG_PAUSED = "paused"
 FLAG_COUNTDOWN = "countdown_not_logged"  # a layer poll without the printer's remaining time: agreement unknown
-FLAGS = (FLAG_SPEED, FLAG_SPEED_UNKNOWN, FLAG_DISAGREE, FLAG_END, FLAG_START, FLAG_FAILED, FLAG_PAUSED, FLAG_COUNTDOWN)
+FLAG_SPAN = "span_too_short"  # fewer than RATE_MIN_SPAN_LAYERS layers or RATE_MIN_SPAN_MIN minutes: no rate
+FLAGS = (FLAG_SPEED, FLAG_SPEED_UNKNOWN, FLAG_DISAGREE, FLAG_END, FLAG_START, FLAG_FAILED, FLAG_PAUSED, FLAG_COUNTDOWN, FLAG_SPAN)
+OLD_LOG = "this log predates 0.4.0: no timestamps; cannot calibrate"
 # Any of these keeps a print out of a point estimate (start and end must both be logged: a finished whole print).
 BLOCKS_POINT = frozenset(FLAGS)
 
@@ -281,6 +288,8 @@ def read_log(lines: Iterable[str | dict]) -> list[Session]:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError as e:
+                if line.strip() in ("{", "[") or line.startswith((" ", "\t")):  # pretty-printed records: the old watch log
+                    raise CalibrationError(f"{OLD_LOG} (line {i} is part of a multi-line JSON record)") from e
                 raise CalibrationError(f"line {i} is not JSON: {e.msg}") from e
         if not isinstance(rec, dict):
             raise CalibrationError(f"line {i} is not a JSON object")
@@ -292,6 +301,8 @@ def read_log(lines: Iterable[str | dict]) -> list[Session]:
         if not sessions:
             sessions.append(Session(None, 1))
         s = sessions[-1]
+        if "read_at" not in rec and kind is None:  # a pre-0.4.0 record: no kind, no timestamp
+            raise CalibrationError(f"{OLD_LOG} (line {i} has no read_at)")
         t = _t(rec.get("read_at"), f"line {i}")
         if last_t is not None and t < last_t:
             raise CalibrationError(f"line {i}: read_at goes back in time (the clock moved); start a new log")
@@ -524,7 +535,11 @@ def fit(polls: list[Poll], session: Session, track: M73Track) -> PrintFit:
     end = next((p for p in polls if p.kind == "end"), None)
     rate = offset = whole = real = None
     rate_layers = None
-    if len(rated) >= 2 and rated[-1].studio_elapsed_min - rated[0].studio_elapsed_min > EPS:
+    short = len(rated) < 2 or (
+        (rated[-1].layer or 0) - (rated[0].layer or 0) + 1 < RATE_MIN_SPAN_LAYERS  # layers 11..30 are 20 layers
+        or rated[-1].elapsed_min - rated[0].elapsed_min < RATE_MIN_SPAN_MIN
+    )
+    if not short and rated[-1].studio_elapsed_min - rated[0].studio_elapsed_min > EPS:
         a, b = rated[0], rated[-1]
         rate = round((b.elapsed_min - a.elapsed_min) / (b.studio_elapsed_min - a.studio_elapsed_min), 3)
         rate_layers = (a.layer or 0, b.layer or 0)
@@ -535,7 +550,7 @@ def fit(polls: list[Poll], session: Session, track: M73Track) -> PrintFit:
     if start is not None and end is not None:
         real = round(end.elapsed_min, 2)
         whole = round(real / track.total_min, 3)
-    flags: list[str] = []
+    flags: list[str] = [FLAG_SPAN] if short else []
     if any(s != STANDARD_SPEED for s in facts.speeds) or any(p != STANDARD_PERCENT for p in facts.percents):
         flags.append(FLAG_SPEED)
     if facts.speed_unknown:

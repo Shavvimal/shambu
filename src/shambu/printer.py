@@ -1379,6 +1379,19 @@ def scrub(text: str | None, secrets: list[str]) -> str | None:
     return text
 
 
+def scrub_tree(x, secrets: list[str]):
+    """A structured record (a watch header) with every string value cleaned: the known secrets (`scrub`), then any IP
+    address, LAN host name or masked serial (`conf.redact_identifiers`). Numbers and keys are never touched, so a code
+    that happens to be digits inside a float cannot corrupt the record (it was once scrubbed as JSON text)."""
+    if isinstance(x, dict):
+        return {k: scrub_tree(v, secrets) for k, v in x.items()}
+    if isinstance(x, list):
+        return [scrub_tree(v, secrets) for v in x]
+    if isinstance(x, str):
+        return conf.redact_identifiers(scrub(x, secrets) or "")
+    return x
+
+
 RAW_SECRET = ("access", "password", "passwd", "token", "ticket", "secret", "auth")
 RAW_DROP = ("net", "wifi_signal", "ipcam", "sn", "dev_id", "serial")  # network, camera URL (holds the IP), serial keys
 

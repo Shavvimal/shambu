@@ -506,3 +506,38 @@ def test_public_raw_scrubs_a_known_access_code_under_an_ordinary_key(conf_file):
     raw = {"print": {"note": f"code {SENTINEL}", "gcode_state": "RUNNING"}}
     got = printer.public_raw(raw, "10.0.0.9", SERIAL)
     assert got["print"]["note"] == "<redacted>" and got["print"]["gcode_state"] == "RUNNING"
+
+
+def test_header_scrub_never_touches_numbers_and_catches_identifiers():
+    """A code of digits inside a float once corrupted the scrubbed JSON text; an IP or a masked serial in a file name
+    passed the literal match."""
+    h = {
+        "kind": "header",
+        "every_s": 100.33333333333333,
+        "gcode3mf": f"{SENTINEL_IP}-{MASKED}-plate.gcode.3mf",
+        "track": {"total_min": 33333333.5},
+    }
+    got = printer.scrub_tree(h, ["33333333", SENTINEL])
+    assert got["every_s"] == 100.33333333333333 and got["track"]["total_min"] == 33333333.5
+    assert got["gcode3mf"] == "<ip>-<redacted>-plate.gcode.3mf"
+    assert json.loads(json.dumps(got)) == got
+
+
+def test_watch_header_drops_an_ip_and_a_masked_serial_from_the_gcode_file_name(stream, capsys, tmp_path):
+    import zipfile
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_calibrate import gcode
+
+    g3 = tmp_path / f"{SENTINEL_IP}-{MASKED}.gcode.3mf"
+    with zipfile.ZipFile(g3, "w") as z:
+        z.writestr("Metadata/project_settings.config", "{}")
+        z.writestr("Metadata/model_settings.config", "<config/>")
+        z.writestr("Metadata/plate_1.gcode", gcode("PETG"))
+    log = tmp_path / "w.jsonl"
+    stream.script = [timed_report("FINISH", layer=3, remaining=0)]
+    assert cli.main(["--json", "printer", "watch", "--ip", SENTINEL_IP, "--log", str(log), "--gcode3mf", str(g3)]) == 0
+    capsys.readouterr()
+    first = log.read_text(encoding="utf-8").splitlines()[0]
+    assert SENTINEL_IP not in first and MASKED not in first and "00X\\u2026999" not in first
+    assert json.loads(first)["gcode3mf"] == "<redacted>-<redacted>.gcode.3mf"  # the endpoint is a known secret here

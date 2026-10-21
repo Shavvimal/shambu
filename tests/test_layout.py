@@ -256,7 +256,7 @@ def test_support_spread_zero_without_support(params):
     assert s.sides() == (0.0, 0.0, 0.0, 0.0) and s.source == "none"
 
 
-@pytest.mark.parametrize(("height", "want"), [(28.9, 8.0), (218.0, 21.8), (300.0, 22.0)])
+@pytest.mark.parametrize(("height", "want"), [(28.9, 8.0), (116.0, 25.52), (218.0, 26.0), (300.0, 26.0)])
 def test_tree_spread_estimate_floor_slope_cap(height, want):
     s = L.support_spread({"enable_support": "1", "support_type": "tree(auto)"}, height)
     assert s.sides() == pytest.approx((want,) * 4) and s.source == "estimate" and s.tree
@@ -290,10 +290,10 @@ def test_pair_clearance_uses_the_facing_side():
 
 
 def test_estimate_shortfall_warns_probe_shortfall_fails():
-    est = L.support_spread({"enable_support": "1"}, 100.0)  # 10 mm, estimated
+    est = L.support_spread({"enable_support": "1"}, 50.0)  # 11 mm, estimated
     a, b = sup("a", x0=10, y0=10, s=est), sup("b", x0=35, y0=10)
     (c,) = [x for x in checks([a, b]) if x.kind == "margin"]
-    assert c.ok and c.warn and c.text == "a and b are 5.0 mm apart; support reaches 10.0 mm (estimated); the slice decides"
+    assert c.ok and c.warn and c.text == "a and b are 5.0 mm apart; support reaches 11.0 mm (estimated); the slice decides"
     a.spread = spread(10.0)
     (c,) = [x for x in checks([a, b]) if x.kind == "margin"]
     assert not c.ok and "measured by a solo slice" in c.text
@@ -449,12 +449,15 @@ def test_bottom_left_fits_plate14_on_one_plate_with_probe_spreads():
     assert [c for c in checks(ps) if not c.ok or c.warn] == []
 
 
-def test_bottom_left_fits_plate14_on_one_plate_with_estimated_spreads():
+def test_bottom_left_keeps_every_estimate_on_plate14_and_needs_the_probe_for_one_plate():
+    """With the estimates (0.22 x height, up to 26 mm, swept from the box) the packer keeps every pair clear of its
+    WARN, so the five parts take two plates; the measured spreads fit one (the test above). The packer's answer, not
+    a proof: the printed plate held them on one."""
     ps = plate14(lambda k, h: L.support_spread(TREE, h))
     got = L.BottomLeftPacker().place(ps)
-    assert len(got) == 1 and got.unplaced == {}
-    assert all(c.ok for c in checks(ps))  # no FAIL, and no WARN either: the packer keeps every estimate
-    assert not any(c.warn for c in checks(ps))
+    assert len(got) == 2 and got.unplaced == {}
+    on_one = [p for p in ps if p in got.plates[0]]
+    assert not any(c.warn or not c.ok for c in checks(on_one))  # no pair it placed is closer than the estimate allows
 
 
 def test_row_packer_needs_two_plates_for_plate14():
@@ -743,3 +746,40 @@ def test_one_outline_rule_with_the_box_guard_and_its_own_warn_kind():
     assert fp is None and "differs from Studio's by 15.0 mm" in why
     c = L.Check(True, "label: the clearance uses the bounding box, not the outline: x", "outline")
     assert c.warn and check_line(c).startswith("WARN outline: ")
+
+
+# ---------------------------------------------------------------------------- empirical replay regressions (2026-10-21)
+def test_plate14b_packer_keeps_the_housing_22_8_mm_from_the_feeler_box():
+    """Box meshes of the 14b sizes: the housing (135 x 124.2 x 218, an estimate) and the feeler (50 x 226.4 x 64).
+    The packer put the housing 8.8 mm (box) from the feeler with the outline sweep and the slice exited -101. The
+    estimate is swept from the box, and a packed pair keeps the clearance pair_check would WARN about."""
+    h = sup("housing", 135.0, 124.2, z=218.0, s=L.support_spread(TREE, 218.0))
+    f = sup("feeler", 50.0, 226.4, z=64.0, s=L.support_spread(TREE, 64.0))
+    got = L.BottomLeftPacker().place([h, f])
+    assert got.unplaced == {} and len(got) == 1
+    gap, _ = L.rect_gap(h.rect(False), f.rect(False))
+    assert gap >= h.spread.most() + L.LINE - 1e-9 and gap >= 22.8
+    assert L.pair_check(h, f) is None  # and check says the same of the packed layout as of a hand layout
+
+
+def test_plate11_packer_keeps_the_coupon_spread_from_the_cradle():
+    """Box meshes of plate 11: the coupon (76 x 84.2 x 116; measured 24.1 mm toward the cradle) and the cradle
+    (22.1 x 99 x 28.9). With the old 0.10 x height estimate (11.6 mm) the packer left 17.6 mm and the slice exited
+    -101; the estimate now covers the measured spread."""
+    c = sup("coupon", 76.0, 84.2, z=116.0, s=L.support_spread(TREE, 116.0))
+    r = sup("cradle", 22.1, 99.0, z=28.9, s=L.support_spread(TREE, 28.9))
+    L.BottomLeftPacker().place([c, r])
+    gap, _ = L.rect_gap(c.rect(False), r.rect(False))
+    assert c.spread.most() >= 24.1 and gap >= 24.1 + L.LINE
+    hand = sup("cradle", 22.1, 99.0, z=28.9, x0=c.x1 + 17.6, y0=c.y0, s=L.support_spread(TREE, 28.9))
+    (w,) = [x for x in checks([c, hand]) if x.kind == "margin"]
+    assert w.warn  # the old packed spot is a WARN for a hand layout too
+
+
+def test_a_fixed_part_off_the_bed_says_at_is_the_min_corner():
+    p = part("housing", w=135, h=124.2, x0=163.5, y0=106)
+    p.fixed = True
+    (t,) = failures([p])
+    assert t.endswith("leaves the bed 256 x 256 (`at` is the min corner)")
+    p.fixed = False
+    assert failures([p])[0].endswith("leaves the bed 256 x 256")

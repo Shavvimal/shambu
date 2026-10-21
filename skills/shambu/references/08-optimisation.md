@@ -537,10 +537,14 @@ a five-part plate that printed (18 h 0 min, 480.7 g). The rule is replaced. Code
 | feeler | 64 | 0.2 | 0.6 | 4.7 | 3.4 |
 | cradle | 29 | 7.1 | 7.1 | inside | inside |
 
-With section 3.6's bracket (170 mm tall, 15.6 mm) this gives the estimate: tree `min(22, max(8, 0.10 x height))`
-(20.9 / 218 = 0.096, 15.6 / 170 = 0.092; the cap is 20.9 plus one line), normal support 5 mm (11.4). The mesh does
-not tell the side: the housing's -y and +y overhangs had 0.3 and 2.9 mm, its -x overhang 20.9 mm. So the estimate
-goes on all four sides, and `--probe-supports` measures per side (11.6).
+With section 3.6's bracket (170 mm tall, 15.6 mm) the first estimate was tree `min(22, max(8, 0.10 x height))`
+(20.9 / 218 = 0.096, 15.6 / 170 = 0.092). The empirical replay (2026-10-21) measured the plate-11 motor-bay coupon,
+116 mm tall, at 24.8 mm on -x and 24.1 on +x (0.214): at 0.10 x height the packer left 17.6 mm and the slice exited
+-101. The estimate is now `min(26, max(8, 0.22 x height))` (the worst ratio of the four parts; the cap is 24.8 plus
+one line), normal support 5 mm (11.4). The mesh does not tell the side or where along it: the housing's -y and +y
+overhangs had 0.3 and 2.9 mm, its -x overhang 20.9 mm. So the estimate goes on all four sides and is swept from the
+bounding box (plate 14b: the housing's outline was 28.8 mm from the feeler, its box 8.8 mm, and the slice exited
+-101). `--probe-supports` measures per side and keeps a support mask (11.6).
 
 Footprints on the printed plate: the feeler's wide part exists only in two end blocks, and the cradle sits between
 them. Box gap -3.7 mm (overlap), convex-hull gap 0.0, real gap 4.95 mm (brim to support), model to model about

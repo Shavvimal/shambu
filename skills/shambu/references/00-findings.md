@@ -172,7 +172,7 @@ build, two watched prints, and the Studio source at tag v02.08.02.61. Details: r
    the bed border only: it does not avoid a neighbour (Support/TreeSupport3D.cpp:5232-5246,
    TreeModelVolumes.cpp:128-133). Measured on the printed plate: 20.9 mm on one side of a 218 mm housing (z 0..5),
    0 to 7.1 mm everywhere else; 15.6 mm under a 170 mm bracket. The estimate is tree
-   `min(22, max(8, 0.10 x height))`, normal 5 mm, raft 5 mm (or `raft_first_layer_expansion`), on all four sides,
+   `min(26, max(8, 0.22 x height))`, normal 5 mm, raft 5 mm (or `raft_first_layer_expansion`), on all four sides,
    because the mesh does not tell the side. "Has support" is Studio's predicate: `enable_support`,
    `enforce_support_layers > 0` or `raft_layers > 0` (Print.hpp:492-494; `layout.needs_support`). The spec
    overrides it per side (`support_spread`) or with `brim_margin` (brim and support together).

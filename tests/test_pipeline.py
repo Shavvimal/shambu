@@ -259,7 +259,7 @@ def test_supported_part_gets_the_support_spread(tmp_path, stls, resolver):
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], recipes=["tree-supports"]))
     p = plan.plates[0].parts[0].placed
     assert p.brim == pytest.approx(5.2)  # the brim, kept apart from the support spread
-    assert p.spread.sides() == pytest.approx((8.0,) * 4) and p.spread.source == "estimate" and p.spread.tree  # 0.10 x 40 < 8 floor
+    assert p.spread.sides() == pytest.approx((8.8,) * 4) and p.spread.source == "estimate" and p.spread.tree  # 0.22 x 40
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"]))
     p = plan.plates[0].parts[0].placed
     assert p.brim == pytest.approx(5.2) and p.spread.source == "none"  # no supports: the brim only

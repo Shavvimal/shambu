@@ -678,3 +678,19 @@ def test_a_parser_error_passes_through_the_stream(tmp_path):
         z.writestr("Metadata/plate_1.gcode", gcode(m73=False))
     with pytest.raises(C.CalibrationError, match="no 'M73"):
         cli._gcode_track(str(path), None)
+
+
+def test_a_short_span_gives_no_rate_and_a_flag():
+    """A 48 s, one-layer log once printed "rate 0.750": below 20 layers or 30 minutes there is no rate."""
+    f = fit_log(print_log(layers=(11, 12), start=False, end=None))
+    assert f.rate is None and C.FLAG_SPAN in f.flags
+    f = fit_log(print_log(rate=0.2, layers=(11, 30), start=False, end=None))  # 20 layers but under 30 minutes
+    assert f.rate is None and C.FLAG_SPAN in f.flags
+
+
+def test_the_old_watch_log_is_refused_in_one_line():
+    pretty = '{\n  "state": "RUNNING",\n  "layer": 12\n}\n'
+    with pytest.raises(C.CalibrationError, match=r"this log predates 0\.4\.0: no timestamps; cannot calibrate"):
+        C.read_log(pretty.splitlines())
+    with pytest.raises(C.CalibrationError, match=r"this log predates 0\.4\.0: no timestamps; cannot calibrate"):
+        C.read_log(['{"state": "RUNNING", "layer": 12}'])

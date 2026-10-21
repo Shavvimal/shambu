@@ -12,7 +12,7 @@ Post-mortem fixes for the G2 rev E plates (2026-10-20 to 10-21): a checker that 
 uncalibrated time estimate, no verb to edit a project, a two-filament slice that never ran, three versions of one tool.
 
 ### Changed
-- Layout: the support margin is a per-side `Spread` (tree estimate `min(22, max(8, 0.10 x height))` mm, normal 5 mm,
+- Layout: the support margin is a per-side `Spread` (tree estimate `min(26, max(8, 0.22 x height))` mm, normal 5 mm,
   measured 20.9 mm on the housing's one side; `--probe-supports` measures each supported part with a solo slice and
   keeps a support mask, cached under `<outdir>/.probe/`). A pair needs the larger spread of the two plus a 1 mm line
   allowance, not the sum. Footprints are raster silhouettes of the oriented mesh (0.5 mm), not bounding boxes.
@@ -56,6 +56,13 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
   printer job and file names, watch headers and `printer raw` drop the serial and access code; a refused patch is
   exit 1 and a file that cannot be written exit 3 with one JSON document; packer results read as the packer's answer,
   not a proof; two meshes of one name no longer overwrite each other under `sweep --write-spec`.
+- Empirical replay (2026-10-21): the tree spread estimate is `min(26, max(8, 0.22 x height))` and is swept from the
+  bounding box (a packed plate-14b and plate-11 sliced -101 at the old estimate swept from the outline); `slice` names
+  the -101 pair; `--add-filament` tests the project's tower spot; `inspect` prints each object's min corner and size;
+  `calibrate` needs 20 layers and 30 minutes for a rate (`span_too_short`) and names a pre-0.4.0 log; a fixed part
+  off the bed says `at` is the min corner; a two-filament estimate shows the tower minutes and the measured options.
+  The tower is sized per plate from the filaments its objects use; per-volume and height-range filament keys follow
+  Studio's scope; the watch header is scrubbed as a structure; `slice` refuses an export missing a requested plate.
 
 ### Added
 - `shambu patch --replace-mesh OBJECT[/PART]=STL` (anchors frame|centre|min, `--rotate-mesh`, `--lay-on-face`, a no-op

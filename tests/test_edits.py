@@ -517,12 +517,31 @@ def test_move_touches_only_the_item_transform(tmp_path, geo_file):
 
 # ---------------------------------------------------------------------------- 21-22 tower
 def test_tower_per_plate_vector(tmp_path):
-    path = make_geo_3mf(tmp_path / "p3.3mf", plates=3)
-    E.EditSet([E.SetTower(90, 100, plate=2)]).apply(str(path), str(tmp_path / "a.3mf"))
+    """Plate 1 prints two filaments (the body's walls on slot 2), plate 2 is empty, plate 3 prints the label alone."""
+    path = _body_part_meta(make_geo_3mf(tmp_path / "p3.3mf", plates=3), "wall_filament", "2")
+    E.EditSet([E.SetTower(90, 100, plate=1)]).apply(str(path), str(tmp_path / "a.3mf"))
     ps = Project(str(tmp_path / "a.3mf")).project_settings
-    assert ps["wipe_tower_x"] == ["208", "90", "208"] and ps["wipe_tower_y"] == ["208", "100", "208"]
-    E.EditSet([E.SetTower(90, 100)]).apply(str(path), str(tmp_path / "b.3mf"))
+    assert ps["wipe_tower_x"] == ["90", "208", "208"] and ps["wipe_tower_y"] == ["100", "208", "208"]
+    es = E.EditSet([E.SetTower(90, 100)])
+    es.apply(str(path), str(tmp_path / "b.3mf"))
     assert Project(str(tmp_path / "b.3mf")).project_settings["wipe_tower_x"] == ["90"] * 3
+    assert any("plate 2 prints with one filament: no prime tower there" in n for n in es.notes)
+    with pytest.raises(E.EditError, match="no plate here prints with two"):
+        E.EditSet([E.SetTower(90, 100, plate=2)]).apply(str(path))
+
+
+def test_tower_size_counts_the_plates_filaments_not_the_loaded_slots(tmp_path):
+    """Four loaded slots, a plate printing two: Studio sizes the tower for two (`plate_extruder_size`). For four the
+    20 mm tower without the rib wall is deep enough to leave the bed at (230, 200); for two it fits."""
+    path = make_geo_3mf(tmp_path / "f4.3mf", filaments=3, prime_tower_width="20", prime_tower_rib_wall="0", prime_tower_brim_width="2")
+    from shambu import tower as T
+
+    p = Project(str(path))
+    four = dataclasses.replace(E.project_tower_settings(p), plate_filaments=4, width=20.0, rib_wall=False, brim=2.0)
+    assert T.footprint(four, 10.0, 230, 200).rect[3] > 256  # sized for every loaded slot: off the bed
+    es = E.EditSet([E.SetTower(230, 200)])
+    es.apply(str(path), str(tmp_path / "o.3mf"))  # sized for the plate's two: accepted
+    assert Project(str(tmp_path / "o.3mf")).project_settings["wipe_tower_x"] == ["230"]
 
 
 def test_tower_off_bed_raises(tmp_path, geo_file):
@@ -1365,3 +1384,68 @@ def test_an_unreadable_pass_log_is_a_warning_not_silence(tmp_path):
     rr = RunResult(["BambuStudio"], 101 % 256, -101, 0.1, tmp_path / "gone" / "x.log", {"return_code": -101}, None)
     rec = checked_outcome(rr, 1)
     assert rec["kind"] == "skippable" and "could not be read" in rec["warning"] and str(tmp_path / "gone" / "x.log") in rec["reason"]
+
+
+def test_add_filament_reports_a_project_tower_that_sits_on_an_object(tmp_path):
+    """The verify slice passes while slot 2 is unused; the first slice that uses it prints the tower at the project's
+    spot. On the body (x 40..70 y 50..70) that is a FAIL line naming it and `--tower`; the tower is not moved."""
+    path = make_geo_3mf(tmp_path / "on.3mf", filaments=1, wipe_tower_x=["35"], wipe_tower_y=["45"])
+    es = E.EditSet([add_patch(path)])
+    es.apply(str(path), str(tmp_path / "two.3mf"))
+    fails = [n for n in es.notes if n.startswith("  FAIL: the project's prime tower")]
+    assert fails and "body" in fails[0] and "--tower X,Y" in fails[0]
+    assert Project(str(tmp_path / "two.3mf")).project_settings["wipe_tower_x"] == ["35"]
+    clear = make_geo_3mf(tmp_path / "off.3mf", filaments=1, wipe_tower_x=["90"], wipe_tower_y=["100"])
+    es = E.EditSet([add_patch(clear)])
+    es.apply(str(clear), str(tmp_path / "two2.3mf"))
+    assert any(n.startswith("  OK: plate 1: the tower is clear of every object") for n in es.notes)
+
+
+def _body_part_meta(path: Path, key: str, value: str, subtype: str = "normal_part") -> Path:
+    """A per-volume setting on the body's one sub-part (and, for a modifier, its subtype)."""
+
+    def fix(t: str) -> str:
+        i = t.index('<metadata key="name" value="body.stl"') if '<metadata key="name" value="body.stl"' in t else t.index('<part id="1"')
+        j = t.index("</part>", i)
+        block = t[i:j].replace('subtype="normal_part"', f'subtype="{subtype}"', 1)
+        return t[:i] + block + f'  <metadata key="{key}" value="{value}"/>\n    ' + t[j:]
+
+    rewrite(path, "Metadata/model_settings.config", fix)
+    return path
+
+
+@pytest.mark.parametrize("subtype", ["normal_part", "modifier_part"])
+def test_strict_move_counts_a_sub_parts_wall_filament(tmp_path, subtype):
+    """Studio resolves wall and infill filaments per volume (PrintObject.cpp:3105): a body sub-part (or a modifier) with
+    wall_filament 2 at x 5 is right-nozzle work in its dead strip."""
+    path = _body_part_meta(make_geo_3mf(tmp_path / "v.3mf"), "wall_filament", "2", subtype)
+    with pytest.raises(E.EditError, match="extruder 2"):
+        E.EditSet([E.MoveObject("body", 5, 50, strict=True)]).apply(str(path), str(tmp_path / "o.3mf"))
+
+
+def _range_option(path: Path, key: str, value: str) -> Path:
+    rewrite(
+        path,
+        "Metadata/layer_config_ranges.xml",
+        lambda t: t.replace(
+            '<option opt_key="layer_height">0.2</option>',
+            f'<option opt_key="layer_height">0.2</option>\n   <option opt_key="{key}">{value}</option>',
+        ),
+    )
+    return path
+
+
+def test_a_range_repeating_the_interface_slot_keeps_it_interface_only(tmp_path):
+    path = _body_meta(make_geo_3mf(tmp_path / "r.3mf", ranges=[(0.0, 5.0)]), ("enable_support", "1"), ("support_interface_filament", "2"))
+    _range_option(path, "support_interface_filament", "2")
+    es = E.EditSet([E.MoveObject("body", 24, 50)])  # 3 mm interface growth: x 21 is in reach
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    assert not _reach_fails(es), es.notes
+
+
+def test_a_stale_range_interface_slot_with_support_off_does_not_constrain(tmp_path):
+    path = _body_meta(make_geo_3mf(tmp_path / "s.3mf", ranges=[(0.0, 5.0)]), ("enable_support", "0"))
+    _range_option(path, "support_interface_filament", "2")
+    es = E.EditSet([E.MoveObject("body", 5, 50)])
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    assert not _reach_fails(es), es.notes

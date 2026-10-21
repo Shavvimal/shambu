@@ -331,7 +331,8 @@ class FootprintClearance:
             if mask is not None:
                 keeps.append(_Keep(p.key, mask, L.LINE, False))
             elif p.spread.most() > 0 and (strict or p.spread.hard):
-                keeps.append(_Keep(p.key, body.grown(*p.spread.sides()), L.LINE, not p.spread.hard))
+                base = L.spread_base(p)  # an estimate from the box, a measured spread from the outline
+                keeps.append(_Keep(p.key, base.grown(*p.spread.sides()), L.LINE, not p.spread.hard))
         return cls(tuple(keeps), strict, ps)
 
     def relaxed(self) -> FootprintClearance:

@@ -239,7 +239,7 @@ def test_estimated_spreads_block_strictly_then_warn():
     test = T.FootprintClearance.of(plate14_outlines(probe=False))
     r = T.footprint(T8, H14, 172, 150).rect
     assert not test.clear(r) and test.relaxed().clear(r)
-    assert test.estimates_within(r) == ["camera_housing", "cradle"]
+    assert set(test.estimates_within(r)) >= {"camera_housing", "cradle", "housing"}  # estimates swept from the boxes
     req = T.TowerRequest(1, "fixed", T8, H14, (), REACH, BED, 172, 150, clearance=test)
     (plan,) = T.plan_project([req])
     assert plan.problem is None and plan.warning is not None and "cradle" in plan.warning  # a fixed spot: WARN too
@@ -254,13 +254,18 @@ def test_estimated_spreads_block_strictly_then_warn():
 
 
 def test_silhouettes_open_the_front_of_plate_14():
-    """The housing's box covers x 44..169 from y 25.9, its outline only x 44..95 below y 63.4: the front then holds a
-    35 mm tower clear of every estimated spread, so auto takes it before any narrower size."""
+    """The housing's box covers x 44..169 from y 25.9, its outline only x 44..95 below y 63.4: the front holds a
+    tower clear of every outline. An estimated spread is swept from the box (layout.spread_base), so no spot clears
+    the estimates and the front spot comes with a WARN; with the measured spreads it is clear."""
     (plan,) = T.plan_project(
         [T.TowerRequest(1, "auto", DEFAULT, H14, (), REACH, BED, clearance=T.FootprintClearance.of(plate14_outlines(False)))]
     )
     fp = plan.footprint
-    assert fp is not None and fp.settings.width == 35.0 and fp.rect[3] < 46.6 and plan.warning is None
+    assert fp is not None and fp.rect[3] < 63.4 and fp.rect[0] > 95.0 and plan.warning is not None
+    (plan,) = T.plan_project(
+        [T.TowerRequest(1, "auto", DEFAULT, H14, (), REACH, BED, clearance=T.FootprintClearance.of(plate14_outlines(True)))]
+    )
+    assert plan.footprint is not None and plan.warning is None
 
 
 def test_footprint_clearance_keeps_the_box_test_for_a_part_without_an_outline():

@@ -81,12 +81,30 @@ def estimate_lines(sl: dict, calibration: list[dict] | None = None, printer_mode
         shown = [f"{k.lower()} {times[k] / 60:.1f} min" for k in FEATURE_TIME_ROLES if times.get(k)]
         if shown:
             out.append(f"- plate {n} time by feature (result.json): " + ", ".join(shown))
+        tower_s = times.get("Prime tower")
+        if tower_s and len(sl["filaments"]) >= 2:
+            out.append(tower_options_line(n, tower_s, changes))
     elif ft:
         out.append(
             f"- plate {n} filament by feature (G-code parser, no result.json grams): model {ft['model_g']:.1f} g, support {ft['support_g']:.1f} g, "
             f"prime tower {ft['tower_g']:.1f} g, flush {ft['flush_g']:.1f} g; {ft['filament_changes']} filament change(s)"
         )
     return out
+
+
+# Measured on plate 14 (PETG part, PLA interface, n=1 each; reference 06 section 10 and the 2026-10-21 replay):
+# the auto 35 mm tower 24 h 13 min, a 22 mm tower without the rib wall 19 h 15, no tower 18 h 48
+TOWER_OPTIONS = (
+    ('`wipe_tower` {"width": 22, "rib_wall": false}', "19 h 15 min against 24 h 13 with the 35 mm tower"),
+    ('`"wipe_tower": false`', "18 h 48 min; the idle nozzle is then not wiped before the interface layers"),
+)
+
+
+def tower_options_line(n: int, tower_s: float, changes: int | None) -> str:
+    """The prime tower's cost on a two-filament plate and the two measured alternatives, for the estimate section."""
+    swaps = f", {changes} filament change(s)" if changes is not None else ""
+    opts = "; ".join(f"{k}: {v}" for k, v in TOWER_OPTIONS)
+    return f"- plate {n} prime tower: {tower_s / 60:.0f} min{swaps} (result.json). Options measured on plate 14 (n=1): {opts}"
 
 
 def check_line(c: L.Check) -> str:

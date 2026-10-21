@@ -113,7 +113,8 @@ def interface_uses(part_spec: PartSpec, process: Mapping, spread: float, files: 
     """The slot that prints only this supported part's support interface, {slot: (spread, source)} for
     `Placed.interface` (`layout.interface_only`). Raises BuildError for a value that is not a slot number."""
     others = effective_filaments(part_spec, files, process, skip=(L.INTERFACE_KEY,))
-    return L.interface_only(part_spec.set, process, others, spread, _slot)
+    ranges = [(f"height range {r.min_z}..{r.max_z}", r.set) for r in part_spec.height_ranges]
+    return L.interface_only(part_spec.set, process, others, spread, _slot, ranges=ranges)
 
 
 def _num(v, default: float) -> float:
@@ -514,16 +515,18 @@ def _finite(v) -> float | None:
     return f if math.isfinite(f) else None
 
 
-def sliced_problems(project: Project, summary: dict, plates: Collection[int] | None = None) -> list[str]:
-    """What a sliced export lacks, for `build --slice` and `shambu slice` alike: G-code at all, and per plate (every
-    plate, or the ids in `plates`) its `Metadata/plate_N.gcode` entry and its slice results, and no G-code outside the
-    printable area. [] for a complete slice."""
+def sliced_problems(project: Project, summary: dict, plates: Collection[int]) -> list[str]:
+    """What a sliced export lacks, for `build --slice` and `shambu slice` alike: G-code at all, every requested plate
+    id (`plates`, from the input, never from the export) present, and per requested plate its
+    `Metadata/plate_N.gcode` entry and its slice results, and no G-code outside the printable area. [] when complete."""
     probs = []
     if not summary["sliced"]:
         probs.append("the file holds no G-code although a slice was requested")
     names = set(project.names())
+    present = {pl["id"] for pl in summary["plates"]}
+    probs += [f"plate {n} is missing from the export (the input has it)" for n in sorted(set(plates) - present)]
     for pl in summary["plates"]:
-        if plates is not None and pl["id"] not in plates:
+        if pl["id"] not in plates:
             continue
         if f"Metadata/plate_{pl['id']}.gcode" not in names:
             probs.append(f"plate {pl['id']} has no G-code entry (Metadata/plate_{pl['id']}.gcode)")
@@ -1523,7 +1526,7 @@ class Pipeline:
         s = pr.summary()
         ps = pr.project_settings
         if sliced:
-            probs += sliced_problems(pr, s)
+            probs += sliced_problems(pr, s, range(1, len(plan.plates) + 1))
         cols = [f["filament_colour"][0].upper() for f in plan.filaments]
         if [c.upper() for c in ps.get("filament_colour", [])] != cols:
             probs.append(f"filament colours in file {ps.get('filament_colour')} differ from {cols}")

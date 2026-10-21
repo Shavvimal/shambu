@@ -151,7 +151,7 @@ def _probe_flag(p: argparse.ArgumentParser) -> None:
         "--probe-supports",
         action="store_true",
         help="slice each supported part alone (cached under <outdir>/.probe) and use its measured support spread per side "
-        "instead of the estimate (tree 0.10 x height, 8..22 mm; normal 5 mm)",
+        "instead of the estimate (tree 0.22 x height, 8..26 mm, swept from the box; normal 5 mm)",
     )
 
 
@@ -826,8 +826,14 @@ class Inspect(Command):
                 )
         for o in s["objects"]:
             parts = ", ".join(f"{p['name']} (filament {p['extruder'] or o['extruder']}, {p['subtype']})" for p in o["parts"])
+            pos = o.get("position") or {}
+            where = (
+                f"plate {pos['plate']} min corner ({pos['min'][0]:g}, {pos['min'][1]:g}), size {' x '.join(f'{v:g}' for v in pos['size'])} mm, "
+                if "min" in pos
+                else (f"position unknown ({pos['error']}), " if "error" in pos else "")
+            )
             lines.append(
-                f"object {o['name']}: filament {o['extruder']}, settings {o['settings'] or '{}'}, parts [{parts}]"
+                f"object {o['name']}: {where}filament {o['extruder']}, settings {o['settings'] or '{}'}, parts [{parts}]"
                 + (f", height ranges {o['height_ranges']}" if o["height_ranges"] else "")
             )
         for c in s["custom_gcode"]:
@@ -1087,6 +1093,7 @@ class Slice(Command):
         for est in r.estimates:
             lines += estimate_lines(est)
         lines += checks_skipped_lines(r.checks_skipped)
+        lines += ["- FAIL: " + x for x in r.fails]
         lines += ["- VERIFY FAIL: " + x for x in r.verify_problems]
         lines += ["- " + n.strip() for n in r.notes]
         if r.ok:
@@ -1206,11 +1213,10 @@ def _watch(a, svc, out: Output) -> int:
     """`printer watch`: one document per poll on stdout; with --log, one JSON line per poll (and a header line) in the
     file. Exit 0 when the print reached a final state or the poll limit, 3 after --max-errors failed reads in a row or
     when the log cannot be opened or written."""
-    from . import conf
     from .calibrate import CalibrationError
     from .conf import DataFileError
     from .errors import ProjectError
-    from .printer import WatchError, outward_secrets, utc_iso
+    from .printer import WatchError, outward_secrets, scrub_tree, utc_iso
 
     if a.every < 1 or a.max_errors < 1 or a.max_polls < 1:
         return usage(out, "--every, --max-errors and --max-polls must be 1 or more")
@@ -1230,7 +1236,7 @@ def _watch(a, svc, out: Output) -> int:
                 return 1
             header.update(gcode3mf=Path(a.gcode3mf).name, gcode=entry, track=track.to_json())
             # the file name and the G-code's labels are free text: the printer boundary's sanitiser applies to them too
-            header = json.loads(conf.scrub_text(json.dumps(header), outward_secrets()))
+            header = scrub_tree(header, outward_secrets(getattr(svc, "serial", None) or "", getattr(svc, "ip", None) or ""))
     log_f = None
     code = 0
 

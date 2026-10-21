@@ -262,8 +262,16 @@ class Bambu:
         )
 
     def inspect(self, path: str | Path, features: bool = True) -> dict:
-        """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature."""
-        return Project(str(path)).summary(features=features)
+        """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature.
+        Each object carries its `position` (plate, min corner and size in plate-local mm, `edits.object_positions`)."""
+        from . import edits
+
+        pr = Project(str(path))
+        s = pr.summary(features=features)
+        pos = edits.object_positions(pr)
+        for o in s["objects"]:
+            o["position"] = pos.get(o["name"])
+        return s
 
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)
