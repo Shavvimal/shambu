@@ -154,13 +154,15 @@ RECIPES: tuple[Recipe, ...] = (
             "enable_prime_tower": "1",
         },
         "PETG part with PLA interface or PLA part with PETG interface; they barely bond. The plate counts as two filaments even "
-        "though only the supports use filament 2, so Studio builds a prime tower sized by the tallest part: 41 mm square plus an "
-        "8 mm brim with the rib wall above 100 mm. Give the plate a wipe_tower spot both nozzles reach (x >= 20.5), or let "
+        "though only the supports use filament 2, so Studio builds a prime tower sized by the tallest part (with the rib wall: "
+        "41 mm square plus an 8 mm brim for a 218 mm part, 35 mm plus 2.6 mm for a 32 mm part). Give the plate a wipe_tower "
+        "spot both extruders reach (x >= 20.5), or let "
         '"auto" find one; if no spot fits, use rib_wall false and a 22 mm width.',
         "notes / research 08 (Studio's support_recommended_params.json, which the headless CLI never applies); "
         "plate 14 and seed runs 2026-10-21 (reference 06, prime tower; reference 03, re-slicing a CLI export)",
         "Filament 2 must be the other material on nozzle 2 (filament_map 1,2). Every supported part must sit at x >= 20.5 plus "
-        "its brim margin plus 3 mm, because the right nozzle prints the interface (2.2 mm past the part box measured, n=1; "
+        "its interface spread (brim margin plus 3 mm), because extruder 2 (right nozzle) prints the interface (2.2 mm past "
+        "the part box measured, n=1; "
         "the seed build exited -102 at x 14.3). Measured on plate 14 (n=1): the tower adds 27 min and 71 g over no tower "
         "(19.25 h against 18.8 h). An unsliced export without the RepairNozzleStats patch exits -100 when re-sliced with "
         '`--slice 1` ("No valid nozzle found"): `shambu build` applies it, `shambu patch --repair-nozzle-stats` fixes an older file. '

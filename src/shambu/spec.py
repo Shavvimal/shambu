@@ -65,7 +65,6 @@ KNOWN_KEYS = {
     "part": {
         "path", "parts", "name", "filament", "count", "subtype", "recipes", "set", "height_ranges", "at", "brim_margin",
         "lay_on_face", "rotate", "orientation",
-        "support_spread",  # the layout checker's per-side tree-support spread (added in the same release)
     },
     "file": {"path", "filament", "subtype"},
     "height_range": {"min_z", "max_z", "set", "range_params"},
@@ -229,7 +228,7 @@ def _num_field(v, what: str) -> float:
 @dataclass(frozen=True)
 class WipeTowerSpec:
     """A plate's prime tower. `mode` "auto" (the default for a plate with two or more filaments) lets shambu find a
-    free spot both nozzles reach; "fixed" puts it at (x, y); "off" writes enable_prime_tower 0 (a WARN line).
+    free spot both extruders reach; "fixed" puts it at (x, y); "off" writes enable_prime_tower 0 (a WARN line).
     width, rib_wall and brim are None for the process value; Studio keeps one value of each per project."""
 
     mode: str = "auto"
@@ -301,7 +300,7 @@ class WipeTowerSpec:
             raise BuildError(f"{where} spans {span}: it leaves the bed {bed_r[2]:g} x {bed_r[3]:g}")
         if not inside(r, reach):
             raise BuildError(
-                f"{where} spans {span}: both nozzles print the tower, and they share only x {reach[0]:g}..{reach[2]:g} "
+                f"{where} spans {span}: extruders 1 and 2 (left and right nozzle) print the tower, and they share only x {reach[0]:g}..{reach[2]:g} "
                 f"y {reach[1]:g}..{reach[3]:g}"
             )
 
@@ -416,13 +415,8 @@ class Spec:
             pset.update(recipe_sets[r])
         pset.update(_strs(pr.get("set")))
         lay = d.get("layout", {})
+        # Different tower sizes on two plates are a plan problem, compared after resolving against the process
         plates = tuple(PlateSpec.from_json(p, i, recipe_sets) for i, p in enumerate(d["plates"], 1))
-        sizes = {p.wipe_tower.size_key() for p in plates if p.wipe_tower.mode == "fixed"}
-        if len(sizes) > 1:
-            raise BuildError(
-                "prime tower size is per project: Studio keeps one prime_tower_width, prime_tower_rib_wall and "
-                f"prime_tower_brim_width for every plate, but the plates ask for (width, rib_wall, brim) {sorted(sizes, key=str)}"
-            )
         return cls(
             str(d["name"]),
             Path(d["outdir"]),

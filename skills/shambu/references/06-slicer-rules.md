@@ -83,9 +83,10 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
   "every reach limit holds", and Studio exited -102: the right nozzle printed interface at x 6.96..88.46 (585
   extrusions under x 20.5, the first at z 1.8, x 14.3). Studio makes the same mistake in its own count
   (`construct_assemble_list: Plate 1, used filaments 1`, BambuStudio.cpp:1338-1343).
-- The interface spreads past the part box: 2.2 mm on the cradle, -0.2 mm on the housing (measured once each). The
-  `InterfaceReach` rule (`tower.py`) grows the box by the brim margin plus 3 mm for the interface extruder, and the
-  packer starts such a part far enough right.
+- The interface spread: the interface prints past the part box, 2.2 mm on the cradle and -0.2 mm on the housing
+  (measured once each). shambu takes the interface spread as the brim margin plus 3 mm (`tower.INTERFACE_SPREAD`) on
+  all four sides: the packer uses it as the part's margin, and the `InterfaceReach` rule (`tower.py`) checks the
+  interface extruder against it. "Has support" is Studio's own predicate (support, enforced layers or a raft).
 
 ## 6. Colour, text and time
 
@@ -132,7 +133,8 @@ chamfer, a bore that wants a coupon, a show face that wants matte filament.
 ## 10. Prime tower on a two-filament plate
 
 Source: Bambu Studio v02.08.02.61 and the plate-14 runs of 2026-10-21 (X2D, PETG part, PLA matte interface).
-`tower.py` ports the estimate; `build.py` reserves its footprint, picks the spot and writes it per plate.
+`tower.py` ports the estimate; `build.py` keeps packed parts off a provisional footprint (grown by the 3 mm
+clearance), picks the spot after packing and writes it per plate.
 
 Studio sizes the tower from the tallest object on the plate, not from the interface volume
 (`PartPlate::estimate_wipe_tower_size`, PartPlate.cpp:2191-2265; WipeTower.cpp:1587-1630):
@@ -164,7 +166,8 @@ What shambu does:
 - Width, rib wall and brim are process-global in Studio: two plates that ask for different sizes are a BuildError
   ("prime tower size is per project"). The chosen values go into the process JSON.
 - `wipe_tower_x/y` are per-plate vectors: each plate gets its own spot, a plate without a tower keeps (208, 208).
-- Auto placement: a 1 mm grid, the footprint inside the area both nozzles reach (x 20.5..256 on the X2D, and
+- Auto placement: a 1 mm grid, the footprint inside the area extruders 1 and 2 (left and right nozzle) reach
+  (x 20.5..256 on the X2D, and
   `aux_x_limit`) and the bed, 3 mm clear of every part's margin-grown rect. Score: the clearance (capped at 10 mm),
   then high y (Studio's own default sits at y 250, PartPlate.cpp:69-70), then high x. If nothing fits, it tries the
   rib wall off at widths 35, 30, 25, 22 and 20 with a 2 mm brim. Then a FAIL names the best spot, the part that

@@ -647,7 +647,7 @@ slices with its first variant's values: PLA Matte got the Direct Drive flow rati
 | `filament_extruder_variant` | 12 entries: each filament's 6 variants in order | wrong per-filament values, the PC:8935 message |
 | `filament_self_index` | 12 entries: `1` x 6, `2` x 6 | |
 | `filament_volume_map`, `filament_nozzle_map` | one entry per filament (Studio resizes with 0, PresetBundle.cpp:2384-2387) | tolerated (Print.cpp:2840-2862) |
-| `wipe_tower_x`, `wipe_tower_y` | one value per plate, at a free spot both nozzles reach | -101 / -104 |
+| `wipe_tower_x`, `wipe_tower_y` | one value per plate, at a free spot both extruders reach | -101 / -104 |
 
 What shambu does: the `RepairNozzleStats` patch repairs the key the CLI reads (a non-empty `_new` wins, else the
 plain key). It writes `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` for each empty or `#0` extruder entry

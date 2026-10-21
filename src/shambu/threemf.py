@@ -30,6 +30,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
@@ -180,6 +181,7 @@ class Project:
         if not self.has(PROJECT_SETTINGS) or not self.has(MODEL_SETTINGS):
             raise ProjectError(f"{path}: no Metadata/project_settings.config or model_settings.config: not a Bambu Studio project")
         self._dirty: set[str] = set()
+        self._changed = False  # an entry was put or removed (slices invalidated, a new entry): save() must write
         self._ms: ET.Element | None = None  # parsed model_settings root
         self._ps: dict | None = None  # parsed project_settings dict
         self._ps_trailing_nl = False
@@ -204,6 +206,7 @@ class Project:
             raise ProjectError(f"{self.path}: {name} is not valid XML ({e})") from e
 
     def _put(self, name: str, data: bytes, before: tuple[str, ...] = ()) -> None:
+        self._changed = True
         for e in self._entries:
             if e.info.filename == name:
                 e.data = data
@@ -220,6 +223,7 @@ class Project:
     def _remove(self, name: str) -> bool:
         n = len(self._entries)
         self._entries = [e for e in self._entries if e.info.filename != name]
+        self._changed = self._changed or len(self._entries) != n
         return len(self._entries) != n
 
     # ------------------------------------------------------------------ parsed parts
@@ -671,8 +675,8 @@ class Project:
         True when something changed. Raises ProjectError when the blocks cannot be rebuilt consistently."""
         ps = self.project_settings
         n = self.n_filaments()
-        if n == 0:
-            return False
+        if n == 0 or ("filament_extruder_variant" not in ps and "filament_self_index" not in ps):
+            return False  # a project without the variant keys (a one-extruder printer) gets none added
         var = [str(v) for v in ps.get("filament_extruder_variant") or []]
         idx = [str(v) for v in ps.get("filament_self_index") or []]
         counts = {i: idx.count(str(i)) for i in range(1, n + 1)}
@@ -708,7 +712,7 @@ class Project:
         changed = False
         nvt = [str(v) for v in ps.get("nozzle_volume_type") or []]
         eff = effective_stats(ps)
-        if eff is not None and nvt and _stats_bad(eff[1], len(nvt)):
+        if eff is not None and nvt and self.needs_nozzle_stats() and _stats_bad(eff[1], self.extruder_count()):
             key, cur = eff
             cnt = [str(v) for v in ps.get("extruder_max_nozzle_count") or []]
 
@@ -731,12 +735,29 @@ class Project:
             self._touch_ps()
         return changed
 
-    def reslice_problems(self) -> list[str]:
-        """Why a later CLI run on this file (`--slice`) would fail or use the wrong per-filament values; [] when none."""
+    def extruder_count(self) -> int:
+        ps = self.project_settings
+        return max(len(ps.get("nozzle_diameter") or []), len(ps.get("nozzle_volume_type") or []), 1)
+
+    def needs_nozzle_stats(self, extruders: int | None = None) -> bool:
+        """Studio reads the nozzle stats only on a multi-extruder or multi-nozzle machine (BambuStudio.cpp:6648): an
+        empty list is fine on a one-extruder, one-nozzle printer (P1S, A1)."""
+        counts = []
+        for v in self.project_settings.get("extruder_max_nozzle_count") or []:
+            try:
+                counts.append(int(str(v)))
+            except ValueError:
+                continue
+        return (extruders or self.extruder_count()) > 1 or any(c > 1 for c in counts)
+
+    def reslice_problems(self, extruders: int | None = None) -> list[str]:
+        """Why a later CLI run on this file (`--slice`) would fail or use the wrong per-filament values; [] when none.
+        `extruders` is the machine's extruder count (machine facts); the file's own count is used without it."""
         ps = self.project_settings
         out = []
         eff = effective_stats(ps)
-        if eff is not None and _stats_bad(eff[1], len(ps.get("nozzle_volume_type") or [])):
+        n_ext = extruders or self.extruder_count()
+        if eff is not None and self.needs_nozzle_stats(n_ext) and _stats_bad(eff[1], n_ext):
             out.append(f'{eff[0]} {eff[1]} (Studio exits -100 "No valid nozzle found")')
         var, idx = ps.get("filament_extruder_variant"), ps.get("filament_self_index")
         if isinstance(var, list) and isinstance(idx, list) and len(var) != len(idx):
@@ -898,6 +919,11 @@ class Project:
 
     # ------------------------------------------------------------------ (c) write
     def save(self, out_path: str) -> None:
+        if not self._dirty and not self._changed:
+            # Nothing changed: keep the original bytes (a rewrite recompresses every entry)
+            if os.path.abspath(out_path) != os.path.abspath(self.path):
+                shutil.copyfile(self.path, out_path)
+            return
         if MODEL_SETTINGS in self._dirty:
             self._put(MODEL_SETTINGS, _xml_bytes(self.model_settings, "  "))
         if PROJECT_SETTINGS in self._dirty:

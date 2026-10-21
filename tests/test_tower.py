@@ -91,7 +91,7 @@ def test_seed_spec_fails_the_right_nozzle_reach_without_a_studio_run(tmp_path, s
     plan = Pipeline(studio, resolver).plan(seed_spec(tmp_path, stls))
     fails = [c.text for c in plan.plates[0].checks if not c.ok]
     assert any(
-        t.startswith("motor_cradle_print has support with the process support_interface_filament 2 (extruder 2, Bowden)")
+        t.startswith("motor_cradle_print has support with the process support_interface_filament 2 (extruder 2 (right nozzle), Bowden)")
         and "extruder 2 reaches x 20.5..256.0" in t
         for t in fails
     ), fails
@@ -114,7 +114,7 @@ def test_packed_seed_starts_far_enough_right_for_the_interface(tmp_path, stls, r
     plan = Pipeline(studio, resolver).plan(seed_spec(tmp_path, stls, cradle_at=None, mount_at=None))
     assert plan.ok, (plan.problems, [c.text for c in plan.plates[0].checks if not c.ok])
     for x in plan.plates[0].parts:
-        assert x.placed.x0 - (L.brim_margin({**plan.process, **x.spec.set}) + T.INTERFACE_OVERSHOOT) >= 20.5 - 1e-9
+        assert x.placed.x0 - (L.brim_margin({**plan.process, **x.spec.set}) + T.INTERFACE_SPREAD) >= 20.5 - 1e-9
 
 
 # ---------------------------------------------------------------------------- 3. the footprint estimate
@@ -186,7 +186,7 @@ def test_auto_placement_failure_names_the_blocking_part():
     wall = [("wall", (20.5, 0.0, 256.0, 256.0))]
     plan = T.plan_auto(3, DEFAULT, H14, wall, REACH)
     assert plan.footprint is None and plan.problem is not None
-    assert plan.problem.startswith("plate 3: no free prime tower spot both nozzles reach")
+    assert plan.problem.startswith(f"plate 3: no free prime tower spot {T.BOTH} reach")
     assert "is blocked by wall" in plan.problem and '"wipe_tower": false' in plan.problem
     (check,) = T.TowerClear(plan).check([], None)
     assert not check.ok
@@ -270,11 +270,24 @@ def test_command_writes_the_spec_tower_spot_per_plate(tmp_path, stls, resolver):
     assert written["prime_tower_width"] == "22" and written["prime_tower_rib_wall"] == "0"
 
 
-def test_two_plates_with_different_tower_sizes_is_a_build_error(tmp_path, stls):
-    from shambu.errors import BuildError
+def test_two_plates_with_different_tower_sizes_is_a_plan_problem(tmp_path, stls, resolver):
+    sp = spec_of(tmp_path, two_plates(stls, {"x": 172, "y": 150, "width": 22}, {"x": 120, "y": 180, "width": 30}))
+    plan = Pipeline(FakeStudio(), resolver).plan(sp)
+    assert any(p.startswith("prime tower size is per project: the plates need different towers") for p in plan.problems)
 
-    with pytest.raises(BuildError, match="prime tower size is per project"):
-        spec_of(tmp_path, two_plates(stls, {"x": 172, "y": 150, "width": 22}, {"x": 120, "y": 180, "width": 30}))
+
+def test_same_effective_size_explicit_and_inherited_is_accepted(tmp_path, stls, resolver):
+    """One plate spells out the process values, the other gives only x/y: the same tower after resolution."""
+    explicit = {"x": 172, "y": 150, "width": 22, "rib_wall": False, "brim": 2}
+    inherited = {"x": 120, "y": 180}
+    sp = spec_of(
+        tmp_path, two_plates(stls, explicit, inherited), prime_tower_width="22", prime_tower_rib_wall="0", prime_tower_brim_width="2"
+    )
+    plan = Pipeline(FakeStudio(), resolver).plan(sp)
+    assert not any("per project" in p for p in plan.problems), plan.problems
+    t1, t2 = (p.tower for p in plan.plates)
+    assert t1 is not None and t2 is not None and t1.footprint and t2.footprint
+    assert t1.footprint.settings == t2.footprint.settings
 
 
 def test_wipe_tower_false_writes_no_tower_and_warns(tmp_path, stls, resolver):
@@ -289,11 +302,23 @@ def test_tower_on_one_plate_and_off_on_another_is_a_problem(tmp_path, stls, reso
     assert any("prime tower on/off is per project" in p for p in plan.problems)
 
 
-def test_fixed_tower_outside_the_shared_reach_is_a_problem_naming_the_plate(tmp_path, stls, resolver):
+def test_fixed_tower_outside_the_shared_reach_fails_once_naming_the_plate(tmp_path, stls, resolver):
     plan = Pipeline(FakeStudio(), resolver).plan(
         spec_of(tmp_path, two_plates(stls, {"x": 10, "y": 150, "width": 22}, {"x": 120, "y": 150, "width": 22}))
     )
-    assert any(p.startswith("plate 1 wipe_tower at (10, 150)") and "x 20.5..256" in p for p in plan.problems), plan.problems
+    fails = [c.text for c in plan.plates[0].checks if not c.ok]
+    tower = [t for t in fails if t.startswith("plate 1 prime tower at (10.0, 150.0)")]
+    assert len(tower) == 1 and "leaves the area extruders 1 and 2 (left and right nozzle) reach" in tower[0], fails
+    assert not any("wipe_tower at" in p for p in plan.problems)  # reported once, as the FAIL
+
+
+def test_fixed_tower_overlapping_a_part_fails_at_pipeline_level(tmp_path, stls, resolver):
+    plan = Pipeline(FakeStudio(), resolver).plan(
+        spec_of(tmp_path, two_plates(stls, {"x": 25, "y": 25, "width": 22}, {"x": 120, "y": 150, "width": 22}))
+    )
+    fails = [c.text for c in plan.plates[0].checks if not c.ok]
+    assert any(t.startswith("plate 1 prime tower at (25.0, 25.0)") and "it overlaps body_1" in t for t in fails), fails
+    assert not plan.ok
 
 
 def test_auto_tower_avoids_packed_parts(tmp_path, stls, resolver):
@@ -488,3 +513,174 @@ def test_placement_takes_a_clearance_binding():
     req = T.TowerRequest(1, "auto", DEFAULT, H14, tuple(PLATE14), REACH, BED, clearance=OpenStrip())
     (plan,) = T.plan_project([req])
     assert plan.footprint is not None and plan.footprint.settings.width == 22.0  # 35, 30, 25 do not fit the strip
+
+
+# ---------------------------------------------------------------------------- review round 2
+def recipe_spec(tmp_path, plates, recipes=("dual-material-interface",), **process_set) -> Spec:
+    return Spec.from_json(
+        {
+            "name": "towers",
+            "outdir": str(tmp_path / "out"),
+            "printer": MACHINE,
+            "process": {"base": PROCESS, "name": PROCESS_NAME, "recipes": list(recipes), "set": dict(process_set)},
+            "filaments": [{"preset": "Test PLA", "colour": "#000000"}, {"preset": "Test PLA", "colour": "#FFFFFF"}],
+            "plates": plates,
+        }
+    )
+
+
+def test_short_supported_part_packs_inside_the_interface_spread_on_every_side(tmp_path, stls, resolver):
+    plates = [{"name": "p", "parts": [{"path": str(stls["body"]), "name": "body_1"}]}]
+    plan = Pipeline(FakeStudio(sizes={"body.stl": (20, 20, 10)}), resolver).plan(recipe_spec(tmp_path, plates))
+    assert plan.ok, (plan.problems, [c.text for c in plan.plates[0].checks if not c.ok])
+    (part,) = plan.plates[0].parts
+    spread = L.brim_margin({**plan.process, **part.spec.set}) + T.INTERFACE_SPREAD
+    assert part.placed.margin >= spread  # the packing margin carries the spread on all four sides
+    assert part.placed.y0 - spread >= 0 and part.placed.x0 - spread >= 20.5
+
+
+def _ctx(aux=None):
+    return L.Context({"bed": FACTS["bed"], "extruders": X2D_EXTRUDERS}, {1: 1, 2: 2}, aux_x_limit=aux)
+
+
+def _placed(x0, y0, w=20.0, h=20.0):
+    from conftest import mesh
+
+    return L.Placed("p", mesh("p.stl", (w, h, 10)), 1, x0, y0)
+
+
+def test_interface_reach_reports_the_y_edge():
+    use = T.InterfaceUse("p", "support_interface_filament", 2, 8.2)
+    (c,) = T.InterfaceReach((use,)).check([_placed(60, 3)], _ctx())
+    assert not c.ok and "spans y -5.2..31.2 with its interface spread (8.2 mm)" in c.text and "reaches y 0.0..256.0" in c.text
+    assert " x " not in c.text.split("spans")[1].split("with")[0]  # only the coordinate that fails
+
+
+def test_interface_reach_takes_the_aux_x_limit_and_names_a_part_level_slot():
+    use = T.InterfaceUse("p", "support_filament", 2, 8.2, "part")
+    (c,) = T.InterfaceReach((use,)).check([_placed(210, 60)], _ctx(aux=235.5))
+    assert c.text.startswith("p has support with the part support_filament 2 (extruder 2 (right nozzle), Bowden)")
+    assert "extruder 2 reaches x 20.5..235.5" in c.text
+    assert list(T.InterfaceReach((use,)).check([_placed(100, 60)], _ctx(aux=235.5))) == []
+
+
+def _fixture_for(tmp_path, plan, **over):
+    keys = {k: plan.process[k] for k in plan.spec.process.set}
+    return make_3mf(tmp_path / "fx.3mf", object_names=("body_1", "base_1"), change_filament_gcode="M600", **{**keys, **over})
+
+
+def test_wipe_tower_false_with_the_recipe_verifies(tmp_path, stls, resolver):
+    plates = [
+        {
+            "name": "p",
+            "wipe_tower": False,
+            "parts": [
+                {"path": str(stls["body"]), "name": "body_1", "at": [60, 40]},
+                {"path": str(stls["base"]), "name": "base_1", "at": [120, 40]},
+            ],
+        }
+    ]
+    sp = recipe_spec(tmp_path, plates)
+    plan = Pipeline(FakeStudio(), resolver).plan(sp)
+    assert plan.process["enable_prime_tower"] == "0" and sp.process.set["enable_prime_tower"] == "1"
+    r = Pipeline(FakeStudio(_fixture_for(tmp_path, plan)), resolver).build(sp)
+    assert r.verify_problems is not None
+    assert not [p for p in r.verify_problems if "enable_prime_tower" in p or "prime_tower" in p], r.verify_problems
+
+
+def test_verify_compares_the_tower_size_and_spot(tmp_path, stls, resolver):
+    plates = [
+        {
+            "name": "p",
+            "wipe_tower": {"x": 172, "y": 150, "width": 22, "rib_wall": False, "brim": 2},
+            "parts": [
+                {"path": str(stls["body"]), "name": "body_1", "at": [60, 40]},
+                {"path": str(stls["base"]), "name": "base_1", "at": [120, 40]},
+            ],
+        }
+    ]
+    sp = recipe_spec(tmp_path, plates)
+    plan = Pipeline(FakeStudio(), resolver).plan(sp)
+    good = _fixture_for(tmp_path, plan, wipe_tower_x=["172"], wipe_tower_y=["150"])
+    r = Pipeline(FakeStudio(good), resolver).build(sp)
+    assert not [p for p in r.verify_problems or [] if "tower" in p], r.verify_problems
+    bad = _fixture_for(tmp_path, plan, wipe_tower_x=["208"], wipe_tower_y=["150"], prime_tower_width="35")
+    r = Pipeline(FakeStudio(bad), resolver).build(sp)
+    probs = r.verify_problems or []
+    assert any(p.startswith("plate 1 wipe_tower_x in file is ['208']") for p in probs)
+    assert any(p.startswith("prime_tower_width in file is '35', the tower plan wrote '22'") for p in probs)
+
+
+def test_spec_warnings_reach_the_plan(tmp_path, stls, resolver):
+    d = recipe_spec(tmp_path, [{"name": "p", "parts": [{"path": str(stls["body"])}]}]).to_json()
+    d["plates"][0]["parts"][0]["brim_margn"] = 2
+    d["wipe_tower"] = False  # a project-level wipe_tower is not read
+    plan = Pipeline(FakeStudio(), resolver).plan(Spec.from_json(d))
+    assert any("unknown key 'brim_margn'" in w for w in plan.warnings)
+    assert any("spec: unknown key 'wipe_tower'" in w for w in plan.warnings)
+
+
+def test_origins_reject_a_footprint_taller_than_the_bed():
+    """Width 20, no rib wall, no brim and a 342 mm3 prime volume: 256.5 mm deep, so there is no spot (int() once
+    accepted y 0..256.5)."""
+    s = T.TowerSettings(width=20.0, rib_wall=False, brim=0.0, wipe_volume=342.0, change_volume=0.0)
+    assert s.size(H14)[1] > 256
+    assert T.find_spot(s, H14, [], REACH)[0] is None
+    assert list(T._origins(20.0, 256.5, 0.0, BED, 1.0)) == []
+
+
+def test_unparsable_tower_value_is_a_build_error():
+    from shambu.errors import BuildError
+
+    with pytest.raises(BuildError, match=r"prime_tower_width = '22mm' is not a number"):
+        T.TowerSettings.from_config({"prime_tower_width": "22mm"})
+
+
+def test_unparsable_interface_slot_is_a_build_error(tmp_path):
+    from shambu.build import interface_uses
+    from shambu.errors import BuildError
+
+    part = PartSpec.from_json({"path": str(tmp_path / "a.stl")})
+    with pytest.raises(BuildError, match="process support_interface_filament = 'two'"):
+        interface_uses(part, {"enable_support": "1", "support_interface_filament": "two"}, "a", 5.2)
+
+
+def test_part_support_slot_with_support_off_is_not_counted(tmp_path):
+    part = PartSpec.from_json({"path": str(tmp_path / "a.stl"), "set": {"support_filament": "2", "enable_support": "0"}})
+    assert effective_filaments(part, process={"enable_support": "0"}) == {1}
+
+
+def test_auto_tower_beside_a_part_packed_against_the_reserve(tmp_path, stls, resolver):
+    """The provisional back-right reserve is grown by the clearance, so a packed part never ends flush with it."""
+    plates = [{"name": "p", "parts": [{"path": str(stls["body"]), "count": 12}, {"path": str(stls["text"]), "filament": 2}]}]
+    plan = Pipeline(FakeStudio(sizes={"body.stl": (45, 45, 20), "text.stl": (10, 10, 5)}), resolver).plan(spec_of(tmp_path, plates))
+    assert plan.ok, (plan.problems, [c.text for c in plan.plates[0].checks if not c.ok])
+    fp = plan.plates[0].tower.footprint
+    assert fp is not None
+    assert all(T._gap(fp.rect, x.placed.rect()) >= T.PART_CLEARANCE - 1e-9 for x in plan.plates[0].parts)
+
+
+def test_process_enable_prime_tower_0_turns_the_tower_off(tmp_path, stls, resolver):
+    plan = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, two_plates(stls, "auto", "auto"), enable_prime_tower="0"))
+    assert all(p.tower is not None and p.tower.mode == "off" for p in plan.plates)
+    assert any(w.startswith("plate 1 wipe_tower false") for w in plan.warnings)
+
+
+def test_tower_size_in_process_set_turns_the_fallback_off():
+    tight = _req(1, PLATE14)
+    (with_fallback,) = T.plan_project([tight])
+    (pinned,) = T.plan_project([tight], fallback=False)
+    assert with_fallback.footprint is not None and pinned.footprint is None
+    assert pinned.problem is not None and "tried 41.4 mm (rib wall) " in pinned.problem
+
+
+def test_prime_volume_mode_saving_uses_15_mm3():
+    s = T.TowerSettings.from_config({"prime_volume_mode": "Saving"}, PLATE14_PRESETS)
+    assert s.wipe_volume == 15.0
+
+
+def test_slicing_error_without_a_log_file(tmp_path):
+    from shambu.studio import RunResult
+
+    rr = RunResult(["BambuStudio"], 156, -100, 1.0, tmp_path / "missing.log", None)
+    assert rr.slicing_error() is None and rr.summary().startswith("exit -100 (")

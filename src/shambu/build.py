@@ -51,7 +51,13 @@ FILAMENT_KEYS = (
     "support_filament",
     "support_interface_filament",
 )
-PRINTING_SUBTYPES = ("normal_part", "modifier_part")  # sub-parts whose filament reaches the nozzle
+PRINTING_SUBTYPES = ("normal_part", "modifier_part")
+TOWER_KEYS = (
+    "prime_tower_width",
+    "prime_tower_rib_wall",
+    "prime_tower_brim_width",
+    "enable_prime_tower",
+)  # set by tower planning  # sub-parts whose filament reaches the nozzle
 UNRESOLVED_FILAMENT = "loaded (unresolved)"  # placeholder preset name for a "loaded" slot the printer did not fill
 FileRefs = Sequence[tuple[Path, int, str]]
 
@@ -93,7 +99,10 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, proc
         out |= {fil for _, fil, sub in refs if sub in PRINTING_SUBTYPES}
         if ext:
             out.add(ext)
+    support = _support_on({**(process or {}), **part_spec.set})
     for k in FILAMENT_KEYS[1:]:
+        if k in SUPPORT_FILAMENT_KEYS and not support:
+            continue  # Studio prints no support (or raft) for this part: its support slots are unused
         if k in part_spec.set and (v := _slot(part_spec.set[k], f"set.{k}")):
             out.add(v)
     for r in part_spec.height_ranges:
@@ -101,28 +110,26 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, proc
             if k in r.set and (v := _slot(r.set[k], f"height range {r.min_z}..{r.max_z} {k}")):
                 out.add(v)
     if process is not None:
-        keys = WALL_INFILL_KEYS + (SUPPORT_FILAMENT_KEYS if _support_on({**process, **part_spec.set}) else ())
+        keys = WALL_INFILL_KEYS + (SUPPORT_FILAMENT_KEYS if support else ())
         for k in keys:
             if k not in part_spec.set and k in process and (v := _slot(process[k], f"process {k}")):
                 out.add(v)
     return out
 
 
-def interface_uses(part_spec: PartSpec, process: Mapping, key: str, brim_margin: float) -> list[T.InterfaceUse]:
+def interface_uses(part_spec: PartSpec, process: Mapping, key: str, brim_margin: float, own: int = 0) -> list[T.InterfaceUse]:
     """The support and support-interface slots a supported part prints with (part `set` first, then the process),
-    for `tower.InterfaceReach`. A slot 0 (the part's own filament) is left out."""
+    for `tower.InterfaceReach`. A slot 0 (the part's own filament) and `own` (the part's main slot) are left out.
+    Raises BuildError for a value that is not a slot number."""
     if not _support_on({**process, **part_spec.set}):
         return []
     out = []
     for k in SUPPORT_FILAMENT_KEYS:
         src = "part" if k in part_spec.set else "process"
         raw = part_spec.set.get(k, process.get(k, "0"))
-        try:
-            slot = int(str(raw).strip() or 0)
-        except ValueError:
-            continue
-        if slot:
-            out.append(T.InterfaceUse(key, k, slot, brim_margin + T.INTERFACE_OVERSHOOT, src))
+        slot = _slot(str(raw).strip() or "0", f"{src} {k}")
+        if slot and slot != own:
+            out.append(T.InterfaceUse(key, k, slot, brim_margin + T.INTERFACE_SPREAD, src))
     return out
 
 
@@ -447,6 +454,7 @@ class Pipeline:
         workdir.mkdir(parents=True, exist_ok=True)
         problems: list[str] = list(resolution.problems) if resolution else []
         warnings: list[str] = list(resolution.warnings) if resolution else []
+        warnings += [w for w in spec.warnings if w not in warnings]  # unknown keys: `check` and `build` warn as `spec` does
         problems += spec.validate()
         machine = self.resolver.for_cli("machine", spec.printer)
         process = self.resolver.for_cli("process", spec.process.base, spec.process.set, spec.process.name)
@@ -543,22 +551,30 @@ class Pipeline:
             multi = len({f for p in parts for f in p.placed.filaments}) > 1 and not sequential
             # Smooth timelapse needs a tower on a one-filament plate too (PartPlate.cpp:2222-2223)
             multi = multi or (T.smooth_timelapse(process) and not sequential)
+            try:
+                uses = tuple(
+                    u
+                    for p in parts
+                    for u in interface_uses(p.spec, process, p.key, L.brim_margin({**process, **p.spec.set}), p.placed.filament)
+                )
+            except BuildError as e:
+                problems.append(f"plate {pi} '{pspec.name}': {e}")
+                uses = ()
+            spread = {u.key: u.interface_spread for u in uses}
+            for p in parts:  # the interface prints past the part box on every side: pack and check with that margin
+                if p.key in spread:
+                    p.placed.margin = max(p.placed.margin, spread[p.key])
             fixed = [p for p in parts if p.placed.fixed]
             free = [p.placed for p in parts if not p.placed.fixed]
             # The tower footprint (fixed spot, or a provisional back-right corner for "auto") keeps packed parts out;
-            # TowerClear checks the final footprint, so the generic reserve rule stays off (reserve=None).
+            # TowerClear checks the final footprint after every plate is planned.
             reserve, tower_base = self._tower_reserve(
                 pspec, pi, multi, parts, bool(free), process, filaments, facts, spec, problems, warnings
             )
-            pctx = replace(ctx, reserve=None, by_object=sequential)
+            pctx = replace(ctx, by_object=sequential)
             obstacles = [p.rect() for p in (x.placed for x in fixed)] + ([reserve] if reserve else [])
-            uses = tuple(u for p in parts for u in interface_uses(p.spec, process, p.key, L.brim_margin({**process, **p.spec.set})))
             if free:
                 x_min_of = {p.key: max(ctx.extruder_of(f)["x"][0] for f in p.filaments) for p in free}
-                margin_of = {p.key: p.margin for p in free}
-                for u in uses:  # the interface spreads past the part's own margin: start the packed rect further right
-                    if u.key in x_min_of and ctx.known(u.slot):
-                        x_min_of[u.key] = max(x_min_of[u.key], ctx.extruder_of(u.slot)["x"][0] + u.margin - margin_of[u.key])
                 plate_placer = placer
                 if sequential and self.placer is None:
                     all_short = all(p.placed.info.size[2] < clr["nozzle_height"] for p in parts)
@@ -683,17 +699,13 @@ class Pipeline:
         base = wt.settings(T.TowerSettings.from_config(process, filaments, n_fil, len(facts["extruders"])))
         height = max((p.placed.info.size[2] for p in parts), default=0.0)
         if wt.mode == "fixed" and wt.x is not None and wt.y is not None:
-            try:
-                wt.check_spot(pi, facts, base, height, spec.aux_x_limit)
-            except BuildError as e:
-                problems.append(str(e))
-            return T.footprint(base, height, wt.x, wt.y).rect, base
+            return T.footprint(base, height, wt.x, wt.y).rect, base  # TowerClear reports a bad spot (once)
         if not has_free:
             return None, base
         area = T.shared_reach(facts["extruders"], facts["bed"], spec.aux_x_limit)
         w, d = base.size(height)
-        b = base.brim_at(height)
-        return (area[2] - w - 2 * b, area[3] - d - 2 * b, area[2], area[3]), base
+        b, c = base.brim_at(height), T.PART_CLEARANCE  # grown by the clearance the auto search keeps to parts
+        return (area[2] - w - 2 * b - c, area[3] - d - 2 * b - c, area[2], area[3]), base
 
     @staticmethod
     def _tower_request(
@@ -1076,10 +1088,11 @@ class Pipeline:
         if not sliced:
             ps.add(SetBedTypeEverywhere(plan.spec.bed_type))
             ps.add(SetFilamentColours(tuple(f["filament_colour"][0] for f in plan.filaments)))
+            # A CLI export without --slice leaves extruder_nozzle_stats [] and every later CLI slice exits -100. The
+            # preset-aware variant repair runs first, so the map patch finds the blocks consistent.
+            ps.add(RepairNozzleStats(tuple(tuple(f.get("filament_extruder_variant") or ()) for f in plan.filaments)))
             if plan.map_applies:
                 ps.add(SetFilamentMap(tuple(plan.filament_map)))
-            # A CLI export without --slice leaves extruder_nozzle_stats [] and every later CLI slice exits -100
-            ps.add(RepairNozzleStats(tuple(tuple(f.get("filament_extruder_variant") or ()) for f in plan.filaments)))
         for old, new in _rename_steps([(p.cli_name, p.key) for p in plan.parts if p.rename and p.cli_name and p.cli_name != p.key]):
             ps.add(RenameObject(old, new))
         for i, pspec in enumerate(plan.spec.plates, 1):
@@ -1135,7 +1148,8 @@ class Pipeline:
             got_seq = pl.get("print_sequence") or str(ps.get("print_sequence") or "by layer")
             if want_seq != got_seq:
                 probs.append(f"plate {pl['id']} print_sequence is {got_seq!r}, expected {want_seq!r}")
-        probs += [f"not re-sliceable by the CLI: {x}" for x in pr.reslice_problems()]
+        probs += [f"not re-sliceable by the CLI: {x}" for x in pr.reslice_problems(len(plan.facts["extruders"]))]
+        probs += self._verify_tower(plan, ps)
         if s["process"] != plan.process["name"]:
             probs.append(f"process in file is {s['process']}, expected {plan.process['name']}")
         if len(s["filaments"]) != len(plan.filaments):
@@ -1159,11 +1173,48 @@ class Pipeline:
             if got != exp:
                 probs.append(f"{k} in file ({len(got)} chars) differs from the resolved machine preset ({len(exp)} chars)")
         for k, v in plan.spec.process.set.items():
+            v = plan.process.get(k, v) if k in TOWER_KEYS else v  # tower planning may override the spec value
             if k not in ps:
                 probs.append(f"process setting {k} is missing from the file, spec says {v!r}")
             elif str(ps[k]) != str(v):
                 probs.append(f"process setting {k} is {ps[k]!r} in the file, spec says {v!r}")
         self.emit("verified", problems=probs)
+        return probs
+
+    @staticmethod
+    def _verify_tower(plan: Plan, ps: dict) -> list[str]:
+        """The tower size and on/off planning wrote into the process, and each planned plate's spot, in the file. A key
+        the file does not hold is not checked (every Studio export holds them; minimal test fixtures do not)."""
+        probs: list[str] = []
+        towers = [p.tower for p in plan.plates if p.tower is not None]
+        if not towers:
+            return probs
+        for k in TOWER_KEYS:
+            if k not in plan.process or k not in ps:
+                continue
+            got, want = ps.get(k), plan.process[k]
+            try:
+                same = got is not None and float(str(got)) == float(str(want))
+            except ValueError:
+                same = str(got) == str(want)
+            if not same:
+                probs.append(f"{k} in file is {got!r}, the tower plan wrote {want!r}")
+        for axis in ("x", "y"):
+            vec = ps.get(f"wipe_tower_{axis}")
+            if vec is None:
+                continue
+            vals = vec if isinstance(vec, list) else [vec]
+            for i, p in enumerate(plan.plates):
+                fp = p.tower.footprint if p.tower is not None else None
+                if fp is None:
+                    continue
+                want_v = fp.x if axis == "x" else fp.y
+                try:
+                    got_v = float(str(vals[i] if i < len(vals) else vals[-1]))
+                except (TypeError, ValueError, IndexError):
+                    got_v = float("nan")
+                if abs(got_v - want_v) > 0.01:
+                    probs.append(f"plate {i + 1} wipe_tower_{axis} in file is {vec!r}, the tower plan put it at {want_v:g}")
         return probs
 
     def report(self, r: BuildResult) -> str:

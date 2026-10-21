@@ -97,7 +97,10 @@ class RepairNozzleStats:
         p.repair_extruder_variants(self.filament_variants or None)
 
     def describe(self) -> str:
-        return "extruder_nozzle_stats, filament_extruder_variant blocks and filament maps made re-sliceable (CLI --slice)"
+        return (
+            "extruder_nozzle_stats(_new), filament_extruder_variant / filament_self_index blocks, "
+            "filament_volume_map / filament_nozzle_map made re-sliceable (CLI --slice)"
+        )
 
 
 @dataclass(frozen=True)

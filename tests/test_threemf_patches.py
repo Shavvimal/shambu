@@ -563,3 +563,80 @@ def test_repair_then_map_leaves_no_reslice_problem(tmp_path):
     X.PatchSet().add(X.SetFilamentMap((2, 1))).apply(str(f))
     assert Project(str(f)).reslice_problems() == []
     assert Project(str(f)).project_settings["filament_extruder_variant"] == X2D_VARIANTS * 2
+
+
+# ---------------------------------------------------------------------------- review round 2
+P1S = {
+    "filament_settings_id": ["Test PLA"],
+    "filament_type": ["PLA"],
+    "nozzle_diameter": ["0.4"],
+    "extruder_type": ["Direct Drive"],
+    "nozzle_volume_type": ["Standard"],
+    "extruder_max_nozzle_count": ["1"],
+    "extruder_nozzle_stats": [],
+    "filament_extruder_variant": ["Direct Drive Standard"],
+    "filament_self_index": ["1"],
+}
+
+
+def test_empty_stats_are_fine_on_a_one_extruder_printer(tmp_path):
+    """Studio initialises the nozzle stats only on a multi-extruder or multi-nozzle machine (BambuStudio.cpp:6648)."""
+    f = make_3mf(tmp_path / "p1s.3mf", **P1S)
+    assert Project(str(f)).reslice_problems() == []
+    with zipfile.ZipFile(f) as z:
+        before = z.read(PROJECT_SETTINGS)
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).read(PROJECT_SETTINGS) == before
+
+
+def test_a_one_entry_stat_is_too_short_for_the_x2d(tmp_path):
+    f = make_3mf(tmp_path / "x2d.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#1"]})
+    assert any(m.startswith("extruder_nozzle_stats ['Standard#1']") for m in Project(str(f)).reslice_problems())
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["Standard#1", "Standard#1"]
+
+
+def test_only_a_zero_count_new_key_is_found_and_repaired(tmp_path):
+    over = {k: v for k, v in UNSLICED_X2D.items() if k != "extruder_nozzle_stats"}
+    f = make_3mf(tmp_path / "new.3mf", **over, extruder_nozzle_stats_new=["Standard#0", "Standard#0"])
+    assert any(m.startswith("extruder_nozzle_stats_new ['Standard#0', 'Standard#0']") for m in Project(str(f)).reslice_problems())
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert ps["extruder_nozzle_stats_new"] == ["Standard#1", "Standard#1"] and "extruder_nozzle_stats" not in ps
+    assert Project(str(f)).reslice_problems() == []
+
+
+def test_repair_never_adds_variant_keys_to_a_project_without_them(tmp_path):
+    f = make_3mf(tmp_path / "plain.3mf")
+    p = Project(str(f))
+    p.project_settings.pop("filament_extruder_variant")
+    p._touch_ps()
+    p.save(str(f))
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert "filament_extruder_variant" not in ps and "filament_self_index" not in ps
+
+
+def test_untouched_correct_archive_is_byte_identical_after_repair(tmp_path, capsys):
+    from shambu import cli
+
+    f = make_3mf(tmp_path / "ok.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#1", "Standard#1"]})
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))  # make it correct (blocks, maps)
+    before = f.read_bytes()
+    assert cli.main(["patch", str(f), "--repair-nozzle-stats"]) == 0
+    assert f.read_bytes() == before
+    out = tmp_path / "copy.3mf"
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f), str(out))
+    assert out.read_bytes() == before
+
+
+def test_preset_aware_repair_runs_before_the_map_patch(tmp_path):
+    """A collapsed project whose filament presets have two variants each: the map patch alone would rebuild the
+    blocks from the six-variant printer list and refuse; the build's order (preset-aware repair first) works."""
+    two = ("Direct Drive Standard", "Bowden Standard")
+    f = make_3mf(tmp_path / "c.3mf", **{**UNSLICED_X2D, "filament_self_index": ["1", "1", "2", "2"]})
+    with pytest.raises(ProjectError):
+        X.PatchSet().add(X.SetFilamentMap((1, 2))).apply(str(f))
+    X.PatchSet().add(X.RepairNozzleStats((two, two)), X.SetFilamentMap((1, 2))).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert ps["filament_extruder_variant"] == list(two) * 2 and ps["filament_self_index"] == ["1", "1", "2", "2"]

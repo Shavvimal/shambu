@@ -71,8 +71,10 @@ def test_failed_patchset_keeps_original(project_file, monkeypatch):
 def test_crc_failure_keeps_original(project_file, monkeypatch):
     before = project_file.read_bytes()
     monkeypatch.setattr(zipfile.ZipFile, "testzip", lambda self: "Metadata/model_settings.config")
+    p = Project(str(project_file))
+    p.set_bed_type("Textured PEI Plate")  # an unchanged project is not rewritten at all
     with pytest.raises(ProjectError, match="CRC"):
-        Project(str(project_file)).save(str(project_file))
+        p.save(str(project_file))
     assert project_file.read_bytes() == before
     assert os.listdir(project_file.parent) == [project_file.name]
 

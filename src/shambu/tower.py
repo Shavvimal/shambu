@@ -1,4 +1,4 @@
-"""The prime tower of a two-filament plate: Studio's footprint estimate, a free spot both nozzles reach, and the rules.
+"""The prime tower of a two-filament plate: Studio's footprint estimate, a free spot both extruders reach, the rules.
 
 Pure planning core: no subprocess, no zip, no network. `build.py` asks this module for a footprint per plate,
 reserves it during packing, writes the chosen `wipe_tower_x/y` per plate, and runs `TowerClear` and
@@ -17,6 +17,13 @@ Limits: the GUI formula is an estimate. Studio recomputes the real tower at slic
 (`WipeTower::plan_tower` and the depth pass, WipeTower.cpp:4520-4585), so the sliced tower can differ. A tower is also
 needed with ONE filament when the process uses Smooth timelapse (`need_wipe_tower`, PartPlate.cpp:2222-2223): build.py
 then plans an "auto" tower on a one-filament plate too.
+
+Design: pure functions for the estimate (`min_depth`, `auto_brim`, `TowerSettings.size`, `footprint`), a grid search
+for a free spot (`find_spot`, `auto_place`) whose obstacle test is a parameter (the `Clearance` protocol:
+`BoxClearance` over part rects here, a silhouette test can bind in its place), `plan_project` for ONE tower size per
+project over every plate, and two `Rule` implementations for the limit checker (`TowerClear`, `InterfaceReach`). It
+handles the tower's size, spot and the interface extruder's reach. It does not handle the post-slice tower, purge
+volumes, or the part layout itself (layout.py).
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Protocol
 
+from .errors import BuildError
 from .layout import Check
 
 Rect = tuple[float, float, float, float]  # x0, y0, x1, y1
@@ -56,13 +64,25 @@ def auto_brim(height: float) -> float:
     return 8.0 if height >= 100 else height / 100.0 * 8.0
 
 
-def _f(v, default: float) -> float:
+def _f(v, default: float, key: str = "value") -> float:
+    """A number from a preset value ("150%" -> 150). Missing -> `default`; a value that does not parse raises
+    BuildError naming the key, so the planned footprint never silently differs from Studio's."""
     if isinstance(v, list):
-        v = v[0] if v else default
-    try:
-        return float(str(v).rstrip("%"))
-    except (TypeError, ValueError):
+        v = v[0] if v else None
+    if v is None or str(v).strip() == "":
         return default
+    try:
+        return float(str(v).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        raise BuildError(f"{key} = {v!r} is not a number (the prime tower estimate needs it)") from None
+
+
+def side(index: int) -> str:
+    """ "extruder 1 (left nozzle)" / "extruder 2 (right nozzle)": one name for an extruder in every message."""
+    return f"extruder {index} ({'left' if index == 1 else 'right'} nozzle)"
+
+
+BOTH = "extruders 1 and 2 (left and right nozzle)"
 
 
 def _on(v, default: bool) -> bool:
@@ -94,19 +114,22 @@ class TowerSettings:
         cls, process: Mapping, filaments: Sequence[Mapping] = (), plate_filaments: int = 2, extruders: int = 2
     ) -> TowerSettings:
         """Read the estimate inputs from a resolved process preset and the filament presets (defaults where absent)."""
-        prime = [_f(v, 45.0) for f in filaments for v in (f.get("filament_prime_volume") or [])] or [45.0]
+        prime = [_f(v, 45.0, "filament_prime_volume") for f in filaments for v in (f.get("filament_prime_volume") or [])] or [45.0]
         if str(process.get("prime_volume_mode", "")).lower() == "saving":
             prime = [15.0]
-        length = max([_f(v, 0.0) for f in filaments for v in (f.get("filament_change_length") or [])] or [0.0])
-        dia = max([_f(v, FILAMENT_DIAMETER) for f in filaments for v in (f.get("filament_diameter") or [])] or [FILAMENT_DIAMETER])
+        length = max([_f(v, 0.0, "filament_change_length") for f in filaments for v in (f.get("filament_change_length") or [])] or [0.0])
+        dia = max(
+            [_f(v, FILAMENT_DIAMETER, "filament_diameter") for f in filaments for v in (f.get("filament_diameter") or [])]
+            or [FILAMENT_DIAMETER]
+        )
         return cls(
-            width=_f(process.get("prime_tower_width"), 35.0),
+            width=_f(process.get("prime_tower_width"), 35.0, "prime_tower_width"),
             rib_wall=_on(process.get("prime_tower_rib_wall"), True),
-            brim=_f(process.get("prime_tower_brim_width"), -1.0),
-            rib_width=_f(process.get("prime_tower_rib_width"), 8.0),
-            extra_rib_length=_f(process.get("prime_tower_extra_rib_length"), 0.0),
-            infill_gap=_f(process.get("prime_tower_infill_gap"), 150.0) / 100.0,
-            layer_height=_f(process.get("layer_height"), 0.2),
+            brim=_f(process.get("prime_tower_brim_width"), -1.0, "prime_tower_brim_width"),
+            rib_width=_f(process.get("prime_tower_rib_width"), 8.0, "prime_tower_rib_width"),
+            extra_rib_length=_f(process.get("prime_tower_extra_rib_length"), 0.0, "prime_tower_extra_rib_length"),
+            infill_gap=_f(process.get("prime_tower_infill_gap"), 150.0, "prime_tower_infill_gap") / 100.0,
+            layer_height=_f(process.get("layer_height"), 0.2, "layer_height"),
             wipe_volume=max(prime),
             change_volume=length * math.pi * dia * dia / 4.0,
             plate_filaments=plate_filaments,
@@ -178,7 +201,7 @@ def footprint(settings: TowerSettings, height: float, x: float, y: float) -> Foo
 
 
 def shared_reach(extruders: Iterable[Mapping], bed: Mapping, aux_x_limit: float | None = None) -> Rect:
-    """The area every given extruder reaches, inside the bed. The tower is printed by both nozzles. `aux_x_limit` is
+    """The area every given extruder reaches, inside the bed. Both extruders print the tower. `aux_x_limit` is
     the user's stricter right edge for extruder 2."""
     x0, y0, x1, y1 = bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1]
     for e in extruders:
@@ -229,20 +252,30 @@ class Clearance(Protocol):
 
 @dataclass(frozen=True)
 class BoxClearance:
-    """Part rects (margin-grown, `Placed.rect()`) plus `margin` mm on every side."""
+    """Part rects (margin-grown, `Placed.rect()`) plus `margin` mm on every side. The grown rects are computed once;
+    `narrow()` keeps only the rects that can touch one x band, so the grid scan stays fast with many parts."""
 
     obstacles: tuple[tuple[str, Rect], ...]
     margin: float = PART_CLEARANCE
 
+    @property
+    def grown(self) -> tuple[tuple[str, Rect, Rect], ...]:
+        m = self.margin
+        return tuple((n, o, (o[0] - m, o[1] - m, o[2] + m, o[3] + m)) for n, o in self.obstacles)
+
+    def narrow(self, x0: float, x1: float) -> BoxClearance:
+        m = self.margin
+        return BoxClearance(tuple((n, o) for n, o in self.obstacles if o[2] + m > x0 and o[0] - m < x1), m)
+
     def clear(self, rect: Rect) -> bool:
-        return all(not _overlaps(rect, o) and _gap(rect, o) >= self.margin - 1e-9 for _, o in self.obstacles)
+        # The grown rect is a quick reject; a corner needs the exact (Euclidean) gap
+        return all(not _overlaps(rect, g) or (not _overlaps(rect, o) and _gap(rect, o) >= self.margin - 1e-9) for _, o, g in self.grown)
 
     def gap(self, rect: Rect) -> float:
         return min((_gap(rect, o) for _, o in self.obstacles), default=CLEARANCE_CAP)
 
     def blocker(self, rect: Rect) -> tuple[float, str | None]:
-        m = self.margin
-        hits = [(_area(rect, (o[0] - m, o[1] - m, o[2] + m, o[3] + m)), n) for n, o in self.obstacles]
+        hits = [(_area(rect, g), n) for n, _, g in self.grown]
         hits = [h for h in hits if h[0] > 0]
         return (sum(a for a, _ in hits), max(hits)[1]) if hits else (0.0, None)
 
@@ -264,10 +297,13 @@ class Placement:
 
 
 def _origins(fw: float, fd: float, brim: float, area: Rect, step: float) -> Iterable[tuple[float, float]]:
-    """Tower origins (x, y) on a `step` grid whose footprint lies inside `area`."""
-    x_lo, x_hi = math.ceil((area[0] + brim) / step) * step, area[2] - fw + brim
-    y_lo, y_hi = math.ceil((area[1] + brim) / step) * step, area[3] - fd + brim
-    nx, ny = int((x_hi - x_lo) / step + 1e-9), int((y_hi - y_lo) / step + 1e-9)
+    """Tower origins (x, y) on a `step` grid whose footprint lies inside `area`; none when the footprint is larger
+    than the area (an inverted bound)."""
+    x_lo, x_hi = math.ceil((area[0] + brim) / step - 1e-9) * step, area[2] - fw + brim
+    y_lo, y_hi = math.ceil((area[1] + brim) / step - 1e-9) * step, area[3] - fd + brim
+    if x_hi < x_lo - 1e-9 or y_hi < y_lo - 1e-9:
+        return
+    nx, ny = math.floor((x_hi - x_lo) / step + 1e-9), math.floor((y_hi - y_lo) / step + 1e-9)
     for i in range(nx + 1):
         for j in range(ny + 1):
             yield x_lo + i * step, y_lo + j * step
@@ -290,15 +326,22 @@ def find_spot(
     fw, fd = fp0.outer
     best_free: tuple[tuple[float, float, float], Footprint] | None = None
     best_blocked: tuple[tuple[float, float, float], Footprint, str | None] | None = None
+    column: tuple[float, Clearance] | None = None
     for x, y in _origins(fw, fd, fp0.brim, area, step):
         fp = replace(fp0, x=x, y=y)
         r = fp.rect
-        if test.clear(r):
-            key = (math.floor(min(test.gap(r), CLEARANCE_CAP) * 2) / 2, y, x)
+        if not inside(r, area):  # guard: never accept a footprint outside the reach or the bed
+            continue
+        if column is None or column[0] != x:
+            narrow = getattr(test, "narrow", None)
+            column = (x, narrow(r[0], r[2]) if narrow else test)
+        local = column[1]
+        if local.clear(r):
+            key = (math.floor(min(local.gap(r), CLEARANCE_CAP) * 2) / 2, y, x)
             if best_free is None or key > best_free[0]:
                 best_free = (key, fp)
         elif best_free is None:
-            total, name = test.blocker(r)
+            total, name = local.blocker(r)
             key_b = (-total, y, x)
             if best_blocked is None or key_b > best_blocked[0]:
                 best_blocked = (key_b, fp, name)
@@ -372,10 +415,10 @@ def _fmt_rect(r: Rect) -> str:
 def _alternative(settings: TowerSettings, height: float, obstacles: Sequence[tuple[str, Rect]], area: Rect, first_w: float) -> str:
     p = auto_place(settings, height, obstacles, area)
     if p.footprint is None:
-        return f'Free spots both nozzles reach: none down to width {FALLBACK_WIDTHS[-1]:g}; set "wipe_tower": false or move parts'
+        return f'Free spots {BOTH} reach: none down to width {FALLBACK_WIDTHS[-1]:g}; set "wipe_tower": false or move parts'
     fp = p.footprint
     lead = "" if fp.settings == settings else f"none at {first_w:.1f} mm; "
-    return f"Free spots both nozzles reach: {lead}x {fp.x:.0f} y {fp.y:.0f} with {fp.settings.describe()}"
+    return f"Free spots {BOTH} reach: {lead}x {fp.x:.0f} y {fp.y:.0f} with {fp.settings.describe()}"
 
 
 def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]], area: Rect, bed: Rect) -> str | None:
@@ -398,7 +441,7 @@ def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]]
             edge.append(f"y {r[1]:.1f}")
         why.append("leaves the bed at " + " and ".join(edge))
     elif not inside(r, area):
-        why.append(f"leaves the area both nozzles reach ({_fmt_rect(area)})")
+        why.append(f"leaves the area {BOTH} reach ({_fmt_rect(area)})")
     if not why:
         return None
     first_w = fp.outer[0] - 2 * fp.brim
@@ -413,7 +456,7 @@ def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | N
             f" is blocked by {blocker}" if blocker else ""
         )
     return (
-        f"plate {plate}: no free prime tower spot both nozzles reach ({_fmt_rect(area)}), tried "
+        f"plate {plate}: no free prime tower spot {BOTH} reach ({_fmt_rect(area)}), tried "
         + ", ".join(tried)
         + f" with {PART_CLEARANCE:g} mm clearance to every part{where}{why}. Move parts, set plates[{plate - 1}].wipe_tower "
         '{"x", "y", "width", "rib_wall", "brim"}, or set "wipe_tower": false'
@@ -506,7 +549,7 @@ def plan_project(requests: Sequence[TowerRequest], fallback: bool = True) -> lis
 def off_warning(plate: int) -> str:
     return (
         f"plate {plate} wipe_tower false: two filaments with no prime tower; Studio slices it (exit 0 measured) "
-        "but the idle nozzle is not wiped before the interface layers"
+        "but the idle extruder is not wiped before the interface layers"
     )
 
 
@@ -552,17 +595,17 @@ class InterfaceUse:
     key: str
     key_name: str  # support_interface_filament | support_filament
     slot: int
-    margin: float  # brim margin + 3 mm: the interface overshoot past the part box (2.2 mm measured, n=1)
+    interface_spread: float  # how far the interface prints past the part box: brim margin + INTERFACE_SPREAD
     source: str = "process"
 
 
-INTERFACE_OVERSHOOT = 3.0
+INTERFACE_SPREAD = 3.0  # mm past the brim margin (2.2 mm measured on the seed cradle, -0.2 mm on the housing; n=1 each)
 
 
 @dataclass(frozen=True)
 class InterfaceReach:
     """Rule: the extruder that prints a part's support interface (or support) reaches the part's box grown by its
-    brim margin plus 3 mm. The seed build exited -102 with the right nozzle's interface at x 14.3 (reference
+    interface spread (brim margin plus INTERFACE_SPREAD) on all four sides. The seed build exited -102 with the right nozzle's interface at x 14.3 (reference
     06-slicer-rules.md section 5). One instance per plate."""
 
     uses: tuple[InterfaceUse, ...]
@@ -574,11 +617,18 @@ class InterfaceReach:
             if p is None or not ctx.known(u.slot):
                 continue
             e = ctx.extruder_of(u.slot)
-            x0, y0, x1, y1 = p.x0 - u.margin, p.y0 - u.margin, p.x1 + u.margin, p.y1 + u.margin
+            m = u.interface_spread
+            x0, y0, x1, y1 = p.x0 - m, p.y0 - m, p.x1 + m, p.y1 + m
             lim_x1 = min(e["x"][1], ctx.aux_x_limit) if (e["index"] == 2 and ctx.aux_x_limit is not None) else e["x"][1]
-            if x0 < e["x"][0] or x1 > lim_x1 or y0 < e["y"][0] or y1 > e["y"][1]:
+            bad_x = x0 < e["x"][0] or x1 > lim_x1
+            bad_y = y0 < e["y"][0] or y1 > e["y"][1]
+            if bad_x or bad_y:
+                span = " ".join(([f"x {x0:.1f}..{x1:.1f}"] if bad_x else []) + ([f"y {y0:.1f}..{y1:.1f}"] if bad_y else []))
+                reach = " ".join(
+                    ([f"x {e['x'][0]:.1f}..{lim_x1:.1f}"] if bad_x else []) + ([f"y {e['y'][0]:.1f}..{e['y'][1]:.1f}"] if bad_y else [])
+                )
                 yield Check(
                     False,
-                    f"{p.key} has support with the {u.source} {u.key_name} {u.slot} (extruder {e['index']}, {e['type']}) and spans "
-                    f"x {x0:.1f}..{x1:.1f} with its interface margin; extruder {e['index']} reaches x {e['x'][0]:.1f}..{lim_x1:.1f}",
+                    f"{p.key} has support with the {u.source} {u.key_name} {u.slot} ({side(e['index'])}, {e['type']}) and spans "
+                    f"{span} with its interface spread ({m:.1f} mm); extruder {e['index']} reaches {reach}",
                 )

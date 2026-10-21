@@ -461,7 +461,7 @@ def test_recipe_keys_pass_the_unknown_key_check(tmp_path, stls, resolver):
     assert "seam_slope_conditional" in R.all_keys()
 
 
-def test_single_two_filament_object_keeps_the_tower_reserve(tmp_path, stls, resolver):
+def test_single_two_filament_object_by_object_still_gets_a_tower(tmp_path, stls, resolver):
     d = spec_json(tmp_path, stls, print_sequence="by object")
     d["plates"][0]["parts"] = [
         {"name": "label", "parts": [{"path": str(stls["base"])}, {"path": str(stls["text"]), "filament": 2}], "at": [220, 220]}
