@@ -659,3 +659,33 @@ def test_malformed_numbers_are_usage_errors(capsys, tmp_path, monkeypatch, argv)
     code, out, _ = run(capsys, "--json", *[a.replace("{f}", f) for a in argv])
     assert code == 2
     assert "error" in one_json(out)
+
+
+def test_slice_never_removes_a_folder_by_name(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    job = tmp_path / "job.slice"
+    job.mkdir()
+    src = make_3mf(job / "source.3mf")
+    (job / "notes.txt").write_text("mine")
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, _, _ = run(capsys, "slice", str(src), "-o", str(tmp_path / "job.gcode.3mf"))
+    assert code == 0
+    assert src.is_file() and (job / "notes.txt").read_text() == "mine"
+    assert (tmp_path / "job.gcode.3mf").is_file()
+
+
+def test_slice_keeps_the_old_output_when_the_export_does_not_read_back(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    old = tmp_path / "out.gcode.3mf"
+    old.write_bytes(b"previous good output")
+    junk = tmp_path / "junk.3mf"
+    junk.write_bytes(b"not a zip")
+    studio = SequenceStudio(junk, codes=[0])  # exit 0, but the export is unreadable
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(old))
+    assert code == 1 and "does not read back" in one_json(out)["error"]
+    assert old.read_bytes() == b"previous good output"

@@ -118,8 +118,9 @@ _REFUSED = ("--pipe", "--datadir", "--uptodate", "--downward")
 _MODEL_EXT = (".3mf", ".stl", ".obj", ".step", ".stp", ".amf")
 
 
-def _assemble_paths_inside(path: Path, inside: Callable[[str, str], str]) -> None:
-    """Every model path of an assemble list must pass `inside` (the escape hatch's working-tree rule)."""
+def _assemble_paths_inside(path: Path, inside: Callable[[str, str], str], scratch: Path | None = None) -> str:
+    """Every model path of an assemble list must pass `inside` (the escape hatch's working-tree rule). With `scratch`,
+    write a copy with those resolved absolute paths there and return its path; else return `path`."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
@@ -128,7 +129,13 @@ def _assemble_paths_inside(path: Path, inside: Callable[[str, str], str]) -> Non
     for plate in plates if isinstance(plates, list) else []:
         for o in (plate.get("objects") or []) if isinstance(plate, dict) else []:
             if isinstance(o, dict) and isinstance(o.get("path"), str):
-                inside(o["path"], f"assemble-list model path in {path.name}:")
+                o["path"] = inside(o["path"], f"assemble-list model path in {path.name}:")
+    if scratch is None:
+        return str(path)
+    scratch.mkdir(parents=True, exist_ok=True)
+    copy = scratch / f"assemble-{path.name}"
+    copy.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    return str(copy.resolve())
 
 
 def signed(status: int) -> int:
@@ -150,13 +157,15 @@ class CliCommand:
     _slice: int | None = None
 
     @classmethod
-    def parse(cls, argv: list[str], cwd: str | Path | None = None) -> CliCommand:
+    def parse(cls, argv: list[str], cwd: str | Path | None = None, scratch: str | Path | None = None) -> CliCommand:
         """A raw Studio argument list as a checked command, for `shambu studio --`. The builder rules apply: `--flag 1`
         becomes `--flag=1`, pre-slice actions move before `--slice`, no action is refused (the GUI would open), and
         `--export-3mf` takes a bare name. Refused: `--pipe`, `--datadir` (shambu owns it), `--uptodate*`,
         `--downward*`, short options, a malformed `--slice` plate, and any path outside the working tree `cwd`:
         positional inputs, every `;`-separated path of a path-valued option (symlinks resolved), and the model paths
-        of an assemble list. Relative paths resolve against `cwd`, because the binary runs in its private datadir."""
+        of an assemble list. Relative paths resolve against `cwd`, because the binary runs in its private datadir. Studio
+        reads an assemble list's model paths verbatim from that datadir, so with `scratch` the list is rewritten there
+        with the resolved, checked absolute paths and the command loads that copy (without `scratch`: check only)."""
         root = Path(cwd or os.getcwd()).resolve()
 
         def inside(v: str, what: str) -> str:
@@ -191,7 +200,7 @@ class CliCommand:
                 if name in _PATH_VALUE and value:
                     value = ";".join(inside(v, name) if v else v for v in value.split(";"))
                 if name == "--load-assemble-list" and value:
-                    _assemble_paths_inside(Path(value), inside)
+                    value = _assemble_paths_inside(Path(value), inside, Path(scratch) if scratch else None)
                 if name == "--slice":
                     try:
                         int(value or 0)

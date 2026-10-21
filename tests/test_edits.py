@@ -1123,3 +1123,88 @@ def test_studio_hatch_contains_every_path(tmp_path):
     ]:
         with pytest.raises(StudioError, match=msg):
             CliCommand.parse(bad, root)
+
+
+# ---------------------------------------------------------------------------- review round 3
+def test_add_filament_extends_a_key_the_preset_omits(tmp_path):
+    path = make_geo_3mf(tmp_path / "two.3mf", filaments=2)
+    ps = Project(str(path)).project_settings
+    preset = {k: v for k, v in NEW_PRESET.items() if k != "filament_density"}
+    es = E.EditSet([E.AddFilament(E.slot_from_preset(ps, preset), "#FCECD6", 1)])
+    es.apply(str(path), str(tmp_path / "three.3mf"))
+    new = Project(str(tmp_path / "three.3mf")).project_settings
+    assert new["filament_density"] == ["1.24", "1.24", "1.24"]
+    assert any("slot 1's value copied" in n and "filament_density" in n for n in es.notes)
+
+
+def test_add_filament_prefers_the_supplied_value_over_a_short_vector(tmp_path):
+    path = make_geo_3mf(tmp_path / "two.3mf", filaments=2, pressure_advance=["0.02"])
+    ps = Project(str(path)).project_settings
+    es = E.EditSet([E.AddFilament(E.slot_from_preset(ps, {**NEW_PRESET, "pressure_advance": ["0.08"]}), "#FCECD6", 1)])
+    es.apply(str(path), str(tmp_path / "three.3mf"))
+    assert Project(str(tmp_path / "three.3mf")).project_settings["pressure_advance"] == ["0.02", "0.02", "0.08"]
+    assert not any("pressure_advance" in n for n in es.notes)
+
+
+def test_composed_relative_moves_add_up(tmp_path, geo_file):
+    out = tmp_path / "out.3mf"
+    es = E.EditSet([E.MoveObject("body", 5, 5, relative=True), E.MoveObject("body", 5, 5, relative=True)])
+    es.apply(str(geo_file), str(out))
+    assert box(out, "body")[0][:2] == pytest.approx((GEO_BODY_AT[0] + 10, GEO_BODY_AT[1] + 10))
+    again = tmp_path / "again.3mf"
+    es.apply(str(out), str(again))  # the set now holds the two absolute targets: a no-op
+    assert again.read_bytes() == out.read_bytes()
+
+
+def test_rename_then_relative_move_and_move_then_rename(tmp_path, geo_file):
+    from shambu.patches import RenameObject
+
+    out = tmp_path / "a.3mf"
+    E.EditSet([RenameObject("body", "shell"), E.MoveObject("shell", 5, 5, relative=True)]).apply(str(geo_file), str(out))
+    assert box(out, "shell")[0][:2] == pytest.approx((GEO_BODY_AT[0] + 5, GEO_BODY_AT[1] + 5))
+    out2 = tmp_path / "b.3mf"
+    E.EditSet([E.MoveObject("body", 70, 80), RenameObject("body", "shell")]).apply(str(geo_file), str(out2))
+    assert box(out2, "shell")[0][:2] == pytest.approx((70, 80))
+
+
+def test_replace_with_a_size_change_then_move(tmp_path, geo_file):
+    stl = write_box_stl(tmp_path / "wide.stl", (0, 0, 0), (40, 20, 10), fine=True)
+    out = tmp_path / "out.3mf"
+    E.EditSet([E.ReplaceMesh("body", str(stl), allow_size_change=True), E.MoveObject("body", 70, 80)]).apply(str(geo_file), str(out))
+    lo, hi = box(out, "body")
+    assert (lo[0], lo[1], hi[0] - lo[0]) == pytest.approx((70, 80, 40))
+
+
+@dataclass(frozen=True)
+class _CachedSneak:
+    """Declares project_settings only, but changes the parsed model settings (no slice to drop)."""
+
+    touches: frozenset[str] = frozenset({"Metadata/project_settings.config"})
+
+    def apply(self, p: Project) -> None:
+        p.model_settings.find("object").set("id", "2")  # type: ignore[union-attr]
+        next(m for m in p.model_settings.iter("metadata") if m.get("key") == "brim_type").set("value", "outer_only")
+        p.touch_model_settings(invalidate=False)
+
+    def describe(self) -> str:
+        return "cached model settings change"
+
+
+def test_dry_run_sees_cached_settings_changes(geo_file):
+    with pytest.raises(ProjectError, match="did not declare"):
+        E.EditSet([_CachedSneak()]).preview(str(geo_file))
+
+
+def test_studio_hatch_rewrites_a_relative_assemble_list(tmp_path):
+    root = tmp_path / "tree"
+    (root / "parts").mkdir(parents=True)
+    (root / "parts" / "a.stl").write_bytes(b"solid x\nendsolid x\n")
+    (root / "list.json").write_text(
+        json.dumps({"plates": [{"plate_name": "p", "need_arrange": False, "objects": [{"path": "parts/a.stl"}]}]})
+    )
+    run_dir = tmp_path / "run"
+    args = CliCommand.parse(["--load-assemble-list", "list.json", "--slice", "1"], root, scratch=run_dir).args()
+    copy_path = Path(args[args.index("--load-assemble-list") + 1])
+    assert copy_path.parent == run_dir.resolve()
+    assert json.loads(copy_path.read_text())["plates"][0]["objects"][0]["path"] == str((root / "parts" / "a.stl").resolve())
+    assert json.loads((root / "list.json").read_text())["plates"][0]["objects"][0]["path"] == "parts/a.stl"  # the user's file stays

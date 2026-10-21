@@ -90,21 +90,21 @@ def verify_filaments(studio: StudioCLI, path: str) -> str:
     """The verify slice: slice plate 1 of the patched archive and look for Studio's variant-lookup miss
     (PrintConfig.cpp:8935), which runs when a slice applies the config, not on a plain export. Only exit 0 with a
     readable log passes; a crash, a timeout, a failed slice or a missing log raises EditError."""
-    with tempfile.TemporaryDirectory(prefix="shambu-verify-") as td:
-        outdir = Path(td)
-        cmd = CliCommand(inputs=[str(Path(path).resolve())]).slice(1, no_check=False).export_3mf("verify.gcode.3mf", outdir)
-        rr = studio.run(cmd, name="add-filament-verify", outputdir=outdir, timeout=1200)
-        try:
-            text = Path(rr.log).read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise EditError(f"verify slice: Studio's log {rr.log} is unreadable ({e}); the filament was not added") from e
+    outdir = Path(tempfile.mkdtemp(prefix="shambu-verify-"))  # kept when the check fails: the error names its log
+    cmd = CliCommand(inputs=[str(Path(path).resolve())]).slice(1, no_check=False).export_3mf("verify.gcode.3mf", outdir)
+    rr = studio.run(cmd, name="add-filament-verify", outputdir=outdir, timeout=1200)
+    try:
+        text = Path(rr.log).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise EditError(f"verify slice: Studio's log {rr.log} is unreadable ({e}); the filament was not added") from e
     if rr.code != 0:
-        raise EditError(f"verify slice: Studio exited {rr.code} ({rr.meaning()}); the filament was not added (log kept: none, temporary)")
+        raise EditError(f"verify slice: Studio exited {rr.code} ({rr.meaning()}); the filament was not added; log {rr.log}")
     if not text.strip():
-        raise EditError("verify slice: Studio wrote an empty log; the filament was not added")
+        raise EditError(f"verify slice: Studio wrote an empty log {rr.log}; the filament was not added")
     if VARIANT_MISS in text:
         line = next(x for x in text.splitlines() if VARIANT_MISS in x)
-        raise EditError(f"verify slice: Studio cannot find a filament's extruder variant: {line.strip()}")
+        raise EditError(f"verify slice: Studio cannot find a filament's extruder variant: {line.strip()}; log {rr.log}")
+    shutil.rmtree(outdir, ignore_errors=True)
     return f"verify slice: Studio sliced plate 1 (exit 0, success); no '{VARIANT_MISS}' in its log"
 
 
@@ -181,11 +181,9 @@ def slice_project(
     prime = [str(v) for v in raw_prime] if isinstance(raw_prime, list) and raw_prime else None
     notes: list[str] = []
     stem = dest.name.removesuffix(".3mf").removesuffix(".gcode")
-    # every pass writes its log, result.json and export into <stem>.slice/ next to the output (kept as the record);
-    # the export there replaces the output only after the run succeeded
-    work = dest.parent / f"{stem}.slice"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
+    # every pass writes its log, result.json and export into a fresh run folder next to the output (kept as the record;
+    # never an existing folder, never removed); the export there replaces the output only after it reads back
+    work = Path(tempfile.mkdtemp(prefix=f"{stem}.slice-", dir=dest.parent))
     tmp_dest = work / f"{stem}.gcode.3mf"
     inp = src
     loads: list[Path] = []
@@ -213,16 +211,19 @@ def slice_project(
     rr, skipped = two_pass_slice(
         studio, make, name=stem, outputdir=work, timeout=timeout, expect_output=tmp_dest, no_check=no_check, plates=plates
     )
-    if rr.ok:
-        os.replace(tmp_dest, dest)
-        rr = RunResult(rr.cmd, rr.status, rr.code, rr.seconds, rr.log, rr.result, dest)
     if inp != src:
         inp.unlink(missing_ok=True)
-    res = SliceResult(src, dest, rr, skipped, notes=notes)
+    estimates: list[dict] = []
     if rr.ok:
-        s = summarise(dest, rr)
+        try:  # read the export back before it replaces anything
+            s = summarise(tmp_dest, rr)
+        except BambuError as e:
+            raise EditError(f"Studio exited 0 but its export {tmp_dest} does not read back ({e}); {dest} is unchanged") from e
         by_id = {sp.id: sp for sp in rr.plates()}
-        res.estimates = [_estimate(pl, by_id.get(pl["id"])) for pl in s["plates"] if pl.get("slice")]
+        estimates = [_estimate(pl, by_id.get(pl["id"])) for pl in s["plates"] if pl.get("slice")]
+        os.replace(tmp_dest, dest)
+        rr = RunResult(rr.cmd, rr.status, rr.code, rr.seconds, rr.log, rr.result, dest)
+    res = SliceResult(src, dest, rr, skipped, estimates=estimates, notes=notes)
     if prime:
         notes.append(f"filament_prime_volume pinned to the project's {prime} in every pass (Studio resets it to 45 on a checked slice)")
     notes.append(f"logs and Studio's result.json: {work}")
@@ -235,10 +236,10 @@ def studio_raw(studio: StudioCLI, raw: list[str], cwd: Path, out_dir: Path, time
     folder `<out_dir>/studio-runs/<UTC stamp>/`: command.json, the log, result.json, exit.txt."""
     from . import __version__  # at call time: shambu/__init__ imports the facade, which imports this module
 
-    cmd = CliCommand.parse(raw, cwd)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     run_dir = Path(out_dir).resolve() / "studio-runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
+    cmd = CliCommand.parse(raw, cwd, scratch=run_dir)  # an assemble list is rewritten into the run folder
     cmd.option("outputdir", str(run_dir))
     rr = studio.run(cmd, name="studio", outputdir=run_dir, timeout=timeout)
     (run_dir / "command.json").write_text(

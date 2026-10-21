@@ -1081,6 +1081,55 @@ FILAMENT_VARIANT_KEYS = frozenset(
         "filament_preheat_temperature_delta", "filament_cooling_before_tower", "slow_down_min_speed",
     }
 )  # fmt: skip
+# The keys of a Studio filament preset (reference 03 appendix, "filament: 128 keys"): with the per-variant set below and
+# PROJECT_ONLY_KEYS this is the per-filament schema, so a key the new preset omits is still extended (with a WARN). It is
+# a list, not a length test: in a one-filament project wipe_tower_x or thumbnail_size also hold one entry, and with two
+# filaments on two extruders every per-extruder key holds two.
+FILAMENT_KEYS = frozenset(
+    {
+        "activate_air_filtration", "additional_cooling_fan_speed", "additional_fan_full_speed_layer",
+        "chamber_temperatures", "circle_compensation_speed", "close_additional_fan_first_x_layers",
+        "close_fan_the_first_x_layers", "complete_print_exhaust_fan_speed", "cool_plate_temp",
+        "cool_plate_temp_initial_layer", "cooling_perimeter_transition_distance", "cooling_slowdown_logic",
+        "counter_coef_1", "counter_coef_2", "counter_coef_3", "counter_limit_max", "counter_limit_min",
+        "diameter_limit", "during_print_exhaust_fan_speed", "eng_plate_temp", "eng_plate_temp_initial_layer",
+        "fan_cooling_layer_time", "fan_max_speed", "fan_min_speed", "filament_adaptive_volumetric_speed",
+        "filament_adhesiveness_category", "filament_bridge_speed", "filament_change_length",
+        "filament_cooling_before_tower", "filament_cost", "filament_density", "filament_deretraction_speed",
+        "filament_dev_ams_drying_ams_limitations", "filament_dev_ams_drying_heat_distortion_temperature",
+        "filament_dev_ams_drying_temperature", "filament_dev_ams_drying_time",
+        "filament_dev_chamber_drying_bed_temperature", "filament_dev_chamber_drying_time",
+        "filament_dev_drying_cooling_temperature", "filament_dev_drying_softening_temperature", "filament_diameter",
+        "filament_enable_overhang_speed", "filament_end_gcode", "filament_extruder_compatibility",
+        "filament_extruder_variant", "filament_flow_ratio", "filament_flush_temp", "filament_flush_temp_fast",
+        "filament_flush_volumetric_speed", "filament_is_support", "filament_long_retractions_when_cut",
+        "filament_max_volumetric_speed", "filament_metal_stickiness", "filament_minimal_purge_on_wipe_tower",
+        "filament_overhang_1_4_speed", "filament_overhang_2_4_speed", "filament_overhang_3_4_speed",
+        "filament_overhang_4_4_speed", "filament_overhang_totally_speed", "filament_pre_cooling_temperature",
+        "filament_pre_cooling_temperature_nc", "filament_preheat_temperature_delta", "filament_prime_volume",
+        "filament_prime_volume_nc", "filament_printable", "filament_ramming_travel_time",
+        "filament_ramming_travel_time_nc", "filament_ramming_volumetric_speed",
+        "filament_ramming_volumetric_speed_nc", "filament_retract_before_wipe", "filament_retract_length_nc",
+        "filament_retract_restart_extra", "filament_retract_when_changing_layer",
+        "filament_retraction_distances_when_cut", "filament_retraction_length",
+        "filament_retraction_minimum_travel", "filament_retraction_speed", "filament_scarf_gap",
+        "filament_scarf_height", "filament_scarf_length", "filament_scarf_seam_type", "filament_settings_id",
+        "filament_shrink", "filament_soluble", "filament_start_gcode",
+        "filament_tower_interface_pre_extrusion_dist", "filament_tower_interface_pre_extrusion_length",
+        "filament_tower_interface_print_temp", "filament_tower_interface_purge_volume",
+        "filament_tower_ironing_area", "filament_type", "filament_velocity_adaptation_factor", "filament_vendor",
+        "filament_wipe", "filament_wipe_distance", "filament_z_hop", "filament_z_hop_types",
+        "first_x_layer_fan_speed", "full_fan_speed_layer", "hole_coef_1", "hole_coef_2", "hole_coef_3",
+        "hole_limit_max", "hole_limit_min", "hot_plate_temp", "hot_plate_temp_initial_layer", "impact_strength_z",
+        "long_retractions_when_ec", "no_slow_down_for_cooling_on_outwalls", "nozzle_temperature",
+        "nozzle_temperature_initial_layer", "nozzle_temperature_range_high", "nozzle_temperature_range_low",
+        "overhang_fan_speed", "overhang_fan_threshold", "override_process_overhang_speed",
+        "reduce_fan_stop_start_freq", "required_nozzle_HRC", "retraction_distances_when_ec",
+        "slow_down_for_layer_cooling", "slow_down_layer_time", "slow_down_min_speed", "supertack_plate_temp",
+        "supertack_plate_temp_initial_layer", "temperature_vitrification", "textured_plate_temp",
+        "textured_plate_temp_initial_layer", "volumetric_speed_coefficients"
+    }
+)  # fmt: skip
 ODD_FILAMENT_KEYS = frozenset(
     {"filament_dev_ams_drying_temperature", "filament_dev_ams_drying_time", "filament_dev_ams_drying_ams_limitations"}
 )
@@ -1123,7 +1172,7 @@ def filament_shape(ps: dict, preset: dict) -> FilamentShape:
     ):
         raise EditError(f"filament_self_index {fsi} does not number {n} filament blocks in order; the project is not a Studio layout")
     per_variant = sorted(k for k in FILAMENT_VARIANT_KEYS if isinstance(ps.get(k), list) and k != "filament_extruder_variant")
-    keys = {k for k, v in preset.items() if isinstance(v, list)} | set(PROJECT_ONLY_KEYS) | {"filament_ids"}
+    keys = {k for k, v in preset.items() if isinstance(v, list)} | FILAMENT_KEYS | set(PROJECT_ONLY_KEYS) | {"filament_ids"}
     per_filament = sorted(
         k for k in keys - set(FILAMENT_VARIANT_KEYS) - ODD_FILAMENT_KEYS - _PRESET_META - _SPECIAL_KEYS if isinstance(ps.get(k), list)
     )
@@ -1208,7 +1257,7 @@ def _project_only(project_ps: dict, preset: dict, single: dict[str, str]) -> tup
     copied = []
     for k in PROJECT_ONLY_KEYS:
         cur = project_ps.get(k)
-        if k in single or not isinstance(cur, list) or len(cur) != n:
+        if k in single or not isinstance(cur, list) or len(cur) not in (n, 1) or not cur:  # one entry = every slot
             continue
         pv = preset.get(k)
         if isinstance(pv, list) and pv:
@@ -1342,7 +1391,8 @@ class AddFilament:
         # every recognised per-filament key: the slot's own, the project-only ones, the colours and the maps. A
         # one-entry vector ("every slot uses entry 0") is written out first; a key with no value for the new slot
         # takes slot 1's value, and the report names it.
-        for k in sorted(set(singles) | set(PROJECT_ONLY_KEYS) | set(named)):
+        per_filament = set(singles) | set(shape.per_filament) | set(PROJECT_ONLY_KEYS) | set(named)
+        for k in sorted(per_filament):
             cur = ps.get(k)
             if not isinstance(cur, list):
                 if k in ps and k in singles:
@@ -1411,7 +1461,9 @@ class AddFilament:
             if fv is not None and len(fv.split()) == n:
                 _set_meta(pl, "filament_volume_maps", f"{fv} 0".strip())
         p.touch_model_settings()
-        self._check(p, before, lookup_before, n, changed, e, set(blocks) | (FILAMENT_VARIANT_KEYS - {"filament_extruder_variant"}))
+        self._check(
+            p, before, lookup_before, n, changed, e, set(blocks) | (FILAMENT_VARIANT_KEYS - {"filament_extruder_variant"}), per_filament
+        )
         p.notes.append(
             f"add-filament: slot {n + 1} = {self.slot.preset} {colour} on extruder {self.extruder}; {len(changed)} per-filament keys "
             f"extended, flush_volumes_matrix {e} x {n + 1} x {n + 1}, plate filament_maps extended; slots 1..{n} unchanged"
@@ -1432,14 +1484,28 @@ class AddFilament:
             )
         p.notes.append(f"  slot {n + 1} is unused until --extruder, --set OBJ:support_interface_filament={n + 1} or --range uses it")
 
-    def _check(self, p: Project, before: dict, lookup_before: dict, n: int, changed: list[str], e: int, variant_keys: set[str]) -> None:
+    def _check(
+        self,
+        p: Project,
+        before: dict,
+        lookup_before: dict,
+        n: int,
+        changed: list[str],
+        e: int,
+        variant_keys: set[str],
+        per_filament: set[str] | None = None,
+    ) -> None:
         """The whole recognised schema after the edit: lengths, the blocks, the variant lookup, the flush matrix, the
         plate maps, that the requested colour and extruder landed, and that slots 1..N are unchanged."""
         ps = p.project_settings
         bad: list[str] = []
         v = len(ps["filament_extruder_variant"])
         for k in (
-            set(PROJECT_ONLY_KEYS) | set(MAP_KEYS) | {"filament_colour", "filament_multi_colour", "filament_settings_id"} | set(changed)
+            set(PROJECT_ONLY_KEYS)
+            | set(MAP_KEYS)
+            | {"filament_colour", "filament_multi_colour", "filament_settings_id"}
+            | set(changed)
+            | (per_filament or set())
         ):
             cur = ps.get(k)
             if isinstance(cur, list) and k not in variant_keys and len(cur) != n + 1:
@@ -1506,21 +1572,53 @@ class EditSet(PatchSet):
     notes: list[str] = field(default_factory=list)
 
     def _run(self, project: Project) -> list[str]:
-        self.patches = [x.absolute(project) if isinstance(x, MoveObject) else x for x in self.patches]
+        """Apply in order. A relative move is resolved against the project as it stands just before that move (so two
+        `+5,+5` moves end at +10, and a rename before it is seen), and the absolute target replaces it in the set. For
+        each moved object the last move's target and the object's id, size and z range just before that move are kept
+        for verification (`_moves`), so a replace or rename around the move does not trip the check."""
+        resolved: list = []
         done = []
+        self._moves: dict[str, tuple[MoveObject, Vec, float]] = {}
         for patch in self.patches:
             try:
+                if isinstance(patch, MoveObject):
+                    patch = patch.absolute(project)
+                    obj = find_object(project, patch.object_name)
+                    lo, hi = _Geometry(project).world_box(obj)
+                    self._moves[obj.oid] = (patch, _size(lo, hi), lo[2])
                 patch.apply(project)
             except (ValueError, KeyError, IndexError, StopIteration, ET.ParseError) as e:
                 raise EditError(f"{patch.describe()}: malformed project data ({type(e).__name__}: {e})") from e
+            resolved.append(patch)
             done.append(patch.describe())
+        self.patches = resolved
         return done
+
+    def _verify_moves(self, after: Project) -> None:
+        root = _root(after)
+        for oid, (move, size, zmin) in self._moves.items():
+            ms = next((o for o in after.model_settings.findall("object") if o.get("id") == oid), None)
+            if ms is None:
+                raise EditError(f"re-open check: the object moved as '{move.object_name}' (id {oid}) is gone")
+            obj = _object(after, ms, root)
+            lo, hi = _Geometry(after).world_box(obj)
+            o = _origin(after, _plate_of(after, oid))
+            if abs(lo[0] - o[0] - move.x) > 1e-3 or abs(lo[1] - o[1] - move.y) > 1e-3:
+                raise EditError(
+                    f"re-open check: '{obj.name}' min corner is ({lo[0] - o[0]:.4f}, {lo[1] - o[1]:.4f}), not ({move.x}, {move.y})"
+                )
+            if any(abs(a - b) > 1e-3 for a, b in zip(_size(lo, hi), size, strict=True)) or abs(lo[2] - zmin) > 1e-3:
+                raise EditError(
+                    f"re-open check: '{obj.name}' is {_v3(_size(lo, hi))} mm from z {lo[2]:.3f}; before its move it was {_v3(size)} mm "
+                    f"from z {zmin:.3f}"
+                )
 
     def preview(self, path: str) -> list[str]:
         """Apply in memory without writing (for --dry-run), with the same touches check as a save: the notes, including
         the move targets."""
         project = Project(path)
         self._run(project)
+        project.materialise()  # the bytes a save would write, so the touches check sees cached settings changes
         project.check_touches(touches_of(self.patches, project))
         self.notes = list(project.notes)
         return self.notes
@@ -1535,8 +1633,9 @@ class EditSet(PatchSet):
             after = Project(tmp)
             for patch in self.patches:
                 v = getattr(patch, "verify", None)
-                if callable(v):
+                if callable(v) and not isinstance(patch, MoveObject):
                     v(after, before)
+            self._verify_moves(after)
             if check is not None:
                 check(tmp)
 

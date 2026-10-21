@@ -807,16 +807,21 @@ class Project:
         return removed
 
     # ------------------------------------------------------------------ (c) write
-    def save(self, out_path: str, touches: Iterable[str] | None = None, verify: Callable[[str], None] | None = None) -> None:
-        """Write the project atomically. `touches` are the entry patterns the applied patches declared (default
-        `Metadata/*`); check_touches() runs first, so an undeclared change raises before anything is written.
-        `verify(tmp_path)` runs on the written temporary archive before it replaces `out_path`: when it raises, the
-        destination stays as it was."""
+    def materialise(self) -> None:
+        """Serialise the parsed settings that patches changed into their entries, without writing a file. save() and
+        a dry run share it, so both compare the same bytes."""
         if MODEL_SETTINGS in self._dirty:
             self._put(MODEL_SETTINGS, _xml_bytes(self.model_settings, "  "))
         if PROJECT_SETTINGS in self._dirty:
             s = json.dumps(self.project_settings, indent=4, ensure_ascii=False)
             self._put(PROJECT_SETTINGS, (s + ("\n" if self._ps_trailing_nl else "")).encode("utf-8"))
+
+    def save(self, out_path: str, touches: Iterable[str] | None = None, verify: Callable[[str], None] | None = None) -> None:
+        """Write the project atomically. `touches` are the entry patterns the applied patches declared (default
+        `Metadata/*`); check_touches() runs first, so an undeclared change raises before anything is written.
+        `verify(tmp_path)` runs on the written temporary archive before it replaces `out_path`: when it raises, the
+        destination stays as it was."""
+        self.materialise()
         names = self.names()
         if MODEL_SETTINGS in names:
             ms = names.index(MODEL_SETTINGS)

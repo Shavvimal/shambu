@@ -665,8 +665,9 @@ on the first conflicting plate (BambuStudio.cpp:7105-7109), and -100 is also the
 (BambuStudio.cpp:7413-7418): only a -100 whose log has `found slicing warnings:` is skippable. A checked slice of a BBL
 3MF without `--load-filaments` resets `filament_prime_volume` to 45, a `--no-check` one does not
 (BambuStudio.cpp:6886-6894); `shambu slice` pins the project's values in every pass. Each pass writes its log and
-`result.json` into its own folder `<name>.slice/<name>.passes/{checked[-plate-N],checked-all,nocheck}/` next to the output; the
-export replaces the output only after the run succeeded, and an output that is the input is refused.
+`result.json` into its own folder `<name>.slice-<random>/<name>.passes/{checked[-plate-N],checked-all,nocheck}/` next to
+the output (a fresh folder per run, never an existing one); the export replaces the output only after it reads back, and
+an output that is the input is refused.
 
 **The touches contract.** Every patch declares the entries it changes, including what `invalidate_slices` removes
 (`Metadata/plate_N.gcode`, `.md5`, `plate_N.json`, the `slice_info.config` plates) and rewrites
