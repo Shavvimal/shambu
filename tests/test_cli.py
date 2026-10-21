@@ -2,6 +2,7 @@
 
 import json
 import zipfile
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -417,26 +418,43 @@ def test_patch_tower_one_plate(capsys, tmp_path):
     assert Project(str(path)).project_settings["wipe_tower_x"] == ["208", "120", "208"]
 
 
-def _scratch_3mf(tmp_path):
-    """The canned scratch export: the one-filament project as Studio's CLI writes it after loading two filaments."""
-    from shambu.threemf import Project
-    from test_edits import scratch_settings
-
-    src = _geo(tmp_path, filaments=1)
-    ps = Project(str(src)).project_settings
-    scratch = tmp_path / "scratch.3mf"
-    with zipfile.ZipFile(src) as z, zipfile.ZipFile(scratch, "w") as w:
+def _with_settings(src, dest, ps):
+    with zipfile.ZipFile(src) as z, zipfile.ZipFile(dest, "w") as w:
         for i in z.infolist():
             data = z.read(i.filename)
             if i.filename == "Metadata/project_settings.config":
-                data = json.dumps(scratch_settings(ps, 1), indent=4).encode()
+                data = json.dumps(ps, indent=4).encode()
             w.writestr(i, data)
-    return src, scratch
+    return dest
+
+
+def _scratch_3mf(tmp_path, src=None):
+    """The canned scratch exports of a one-filament project: the new preset alone (normalised), then all slots."""
+    from shambu.threemf import Project
+    from test_edits import normalised_settings, scratch_settings
+
+    src = src or _geo(tmp_path, filaments=1)
+    ps = Project(str(src)).project_settings
+    norm = _with_settings(src, tmp_path / "normalised.3mf", normalised_settings(ps))
+    flush = _with_settings(src, tmp_path / "flush.3mf", scratch_settings(ps, 1))
+    return src, [norm, flush, norm]
+
+
+@dataclass
+class FixturesStudio(FakeStudio):
+    """FakeStudio that copies fixtures[i] on call i."""
+
+    fixtures: list = field(default_factory=list)
+
+    def run(self, cmd, **kw):
+        i = len([c for c in self.calls if c[0] == "run"])
+        self.fixture = self.fixtures[min(i, len(self.fixtures) - 1)]
+        return super().run(cmd, **kw)
 
 
 def test_patch_add_filament_with_studio(capsys, tmp_path, monkeypatch, resolver):
     src, scratch = _scratch_3mf(tmp_path)
-    studio = FakeStudio(scratch)
+    studio = FixturesStudio(fixtures=scratch)
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
     out_path = tmp_path / "two.3mf"
     code, out, _ = run(capsys, "--json", "patch", str(src), "-o", str(out_path), "--add-filament", "Test PETG Basic:#FCECD6@2")
@@ -449,7 +467,8 @@ def test_patch_add_filament_with_studio(capsys, tmp_path, monkeypatch, resolver)
     assert ps["filament_self_index"] == ["1"] * 6 + ["2"] * 6
     assert any(n.startswith("verify: Studio sliced plate 1") for n in doc["notes"])
     runs = [c[1] for c in studio.calls if c[0] == "run"]
-    assert len(runs) == 2 and any("--load-filaments" in a for a in runs[0]) and "--slice=1" in runs[1]
+    assert len(runs) == 3 and all("--load-filaments" in r for r in runs[:2]) and "--slice=1" in runs[2]
+    assert runs[0][runs[0].index("--load-filaments") + 1].endswith("filament-new.json")  # the new preset alone
 
 
 def test_patch_add_filament_without_studio_warns(capsys, tmp_path, monkeypatch, resolver):
@@ -538,11 +557,11 @@ def test_patch_add_filament_with_an_absent_old_preset(capsys, tmp_path, monkeypa
     from conftest import make_geo_3mf
 
     src = make_geo_3mf(tmp_path / "gone.3mf", filaments=1, filament_settings_id=["My Deleted PLA"])
-    _, scratch = _scratch_3mf(tmp_path)
-    studio = FakeStudio(scratch)
+    _, scratch = _scratch_3mf(tmp_path, src)
+    studio = FixturesStudio(fixtures=scratch)
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
     code, out, _ = run(capsys, "--json", "patch", str(src), "-o", str(tmp_path / "o.3mf"), "--add-filament", "Test PETG Basic:#FCECD6@2")
     assert code == 0, out
-    argv = studio.calls[0][1]
+    argv = studio.calls[1][1]
     loads = argv[argv.index("--load-filaments") + 1]
     assert loads.endswith("filament-1.json;" + loads.split(";")[1]) and loads.split(";")[1].endswith("filament-new.json")

@@ -901,25 +901,28 @@ def _add_filament(app, file: str, arg: str, allow_duplicate: bool) -> AddFilamen
         work = Path(td)
         src = work / "in.3mf"
         shutil.copyfile(file, src)
-        # slots 1..N from the project's own settings (their presets may be custom or gone), slot N+1 the new preset;
-        # every JSON carries a filament_colour, else the CLI's vector-size check fails (exit -5), as build.py knows
+        new_json = presets.write({**preset, "filament_colour": [colour]}, work / "filament-new.json")
+
+        def export(name: str, paths: list[Path], cols: list[str]) -> dict:
+            outdir = work / name
+            outdir.mkdir()
+            cmd = CliCommand(inputs=[str(src)]).load_filaments(*paths).setting("filament_colour", ";".join(cols))
+            rr = studio.run(
+                cmd.export_3mf("scratch.3mf", outdir), name=name, outputdir=outdir, timeout=300, expect_output=outdir / "scratch.3mf"
+            )
+            if not rr.ok:
+                raise StudioError(f"the scratch export ({name}) for the new filament failed: {rr.summary()}")
+            return Project(str(outdir / "scratch.3mf")).project_settings
+
+        # 1. the new preset alone: Studio's normalised values for it, as slot 1 of the scratch copy
+        normalised = export("add-filament-normalise", [new_json], [colour])
+        # 2. slots 1..N from the project's own settings (their presets may be custom or gone) plus the new one, with
+        # every colour: only its flush matrix is read. Every JSON carries a filament_colour, else the CLI's vector-size
+        # check fails (exit -5), as build.py knows.
         old = slot_presets(ps, preset)
-        cols = [f["filament_colour"][0].upper() for f in old] + [colour]
-        paths = [presets.write(f, work / f"filament-{i}.json") for i, f in enumerate(old, 1)]
-        paths.append(presets.write({**preset, "filament_colour": [colour]}, work / "filament-new.json"))
-        outdir = work / "out"
-        outdir.mkdir()
-        cmd = (
-            CliCommand(inputs=[str(src)])
-            .load_filaments(*paths)
-            .setting("filament_colour", ";".join(cols))
-            .export_3mf("scratch.3mf", outdir)
-        )
-        rr = studio.run(cmd, name="add-filament-scratch", outputdir=outdir, timeout=300, expect_output=outdir / "scratch.3mf")
-        if not rr.ok:
-            raise StudioError(f"the scratch export that normalises the new filament failed: {rr.summary()}")
-        scratch = Project(str(outdir / "scratch.3mf")).project_settings
-    return AddFilament(slot_from_export(ps, scratch, preset), colour, extruder, allow_duplicate)
+        paths = [presets.write(f, work / f"filament-{i}.json") for i, f in enumerate(old, 1)] + [new_json]
+        flush = export("add-filament-flush", paths, [f["filament_colour"][0].upper() for f in old] + [colour])
+    return AddFilament(slot_from_export(ps, normalised, preset, flush), colour, extruder, allow_duplicate)
 
 
 def _verify_filaments(app, path: str) -> str:

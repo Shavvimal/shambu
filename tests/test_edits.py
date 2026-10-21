@@ -298,9 +298,23 @@ def one_filament(tmp_path) -> Path:
     return make_geo_3mf(tmp_path / "one.3mf", filaments=1)
 
 
+def normalised_settings(ps: dict) -> dict:
+    """What Studio's CLI export of a scratch copy loaded with the new preset alone holds: one filament, the new one,
+    its variant block normalised (250 for the temperatures), the project-only keys as the project had them."""
+    shape = E.filament_shape(ps, NEW_PRESET)
+    s = copy.deepcopy(ps)
+    for k in shape.per_filament:
+        s[k] = [str(ps[k][0])] if k in E.PROJECT_ONLY_KEYS else [str((NEW_PRESET.get(k) or ps[k])[0])]
+    for k in shape.per_variant:
+        s[k] = [str(x) for x in NEW_PRESET[k]] if k in NEW_PRESET else [str(ps[k][0])] * 6
+    s.update(filament_settings_id=["Test PETG Basic"], filament_extruder_variant=list(VARIANTS), filament_self_index=["1"] * 6)
+    return s
+
+
 def add_patch(path: Path, colour: str = "#FCECD6", extruder: int = 2, **kw) -> E.AddFilament:
     ps = Project(str(path)).project_settings
-    slot = E.slot_from_export(ps, scratch_settings(ps, len(ps["filament_settings_id"])), NEW_PRESET)
+    n = len(ps["filament_settings_id"])
+    slot = E.slot_from_export(ps, normalised_settings(ps), NEW_PRESET, scratch_settings(ps, n))
     return E.AddFilament(slot, colour, extruder, **kw)
 
 
@@ -342,6 +356,16 @@ def test_add_filament_keeps_existing_slots(tmp_path):
             assert after[k][: len(v)] == v, k
     assert after["inherits_group"][0] == before["inherits_group"][0] and after["inherits_group"][-1] == before["inherits_group"][-1]
     assert after["flush_volumes_matrix"][0] == "0"
+
+
+def test_add_filament_reads_the_normalised_slot(tmp_path):
+    path = one_filament(tmp_path)
+    ps = Project(str(path)).project_settings
+    slot = E.slot_from_export(ps, normalised_settings(ps), NEW_PRESET, scratch_settings(ps, 1))
+    assert dict(slot.block)["nozzle_temperature"] == ("250",) * 6
+    assert dict(slot.single)["filament_type"] == "PETG" and slot.flush == ("0", "609", "182", "0") * 2
+    with pytest.raises(E.EditError, match="slot 1 is"):
+        E.slot_from_export(ps, ps, NEW_PRESET)  # an export whose slot 1 is not the new preset
 
 
 def test_add_filament_self_index_blocks(tmp_path):
@@ -756,7 +780,9 @@ def test_add_filament_two_to_three_keeps_flush_cells(tmp_path):
     scratch = scratch_settings(ps, 2)
     scratch["flush_volumes_matrix"] = [str(100 + i) for i in range(18)]
     out = tmp_path / "three.3mf"
-    E.EditSet([E.AddFilament(E.slot_from_export(ps, scratch, NEW_PRESET), "#FCECD6", 1)]).apply(str(path), str(out))
+    E.EditSet([E.AddFilament(E.slot_from_export(ps, normalised_settings(ps), NEW_PRESET, scratch), "#FCECD6", 1)]).apply(
+        str(path), str(out)
+    )
     new = Project(str(out)).project_settings
     assert new["filament_self_index"] == ["1"] * 6 + ["2"] * 6 + ["3"] * 6
     fvm = new["flush_volumes_matrix"]

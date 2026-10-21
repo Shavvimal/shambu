@@ -1131,20 +1131,26 @@ def _project_only(project_ps: dict, preset: dict, single: dict[str, str]) -> tup
     return (f"copied from slot 1 (no preset value): {', '.join(copied)}",) if copied else ()
 
 
-def slot_from_export(project_ps: dict, scratch_ps: dict, preset: dict) -> FilamentSlot:
-    """Slot values from Studio's CLI export of a scratch copy loaded with the N slot_presets() plus the new preset:
-    entry N of every per-filament key and the last block of every per-variant key. Slots 1..N of the export are
-    ignored. A key the export lacks or holds in another shape takes the preset's value, and the notes say so."""
+def slot_from_export(project_ps: dict, normalised_ps: dict, preset: dict, flush_ps: dict | None = None) -> FilamentSlot:
+    """Slot values from two scratch CLI exports. `normalised_ps`: a scratch copy loaded with the new preset ALONE, so it
+    is slot 1 there; entry 0 of every per-filament key and the first block of every per-variant key are Studio's
+    normalised values. (An export loaded with N+1 filaments does not do: it writes the per-filament keys in slot order
+    but the loaded preset's variant block FIRST and filament_self_index all "1", live on 02.08.02.61.) `flush_ps`: the
+    export loaded with slot_presets() plus the new preset and N+1 colours, read only for its E x (N+1)^2 flush matrix.
+    A key the export lacks or holds in another shape takes the preset's value, and the notes say so."""
     shape = filament_shape(project_ps, preset)
     variants, notes = _variants_of(preset, project_ps, shape)
     b = len(variants)
+    got = [str(x) for x in normalised_ps.get("filament_settings_id") or []]
+    if not got or got[0] != str(preset.get("name", "")):
+        raise EditError(f"the scratch export's slot 1 is {got[:1]}, not the new preset {preset.get('name')!r}: its values cannot be read")
     single: dict[str, str] = {}
     block: dict[str, tuple[str, ...]] = {}
     from_preset: list[str] = []
     for k in shape.per_variant:
-        v = scratch_ps.get(k)
-        if isinstance(v, list) and len(v) == shape.v + b:
-            block[k] = tuple(str(x) for x in v[shape.v :])
+        v = normalised_ps.get(k)
+        if isinstance(v, list) and len(v) >= b and len(v) % b == 0 and b > 0:
+            block[k] = tuple(str(x) for x in v[:b])
         elif isinstance(v, list) and len(v) == 1:
             block[k] = (str(v[0]),) * b
         elif isinstance(preset.get(k), list) and len(preset[k]) in (1, b):
@@ -1152,9 +1158,11 @@ def slot_from_export(project_ps: dict, scratch_ps: dict, preset: dict) -> Filame
             block[k] = tuple(pv if len(pv) == b else pv * b)
             from_preset.append(k)
     for k in shape.per_filament:
-        v = scratch_ps.get(k)
-        if isinstance(v, list) and len(v) == shape.n + 1:
-            single[k] = str(v[shape.n])
+        v = normalised_ps.get(k)
+        if k in PROJECT_ONLY_KEYS:
+            continue  # the CLI keeps the project's own values there: _project_only() decides, with a note
+        if isinstance(v, list) and v:
+            single[k] = str(v[0])
         elif isinstance(preset.get(k), list) and preset[k]:
             single[k] = str(preset[k][0])
             from_preset.append(k)
@@ -1162,7 +1170,7 @@ def slot_from_export(project_ps: dict, scratch_ps: dict, preset: dict) -> Filame
     notes += _project_only(project_ps, preset, single)
     if from_preset:
         notes += (f"from the preset JSON (the export holds them in another shape): {', '.join(sorted(from_preset))}",)
-    fvm = scratch_ps.get("flush_volumes_matrix")
+    fvm = (flush_ps or {}).get("flush_volumes_matrix")
     flush = tuple(str(x) for x in fvm) if isinstance(fvm, list) and len(fvm) == shape.e * (shape.n + 1) ** 2 else None
     return FilamentSlot(
         str(preset.get("name", "")), variants, tuple(sorted(single.items())), tuple(sorted(block.items())), flush, "studio", notes
