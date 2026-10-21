@@ -118,7 +118,7 @@ def check_line(c: L.Check) -> str:
         return c.text  # "Spreads measured: ...": the plan re-ran with the support probe
     if c.kind == "placement" and not c.ok:
         return "PLACEMENT NOT DONE: " + c.text
-    if c.kind == "margin":
+    if c.kind in ("margin", L.REACH_ESTIMATE):
         return ("WARN margin rule: " if c.ok else "FAIL margin rule: ") + c.text
     if c.kind == "brim" and c.ok:
         return "WARN brim: " + c.text

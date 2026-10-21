@@ -697,12 +697,16 @@ def overlaps(a: Rect, b: Rect) -> bool:
 
 
 # ---------------------------------------------------------------------------- checks
+REACH_ESTIMATE = "reach_estimate"  # an estimated support spread past a nozzle's reach: a WARN margin rule, probed by the plan
+
+
 @dataclass
 class Check:
     """One line of the plate's check. `kind` sorts it: body (the parts themselves meet), margin (the margin rule: a
     support spread reaches another part or the bed edge, the bodies are apart), placement (the packer could not place a part), bed, reach, height, spool, tower,
     sequence, mesh, summary, brim (a brim Studio will clip), outline (the bounding box stands in for a mesh that did not
-    rasterise). An ok Check of kind margin, brim or outline is a WARN."""
+    rasterise), reach_estimate (only an estimated spread crosses a nozzle's reach). An ok Check of kind margin, brim,
+    outline or reach_estimate is a WARN."""
 
     ok: bool
     text: str
@@ -710,7 +714,7 @@ class Check:
 
     @property
     def warn(self) -> bool:
-        return self.ok and self.kind in ("margin", "brim", "outline")
+        return self.ok and self.kind in ("margin", "brim", "outline", REACH_ESTIMATE)
 
 
 def spread_base(p: Placed) -> Footprint:
@@ -948,7 +952,8 @@ class ExtruderReach:
     reached 5.5 mm into the right nozzle's dead strip, exit -102 (reference 08 section 3.3b). A slot that prints only
     the support interface counts with the interface spread instead (`Placed.reach_growth`): the seed cradle at x 9.2
     exited -102 with the right nozzle's interface at x 14.3 (reference 06 section 5). One FAIL line per part and
-    extruder, naming every side it crosses. A brim that crosses the reach is a WARN: Studio clips brims to each
+    extruder, naming every side it crosses. A crossing that only an estimated spread makes (the box is inside) is a
+    WARN margin rule (`REACH_ESTIMATE`): the plan measures it, and a probe or spec spread that crosses FAILs. A brim that crosses the reach is a WARN: Studio clips brims to each
     nozzle's printable area (Brim.cpp:1079-1095, 1129-1138)."""
 
     def check(self, placed, ctx):
@@ -979,6 +984,7 @@ class ExtruderReach:
             ("+y", "y", 3, box[3], e["y"][1], e["y"][1] < bed["y"][1], 1),
         )
         fails, limits, brims = [], [], []
+        estimated = []  # the sides only an estimated spread carries past the reach (the box itself is inside)
         for side, axis, i, edge, limit, narrower, sign in sides:
             if not narrower:
                 continue
@@ -986,6 +992,8 @@ class ExtruderReach:
             grow, what = max((p.reach_growth(f) for f in fils), key=lambda r: r[0][i])
             at = edge + sign * grow[i]
             if sign * (at - limit) > 1e-9:
+                if what == "support" and p.spread.source == "estimate" and sign * (edge - limit) <= 1e-9:
+                    estimated.append(f"{axis} {at:.1f} on {side} with its estimated support {grow[i]:.1f} mm")
                 fails.append(f"{axis} {at:.1f} on {side} with its {what} {grow[i]:.1f} mm")
                 aux = side == "+x" and limit != e["x"][1]
                 limits.append(
@@ -999,7 +1007,19 @@ class ExtruderReach:
             at_brim = edge + sign * (s + m)
             if m > 0 and sign * (at_brim - limit) > 1e-9:
                 brims.append((axis, at_brim, side, limit))
-        if fails:
+        if fails and len(estimated) == len(fails):
+            # Only the estimate crosses: advisory, as between two parts. The plan measures it (Pipeline.plan); when it
+            # cannot, this is the answer
+            yield Check(
+                True,
+                f"{p.key} uses filament {names} (extruder {e['index']}, {e['type']}) and reaches "
+                + " and ".join(estimated)
+                + "; "
+                + "; ".join(dict.fromkeys(limits))
+                + "; estimated; the slice decides",
+                REACH_ESTIMATE,
+            )
+        elif fails:
             yield Check(
                 False,
                 f"{p.key} uses filament {names} (extruder {e['index']}, {e['type']}) and reaches "

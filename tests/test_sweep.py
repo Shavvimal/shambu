@@ -360,3 +360,16 @@ def test_write_spec_failure_still_prints_the_table(capsys, sweep_files, monkeypa
     code = cli.main(["sweep", str(sp), "--variants", str(vp), "--write-spec", str(tmp / "best.json"), "--pick", "slow"])
     out = capsys.readouterr().out
     assert code == 3 and "baseline" in out and "slow" in out and out.rstrip().endswith(f"BuildError: cannot write {tmp / 'best.json'}")
+
+
+def test_every_variant_shares_one_probe_cache(tmp_path, monkeypatch):
+    """Each variant builds into its own outdir, but the probe cache is the input spec's: a part is probed once."""
+    from shambu.facade import Bambu
+
+    seen = []
+    monkeypatch.setattr(Bambu, "build", lambda self, spec, **kw: seen.append(kw.get("probe_dir")) or _Result(True, 100, 1.0))
+    monkeypatch.setattr(S, "run", lambda spec_json, variants, build, **kw: [build(spec_json, False) for _ in range(3)] and [])
+    sp = tmp_path / "plate.json"
+    sp.write_text(json.dumps({"name": "c", "outdir": str(tmp_path / "out"), "plates": []}))
+    cli.main(["sweep", str(sp), "--no-slice"])
+    assert len(seen) == 3 and set(seen) == {tmp_path / "out" / ".probe"}

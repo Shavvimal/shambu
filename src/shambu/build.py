@@ -675,7 +675,8 @@ class Pipeline:
         self.placer = placer
         self.checker = checker or L.LimitChecker()
         self.listeners = listeners or []
-        self.probe = probe  # None: a StudioProbe under <outdir>/.probe when a build asks for probe_supports
+        self.probe = probe  # None: a StudioProbe under `probe_dir` (default <outdir>/.probe) when a plan measures
+        self.probe_dir: Path | None = None  # a shared probe cache (sweep: the input spec's outdir, for every variant)
         self.checks_skipped: dict | None = None
 
     def emit(self, event: str, **data) -> None:
@@ -752,14 +753,20 @@ class Pipeline:
 
     @staticmethod
     def _estimate_failure(p: PlannedPlate) -> str | None:
-        """Why the estimates failed this plate, or None: more plates than declared, or no tower spot clear of them."""
+        """Why the estimates failed this plate, or None: more plates than declared, a part left without a position, no
+        tower spot clear of them, or an estimated spread past a nozzle's reach."""
         if not any(x.placed.spread.source == "estimate" for x in p.parts):
             return None
         if p.packed_plates > 1:
             return f"the estimated support spread needed {p.packed_plates} plates"
+        lost = [x.key for x in p.parts if not x.placed.placed and x.placed.spread.source == "estimate"]
+        if lost:
+            return f"the estimated support spread left {', '.join(lost)} without a position"
         t = p.tower
         if t is not None and t.mode == "auto" and (t.problem or t.warning):
             return "the estimated support spread left no tower spot"
+        if any(c.kind == L.REACH_ESTIMATE for c in p.checks):
+            return "the estimated support spread crossed a nozzle's reach"
         return None
 
     @staticmethod
@@ -772,11 +779,13 @@ class Pipeline:
             elif sp.source == "estimate":
                 failed = any(f"({x.spec.key()}): support probe failed" in w for w in warnings)
                 bits.append(f"{x.key}: estimate kept ({'the probe failed' if failed else 'not probed: several files'})")
-        return (
-            f"Spreads measured: {cause}; a solo slice per supported part measured (mm on -x/+x/-y/+y) "
-            + "; ".join(bits)
-            + "; placement uses the measurements"
+        tail = (
+            f"the plate still needs {p.packed_plates} plates with the measurements: the packer's answer (a heuristic, no "
+            "rotation); place the parts with `at` or split the spec"
+            if p.packed_plates > 1
+            else "placement uses the measurements"
         )
+        return f"Spreads measured: {cause}; a solo slice per supported part measured (mm on -x/+x/-y/+y) " + "; ".join(bits) + "; " + tail
 
     def _plan_once(self, spec: Spec, resolution: FilamentResolution | None, probe_plates: set[int] | None) -> Plan:
         """One planning pass. `probe_plates`: the plates whose supported parts the probe measures (None: every plate)."""
@@ -862,7 +871,8 @@ class Pipeline:
         )
         probe: SpreadProbe | None = None
         if probe_plates is None or probe_plates:
-            probe = self.probe or StudioProbe(self.studio, outdir / ".probe", machine, process, filaments, spec.bed_type, fmap)
+            cache = self.probe_dir or outdir / ".probe"
+            probe = self.probe or StudioProbe(self.studio, cache, machine, process, filaments, spec.bed_type, fmap)
         for pi, (pspec, seq) in enumerate(zip(spec.plates, sequences, strict=True), 1):
             on = probe if probe_plates is None or pi in probe_plates else None
             parts = self._measure(pspec.parts, pi, process, problems, len(filaments), used_keys, workdir, orient_settings, on, warnings)
@@ -913,12 +923,7 @@ class Pipeline:
                     )
                 packed = plate_placer.place(free, obstacles, x_min_of, fixed=fixed, x_max_of=x_max_of)
                 placement_checks = self._placement_checks(packed, free, plate_placer)
-                overflow = len(packed) > 1
-                if overflow:
-                    problems.append(
-                        f"plate {pi} '{pspec.name}': the packer put the parts on {len(packed)} plates (a heuristic, no rotation; "
-                        "a hand layout can differ); move some to another plate in the spec or give them an `at`"
-                    )
+                overflow = len(packed) > 1  # the PLACEMENT NOT DONE line says it (one line, not a Problem as well)
             for p in parts:
                 p.place_members()
             requests.append(self._tower_request(pspec, pi, multi, parts, tower_base, facts, spec) if not overflow else None)

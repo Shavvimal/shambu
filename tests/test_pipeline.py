@@ -175,12 +175,13 @@ def test_missing_stl_is_a_problem(tmp_path, stls, resolver):
     assert any("does not exist" in p for p in plan.problems)
 
 
-def test_overfull_plate_is_a_problem(tmp_path, stls, resolver):
+def test_overfull_plate_fails_the_plan_with_one_line(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (200.0, 200.0, 10.0)})
     spec = make_spec(tmp_path, stls)
     spec = Spec.from_json({**spec.to_json(), "plates": [{"name": "p", "parts": [{"path": str(stls["body"]), "count": 2}]}]})
     plan = pipeline(resolver, studio).plan(spec)
-    assert any("the packer put the parts on 2 plates" in p for p in plan.problems)
+    assert not plan.ok and not any("plates" in p for p in plan.problems)  # the PLACEMENT NOT DONE line says it once
+    assert any(c.kind == "placement" and "put the parts on 2 plates" in c.text for c in plan.plates[0].checks)
 
 
 def test_bad_filament_map_is_a_problem(tmp_path, stls, resolver):
@@ -221,7 +222,7 @@ def test_overflow_gives_one_fail_line(tmp_path, stls, resolver):
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], count=3))
     fails = [c.text for c in plan.plates[0].checks if not c.ok]
     assert len(fails) == 1 and "put the parts on 3 plates" in fails[0]  # no repeated overlap and reach failures
-    assert sum("put the parts on 3 plates" in p for p in plan.problems) == 1
+    assert not any("put the parts on 3 plates" in p for p in plan.problems)  # one line, not a Problem as well
 
 
 def test_orientation_without_flat_contact_is_a_problem(tmp_path, resolver):

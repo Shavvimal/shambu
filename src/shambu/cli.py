@@ -693,6 +693,7 @@ class Sweep(Command):
                 do_slice=do_slice,
                 printer=not a.no_printer,
                 allow_filament_mismatch=a.allow_filament_mismatch,
+                probe_dir=Path(str(spec_json.get("outdir") or ".")).expanduser() / ".probe",
                 **({"no_probe": True} if a.no_probe else {}),
             ),
             do_slice=not a.no_slice,

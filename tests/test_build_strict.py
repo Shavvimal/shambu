@@ -997,7 +997,7 @@ def test_no_probe_keeps_the_estimates_answer(tmp_path, resolver):
     probe = _Measured()
     plan = Pipeline(studio, resolver, probe=probe).plan(sp, no_probe=True)
     assert probe.seen == [] and plan.plates[0].packed_plates == 4 and not plan.ok
-    assert any("the packer put the parts on 4 plates (a heuristic" in x for x in plan.problems)
+    assert any(c.kind == "placement" and "put the parts on 4 plates" in c.text for c in plan.plates[0].checks)
 
 
 def test_a_failing_probe_keeps_that_parts_estimate_and_says_so(tmp_path, resolver):
@@ -1008,3 +1008,148 @@ def test_a_failing_probe_keeps_that_parts_estimate_and_says_so(tmp_path, resolve
     assert "d: estimate kept (the probe failed)" in line
     assert next(x for x in p.parts if x.key == "d").placed.spread.source == "estimate"
     assert any("(d): support probe failed (no G-code); the estimate applies" in w for w in plan.warnings)
+
+
+class _Big:
+    """A SpreadProbe fake that measures 30 mm on every side: the second pass still overflows."""
+
+    def __init__(self):
+        self.seen = []
+
+    def measure(self, req):
+        from shambu.probe import ProbeResult
+
+        self.seen.append(req.key)
+        return ProbeResult(L.Spread(30.0, 30.0, 30.0, 30.0, "probe", True))
+
+
+def test_the_tower_trigger_measures_end_to_end(tmp_path, resolver):
+    """One 150 x 150 x 200 part with its walls on filament 2, fixed in the middle: the 26 mm estimate leaves no tower
+    spot clear of it, the 1 mm measurement does."""
+    studio = FakeStudio(sizes={"big.stl": (150.0, 150.0, 200.0)})
+    parts = [
+        {
+            "path": str(stl_named(tmp_path, "big")),
+            "name": "big",
+            "recipes": ["tree-supports"],
+            "at": [53, 53],
+            "set": {"wall_filament": "2"},
+        }
+    ]
+    sp = spec(tmp_path, [{"name": "p", "parts": parts}])
+    est = Pipeline(studio, resolver, probe=_Measured()).plan(sp, no_probe=True)
+    assert est.plates[0].tower is not None and (est.plates[0].tower.warning or est.plates[0].tower.problem)
+    probe = _Measured()
+    plan = Pipeline(studio, resolver, probe=probe).plan(sp)
+    assert probe.seen == ["big"]
+    (line,) = [c.text for c in plan.plates[0].checks if c.kind == "measured"]
+    assert line.startswith("Spreads measured: the estimated support spread left no tower spot")
+    t = plan.plates[0].tower
+    assert t is not None and t.footprint is not None and t.warning is None and t.problem is None
+
+
+def test_the_measured_line_reaches_result_json(tmp_path, resolver):
+    studio, sp = _four_tall(tmp_path)
+    r = Pipeline(studio, resolver, probe=_Measured()).build(sp, export=False)
+    pj = r.to_json()["plates"][0]
+    assert "measured" in pj["check_kinds"] and any(t.startswith("Spreads measured:") for _, t in pj["checks"])
+    assert sum("Spreads measured" in ln for ln in r.report.splitlines()) == 1
+
+
+def test_a_second_pass_that_still_overflows_says_so_once(tmp_path, resolver):
+    studio, sp = _four_tall(tmp_path)
+    r = Pipeline(studio, resolver, probe=_Big()).build(sp, export=False)
+    assert not r.plan.ok
+    (line,) = [c.text for c in r.plan.plates[0].checks if c.kind == "measured"]
+    assert line.endswith(
+        "the plate still needs 4 plates with the measurements: the packer's answer (a heuristic, no rotation); place the "
+        "parts with `at` or split the spec"
+    )
+    assert sum("put the parts on 4 plates" in ln for ln in r.report.splitlines()) == 1  # not in Problems as well
+
+
+def test_a_multi_file_part_keeps_its_estimate_and_is_named(tmp_path, resolver):
+    names = ["a", "b", "c"]
+    studio = FakeStudio(sizes={f"{n}.stl": (115.0, 115.0, 200.0) for n in [*names, "d1", "d2"]})
+    parts = [{"path": str(stl_named(tmp_path, n)), "name": n, "recipes": ["tree-supports"]} for n in names]
+    parts.append(
+        {
+            "name": "d",
+            "recipes": ["tree-supports"],
+            "parts": [{"path": str(stl_named(tmp_path, "d1"))}, {"path": str(stl_named(tmp_path, "d2"))}],
+        }
+    )
+    plan = Pipeline(studio, resolver, probe=_Measured()).plan(boxes_spec(tmp_path, parts))
+    (line,) = [c.text for c in plan.plates[0].checks if c.kind == "measured"]
+    assert "d: estimate kept (not probed: several files)" in line
+
+
+def test_check_writes_the_probe_cache_under_outdir(tmp_path, resolver):
+    names = ["a", "b", "c", "d"]
+    studio = ProbeStudio(sizes={f"{n}.stl": (115.0, 115.0, 200.0) for n in names})
+    parts = [{"path": str(stl_named(tmp_path, n)), "name": n, "recipes": ["tree-supports"]} for n in names]
+    sp = boxes_spec(tmp_path, parts)
+    Pipeline(studio, resolver).build(sp, export=False)
+    assert studio.probes >= 1 and (sp.outdir / ".probe").is_dir()
+
+
+def test_only_the_failing_plate_is_probed(tmp_path, resolver):
+    studio, sp = _four_tall(tmp_path)
+    studio.sizes["small.stl"] = (20.0, 20.0, 30.0)
+    plates = [
+        *[p.to_json() for p in sp.plates],
+        {"name": "q", "parts": [{"path": str(stl_named(tmp_path, "small")), "name": "small", "recipes": ["tree-supports"]}]},
+    ]
+    sp2 = Spec.from_json({**sp.to_json(), "plates": plates})
+    probe = _Measured()
+    plan = Pipeline(studio, resolver, probe=probe).plan(sp2)
+    assert sorted(probe.seen) == ["a", "b", "c", "d"]  # plate 2 is fine with its estimate
+    assert next(x for x in plan.plates[1].parts if x.key == "small").placed.spread.source == "estimate"
+
+
+def _reach_spec(tmp_path):
+    parts = [{"path": str(stl_named(tmp_path, "t")), "name": "t", "filament": 2, "recipes": ["tree-supports"], "at": [40, 3]}]
+    return FakeStudio(sizes={"t.stl": (40.0, 40.0, 100.0)}), spec(tmp_path, [{"name": "p", "parts": parts}])
+
+
+def test_an_estimate_past_a_nozzles_reach_warns_and_is_measured(tmp_path, resolver):
+    """A 40 x 40 x 100 tree part on filament 2 at [40, 3]: the 22 mm estimate reaches x 18 < 20.5. That is a WARN margin
+    rule with `--no-probe`, and the plan measures it otherwise; a measured spread past the reach FAILs."""
+    from shambu.report import check_line
+
+    studio, sp = _reach_spec(tmp_path)
+    plan = Pipeline(studio, resolver, probe=_Measured()).plan(sp, no_probe=True)
+    (w,) = [c for c in plan.plates[0].checks if c.kind == L.REACH_ESTIMATE]
+    assert w.ok and w.warn and w.text.endswith("estimated; the slice decides") and check_line(w).startswith("WARN margin rule: ")
+    assert plan.ok
+    probe = _Measured()
+    plan = Pipeline(studio, resolver, probe=probe).plan(sp)
+    assert probe.seen == ["t"] and not any(c.kind in ("reach", L.REACH_ESTIMATE) for c in plan.plates[0].checks)
+    plan = Pipeline(studio, resolver, probe=_Big()).plan(sp)
+    assert any(not c.ok and c.kind == "reach" for c in plan.plates[0].checks)  # measured 30 mm: a FAIL
+
+
+def test_a_part_left_unplaced_by_its_estimate_is_measured(tmp_path, resolver):
+    studio = FakeStudio(sizes={"w.stl": (220.0, 220.0, 200.0)})
+    parts = [{"path": str(stl_named(tmp_path, "w")), "name": "w", "filament": 2, "recipes": ["tree-supports"]}]
+    probe = _Measured()
+    plan = Pipeline(studio, resolver, probe=probe).plan(spec(tmp_path, [{"name": "p", "parts": parts}]))
+    assert probe.seen == ["w"] and plan.unplaced == []
+    (line,) = [c.text for c in plan.plates[0].checks if c.kind == "measured"]
+    assert line.startswith("Spreads measured: the estimated support spread left w without a position")
+
+
+def test_no_probe_through_the_cli(tmp_path, resolver, capsys, monkeypatch):
+    from shambu import cli
+    from shambu.facade import Bambu
+
+    names = ["a", "b", "c", "d"]
+    parts = [{"path": str(stl_named(tmp_path, n)), "name": n, "recipes": ["tree-supports"]} for n in names]
+    p = tmp_path / "spec.json"
+    p.write_text(json.dumps(boxes_spec(tmp_path, parts).to_json()), encoding="utf-8")
+    for flag, want in (([], True), (["--no-probe"], False)):
+        studio = ProbeStudio(sizes={f"{n}.stl": (115.0, 115.0, 200.0) for n in names})
+        monkeypatch.setattr(cli, "Bambu", lambda s=studio: Bambu(studio=s, resolver=resolver))
+        cli.main(["check", "--no-printer", *flag, str(p)])
+        out = capsys.readouterr().out
+        assert (studio.probes > 0) is want and ("Spreads measured" in out) is want
