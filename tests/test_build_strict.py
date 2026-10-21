@@ -293,9 +293,13 @@ FACTS = {
 }
 
 
-def test_inside_bed_counts_the_brim_margin():
+def test_inside_bed_counts_the_brim_margin_as_a_clipped_brim():
+    """Studio clips a brim at the bed edge (Brim.cpp:1011-1138): a WARN, not a FAIL."""
     p = L.Placed("a", mesh("a.stl"), 1, 1.0, 30.0, margin=3.0)
-    assert any("leaves the bed" in c.text for c in L.LimitChecker().check([p], L.Context(FACTS)) if not c.ok)
+    checks = L.LimitChecker().check([p], L.Context(FACTS))
+    assert all(c.ok for c in checks)
+    (w,) = [c for c in checks if c.kind == "brim"]
+    assert w.warn and "the 3.0 mm brim reaches x -2.0..24.0" in w.text and "will be clipped at x 0.0..24.0" in w.text
 
 
 def test_reserve_rule_flags_a_fixed_part_in_the_tower_corner():
@@ -396,7 +400,7 @@ def test_unplaced_part_gets_one_line_and_no_bed_fail(tmp_path, stls, resolver):
     checks = r.plan.plates[0].checks
     bad = [c for c in checks if not c.ok]
     assert [c.kind for c in bad] == ["placement"]
-    assert bad[0].text.startswith("the packer could not place feeler: 300.0 mm deep + 2 x 5.2 mm margin = 310.4 mm")
+    assert bad[0].text.startswith("the packer could not place feeler: 300.0 mm deep + 2 x 0.0 mm margin = 300.0 mm")
     assert "No position was computed for feeler, so no overlap, bed-edge or reach check ran for it" in bad[0].text
     assert "leaves the bed" not in r.report
     assert "- PLACEMENT NOT DONE: the packer could not place feeler" in r.report
@@ -557,16 +561,25 @@ class ProbeStudio(FakeStudio):
     """Writes a .gcode.3mf with the fixture G-code for every probe slice and counts them."""
 
     probes: int = 0
+    ver: str = "02.08.02.61"
+    gcode: str = PROBE_GCODE
+    positions: list = field(default_factory=list)  # the pos of every probed object, from its assemble list
+
+    def version(self) -> str:
+        return self.ver
 
     def run(self, cmd, *, name="run", outputdir=None, timeout=1200, expect_output=None):
-        if name != "probe":
+        if not name.startswith("probe"):
             return super().run(cmd, name=name, outputdir=outputdir, timeout=timeout, expect_output=expect_output)
         import zipfile
 
         self.probes += 1
+        self.positions.append(json.loads((Path(outputdir) / "assemble.json").read_text())["plates"][0]["objects"][0]["pos_x"])
+        log = Path(outputdir) / f"{name}.log"
+        log.write_text("$ fake probe\n", encoding="utf-8")
         with zipfile.ZipFile(expect_output, "w") as z:
-            z.writestr("Metadata/plate_1.gcode", PROBE_GCODE)
-        return RunResult(["BambuStudio"], 0, 0, 0.1, Path(outputdir) / "probe.log", {"return_code": 0}, expect_output)
+            z.writestr("Metadata/plate_1.gcode", self.gcode)
+        return RunResult(["BambuStudio"], 0, 0, 0.1, log, {"return_code": 0}, expect_output)
 
 
 def test_support_probe_is_cached_by_mesh_hash(tmp_path, resolver):
@@ -605,12 +618,13 @@ def test_footprint_comes_from_the_oriented_stl(tmp_path, resolver):
 
 def test_a_failed_probe_keeps_the_estimate_with_a_warning(tmp_path, stls, resolver):
     from shambu.errors import StudioError
+    from shambu.probe import ProbeResult
 
     class Fixed:  # a SpreadProbe fake: the first part measures, the second fails
         def measure(self, req):
             if req.key == "bad":
                 raise StudioError("no G-code")
-            return L.Spread(3.0, 0.0, 0.0, 1.0, "probe", True)
+            return ProbeResult(L.Spread(3.0, 0.0, 0.0, 1.0, "probe", True))
 
     parts = [
         {"path": str(stls["body"]), "name": "good", "recipes": ["tree-supports"]},
@@ -620,3 +634,92 @@ def test_a_failed_probe_keeps_the_estimate_with_a_warning(tmp_path, stls, resolv
     good, bad = (x.placed.spread for x in plan.plates[0].parts)
     assert good.sides() == (3.0, 0.0, 0.0, 1.0) and bad.source == "estimate"
     assert any("(bad): support probe failed (no G-code); the estimate applies" in w for w in plan.warnings)
+
+
+# ---------------------------------------------------------------------------- 14. review fixes (Codex, 2026-10-21)
+def test_keep_going_never_exports_an_unplaced_part(tmp_path, stls, resolver):
+    """--keep-going overrides advisory checks, never a part without a position: its pos would be one nobody chose."""
+    studio = FakeStudio(sizes={"body.stl": (200.0, 200.0, 10.0)})
+    r = Pipeline(studio, resolver).build(boxes_spec(tmp_path, [{"path": str(stls["body"]), "name": "big", "count": 3}]), keep_going=True)
+    assert r.plan.unplaced == ["big #2", "big #3"] and not r.plan.exportable
+    assert [k for k, _ in studio.calls if k == "run"] == []
+    assert r.run is None and "`--keep-going` never exports a plate with parts that have no position (big #2, big #3)" in r.report
+
+
+def test_keep_going_still_exports_past_an_advisory_fail(tmp_path, stls, resolver):
+    parts = [{"path": str(stls["body"]), "name": "a", "at": [20, 20]}, {"path": str(stls["base"]), "name": "b", "at": [20, 20]}]
+    studio = FakeStudio()
+    Pipeline(studio, resolver).build(boxes_spec(tmp_path, parts), keep_going=True)
+    assert [k for k, _ in studio.calls if k == "run"]  # placed but overlapping: the user asked to export anyway
+
+
+def test_exit_101_names_the_second_copy(tmp_path, stls, resolver):
+    """shambu's `count` copies are separate model objects (live: two <object> entries and two build items in the
+    exported 3MF), so Studio's conflict check, which reads the first instance of each PrintObject
+    (ConflictChecker.cpp:244-245), sees every copy, and the log names copy 2 by its own CLI name."""
+    parts = [
+        {"path": str(stls["body"]), "name": "cube", "count": 2},
+        {"path": str(stls["base"]), "name": "ell", "at": [200, 10]},
+    ]
+    studio = LogStudio(code=-101, log_text="[error] gcode path conflicts found between body_2 and base_1\n")
+    r = Pipeline(studio, resolver).build(boxes_spec(tmp_path, parts), do_slice=True)
+    assert [p.cli_name for p in r.plan.parts] == ["body_1", "body_2", "base_1"]
+    assert r.export_fails() == ["Studio found crossing G-code paths between cube #2 and ell (exit -101). Move them apart and build again."]
+
+
+def test_raft_only_part_gets_a_spread_and_pins_its_support_filaments(tmp_path, stls, resolver):
+    parts = [{"path": str(stls["body"]), "name": "raft", "set": {"raft_layers": "3"}}, {"path": str(stls["base"]), "filament": 2}]
+    plan = Pipeline(FakeStudio(), resolver).plan(spec(tmp_path, [{"name": "p", "parts": parts}]))
+    raft = plan.plates[0].parts[0]
+    assert raft.placed.spread.most() == 5.0 and raft.placed.spread.source == "estimate"
+    assert plan.assemble.plates[0].items[0].print_params["support_interface_filament"] == "1"
+    assert any("raft:support_interface_filament" in w for w in plan.warnings)
+
+
+def test_support_probe_cache_misses_when_the_studio_version_changes(tmp_path, resolver):
+    from shambu import mesh as M
+    from test_mesh import box
+
+    a = M.write_stl(tmp_path / "stl" / "a.stl", box((0, 0, 0), (20, 20, 10)))
+    parts = [{"path": str(a), "name": "a", "recipes": ["tree-supports"]}]
+    studio = ProbeStudio()
+    Pipeline(studio, resolver).plan(boxes_spec(tmp_path, parts), probe_supports=True)
+    Pipeline(studio, resolver).plan(boxes_spec(tmp_path, parts), probe_supports=True)
+    assert studio.probes == 1
+    studio.ver = "02.09.00.10"
+    Pipeline(studio, resolver).plan(boxes_spec(tmp_path, parts), probe_supports=True)
+    assert studio.probes == 2 and len(list((tmp_path / "out" / ".probe").glob("*.json"))) == 2
+
+
+def test_support_probe_slices_at_the_bed_centre_in_its_own_directory(tmp_path, resolver):
+    """Studio clips tree support at the bed border (TreeSupport.cpp:626-629): a probe at the edge would under-measure.
+    Each probe slices in <outdir>/.probe/<cache key>/ with its own log, never in the export directory."""
+    from shambu import mesh as M
+    from test_mesh import box
+
+    a = M.write_stl(tmp_path / "stl" / "a.stl", box((0, 0, 0), (20, 20, 10)))
+    b = M.write_stl(tmp_path / "stl" / "b.stl", box((0, 0, 0), (40, 20, 10)))
+    parts = [
+        {"path": str(a), "name": "a", "recipes": ["tree-supports"], "at": [2, 2]},
+        {"path": str(b), "name": "b", "recipes": ["tree-supports"]},
+    ]
+    studio = ProbeStudio(sizes={"b.stl": (40.0, 20.0, 10.0)})
+    Pipeline(studio, resolver).plan(boxes_spec(tmp_path, parts), probe_supports=True)
+    assert studio.positions == [[118.0], [108.0]]  # 128 - w / 2: the centre, whatever the spec's `at`
+    logs = sorted((tmp_path / "out" / ".probe").glob("*/*.log"))
+    assert len(logs) == 2 and logs[0].parent != logs[1].parent
+    assert not list((tmp_path / "out").glob("probe*.log"))
+
+
+def test_support_probe_keeps_the_mask_in_the_footprint_frame(tmp_path, resolver):
+    """The fixture's part lands at x 118..138 (a 20 mm box at the centre); its support runs from x 80, so the mask
+    starts 38 mm left of the footprint frame, and it survives the cache."""
+    from shambu import mesh as M
+    from test_mesh import box
+
+    a = M.write_stl(tmp_path / "stl" / "a.stl", box((0, 0, 0), (20, 20, 10)))
+    parts = [{"path": str(a), "name": "a", "recipes": ["tree-supports"]}]
+    for _ in range(2):
+        plan = Pipeline(ProbeStudio(), resolver).plan(boxes_spec(tmp_path, parts), probe_supports=True)
+        mask = plan.plates[0].parts[0].placed.support_mask
+        assert mask is not None and mask.bbox()[0] == pytest.approx(80.0 - 118.0)

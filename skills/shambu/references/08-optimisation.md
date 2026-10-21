@@ -590,3 +590,26 @@ never rotated, so a part turned 45 degrees keeps its real outline (a 50 x 226 ba
 - Fade with z: every neighbour on plate 14 stands on the bed, so the z 0..5 band decides. An overhanging neighbour
   (the feeler's end blocks at z 36..64 over the cradle) is where a z-aware check would matter.
 - Collinear support overlap still conflicts (`ConflictChecker.cpp:295-296`); not reproduced.
+
+### 11.9 Review corrections (Codex review against the source, 2026-10-21)
+
+- The 1.0 mm pair allowance (`layout.LINE`) is shambu's policy, not a Studio limit. Studio refuses lines of two objects
+  that overlap collinearly by more than 0.01 mm, whatever their roles, or cross more than 0.01 mm from an endpoint;
+  only support-on-support crossings get a 100 mm threshold (`ConflictChecker.cpp:291-310`).
+- The conflict check reads the first instance of each PrintObject (`ConflictChecker.cpp:226, 244-245`), and Studio
+  groups a model object's instances that differ only by an XY shift into one PrintObject (`PrintApply.cpp:140-160`).
+  shambu's `count` copies are separate model objects: a two-copy export holds two `<object>` entries and two build
+  items, each with `instance_id` 0 (live, 2026-10-21). So every copy is clash-tested, and the -101 log names copy 2 by
+  its own CLI name (`<stem>_2`). GUI instances (copies made in Studio) are not: there only the first copy is tested.
+- "Has support" is `enable_support || enforce_support_layers > 0 || raft_layers > 0` (`Print.hpp:492-494`):
+  `layout.needs_support`. A raft-only part gets a 5 mm spread (or `raft_first_layer_expansion`) and its support
+  filaments are pinned on a two-filament plate.
+- A brim that leaves the bed or a nozzle's reach is clipped (`Brim.cpp:1011-1045, 1079-1095, 1129-1138`): WARN brim.
+  A model or support that crosses stays a FAIL. The packer keeps the whole brim on the bed when it can.
+- Four spreads cannot see support inside a notch. A probe now keeps the support centreline cells (0.5 mm) in the
+  part's footprint frame, and the pair rule tests that mask against the other part's model. The probe slices at the
+  bed centre (Studio clips trees at the border, `TreeSupport.cpp:626-629`), in `<outdir>/.probe/<cache key>/` with its
+  own log. The cache key holds the Studio version. Live rerun on the plate-14 spec: same spreads as 11.6, no WARN and
+  no FAIL with the masks, 14.7 s for five fresh probes.
+- `--keep-going` never exports a plate with an unplaced part, as it never exports a placeholder filament.
+- Fixed parts (`at`) and filament groups keep their outlines (the group is the union of its members' outlines).

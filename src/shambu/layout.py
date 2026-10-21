@@ -12,14 +12,22 @@ strategies run by `LimitChecker`, so a new printer fact is one more rule.
 
 What Studio enforces, by layer (Bambu Studio 02.08.02.61 source, reference 08 section 11):
 - no clearance between objects before slicing (`Print.cpp:944-1050` checks hulls against the bed exclude area only);
-- after slicing, exit -101 when extrusion centrelines of two objects cross in one layer (`ConflictChecker.cpp:203-314`);
-  brims and skirts are not in that test, and brims of different objects are clipped against each other
-  (`Brim.cpp:258-365`);
+- after slicing, exit -101 when the extrusion centrelines of two objects in one layer overlap collinearly by more than
+  0.01 mm (any roles), or cross more than 0.01 mm from an endpoint; crossings of two supports only count past 100 mm,
+  which almost switches them off (`ConflictChecker.cpp:291-310`). The check takes the first instance of each
+  PrintObject (`ConflictChecker.cpp:226, 244-245`), and Studio groups the instances of one model object that differ
+  only by an XY shift into one PrintObject (`PrintApply.cpp:140-160`). shambu's `count` copies are separate model
+  objects (live: two `<object>` entries and two build items in the exported 3MF), so every copy is checked. A project
+  with GUI instances (Ctrl+K copies) is not: there only the first copy is clash-tested;
+- brims and skirts are not in that test; brims of different objects are clipped against each other, against support
+  and against the bed and each nozzle's reach (`Brim.cpp:258-365, 1011-1138`), so a brim crossing is a WARN here;
 - tree supports grow per object, against that object's outlines and the bed border only
-  (`TreeSupport3D.cpp:5232-5246`, `TreeSupport.cpp:2507-2522`): they do not avoid a neighbour, and they never leave
-  the bed.
-So the pair rule (`Clearance`) holds the support spread between models, not the brim, and takes the larger of the two
-facing spreads, not their sum. An estimated spread that is short is a WARN: the slice (exit -101) decides.
+  (`TreeSupport3D.cpp:5232-5246`, `TreeSupport.cpp:626-629, 2507-2522`): they do not avoid a neighbour, and they never
+  leave the bed.
+So the pair rule (`Clearance`) holds the support between models, not the brim, and takes the larger of the two facing
+spreads, not their sum. A probed part brings its measured support mask, which the pair rule uses in place of the four
+spreads (a support inside a U-shaped notch stays inside the box). An estimated spread that is short is a WARN: the
+slice (exit -101) decides. "Studio has a support" is `needs_support` (`Print.hpp:492-494`).
 
 Not here: Studio's own arrange, rotation trials, z-aware support (the spread is the widest band, z 0..5).
 """
@@ -39,8 +47,10 @@ BED = 256.0
 EDGE = 2.0
 GAP = 5.0
 WIPE_TOWER = (15.0, 220.0, 35.0, 35.0)  # x, y, w, h reserved when a plate uses two filaments (CLI default position)
-# Two models may touch (no support, gap 0 sliced with exit 0) but their lines may not cross (exit -101); 1.0 mm is two
-# line widths (reference 08 section 11.4, live clash test).
+# shambu's clearance policy, not a Studio limit: Studio has no clearance distance, it refuses lines that overlap or
+# cross by more than 0.01 mm (ConflictChecker.cpp:291-310). Two unsupported models 0 mm apart sliced with exit 0 (walls
+# 0.42 mm apart, reference 08 section 11.4), so 1.0 mm, about two line widths, is a margin for the slicer's own
+# rounding, not a measured threshold.
 LINE = 1.0
 # Tree support spread past the model box, per side, as an estimate (reference 08 section 11.2, G-code of the printed
 # plate 14): the housing, 218 mm tall, 20.9 mm on -x at z 0..5 (20.9 / 218 = 0.096); the bracket, 170 mm tall,
@@ -125,8 +135,23 @@ class Spread:
 NO_SPREAD = Spread()
 
 
-def _supported(p: Mapping) -> bool:
-    return str(p.get("enable_support", "0")) in ("1", "true")
+def _int(v) -> int:
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def needs_support(params: Mapping | None) -> bool:
+    """Studio prints support material for an object when `enable_support`, or `enforce_support_layers > 0`, or
+    `raft_layers > 0` (`Print.hpp:492-494`: has_support() || has_raft()). The one predicate for the layout and for
+    the filament accounting (a raft prints with the support filaments too)."""
+    p = params or {}
+    return (
+        str(p.get("enable_support", "0")).strip().lower() in ("1", "true")
+        or _int(p.get("enforce_support_layers", 0)) > 0
+        or _int(p.get("raft_layers", 0)) > 0
+    )
 
 
 def is_tree(p: Mapping) -> bool:
@@ -140,12 +165,20 @@ def support_spread(params: Mapping | None, height: float, probe: Spread | None =
     No support: nothing. A probe (a solo slice of the part, measured per side): returned as it is. Otherwise an
     estimate on all four sides, because the mesh does not tell which side the trees grow on (reference 08 section
     11.2: the housing's -y and +y overhangs had 0.3 and 2.9 mm of spread, its -x overhang 20.9 mm):
-    tree `min(22, max(8, 0.10 x height))`, normal 5 mm."""
+    tree `min(22, max(8, 0.10 x height))`, normal 5 mm. A raft without support (raft_layers > 0) grows like normal
+    support: 5 mm, or `raft_first_layer_expansion` when that is larger."""
     p = params or {}
-    if not _supported(p):
+    if not needs_support(p):
         return NO_SPREAD
     if probe is not None:
         return probe
+    if str(p.get("enable_support", "0")).strip().lower() not in ("1", "true") and _int(p.get("enforce_support_layers", 0)) <= 0:
+        try:
+            exp = float(p.get("raft_first_layer_expansion", -1))
+        except (TypeError, ValueError):
+            exp = -1.0
+        s = max(NORMAL_SPREAD, exp)
+        return Spread(s, s, s, s, "estimate", False, "raft, estimated")
     if is_tree(p):
         raw = TREE_SPREAD_PER_MM * height
         s = min(TREE_SPREAD_CAP, max(TREE_SPREAD_FLOOR, raw))
@@ -252,16 +285,29 @@ class Footprint(Protocol):
 
 @dataclass(frozen=True)
 class _Bands:
-    """Shared gap logic: bands in a local frame (bbox minimum at 0, 0) plus an offset on the bed."""
+    """Shared gap logic: bands in a local frame plus an offset on the bed. The local bbox starts at (lx, ly): 0, 0 for
+    a part's outline (its bbox minimum), anywhere for a support mask, which can reach past the part's box."""
 
     rows: tuple[Band, ...]
     w: float
     h: float
     ox: float = 0.0
     oy: float = 0.0
+    lx: float = 0.0
+    ly: float = 0.0
 
     def bbox(self) -> Rect:
-        return (self.ox, self.oy, self.ox + self.w, self.oy + self.h)
+        return (self.ox + self.lx, self.oy + self.ly, self.ox + self.lx + self.w, self.oy + self.ly + self.h)
+
+    def to_json(self) -> dict:
+        """The local bands (no offset), for the probe cache."""
+        return {
+            "rows": [[y0, y1, [list(r) for r in runs]] for y0, y1, runs in self.rows],
+            "w": self.w,
+            "h": self.h,
+            "lx": self.lx,
+            "ly": self.ly,
+        }
 
     def translated(self, dx: float, dy: float) -> Footprint:
         return replace(self, ox=self.ox + dx, oy=self.oy + dy)
@@ -306,6 +352,62 @@ class RasterFootprint(_Bands):
             rows.append((lo - sil.y0, hi - sil.y0, tuple((a - sil.x0, b - sil.x0) for a, b in runs)))
         return cls(tuple(rows), sil.x1 - sil.x0, sil.y1 - sil.y0)
 
+    @classmethod
+    def from_json(cls, d: dict) -> RasterFootprint:
+        rows = tuple((float(y0), float(y1), tuple((float(a), float(b)) for a, b in runs)) for y0, y1, runs in d["rows"])
+        return cls(rows, float(d["w"]), float(d["h"]), lx=float(d.get("lx", 0.0)), ly=float(d.get("ly", 0.0)))
+
+    @classmethod
+    def from_cells(cls, cells: Mapping[int, Iterable[int]], cell: float) -> RasterFootprint | None:
+        """From occupied grid cells {row: columns} of size `cell` in the local frame (cell (0, 0) starts at 0, 0)."""
+        rows: list[Band] = []
+        for r in sorted(cells):
+            cs = sorted(set(cells[r]))
+            if not cs:
+                continue
+            runs = []
+            start = prev = cs[0]
+            for c in cs[1:]:
+                if c != prev + 1:
+                    runs.append((start * cell, (prev + 1) * cell))
+                    start = c
+                prev = c
+            runs.append((start * cell, (prev + 1) * cell))
+            rows.append((r * cell, (r + 1) * cell, tuple(runs)))
+        if not rows:
+            return None
+        lx = min(rr[0][0] for _, _, rr in rows)
+        hx = max(rr[-1][1] for _, _, rr in rows)
+        return cls(tuple(rows), hx - lx, rows[-1][1] - rows[0][0], lx=lx, ly=rows[0][0])
+
+
+SUPPORT_MASK_CELL = 0.5  # the same cell as mesh.SILHOUETTE_CELL
+
+
+def mask_from_points(points: Iterable[tuple[float, float]], cell: float = SUPPORT_MASK_CELL) -> RasterFootprint | None:
+    """The cells that sampled support centrelines touch (local frame of the part), as a footprint. probe.py samples
+    every extrusion at least every `cell` mm, so a line marks every cell it crosses."""
+    cells: dict[int, set[int]] = {}
+    for x, y in points:
+        cells.setdefault(math.floor(y / cell), set()).add(math.floor(x / cell))
+    return RasterFootprint.from_cells(cells, cell)
+
+
+def union_footprint(shapes: Iterable[Footprint], origin: tuple[float, float], cell: float = SUPPORT_MASK_CELL) -> Footprint | None:
+    """One outline for several placed shapes (a filament group), in the frame that starts at `origin`: every band of
+    every shape, rasterised outward to `cell`. None when a shape has no bands."""
+    cells: dict[int, set[int]] = {}
+    for s in shapes:
+        if not isinstance(s, _Bands):
+            return None
+        for y0, y1, runs in s.rows:
+            r0, r1 = math.floor((y0 + s.oy - origin[1]) / cell + 1e-9), math.ceil((y1 + s.oy - origin[1]) / cell - 1e-9)
+            for a, b in runs:
+                c0, c1 = math.floor((a + s.ox - origin[0]) / cell + 1e-9), math.ceil((b + s.ox - origin[0]) / cell - 1e-9)
+                for r in range(r0, max(r1, r0 + 1)):
+                    cells.setdefault(r, set()).update(range(c0, max(c1, c0 + 1)))
+    return RasterFootprint.from_cells(cells, cell)
+
 
 # ---------------------------------------------------------------------------- placed parts
 @dataclass
@@ -330,6 +432,7 @@ class Placed:
     footprint: Footprint | None = None
     placed: bool = True
     why_not: str = ""
+    support_mask: Footprint | None = None  # measured support centrelines (probe), same frame as `footprint`
 
     @property
     def filaments(self) -> set[int]:
@@ -356,11 +459,13 @@ class Placed:
         """One margin for every side, for the row packer: the larger of brim and support spread."""
         return max(self.margin, self.spread.most())
 
-    def bed_margin(self) -> tuple[float, float, float, float]:
-        """Growth per side (-x, +x, -y, +y) that must stay on the bed: the brim, plus the support spread unless it is
-        tree support (Studio clips trees to the bed border, TreeSupport.cpp:2507-2522)."""
+    def bed_margin(self, with_brim: bool = True) -> tuple[float, float, float, float]:
+        """Growth per side (-x, +x, -y, +y) that must stay on the bed: the support spread unless it is tree support
+        (Studio clips trees to the bed border, TreeSupport.cpp:2507-2522), plus the brim when `with_brim` (Studio
+        clips a brim too, Brim.cpp:1011-1138, so a brim off the bed is a WARN, not a FAIL)."""
         s = (0.0, 0.0, 0.0, 0.0) if self.spread.tree else self.spread.sides()
-        return (self.margin + s[0], self.margin + s[1], self.margin + s[2], self.margin + s[3])
+        m = self.margin if with_brim else 0.0
+        return (m + s[0], m + s[1], m + s[2], m + s[3])
 
     def rect(self, with_margin: bool = True) -> Rect:
         """The bounding box, grown by brim plus support spread on each side when `with_margin`."""
@@ -372,6 +477,9 @@ class Placed:
     def shape(self) -> Footprint:
         fp = self.footprint if self.footprint is not None else BoxFootprint.of(self.w, self.h)
         return fp.translated(self.x0, self.y0)
+
+    def mask_shape(self) -> Footprint | None:
+        return self.support_mask.translated(self.x0, self.y0) if self.support_mask is not None else None
 
     def pos(self) -> tuple[float, float, float]:
         """Translation for the assemble list: bbox starts at (x0, y0) and the part sits on the bed."""
@@ -418,7 +526,7 @@ def overlaps(a: Rect, b: Rect) -> bool:
 class Check:
     """One line of the plate's check. `kind` sorts it: body (the parts themselves meet), margin (a support or brim
     margin, not the bodies), placement (the packer could not place a part), bed, reach, height, spool, tower,
-    sequence, mesh, summary. An ok Check of kind margin is a WARN."""
+    sequence, mesh, summary, brim (a brim Studio will clip). An ok Check of kind margin or brim is a WARN."""
 
     ok: bool
     text: str
@@ -426,16 +534,20 @@ class Check:
 
     @property
     def warn(self) -> bool:
-        return self.ok and self.kind == "margin"
+        return self.ok and self.kind in ("margin", "brim")
 
 
 def pair_check(a: Placed, b: Placed) -> Check | None:
     """The pair rule (fix 2 of the plate-14 post-mortem). None when the pair is clear.
 
-    - footprints closer than LINE (1 mm): FAIL body, because their lines would cross (exit -101);
-    - closer than max(a's spread toward b, b's spread toward a) + LINE: the support of one could reach the other's
-      model. A probe or spec spread that is short is a FAIL. An estimate that is short is a WARN: the slice decides.
-    Support-on-support crossings do not fail Studio (ConflictChecker.cpp:291, 306-311), so the max counts, not the sum."""
+    - footprints closer than LINE (1 mm, shambu's policy): FAIL body, because their lines could cross (exit -101);
+    - a part with a measured support mask (probe): its support cells closer than LINE to the other's model is a FAIL.
+      The mask, not the four spreads, because support inside a U-shaped notch stays inside the box (all spreads 0)
+      and still meets a part nested in the notch;
+    - otherwise closer than its spread toward the other + LINE: its support could reach the other's model. Short
+      against a probe or spec spread is a FAIL. Short against an estimate is a WARN: the slice decides.
+    Each part is tested against the other's model only: Studio counts a crossing of two supports only past 100 mm
+    (ConflictChecker.cpp:291-310), so the max of the two counts, not the sum."""
     sa, sb = a.shape(), b.shape()
     g, (dx, dy) = sa.gap(sb, limit=max(a.spread.most(), b.spread.most()) + LINE + 0.01)
     if g < LINE:
@@ -447,16 +559,33 @@ def pair_check(a: Placed, b: Placed) -> Check | None:
             text = f"{where_a} and {where_b} intersect by {iw:.1f} x {ih:.1f} mm. The parts themselves overlap: move one."
         else:
             text = (
-                f"{where_a} and {where_b}: the footprints touch ({g:.1f} mm apart, {LINE:.1f} mm needed). "
+                f"{where_a} and {where_b}: the footprints touch ({g:.1f} mm apart; shambu keeps {LINE:.1f} mm). "
                 "Studio refuses crossing paths (exit -101): move one."
             )
         return Check(False, text, "body")
-    fa, side_a = a.spread.facing(dx, dy)
-    fb, side_b = b.spread.facing(-dx, -dy)
-    need = max(fa, fb) + LINE
-    if g >= need:
+    masked: list[tuple[Placed, Placed, float]] = []
+    spread_short: list[tuple[Placed, float, str]] = []
+    for src, dst, sgn in ((a, b, 1.0), (b, a, -1.0)):
+        m = src.mask_shape()
+        if m is not None:
+            gm, _ = m.gap(dst.shape(), limit=LINE + 0.01)
+            if gm < LINE:
+                masked.append((src, dst, gm))
+            continue
+        f, side = src.spread.facing(sgn * dx, sgn * dy)
+        if g < f + LINE:
+            spread_short.append((src, f, side))
+    if masked:
+        src, dst, gm = masked[0]
+        return Check(
+            False,
+            f"{a.key} and {b.key} are {g:.1f} mm apart; {src.key}'s support (measured by a solo slice) comes within "
+            f"{max(gm, 0.0):.1f} mm of {dst.key}: move them apart",
+            "margin",
+        )
+    if not spread_short:
         return None
-    hard = [(p, f, sd) for p, f, sd in ((a, fa, side_a), (b, fb, side_b)) if p.spread.hard and g < f + LINE]
+    hard = [s for s in spread_short if s[0].spread.hard]
     if hard:
         p, f, sd = max(hard, key=lambda h: h[1])
         how = "measured by a solo slice" if p.spread.source == "probe" else "set in the spec"
@@ -466,9 +595,8 @@ def pair_check(a: Placed, b: Placed) -> Check | None:
             f"they need {f + LINE:.1f} mm: move them apart",
             "margin",
         )
-    return Check(
-        True, f"{a.key} and {b.key} are {g:.1f} mm apart; support reaches {need - LINE:.1f} mm (estimated); the slice decides", "margin"
-    )
+    reach = max(f for _, f, _ in spread_short)
+    return Check(True, f"{a.key} and {b.key} are {g:.1f} mm apart; support reaches {reach:.1f} mm (estimated); the slice decides", "margin")
 
 
 @dataclass
@@ -532,29 +660,42 @@ class Clearance:
 
 
 class InsideBed:
-    """The body, its brim and any normal-support spread stay on the bed. Tree spread does not count: Studio clips
-    tree support to the bed border (TreeSupport.cpp:2507-2522)."""
+    """The body and any normal-support spread stay on the bed (FAIL). Tree spread does not count: Studio clips tree
+    support to the bed border (TreeSupport.cpp:2507-2522). A brim that leaves the bed is a WARN: Studio clips the
+    brim to the printable area (Brim.cpp:1011-1138)."""
 
     def check(self, placed, ctx):
         bed = ctx.facts["bed"]
         size = f"{bed['x'][1]:.0f} x {bed['y'][1]:.0f}"
+
+        def off(r: Rect) -> bool:
+            return r[0] < bed["x"][0] or r[2] > bed["x"][1] or r[1] < bed["y"][0] or r[3] > bed["y"][1]
+
         for p in _on_bed(placed):
             body = p.rect(with_margin=False)
             where = f"x {body[0]:.1f}..{body[2]:.1f} y {body[1]:.1f}..{body[3]:.1f}"
-            if body[0] < bed["x"][0] or body[2] > bed["x"][1] or body[1] < bed["y"][0] or body[3] > bed["y"][1]:
+            if off(body):
                 yield Check(False, f"{p.key} body {where} leaves the bed {size}", "bed")
                 continue
-            mx, px, my, py = p.bed_margin()
+            mx, px, my, py = p.bed_margin(with_brim=False)
             g = (body[0] - mx, body[1] - my, body[2] + px, body[3] + py)
-            if g[0] < bed["x"][0] or g[2] > bed["x"][1] or g[1] < bed["y"][0] or g[3] > bed["y"][1]:
-                what = f"brim {p.margin:.1f} mm" if p.margin else "no brim"
-                if not p.spread.tree and p.spread.most() > 0:
-                    what += f" and {p.spread.source} margin {p.spread.describe()}"
+            if off(g):
                 yield Check(
                     False,
-                    f"{p.key} body {where} is on the bed, but with its {what} it reaches x {g[0]:.1f}..{g[2]:.1f} "
-                    f"y {g[1]:.1f}..{g[3]:.1f}: that leaves the bed {size}",
+                    f"{p.key} body {where} is on the bed, but with its {p.spread.source} support margin {p.spread.describe()} "
+                    f"it reaches x {g[0]:.1f}..{g[2]:.1f} y {g[1]:.1f}..{g[3]:.1f}: that leaves the bed {size}",
                     "margin",
+                )
+                continue
+            m = p.margin
+            gb = (g[0] - m, g[1] - m, g[2] + m, g[3] + m)
+            if m > 0 and off(gb):
+                clip = (max(gb[0], bed["x"][0]), max(gb[1], bed["y"][0]), min(gb[2], bed["x"][1]), min(gb[3], bed["y"][1]))
+                yield Check(
+                    True,
+                    f"{p.key}: the {m:.1f} mm brim reaches x {gb[0]:.1f}..{gb[2]:.1f} y {gb[1]:.1f}..{gb[3]:.1f} and will be clipped "
+                    f"at x {clip[0]:.1f}..{clip[2]:.1f} y {clip[1]:.1f}..{clip[3]:.1f} (the bed {size})",
+                    "brim",
                 )
 
 
@@ -576,10 +717,11 @@ class ReserveClear:
 
 
 class ExtruderReach:
-    """Every extruder a part uses (its filament, height ranges, sub-parts) must reach the whole part with its brim
-    and support. Only the sides where the extruder's reach is narrower than the bed are checked (InsideBed covers
-    the rest). On those sides the support spread counts in full, trees too: a jaw's support reached 5.5 mm into the
-    right nozzle's dead strip, exit -102 (reference 08 section 3.3b)."""
+    """Every extruder a part uses (its filament, height ranges, sub-parts) must reach the whole part and its support.
+    Only the sides where the extruder's reach is narrower than the bed are checked (InsideBed covers the rest). On
+    those sides the support spread counts in full, trees too: a jaw's support reached 5.5 mm into the right nozzle's
+    dead strip, exit -102 (reference 08 section 3.3b). A brim that crosses the reach is a WARN: Studio clips brims to
+    each nozzle's printable area (Brim.cpp:1079-1095, 1129-1138)."""
 
     def check(self, placed, ctx):
         bed = ctx.facts["bed"]
@@ -596,29 +738,39 @@ class ExtruderReach:
                 if not p.placed:
                     continue
                 s, m = p.spread, p.margin
-                g = (p.x0 - m - s.mx, p.y0 - m - s.my, p.x1 + m + s.px, p.y1 + m + s.py)
+                sup = (p.x0 - s.mx, p.y0 - s.my, p.x1 + s.px, p.y1 + s.py)
+                lo_x, hi_x = e["x"]
+                if e["index"] == 2 and ctx.aux_x_limit is not None:
+                    hi_x = min(hi_x, ctx.aux_x_limit)
                 limits = (
-                    ("-x", g[0] < e["x"][0] and e["x"][0] > bed["x"][0], s.mx, "x", g[0]),
-                    ("+x", g[2] > e["x"][1] and e["x"][1] < bed["x"][1], s.px, "x", g[2]),
-                    ("-y", g[1] < e["y"][0] and e["y"][0] > bed["y"][0], s.my, "y", g[1]),
-                    ("+y", g[3] > e["y"][1] and e["y"][1] < bed["y"][1], s.py, "y", g[3]),
+                    ("-x", "x", sup[0], sup[0] - m, lo_x, lo_x > bed["x"][0], -1, s.mx),
+                    ("+x", "x", sup[2], sup[2] + m, hi_x, hi_x < bed["x"][1], 1, s.px),
+                    ("-y", "y", sup[1], sup[1] - m, e["y"][0], e["y"][0] > bed["y"][0], -1, s.my),
+                    ("+y", "y", sup[3], sup[3] + m, e["y"][1], e["y"][1] < bed["y"][1], 1, s.py),
                 )
-                for side, bad, sv, axis, at in limits:
-                    if bad:
+                for side, axis, at, at_brim, limit, narrower, sign, sv in limits:
+                    if not narrower:
+                        continue
+                    what = (
+                        "the configured aux_x_limit for the auxiliary nozzle is"
+                        if (side == "+x" and limit != e["x"][1])
+                        else "that extruder reaches"
+                    )
+                    reach = f"{limit} mm" if what.startswith("the configured") else f"{axis} {e[axis][0]:.1f}..{e[axis][1]:.1f}"
+                    if sign * (at - limit) > 1e-9:
                         yield Check(
                             False,
                             f"{p.key} uses filament {fil} (extruder {e['index']}, {e['type']}) and reaches {axis} {at:.1f} on {side} "
-                            f"with its brim {m:.1f} mm and support {sv:.1f} mm; that extruder reaches {axis} "
-                            f"{e[axis][0]:.1f}..{e[axis][1]:.1f}",
+                            f"with its support {sv:.1f} mm; {what} {reach}",
                             "reach",
                         )
-                if e["index"] == 2 and ctx.aux_x_limit is not None and g[2] > ctx.aux_x_limit:
-                    yield Check(
-                        False,
-                        f"{p.key} uses extruder 2 and ends at x {g[2]:.1f} with its brim {m:.1f} mm and support {s.px:.1f} mm on +x; "
-                        f"the configured aux_x_limit for the auxiliary nozzle is {ctx.aux_x_limit} mm",
-                        "reach",
-                    )
+                    elif m > 0 and sign * (at_brim - limit) > 1e-9:
+                        yield Check(
+                            True,
+                            f"{p.key}: the {m:.1f} mm brim on filament {fil} reaches {axis} {at_brim:.1f} on {side} and will be clipped at "
+                            f"{axis} {limit:.1f} (extruder {e['index']} reach)",
+                            "brim",
+                        )
 
 
 class TpuOnMain:
@@ -894,7 +1046,7 @@ class BottomLeftPacker:
         unplaced: dict[str, str] = {}
         plates: list[list[Placed]] = [[]]
         for p in sorted(parts, key=lambda q: -(q.w * q.h)):
-            why = _too_big(p, self.x_range, self.y_range, p.bed_margin())
+            why = _too_big(p, self.x_range, self.y_range, p.bed_margin(with_brim=False))  # a brim may be clipped
             if why:
                 _unplace(p, f"the packer could not place {p.key}: {why}", unplaced)
                 continue
@@ -925,14 +1077,24 @@ class BottomLeftPacker:
         return spread + LINE + self.gap if spread > 0 else max(self.gap, LINE)
 
     def _put(self, p: Placed, others: Sequence[Placed], obstacles: Sequence[Rect], x_lo: float | None, x_hi: float | None) -> bool:
-        bm = p.bed_margin()
+        """A position with the whole brim inside the bed and the reach if one exists, else one where only the brim is
+        clipped (Studio clips brims, Brim.cpp:1011-1138; the rules then give a WARN brim line)."""
+        return self._put_once(p, others, obstacles, x_lo, x_hi, True) or (
+            p.margin > 0 and self._put_once(p, others, obstacles, x_lo, x_hi, False)
+        )
+
+    def _put_once(
+        self, p: Placed, others: Sequence[Placed], obstacles: Sequence[Rect], x_lo: float | None, x_hi: float | None, brim: bool
+    ) -> bool:
+        bm = p.bed_margin(with_brim=brim)
         s = p.spread
+        m = p.margin if brim else 0.0
         lo_x = self.x_range[0] + bm[0]
-        if x_lo is not None and x_lo > self.x_range[0]:  # a reach narrower than the bed: brim and all spread inside it
-            lo_x = max(lo_x, x_lo + p.margin + s.mx)
+        if x_lo is not None and x_lo > self.x_range[0]:  # a reach narrower than the bed: all spread inside it
+            lo_x = max(lo_x, x_lo + m + s.mx)
         hi_x = self.x_range[1] - bm[1]
         if x_hi is not None and x_hi < self.x_range[1]:
-            hi_x = min(hi_x, x_hi - p.margin - s.px)
+            hi_x = min(hi_x, x_hi - m - s.px)
         lo_y, hi_y = self.y_range[0] + bm[2], self.y_range[1] - bm[3]
         xs = {lo_x}
         ys = {lo_y}

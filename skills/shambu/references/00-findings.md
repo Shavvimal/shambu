@@ -160,3 +160,6 @@ held it off the bed edge, and compared bounding boxes. It refused a five-part pl
   fits nowhere gets one "PLACEMENT NOT DONE" line with the arithmetic, never bed-edge FAILs at the origin.
 - On exit -101 the report names the two spec keys from Studio's log line (it has no z). Exit -21 is Studio's own
   arrange (24 mm between objects with tree supports).
+- Review corrections (reference 08 section 11.9): brims crossing the bed or a nozzle's reach are clipped (WARN), a
+  probe keeps a support mask for the pair rule, `count` copies are separate objects (each one clash-tested), and
+  `--keep-going` never exports an unplaced part.

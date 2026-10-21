@@ -12,7 +12,7 @@ Each item has a test a reviewer can run. An item passes only when its test passe
 3. **Constructors only store.** No `__init__` does I/O. (`StudioCLI.__post_init__` checks that the binary exists: that is a stat, documented.)
 4. **Pure planning core.** `spec.py`, `assemble.py`, `layout.py`, `patches.py`, `recipes.py` import no `subprocess`, `socket`, `paho`, `zipfile`.
    Fail if `rg -n "import (subprocess|socket|zipfile)|paho" shambu/{spec,assemble,layout,patches,recipes}.py` matches.
-5. **Pattern economy.** Every Protocol or Strategy has two implementations or a test fake: `PresetSource` (DirectorySource, ChainedSource), `Placer` (ShelfPacker + test fake), `Rule` (five), `Patch` (eleven), `Discovery` (ArpProbe, SsdpListen), `Listener` (CLI logger + test recorder).
+5. **Pattern economy.** Every Protocol or Strategy has two implementations or a test fake: `PresetSource` (DirectorySource, ChainedSource), `Placer` (ShelfPacker, BottomLeftPacker + test fake), `Footprint` (RasterFootprint, BoxFootprint), `SpreadProbe` (StudioProbe + test fake), `Rule` (Clearance, InsideBed, ReserveClear, ExtruderReach, TpuOnMain, MeshSane, SequentialClearance), `Patch` (eleven), `Discovery` (ArpProbe, SsdpListen), `Listener` (CLI logger + test recorder).
 6. **Template Method is overridable.** A `Pipeline` subclass that overrides `export()` with a fake runs end to end in tests without Bambu Studio.
 
 ## Correctness

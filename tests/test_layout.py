@@ -145,10 +145,17 @@ def test_aux_x_limit():
     assert failures([part("a", filament=1, x0=220, y0=30)], aux_x_limit=235.5) == []
 
 
-def test_aux_x_limit_counts_the_brim_margin():
-    """The mesh ends at x 230 (under 235.5), but its 10 mm brim and support margin reaches x 240."""
-    t = failures([part("a", filament=2, x0=210, y0=30, margin=10)], aux_x_limit=235.5)
-    assert any("aux_x_limit" in x and "240.0" in x for x in t)
+def test_aux_x_limit_clips_a_brim_and_fails_a_support():
+    """The mesh ends at x 230 (under 235.5). Its 10 mm brim reaches x 240: Studio clips it (WARN). A 10 mm support
+    spread reaching x 240 is a FAIL."""
+    p = part("a", filament=2, x0=210, y0=30, margin=10)
+    cs = L.LimitChecker().check([p], L.Context(FACTS, aux_x_limit=235.5))
+    assert all(c.ok for c in cs) and any(
+        c.kind == "brim" and "reaches x 240.0 on +x" in c.text and "clipped at x 235.5" in c.text for c in cs
+    )
+    p.margin, p.spread = 0.0, L.Spread(0, 10, 0, 0, "probe", True)
+    t = failures([p], aux_x_limit=235.5)
+    assert any("aux_x_limit" in x and "235.5" in x and "reaches x 240.0" in x for x in t)
 
 
 def test_filament_map_redirects_reach():
@@ -214,10 +221,17 @@ def test_sequential_clearance_has_no_ok_line_after_a_fail():
 
 
 def test_extruder_reach_counts_the_margin():
-    """Brim and support spread print with the part's filament, so they must stay in that extruder's reach."""
+    """Support prints with the part's filament, so it must stay in that extruder's reach (FAIL). A brim past the reach
+    is clipped by Studio to the nozzle's printable area (Brim.cpp:1079-1095, 1129-1138): a WARN."""
     assert failures([part("a", filament=2, x0=25, y0=30)]) == []
-    t = failures([part("a", filament=2, x0=25, y0=30, margin=5)])  # 25 - 5 = 20 < 20.5
-    assert any("reaches x 20.0 on -x with its brim 5.0 mm and support 0.0 mm; that extruder reaches x 20.5..256.0" in x for x in t)
+    brim = part("a", filament=2, x0=25, y0=30, margin=5)  # 25 - 5 = 20 < 20.5
+    cs = L.LimitChecker().check([brim], L.Context(FACTS))
+    assert all(c.ok for c in cs)
+    assert any(c.kind == "brim" and "brim on filament 2 reaches x 20.0 on -x and will be clipped at x 20.5" in c.text for c in cs)
+    sup_part = part("a", filament=2, x0=25, y0=30)
+    sup_part.spread = L.Spread(5, 0, 0, 0, "probe", True)
+    t = failures([sup_part])
+    assert any("reaches x 20.0 on -x with its support 5.0 mm; that extruder reaches x 20.5..256.0" in x for x in t)
 
 
 # ---------------------------------------------------------------------------- support spread (reference 08 section 11)
@@ -315,7 +329,24 @@ def test_inside_bed_ignores_tree_spread_counts_normal_spread():
     assert failures([tree]) == []
     normal = sup("feeler", 50.0, 226.4, x0=100, y0=14.8, margin=5.2, s=spread(16.0, source="estimate", tree=False))
     (t,) = failures([normal])
-    assert "is on the bed, but with its brim 5.2 mm and estimate margin 16.0 mm each side" in t and "leaves the bed" in t
+    assert "is on the bed, but with its estimate support margin 16.0 mm each side" in t and "leaves the bed" in t
+
+
+def test_brim_only_off_the_bed_is_a_warn_support_off_the_bed_a_fail():
+    brim = sup("a", x0=2, y0=30, margin=5.2)
+    cs = checks([brim])
+    assert all(c.ok for c in cs) and [c.kind for c in cs if c.warn] == ["brim"]
+    normal = sup("a", x0=2, y0=30, s=spread(5.0, source="estimate", tree=False))
+    assert any("support margin" in t for t in failures([normal]))
+
+
+def test_packer_keeps_the_brim_on_the_bed_when_it_can_and_clips_it_when_it_must():
+    p = sup("wide", 250, 20, margin=5.2)  # 250 + 2 x 5.2 > 252: only a clipped brim fits
+    got = L.BottomLeftPacker().place([p])
+    assert got.unplaced == {} and any(c.kind == "brim" for c in checks([p]))
+    q = sup("small", 20, 20, margin=5.2)
+    L.BottomLeftPacker().place([q])
+    assert q.x0 - q.margin >= 2.0  # room for the whole brim: the brim stays on the bed
 
 
 def test_reach_counts_spread_only_toward_the_dead_strip():
@@ -493,3 +524,74 @@ def test_plate14_printed_layout_passes():
         p.spread = L.Spread(*PLATE14_PROBE[p.key], "probe", True)
     assert L.overlaps(feeler.rect(False), others[2].rect(False))  # the boxes overlap by 3.3 mm
     assert [c.text for c in checks(ps) if not c.ok or c.warn] == []
+
+
+# ---------------------------------------------------------------------------- review fixes (Codex, 2026-10-21)
+U_RECTS = [(0, 0, 10, 100), (10, 0, 40, 10), (10, 90, 40, 100)]  # a U open to +x
+
+
+@pytest.mark.parametrize(
+    ("params", "want"),
+    [
+        ({"enable_support": "1"}, True),
+        ({"enable_support": "true"}, True),
+        ({"enforce_support_layers": "3"}, True),
+        ({"raft_layers": "2"}, True),
+        ({"enable_support": "0", "enforce_support_layers": "0", "raft_layers": "0"}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_needs_support_follows_studio(params, want):
+    """Print.hpp:492-494: has_support() || has_raft()."""
+    assert L.needs_support(params) is want
+
+
+def test_raft_only_part_gets_a_spread():
+    s = L.support_spread({"raft_layers": "3"}, 40.0)
+    assert s.sides() == (5.0,) * 4 and s.source == "estimate" and not s.tree
+    assert L.support_spread({"raft_layers": "3", "raft_first_layer_expansion": "8"}, 40.0).most() == 8.0
+
+
+def test_support_inside_a_notch_fails_with_the_mask():
+    """Support that fills a U-shaped notch stays inside the U's box: all four spreads are 0. A part nested in the
+    notch 5 mm from the U's back passes on the spreads and fails on the measured support mask."""
+    u = raster_part("u", U_RECTS, 0, 0, s=L.Spread(0, 0, 0, 0, "probe", True))
+    inner = sup("inner", 20, 60, x0=15, y0=20)
+    assert L.pair_check(u, inner) is None  # the spreads cannot see it
+    u.support_mask = L.mask_from_points((x / 2, y / 2) for x in range(24, 78) for y in range(30, 170))  # x 12..39, y 15..85
+    c = L.pair_check(u, inner)
+    assert c is not None and not c.ok and c.kind == "margin"
+    assert "u's support (measured by a solo slice) comes within 0.0 mm of inner" in c.text
+    inner.x0 = 60  # out of the notch, clear of the mask
+    assert L.pair_check(u, inner) is None
+
+
+def test_mask_round_trips_through_json():
+    m = L.mask_from_points([(-3.2, 1.1), (-2.9, 1.2), (5.0, -4.0)])
+    assert m is not None and m.bbox() == (-3.5, -4.0, 5.5, 1.5)
+    assert L.RasterFootprint.from_json(m.to_json()) == m
+
+
+def test_group_outline_keeps_a_members_notch():
+    u = raster_part("u", U_RECTS, 0, 0)
+    group = L.union_footprint([u.shape()], (0.0, 0.0))
+    assert group is not None
+    inner = sup("inner", 20, 60, x0=15, y0=20)
+    g, _ = group.gap(inner.shape())
+    assert g == pytest.approx(5.0)
+
+
+def test_a_concave_part_keeps_its_outline_when_fixed():
+    """A part that fits beside a concave free object fits beside the same object when it is fixed with `at`: the
+    packer reads the fixed part's footprint, not its box."""
+    free_u = raster_part("u", U_RECTS, 0, 0)
+    small = sup("small", 20, 60)
+    got = L.BottomLeftPacker().place([free_u, small])
+    assert len(got) == 1 and got.unplaced == {}
+    fixed_u = raster_part("u", U_RECTS, free_u.x0, free_u.y0)
+    fixed_u.fixed = True
+    small2 = sup("small", 20, 60)
+    got2 = L.BottomLeftPacker().place([small2], fixed=[fixed_u])
+    assert len(got2) == 1 and got2.unplaced == {} and L.pair_check(small2, fixed_u) is None
+    assert (small2.x0, small2.y0) == (small.x0, small.y0)

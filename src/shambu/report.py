@@ -69,11 +69,14 @@ def check_line(c: L.Check) -> str:
     """One check as a report line, its kind first so a reader (and the skill) can sort them: `PLACEMENT NOT DONE:`
     (the packer gave up, no position exists), `FAIL body overlap:` (the parts themselves meet), `FAIL margin rule:`
     (a measured or spec margin, the bodies are apart), `WARN margin rule:` (an estimate; the slice decides),
+    `WARN brim:` (a brim Studio will clip at the bed edge or a nozzle's reach),
     `FAIL:` and `OK:` for the rest."""
     if c.kind == "placement" and not c.ok:
         return "PLACEMENT NOT DONE: " + c.text
     if c.kind == "margin":
         return ("WARN margin rule: " if c.ok else "FAIL margin rule: ") + c.text
+    if c.kind == "brim" and c.ok:
+        return "WARN brim: " + c.text
     if c.kind == "body" and not c.ok:
         return "FAIL body overlap: " + c.text
     return ("OK: " if c.ok else "FAIL: ") + c.text
@@ -209,7 +212,10 @@ def render(r: BuildResult) -> str:
             "",
             "## Next",
             "- The checks failed (see Problems and the FAIL lines above): nothing was exported, so there is no new project to open. "
-            "Fix the spec and build again.",
+            "Fix the spec and build again."
+            + (
+                f" `--keep-going` never exports a plate with parts that have no position ({', '.join(pl.unplaced)})." if pl.unplaced else ""
+            ),
         ]
         out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
         return "\n".join(out) + "\n"

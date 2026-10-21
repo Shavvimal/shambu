@@ -188,6 +188,17 @@ class Plan:
         return [i for i, f in enumerate(self.filaments, 1) if f.get("name") == UNRESOLVED_FILAMENT]
 
     @property
+    def unplaced(self) -> list[str]:
+        """Parts with no computed position (PLACEMENT NOT DONE, or past plate 1): nothing to export for them, whatever
+        `--keep-going` says. Their pos would be a position nobody chose."""
+        return [x.key for x in self.parts if not x.placed.placed]
+
+    @property
+    def exportable(self) -> bool:
+        """The structural prerequisites of an export: every filament resolved and every part placed."""
+        return not self.unresolved_filaments and not self.unplaced
+
+    @property
     def map_applies(self) -> bool:
         """The filament -> extruder map is written (CLI, patch, verify) when the spec gives one or there are 2+ filaments."""
         return bool(self.spec.filament_map) or len(self.filaments) > 1
@@ -423,7 +434,8 @@ class Pipeline:
         result = BuildResult(plan, plan.outdir / (f"{spec.name}.gcode.3mf" if do_slice else f"{spec.name}.3mf"), sliced=do_slice)
         result.inputs = self.write_inputs(plan)
         self.emit("planned", ok=plan.ok, problems=plan.problems)
-        if plan.ok or (keep_going and not plan.unresolved_filaments):  # a placeholder filament can never export
+        # --keep-going overrides advisory checks, never a placeholder filament or a part without a position
+        if plan.exportable and (plan.ok or keep_going):
             if export:
                 result.run = self.export(plan, result.inputs, result.project, timeout, do_slice)
                 if result.run.ok:
@@ -585,7 +597,7 @@ class Pipeline:
             for group in groups.values():
                 first = group[0]
                 settings = dict(first.spec.set)
-                if len(filaments) > 1 and str(settings.get("enable_support", process.get("enable_support", "0"))) == "1":
+                if len(filaments) > 1 and L.needs_support({**process, **settings}):
                     # Studio prints "default" (0) support with whichever filament is loaded; on a two-filament plate that
                     # put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102, reference 08 3.3b).
                     for key in ("support_filament", "support_interface_filament"):
@@ -729,12 +741,19 @@ class Pipeline:
             main = files[0][1] if not eff or files[0][1] in eff else min(eff)
             body = L.union_info(ok_infos)  # merged sub-parts share one translation: pack their union bbox
             eff_settings = {**process, **ps.set}
-            margin, spread = self._margins(ps, eff_settings, body, files, main, probe, warnings, where)
+            margin, spread, mask = self._margins(ps, eff_settings, body, files, main, probe, warnings, where)
             footprint = self._footprint(files, body)
             for copy in range(ps.count):
                 key = _unique_key(ps.key(), used_keys)
                 placed = L.Placed(
-                    key, body, main, margin=margin, also_filaments=frozenset(eff - {main}), spread=spread, footprint=footprint
+                    key,
+                    body,
+                    main,
+                    margin=margin,
+                    also_filaments=frozenset(eff - {main}),
+                    spread=spread,
+                    footprint=footprint,
+                    support_mask=mask,
                 )
                 if ps.at is not None and copy == 0:
                     placed.x0, placed.y0, placed.fixed = float(ps.at[0]), float(ps.at[1]), True
@@ -751,25 +770,28 @@ class Pipeline:
         probe: SpreadProbe | None,
         warnings: list[str] | None,
         where: str,
-    ) -> tuple[float, L.Spread]:
-        """Brim and support spread of one part (reference 08 section 11). The spec's `brim_margin` replaces both, on
-        every side. The spec's `support_spread` [mx, px, my, py] replaces the support part. A probe (a solo slice,
-        single-file supported parts only) replaces the estimate. Otherwise `layout.support_spread` estimates it."""
+    ) -> tuple[float, L.Spread, L.Footprint | None]:
+        """Brim, support spread and (with a probe) the measured support mask of one part (reference 08 section 11).
+        The spec's `brim_margin` replaces brim and support on every side. The spec's `support_spread` [mx, px, my, py]
+        replaces the support part. A probe (a solo slice, single-file supported parts only) replaces the estimate and
+        brings the mask the pair rule uses. Otherwise `layout.support_spread` estimates it."""
         if ps.brim_margin is not None:
-            return 0.0, L.spec_spread(ps.brim_margin)
+            return 0.0, L.spec_spread(ps.brim_margin), None
         brim = L.brim_margin(eff_settings)
         if ps.support_spread is not None:
             mx, px, my, py = ps.support_spread
-            return brim, L.Spread(mx, px, my, py, "spec", L.is_tree(eff_settings), "spec support_spread")
+            return brim, L.Spread(mx, px, my, py, "spec", L.is_tree(eff_settings), "spec support_spread"), None
         measured: L.Spread | None = None
-        if probe is not None and str(eff_settings.get("enable_support", "0")) in ("1", "true") and len(files) == 1:
+        mask: L.Footprint | None = None
+        if probe is not None and L.needs_support(eff_settings) and len(files) == 1:
             try:
                 tag = ps.orientation.tag() if not ps.orientation.is_identity else "as-is"
-                measured = probe.measure(ProbeRequest(ps.key(), files[0][0], body, main, dict(ps.set), tag))
+                res = probe.measure(ProbeRequest(ps.key(), files[0][0], body, main, dict(ps.set), tag))
+                measured, mask = res.spread, res.mask
             except BambuError as e:
                 if warnings is not None:
                     warnings.append(f"{where} ({ps.key()}): support probe failed ({e}); the estimate applies")
-        return brim, L.support_spread(eff_settings, body.size[2], measured)
+        return brim, L.support_spread(eff_settings, body.size[2], measured), mask
 
     @staticmethod
     def _footprint(files: list[tuple[Path, int, str]], body: MeshInfo) -> L.Footprint | None:
@@ -929,6 +951,8 @@ class Pipeline:
                 margin=max(m.placed.margin for m in members),
                 also_filaments=first.placed.also_filaments,
                 spread=max((m.placed.spread for m in members), key=lambda sp: sp.most()),
+                # the members' own outlines, not the group's box: a part beside a concave member keeps its room
+                footprint=L.union_footprint([m.placed.shape() for m in members], (x0, y0)),
             )
             offsets = [(m.placed.x0 - x0, m.placed.y0 - y0) for m in members]
             out.append(PlannedPart(gspec, key, files, [m.infos[0] for m in members], placed, members=members, offsets=offsets))
