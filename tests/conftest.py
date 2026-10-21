@@ -32,6 +32,7 @@ def offline(monkeypatch, tmp_path_factory):
 
     monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
     monkeypatch.setattr(conf, "CONF", tmp_path_factory.mktemp("conf") / "no-such-BambuStudio.conf")
+    monkeypatch.setattr(conf, "CALIBRATION", tmp_path_factory.mktemp("calibration") / "no-such-calibration.json")
 
 
 MACHINE = "Test X2D 0.4 nozzle"

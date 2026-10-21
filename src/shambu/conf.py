@@ -4,17 +4,27 @@
 selected printer serial, the presets last used in the GUI, the bed type index, and the LAN
 access code per serial. The access code is returned only by `access_code()` and must never be
 printed or written to disk by callers.
+
+shambu's own data file lives beside it: `~/Library/Application Support/shambu/calibration.json`
+(`CALIBRATION`), the measured prints `shambu calibrate --add` stores. `load_calibration()` and
+`save_calibration()` read and write it (atomic: a temp file, then `os.replace`). It holds a list of
+prints (date, printer model, material, Studio total, ratio, flags, log path) and never an IP, a
+serial or an access code: `save_calibration` refuses a record with an `ip`, `serial` or secret key.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from .errors import ConfError
 
 APPSUPPORT = Path.home() / "Library/Application Support/BambuStudio"
 CONF = APPSUPPORT / "BambuStudio.conf"
+CALIBRATION = Path.home() / "Library/Application Support/shambu/calibration.json"
+CALIBRATION_VERSION = 1
 BED_TYPES = {
     "0": "Default Plate",
     "1": "Cool Plate",
@@ -84,6 +94,50 @@ def redact(obj):
     if isinstance(obj, list):
         return [redact(v) for v in obj]
     return obj
+
+
+def load_calibration(path: Path | None = None) -> list[dict]:
+    """The stored prints; [] when the file does not exist. A file that is not shambu's calibration JSON raises."""
+    p = path or CALIBRATION
+    if not p.is_file():
+        return []
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ConfError(f"{p} is not readable JSON: {e}") from e
+    if not isinstance(d, dict) or not isinstance(d.get("prints"), list):
+        raise ConfError(f'{p} is not a shambu calibration file (no "prints" list)')
+    return [r for r in d["prints"] if isinstance(r, dict)]
+
+
+def _identifying_keys(record: dict) -> list[str]:
+    # not SECRET_RE: its "code" would match `gcode3mf`
+    return [
+        k
+        for k in record
+        if k.lower() in ("ip", "serial", "serial_masked", "printer_id", "access_code")
+        or any(s in k.lower() for s in ("token", "ticket", "password", "secret"))
+    ]
+
+
+def save_calibration(prints: list[dict], path: Path | None = None) -> Path:
+    """Write the prints atomically. Refuses a record that carries an IP, a serial or a secret-looking key."""
+    p = path or CALIBRATION
+    for r in prints:
+        bad = _identifying_keys(r)
+        if bad:
+            raise ConfError(f"refusing to store a calibration record with {bad}: the file never holds an IP, a serial or a secret")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".calibration-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"version": CALIBRATION_VERSION, "prints": prints}, f, indent=1)
+            f.write("\n")
+        os.replace(tmp, p)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return p
 
 
 def hms_table(serial_prefix: str = "20P", lang: str = "en") -> dict:

@@ -1,0 +1,1201 @@
+{
+ "_source": "research C (2026-10-21): bracket D.7 (2026-10-16, 42 polls, clock rebuilt from ends_at) and the E7a cradle (7 polls)",
+ "d7": {
+  "track": {
+   "total_min": 410.3833333333333,
+   "layers": {
+    "11": [
+     3,
+     395
+    ],
+    "12": [
+     3,
+     395
+    ],
+    "24": [
+     4,
+     390
+    ],
+    "25": [
+     4,
+     390
+    ],
+    "44": [
+     6,
+     384
+    ],
+    "45": [
+     6,
+     383
+    ],
+    "63": [
+     7,
+     377
+    ],
+    "64": [
+     8,
+     377
+    ],
+    "79": [
+     9,
+     371
+    ],
+    "80": [
+     9,
+     371
+    ],
+    "91": [
+     10,
+     365
+    ],
+    "92": [
+     11,
+     365
+    ],
+    "101": [
+     12,
+     358
+    ],
+    "102": [
+     12,
+     358
+    ],
+    "110": [
+     13,
+     353
+    ],
+    "111": [
+     13,
+     352
+    ],
+    "121": [
+     15,
+     348
+    ],
+    "122": [
+     15,
+     347
+    ],
+    "132": [
+     16,
+     342
+    ],
+    "133": [
+     16,
+     341
+    ],
+    "139": [
+     17,
+     336
+    ],
+    "140": [
+     18,
+     336
+    ],
+    "154": [
+     19,
+     329
+    ],
+    "155": [
+     19,
+     328
+    ],
+    "169": [
+     21,
+     321
+    ],
+    "170": [
+     21,
+     321
+    ],
+    "185": [
+     23,
+     314
+    ],
+    "186": [
+     23,
+     313
+    ],
+    "203": [
+     25,
+     306
+    ],
+    "204": [
+     25,
+     306
+    ],
+    "220": [
+     27,
+     298
+    ],
+    "221": [
+     27,
+     298
+    ],
+    "236": [
+     29,
+     291
+    ],
+    "237": [
+     29,
+     290
+    ],
+    "250": [
+     30,
+     284
+    ],
+    "251": [
+     30,
+     283
+    ],
+    "265": [
+     32,
+     278
+    ],
+    "266": [
+     32,
+     277
+    ],
+    "279": [
+     33,
+     272
+    ],
+    "280": [
+     33,
+     271
+    ],
+    "290": [
+     35,
+     265
+    ],
+    "291": [
+     35,
+     265
+    ],
+    "304": [
+     37,
+     258
+    ],
+    "305": [
+     37,
+     257
+    ],
+    "318": [
+     38,
+     250
+    ],
+    "319": [
+     39,
+     250
+    ],
+    "332": [
+     40,
+     242
+    ],
+    "333": [
+     41,
+     242
+    ],
+    "344": [
+     42,
+     234
+    ],
+    "345": [
+     42,
+     233
+    ],
+    "357": [
+     44,
+     226
+    ],
+    "358": [
+     44,
+     226
+    ],
+    "374": [
+     46,
+     217
+    ],
+    "375": [
+     47,
+     217
+    ],
+    "388": [
+     48,
+     210
+    ],
+    "389": [
+     48,
+     209
+    ],
+    "403": [
+     50,
+     203
+    ],
+    "404": [
+     50,
+     202
+    ],
+    "418": [
+     52,
+     195
+    ],
+    "419": [
+     52,
+     195
+    ],
+    "432": [
+     53,
+     188
+    ],
+    "433": [
+     54,
+     188
+    ],
+    "448": [
+     55,
+     181
+    ],
+    "449": [
+     55,
+     180
+    ],
+    "466": [
+     57,
+     173
+    ],
+    "467": [
+     57,
+     173
+    ],
+    "486": [
+     59,
+     165
+    ],
+    "487": [
+     59,
+     165
+    ],
+    "506": [
+     61,
+     157
+    ],
+    "507": [
+     61,
+     157
+    ],
+    "522": [
+     62,
+     151
+    ],
+    "523": [
+     63,
+     151
+    ],
+    "542": [
+     64,
+     145
+    ],
+    "543": [
+     64,
+     145
+    ],
+    "561": [
+     65,
+     139
+    ],
+    "562": [
+     65,
+     139
+    ],
+    "578": [
+     67,
+     134
+    ],
+    "579": [
+     67,
+     133
+    ],
+    "593": [
+     68,
+     128
+    ],
+    "594": [
+     68,
+     127
+    ],
+    "605": [
+     70,
+     121
+    ],
+    "606": [
+     70,
+     121
+    ],
+    "620": [
+     71,
+     114
+    ],
+    "621": [
+     72,
+     114
+    ]
+   },
+   "printer_model": "Bambu Lab X2D",
+   "material": "PETG"
+  },
+  "log": [
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:28:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 4,
+    "layer": 11,
+    "total_layers": 850,
+    "remaining_min": 294,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:33:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 5,
+    "layer": 24,
+    "total_layers": 850,
+    "remaining_min": 289,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:38:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 7,
+    "layer": 44,
+    "total_layers": 850,
+    "remaining_min": 284,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:43:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 9,
+    "layer": 63,
+    "total_layers": 850,
+    "remaining_min": 279,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:48:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 10,
+    "layer": 79,
+    "total_layers": 850,
+    "remaining_min": 274,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:54:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 12,
+    "layer": 91,
+    "total_layers": 850,
+    "remaining_min": 269,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T16:59:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 13,
+    "layer": 101,
+    "total_layers": 850,
+    "remaining_min": 264,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:04:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 15,
+    "layer": 110,
+    "total_layers": 850,
+    "remaining_min": 259,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:09:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 17,
+    "layer": 121,
+    "total_layers": 850,
+    "remaining_min": 255,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:14:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 18,
+    "layer": 132,
+    "total_layers": 850,
+    "remaining_min": 250,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:19:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 20,
+    "layer": 139,
+    "total_layers": 850,
+    "remaining_min": 245,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:25:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 21,
+    "layer": 154,
+    "total_layers": 850,
+    "remaining_min": 240,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:30:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 23,
+    "layer": 169,
+    "total_layers": 850,
+    "remaining_min": 235,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:35:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 25,
+    "layer": 185,
+    "total_layers": 850,
+    "remaining_min": 230,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:40:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 26,
+    "layer": 203,
+    "total_layers": 850,
+    "remaining_min": 225,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:45:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 28,
+    "layer": 220,
+    "total_layers": 850,
+    "remaining_min": 220,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:50:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 29,
+    "layer": 236,
+    "total_layers": 850,
+    "remaining_min": 215,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T17:55:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 31,
+    "layer": 250,
+    "total_layers": 850,
+    "remaining_min": 210,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:01:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 33,
+    "layer": 265,
+    "total_layers": 850,
+    "remaining_min": 205,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:06:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 34,
+    "layer": 279,
+    "total_layers": 850,
+    "remaining_min": 200,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:11:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 36,
+    "layer": 290,
+    "total_layers": 850,
+    "remaining_min": 195,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:16:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 37,
+    "layer": 304,
+    "total_layers": 850,
+    "remaining_min": 190,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:21:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 39,
+    "layer": 318,
+    "total_layers": 850,
+    "remaining_min": 186,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:26:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 41,
+    "layer": 332,
+    "total_layers": 850,
+    "remaining_min": 181,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:31:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 42,
+    "layer": 344,
+    "total_layers": 850,
+    "remaining_min": 176,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:36:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 44,
+    "layer": 357,
+    "total_layers": 850,
+    "remaining_min": 171,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:42:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 45,
+    "layer": 374,
+    "total_layers": 850,
+    "remaining_min": 166,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:47:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 47,
+    "layer": 388,
+    "total_layers": 850,
+    "remaining_min": 161,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:52:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 49,
+    "layer": 403,
+    "total_layers": 850,
+    "remaining_min": 156,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T18:57:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 50,
+    "layer": 418,
+    "total_layers": 850,
+    "remaining_min": 151,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:02:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 52,
+    "layer": 432,
+    "total_layers": 850,
+    "remaining_min": 146,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:07:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 53,
+    "layer": 448,
+    "total_layers": 850,
+    "remaining_min": 141,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:12:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 55,
+    "layer": 466,
+    "total_layers": 850,
+    "remaining_min": 136,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:18:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 57,
+    "layer": 486,
+    "total_layers": 850,
+    "remaining_min": 131,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:23:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 58,
+    "layer": 506,
+    "total_layers": 850,
+    "remaining_min": 126,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:28:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 60,
+    "layer": 522,
+    "total_layers": 850,
+    "remaining_min": 121,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:33:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 62,
+    "layer": 542,
+    "total_layers": 850,
+    "remaining_min": 116,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:38:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 63,
+    "layer": 561,
+    "total_layers": 850,
+    "remaining_min": 111,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:43:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 65,
+    "layer": 578,
+    "total_layers": 850,
+    "remaining_min": 106,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:48:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 66,
+    "layer": 593,
+    "total_layers": 850,
+    "remaining_min": 101,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:53:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 68,
+    "layer": 605,
+    "total_layers": 850,
+    "remaining_min": 97,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-16T19:59:00Z",
+    "task": "plate-9-bracket-D7.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 70,
+    "layer": 620,
+    "total_layers": 850,
+    "remaining_min": 92,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   }
+  ]
+ },
+ "e7a": {
+  "track": {
+   "total_min": 1080.35,
+   "layers": {
+    "135": [
+     26,
+     792
+    ],
+    "136": [
+     26,
+     790
+    ],
+    "141": [
+     27,
+     783
+    ],
+    "142": [
+     27,
+     781
+    ],
+    "150": [
+     28,
+     772
+    ],
+    "151": [
+     28,
+     771
+    ],
+    "159": [
+     29,
+     763
+    ],
+    "160": [
+     29,
+     762
+    ],
+    "168": [
+     30,
+     753
+    ],
+    "169": [
+     30,
+     752
+    ],
+    "176": [
+     31,
+     744
+    ],
+    "177": [
+     31,
+     742
+    ],
+    "182": [
+     31,
+     734
+    ],
+    "183": [
+     32,
+     733
+    ]
+   },
+   "printer_model": "Bambu Lab X2D",
+   "material": "PETG"
+  },
+  "log": [
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T14:23:55Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 26,
+    "layer": 135,
+    "total_layers": 1090,
+    "remaining_min": 792,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T14:34:02Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 27,
+    "layer": 141,
+    "total_layers": 1090,
+    "remaining_min": 782,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T14:44:09Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 28,
+    "layer": 150,
+    "total_layers": 1090,
+    "remaining_min": 773,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T14:54:16Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 29,
+    "layer": 159,
+    "total_layers": 1090,
+    "remaining_min": 763,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T15:04:23Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 30,
+    "layer": 168,
+    "total_layers": 1090,
+    "remaining_min": 753,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T15:14:30Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 31,
+    "layer": 176,
+    "total_layers": 1090,
+    "remaining_min": 744,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   },
+   {
+    "kind": "poll",
+    "read_at": "2026-10-21T15:24:33Z",
+    "task": "all-on-one-set-E7a-cradle.gcode",
+    "task_id": null,
+    "state": "RUNNING",
+    "percent": 32,
+    "layer": 182,
+    "total_layers": 1090,
+    "remaining_min": 734,
+    "speed_level": null,
+    "speed_percent": null,
+    "stage": 0,
+    "stages": null,
+    "print_error": 0
+   }
+  ]
+ }
+}

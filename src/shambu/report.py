@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from . import conf
 from . import layout as L
-from .errors import BuildError
+from .errors import BambuError, BuildError
 
 if TYPE_CHECKING:
     from .build import BuildResult, PlannedPart
@@ -20,13 +21,17 @@ STANDING_WARNINGS = (
 FEATURE_TIME_ROLES = ("Support", "Support interface", "Prime tower", "Flush", "Travel")
 
 
-def estimate_lines(sl: dict) -> list[str]:
+def estimate_lines(sl: dict, calibration: list[dict] | None = None, printer_model: str | None = None) -> list[str]:
     """Report lines for one entry of BuildResult.estimates(). Each number names its source: slice_info.config,
     result.json (seconds per feature, tower plus flush grams) or the G-code parser (support grams, filament changes
-    as tool switches, and everything by feature when the run left no result.json)."""
+    as tool switches, and everything by feature when the run left no result.json). The time is always "Studio
+    estimate"; `calibration` (the stored measured prints) adds their range, or a calibrated time when n >= 3 agree."""
+    from .calibrate import handback, material_key
+
     n = sl["plate"]
+    cal = handback(calibration or [], printer_model, material_key(f["type"] for f in sl["filaments"]), sl["prediction_s"])
     out = [
-        f"- plate {n} estimate: {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min, {sl['weight_g']:.1f} g ("
+        f"- plate {n} estimate: Studio estimate {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min{cal}, {sl['weight_g']:.1f} g ("
         + ", ".join(f"filament {f['id']} {f['type']} {f['used_g']:.1f} g" for f in sl["filaments"])
         + ")"
         + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")
@@ -182,8 +187,13 @@ def render(r: BuildResult) -> str:
                 "- verified: bed type (project and plates), process name and every override, filament presets, colours and map, "
                 "plate and object counts, object names, machine start/end/filament-change G-code" + (", G-code present" if r.sliced else "")
             )
+        try:
+            cal = conf.load_calibration() if r.estimates() else []
+        except BambuError:  # an unreadable calibration file must not hide the estimate; its path stays out of the report
+            cal = []
+            out.append("- calibration file not read: `shambu calibrate --show` names the problem")
         for sl in r.estimates():
-            out += estimate_lines(sl)
+            out += estimate_lines(sl, cal, pl.facts.get("printer_model"))
         out += ["- VERIFY FAIL: " + x for x in (r.verify_problems or [])]
     if r.run is not None and not r.run.ok:
         out += ["", "## Next", "- The export failed (above): nothing to open. Fix the spec or the part and build again."]

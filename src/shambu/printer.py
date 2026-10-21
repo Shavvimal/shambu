@@ -29,6 +29,14 @@ the two external spools are `print.vir_slot[]` with ids "254" (feeds the main/le
 (Bambu's filament id, e.g. GFG99 = Generic PETG, GFG00 = Bambu PETG Basic; the installed filament presets carry the
 same value as `filament_id`), `tray_sub_brands`, `remain` and `k`. Each extruder's `snow` ("slot now") packs the tray
 it holds: (ams id << 8) | slot, 0xFFFF for none; the capture showed left snow 0xFE00 (= 254) and right 0xFF00 (= 255).
+
+Time fields (live X2D report, firmware 20018, 2026-10-21; Studio's DeviceManager.cpp): the report carries no start time
+and no total estimate, only `mc_remaining_time` (min). So `Status.read_at` stamps each read in UTC when the report is
+decoded, and `watch` polls more often near the start and the end of a print, where the times matter. `spd_lvl` is the
+speed level (1 silent, 2 standard, 3 sport, 4 ludicrous), `spd_mag` its percent, `stg` the list of startup stages this
+job runs and `stg_cur` the current one (0 = printing); names in `STAGE_NAMES`. No output of this module names the IP:
+`Status.to_json` redacts it and keeps only the masked serial, and `Status.log_record` (a `watch --log` line) holds
+neither the IP nor the serial.
 """
 
 from __future__ import annotations
@@ -80,6 +88,35 @@ HANDSHAKE_S = 5.0
 KEEPALIVE_S = 10
 READ_TIMEOUT_S = 15.0
 TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
+SPEED_LEVELS = {1: "silent", 2: "standard", 3: "sport", 4: "ludicrous"}  # `spd_lvl`; Studio StatusPanel.cpp
+STANDARD_SPEED = 2
+# `stg` / `stg_cur` ids -> Studio's text (DeviceManager.cpp get_stage_string, v02.08.02.61). Every id the live X2D job
+# listed on 2026-10-21 is here; 255 is in that list, but Studio's table has no text for it.
+STAGE_NAMES = {
+    0: "printing",
+    1: "auto bed levelling",
+    2: "heatbed preheating",
+    3: "vibration compensation",
+    4: "changing filament",
+    7: "heating nozzle",
+    8: "calibrating dynamic flow",
+    11: "identifying build plate type",
+    13: "homing toolhead",
+    14: "cleaning nozzle tip",
+    29: "cooling chamber",
+    39: "nozzle offset calibration",
+    51: "printing calibration lines",
+    54: "waiting for the heatbed to reach its target",
+    73: "build plate alignment detection",
+    74: "heatbed surface foreign object detection",
+    75: "heatbed underside foreign object detection",
+    255: "no name in Studio's table",
+}
+REDACTED_IP = "<ip>"
+# watch(): at most FAST_POLL_S between polls near the start and the end of a print, where Studio's model is worst.
+FAST_POLL_S = 60
+START_WINDOW_S = 15 * 60
+END_WINDOW_MIN = 15
 # External spools on a dual-nozzle printer: virtual tray id -> the extruder id it feeds (live X2D, 2026-10-16; each
 # extruder's `snow` confirmed it). Single-nozzle printers report one external spool as `vt_tray` with tray_now 254.
 EXTERNAL_TRAY_EXTRUDER = {254: 1, 255: 0}
@@ -590,6 +627,11 @@ class Status:
     wifi: str | None
     stage: int | None
     tls_verified: bool | None
+    read_at: str | None = None  # UTC ISO 8601 with seconds, set when the report is decoded
+    speed_level: int | None = None  # spd_lvl: 1 silent, 2 standard, 3 sport, 4 ludicrous
+    speed_percent: int | None = None  # spd_mag
+    stages: list[int] | None = None  # stg: the startup stages of this job, as the printer sends them
+    task_id: str | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -606,15 +648,41 @@ class Status:
             return None
         return time.strftime("%H:%M", time.localtime(time.time() + self.remaining_min * 60))
 
+    @property
+    def speed_name(self) -> str | None:
+        return None if self.speed_level is None else SPEED_LEVELS.get(self.speed_level, f"level {self.speed_level}")
+
     def to_json(self) -> dict:
+        """Every field but `raw`, with the IP redacted (CONTRIBUTING: an IP never lands in a file) and the serial masked."""
         d = {k: v for k, v in self.__dict__.items() if k != "raw"}
+        d["ip"] = REDACTED_IP
         d["ends_at"] = self.ends_at()
+        d["speed"] = self.speed_name
         return d
+
+    def log_record(self) -> dict:
+        """One `watch --log` line: the time and job fields only. No IP, no serial (not even masked), no wifi."""
+        return {
+            "read_at": self.read_at,
+            "task": self.task,
+            "task_id": self.task_id,
+            "state": self.raw_state,
+            "percent": self.percent,
+            "layer": self.layer,
+            "total_layers": self.total_layers,
+            "remaining_min": self.remaining_min,
+            "speed_level": self.speed_level,
+            "speed_percent": self.speed_percent,
+            "stage": self.stage,
+            "stages": self.stages,
+            "print_error": self.print_error,
+        }
 
     def lines(self) -> list[str]:
         out = [
-            f"printer {self.serial_masked} at {self.ip}: {self.state} ({self.raw_state})"
+            f"printer {self.serial_masked}: {self.state} ({self.raw_state})"
             + ("" if self.tls_verified else ", TLS unverified")
+            + (f", read {self.read_at}" if self.read_at else "")
         ]
         if self.task:
             out.append(f"job: {self.task}" + (f"  file {self.file}" if self.file and self.file != self.task else ""))
@@ -625,6 +693,10 @@ class Status:
             if self.remaining_min is not None:
                 prog += f", {self.remaining_min // 60} h {self.remaining_min % 60} min left, ends about {self.ends_at()}"
             out.append(prog)
+        if self.speed_level is not None and self.busy:
+            out.append(f"speed {self.speed_name}" + (f" ({self.speed_percent} %)" if self.speed_percent is not None else ""))
+        if self.stage and self.busy:
+            out.append(f"stage {self.stage}: {STAGE_NAMES.get(self.stage, 'no name in this table')}")
         for n in self.nozzles:
             tgt = f" -> {n['target_c']:.0f}" if n.get("target_c") else ""
             out.append(
@@ -647,9 +719,26 @@ class Status:
         return out
 
 
+def utc_iso(t: float) -> str:
+    """Epoch seconds -> '2026-10-21T14:23:55Z'."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _int_or_none(v) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class StatusDecoder:
-    def __init__(self, hms_table: dict | None = None):
+    """Raw report -> Status. `now` is the clock for `read_at`, injected so that tests can fix it."""
+
+    def __init__(self, hms_table: dict | None = None, now: Callable[[], float] = time.time):
         self.hms_table = hms_table or {}
+        self.now = now
 
     def decode(self, report: dict, serial: str, ip: str) -> Status:
         p = report.get("print", {})
@@ -697,6 +786,9 @@ class StatusDecoder:
         if cham is None and "chamber_temper" in p:
             cham = float(p["chamber_temper"])
         raw_state = str(p.get("gcode_state", "UNKNOWN"))
+        stg = p.get("stg")
+        stages = [s for s in (_int_or_none(x) for x in stg) if s is not None] if isinstance(stg, list) else None
+        task_id = p.get("task_id") if p.get("task_id") not in (None, "") else p.get("subtask_id")
         return Status(
             conf.mask(serial),
             ip,
@@ -718,7 +810,12 @@ class StatusDecoder:
             p.get("wifi_signal"),
             p.get("stg_cur"),
             report.get("_tls_verified"),
-            report,
+            read_at=utc_iso(self.now()),
+            speed_level=_int_or_none(p.get("spd_lvl")),
+            speed_percent=_int_or_none(p.get("spd_mag")),
+            stages=stages,
+            task_id=None if task_id in (None, "") else str(task_id),
+            raw=report,
         )
 
 
@@ -846,7 +943,7 @@ class LoadedFilaments:
     def to_json(self) -> dict:
         return {
             "serial_masked": self.serial_masked,
-            "ip": self.ip,
+            "ip": REDACTED_IP,
             "read_at": self.read_at,
             "read_epoch": self.read_epoch,
             "tls_verified": self.tls_verified,
@@ -857,7 +954,7 @@ class LoadedFilaments:
 
     def lines(self) -> list[str]:
         out = [
-            f"printer {self.serial_masked} at {self.ip}: filaments read at {self.read_at}"
+            f"printer {self.serial_masked}: filaments read at {self.read_at}"
             + ("" if self.tls_verified else ", TLS unverified")
             + (f"; presets for {self.printer_preset}" if self.printer_preset else "")
         ]
@@ -1134,14 +1231,87 @@ class PrinterService:
         ip, serial, report = self._bounded(self._resolve_and_read)
         return FilamentDecoder(resolver, printer_preset).decode(report, serial, ip)
 
-    def watch(self, every_s: int = 300, until_idle: bool = True, max_polls: int = 200):
-        """Generator of Status every `every_s` seconds; stops on a final state (idle, finished, failed) or after
-        `max_polls`. An unknown or unrecognised state is not final: it logs a warning and keeps polling."""
+    def watch(
+        self,
+        every_s: float = 300,
+        until_idle: bool = True,
+        max_polls: int = 200,
+        max_errors: int | None = None,
+        sleep: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        now: Callable[[], float] | None = None,
+    ) -> Iterator[Status | WatchError]:
+        """Generator of Status, one per poll; stops on a final state (idle, finished, failed) or after `max_polls`.
+        An unknown or unrecognised state is not final: it logs a warning and keeps polling.
+
+        The interval is `poll_interval()`: `every_s`, but at most 60 s in the first 15 minutes of RUNNING (when this
+        watch saw the print start) and while less than 15 minutes remain. `max_errors=None` lets a failed read raise
+        (the old behaviour). With a number, a failed read yields a `WatchError` and the watch goes on; after
+        `max_errors` failures in a row the last `WatchError` has `gave_up=True` and the generator ends.
+        `sleep`, `clock` (monotonic) and `now` (epoch, for an error's `read_at`) are injectable for tests."""
+        sleep = sleep or time.sleep
+        clock = clock or time.monotonic
+        now = now or time.time
+        running_since: float | None = None  # clock() at the first RUNNING poll, when this watch saw the start
+        seen_any = joined_mid_print = False
+        errors = 0
         for _ in range(max_polls):
-            st = self.status()
+            try:
+                st = self.status()
+            except PrinterError as e:
+                if max_errors is None:
+                    raise
+                errors += 1
+                gave_up = errors >= max_errors
+                yield WatchError(utc_iso(now()), redact_ip(f"{type(e).__name__}: {e}"), errors, gave_up)
+                if gave_up:
+                    return
+                sleep(every_s)
+                continue
+            errors = 0
+            if st.raw_state == "RUNNING" and running_since is None and not joined_mid_print:
+                if seen_any or (st.layer or 0) <= 1:
+                    running_since = clock()
+                else:
+                    joined_mid_print = True  # the first poll found the print past layer 1: its start is not ours
+            seen_any = True
             yield st
             if until_idle and st.done:
                 return
             if not st.busy and not st.done:
                 log.warning("printer state %s (%s) is not final; still watching", st.state, st.raw_state)
-            time.sleep(every_s)
+            sleep(poll_interval(every_s, st, None if running_since is None else clock() - running_since))
+
+
+_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+
+def redact_ip(text: str) -> str:
+    """A read error names the host it tried; a watch log or stdout must not (CONTRIBUTING: never commit an IP)."""
+    return _IPV4.sub(REDACTED_IP, text)
+
+
+@dataclass(frozen=True)
+class WatchError:
+    """One failed poll of `PrinterService.watch`. `error` has the IP redacted; `consecutive` counts the failures in a
+    row; `gave_up` is True on the failure that reached `max_errors`."""
+
+    read_at: str
+    error: str
+    consecutive: int
+    gave_up: bool = False
+
+    def log_record(self) -> dict:
+        return {"read_at": self.read_at, "error": self.error, "consecutive": self.consecutive, "gave_up": self.gave_up}
+
+
+def poll_interval(every_s: float, st: Status, running_for_s: float | None) -> float:
+    """Seconds to the next poll. At most FAST_POLL_S while the printer prepares, in the first START_WINDOW_S of
+    RUNNING (`running_for_s` is None when the watch joined mid-print), and while fewer than END_WINDOW_MIN minutes
+    remain: Studio's model is worst at the start and the end, and these polls bound the real start and end."""
+    fast = st.raw_state == "PREPARE"
+    if st.raw_state == "RUNNING" and running_for_s is not None and running_for_s < START_WINDOW_S:
+        fast = True
+    if st.raw_state in ("RUNNING", "PAUSE") and st.remaining_min is not None and st.remaining_min < END_WINDOW_MIN:
+        fast = True
+    return min(every_s, FAST_POLL_S) if fast else every_s

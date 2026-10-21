@@ -117,3 +117,68 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
 Fillets, teardrop holes, nut slots, inserts, design advice (the CAD step) and polishing (the user's hands). The
 skill still names them in the hand-back when they decide the result: a bed-side fillet that should be a
 chamfer, a bore that wants a coupon, a show face that wants matte filament.
+
+## 10. Studio's time estimate versus the printer
+
+Source: research C (2026-10-21), from two watched X2D prints, Studio's `GCodeProcessor.cpp` (v02.08.02.61) and five
+outside reports. This section replaces the "slicer estimate wins" line in section 8: show the Studio estimate, and
+show a measured ratio only from `shambu calibrate` data, with n.
+
+**The two measured pairs disagree.** Both prints used Generic PETG, a 0.4 HS01 nozzle and the X2D 0.4 profile.
+
+| Print | Span | Studio | Real | Ratio | Resolution |
+| --- | --- | --- | --- | --- | --- |
+| Bracket D.7, 2026-10-16 | layers 11 to 620 | 281 min | 211 min | 0.751 | about ±0.01 (±1 min per end) |
+| Bracket D.7, whole print | start to end (both rebuilt) | 410 min (6 h 50) | about 5 h 0 to 5 h 30 | about 0.8 | ±15 min: neither the start nor the end was logged |
+| E7a cradle, 2026-10-21 | layers 135 to 182 | 57.5 min | 60.6 min | 1.054 | ±0.03 (one layer is about 1.5 min of Studio time) |
+| E7a cradle, send to layer 135 | upper bound | 289.3 min | at most 298.4 min | at most 1.031 | upper bound only |
+
+So no single ratio exists for this printer yet (n=2, 0.75 to 1.05). `shambu calibrate` reports the range, and it
+offers a point estimate only with n >= 3 prints, all logged at Standard speed, whose ratios lie within 0.15.
+
+**Corrections to the D.7 post-mortem.**
+
+- D.7 was PETG, not PLA (`filament_type = PETG` in its G-code; the report said "filament 1 PETG 179.6 g").
+- HS01 is a standard-flow hardened-steel nozzle, not high flow: Studio reads character 2 of the type as the flow
+  (`S` standard, `H`/`E` high flow) and characters 3 to 4 as the material (`01` hardened steel)
+  (`DevNozzleSystem.cpp` :637-670). The "Standard" preset was correct.
+- 0.75 is the mid-print ratio (layers 11 to 620). The whole print is about 0.8, because the startup took longer than
+  Studio allowed.
+- The D.7 times are local time (BST), not UTC: `Status.ends_at()` uses the local clock.
+- The printer's countdown on D.7 ran at 0.74 to 0.81 x Studio's M73 `R`. On E7a it equalled M73 `R`. The speed level
+  was not logged on D.7; a level other than Standard is the most likely cause. The watch log now records it.
+
+**What Studio counts as 0 s.** Studio simulates the G-code's moves against the machine limits and adds a few fixed
+times. Heat waits (`M109`, `M190`) count 0 s. The calibration commands have no handler, so they count 0 s too:
+`M983` dynamic flow, `M970`/`M974` vibration compensation, `G383`/`G3811` foreign-object and underside detection,
+plate detection, nozzle wipe and Z-offset calibration. `G29` (bed levelling) counts a fixed 260 s
+(`machine_prepare_compensation_time`), and only inside an `M622 J1` block. `M191 S` above 40 adds 720 s. `G4`,
+`M400 S/P` and `SYNC T` add their stated time. Studio counts both branches of an `M622 J1`/`J2` flag block, whichever
+the printer runs. No code path scales the result per printer. The startup is therefore the part Studio cannot model,
+and `shambu calibrate` fits it as an offset (minutes from the first RUNNING poll to Studio's time at the first logged
+layer).
+
+**Outside reports.**
+
+1. No fixed ratio; errors go both ways. BambuStudio #11150 (P2S, 2026-06): the estimate grew by 58 % on a long
+   print; Bambu staff said their reprint matched the estimate and that the AMS tube length affects it.
+   https://github.com/bambulab/BambuStudio/issues/11150
+2. X2D profile slow-downs inflate the X2D estimate. BambuStudio #10590 (X2D, 2026-05): with "slow down for
+   overhangs", `z_direction_outwall_speed_continuous = 1` and `outer_wall_speed = 200,50`, the X2D slices much
+   slower than an A1 Mini. D.7 and E7a both carry these settings. https://github.com/bambulab/BambuStudio/issues/10590
+3. Long multi-colour prints overrun by about 20 % (H2D, X1C). Users name fixed filament-change times, PTFE length
+   and purge. https://forum.bambulab.com/t/actual-print-time-is-about-20-longer-than-estimated/172472
+4. Single-colour long prints can finish early (P1S, three 19 h prints about 1 h early, about 5.5 %).
+   https://forum.bambulab.com/t/how-come-prints-finish-much-earlier-than-bs-estimated/124230
+5. The speed level and firmware acceleration change the live remaining time.
+   https://forum.bambulab.com/t/bambu-lab-acceleration-overridden/133523 and
+   https://forum.bambulab.com/t/change-speed-modes-midprint-automatically/59467
+
+No Bambu statement gives a ratio. The community sees about -5 % to +20 %, mostly from multi-colour work and profile
+slow-downs. D.7's 0.75 is an outlier, and a non-Standard speed level explains it better than any slicer cause.
+
+**How to add a measured print.** Export the plate as a `.gcode.3mf`. Start
+`shambu printer watch --log print.jsonl --gcode3mf plate.gcode.3mf` right after sending the print, while it
+prepares (a watch that finds the printer idle stops at once), and leave it until it logs FINISH. Then run `shambu calibrate --log print.jsonl --add`. `shambu calibrate --show` prints the
+stored prints and the fit per printer model and material. The build report then adds "measured prints ran at A to B x
+Studio (n=N)", or "calibrated about H h M min (n=N)" when the fit allows a point estimate.
