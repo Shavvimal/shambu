@@ -20,6 +20,9 @@ the answer off a table instead of guessing. A variant is a small JSON patch over
 own auto-orient table) into variants for one part, and
 `by_object_variant()` flips every plate to print-by-object, so the two hacks the skill leans on most are one
 flag each on the command line.
+
+A plate's `checks` are `[ok, text]` pairs with a parallel `check_kinds` list; a WARN (kind margin or brim) is ok=True
+and never counts as a failed variant.
 """
 
 from __future__ import annotations
@@ -27,7 +30,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
+import stat
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -297,6 +302,7 @@ class VariantResult:
     orientation: dict | None = None
     warnings: list[str] = field(default_factory=list)  # the build's warnings (the printer fallback WARNING among them)
     filaments: str | None = None  # the build's `Filaments:` headline: where each preset came from
+    filament_sources: list[dict] = field(default_factory=list)  # per slot: the preset and colour the build used, and why
 
     @property
     def total_s(self) -> int:
@@ -431,6 +437,11 @@ def run(spec_json: dict, variants: Sequence[dict], build: Builder, *, do_slice: 
                 v.get("orientation"),
                 list(j.get("warnings") or []),
                 (j.get("filaments") or {}).get("headline"),
+                [
+                    {k: s.get(k) for k in ("slot", "preset", "colour", "source")}
+                    for s in (j.get("filaments") or {}).get("sources") or []
+                    if isinstance(s, dict)
+                ],
             )
         )
     return out
@@ -445,9 +456,14 @@ def _hms(s: int) -> str:
     return f"{m // 60}h{m % 60:02d}"
 
 
+def ranked(results: Sequence[VariantResult]) -> list[VariantResult]:
+    """The variants that passed and sliced, fastest first, then fewest grams: the table's order."""
+    return sorted((r for r in results if r.ok and r.plates), key=lambda r: (r.total_s, r.total_g))
+
+
 def table(results: Sequence[VariantResult]) -> list[str]:
     """Sorted by time, fastest first; variants that failed sink to the bottom with their first problem."""
-    ok = sorted((r for r in results if r.ok and r.plates), key=lambda r: (r.total_s, r.total_g))
+    ok = ranked(results)
     rest = [r for r in results if not (r.ok and r.plates)]
     best = ok[0] if ok else None
     mins = "".join(f" {h:>10}" for h in _TIME_HEADS)
@@ -477,3 +493,177 @@ def _cell(v: float | None, width: int, fmt: str = "") -> str:
     if v is None:
         return f"{'-':>{width}}"
     return f"{int(v):{fmt}}" if fmt else f"{v:{width}.1f}"
+
+
+# ---------------------------------------------------------------------------- --write-spec
+def choose(results: Sequence[VariantResult], pick: str | None = None) -> VariantResult | None:
+    """The variant to write: `pick` by name (passed or not; the caller refuses a failed one), else the table's first row."""
+    if pick is not None:
+        return next((r for r in results if r.name == pick), None)
+    best = ranked(results)
+    return best[0] if best else None
+
+
+def _paths(d: dict) -> list[str]:
+    out = []
+    for pl in d.get("plates", []):
+        for p in pl.get("parts", []):
+            out += [str(q["path"]) for q in [p, *(p.get("parts") or [])] if isinstance(q, dict) and q.get("path")]
+    return out
+
+
+def written_spec(
+    spec_json: dict,
+    variant: dict,
+    result: VariantResult,
+    source: str,
+    baseline: VariantResult | None = None,
+    *,
+    studio_version: str | None = None,
+    command: Sequence[str] | None = None,
+) -> dict:
+    """The chosen variant applied to the input spec as a full spec, with the input's own `outdir` (not
+    `<outdir>/sweep/<name>`), so `shambu build` on it writes beside the original project. `_sweep` records where it came
+    from, the numbers that chose it, the filament presets and colours the measurement used (the spec keeps `"loaded"`:
+    the next build reads the printer again), the Studio version and the sweep command that reproduces it.
+    `Spec.from_json` ignores the key. A part path the variant changed (a mm copy under `sweep/_units/`) is listed in
+    `_sweep.paths_changed`; `relocate_meshes` moves those next to the written spec."""
+    d = apply_variant(spec_json, variant)
+    if "outdir" in spec_json:
+        d["outdir"] = spec_json["outdir"]
+    sliced = result.sliced and bool(result.plates)
+    prov: dict[str, Any] = {
+        "from": source,
+        "variant": result.name,
+        "studio_estimate_s": result.total_s if sliced else None,
+        "grams": round(result.total_g, 1) if sliced else None,
+        "baseline_s": baseline.total_s if baseline is not None and baseline.ok and baseline.sliced and baseline.plates else None,
+        "measured_with": [dict(s) for s in result.filament_sources],
+        "studio_version": studio_version,
+        "command": list(command) if command else None,
+    }
+    before = set(_paths(spec_json))
+    changed = [p for p in _paths(d) if p not in before]
+    if changed:
+        prov["paths_changed"] = changed
+    if variant.get("orientation"):
+        prov["orientation"] = variant["orientation"]
+    d["_sweep"] = prov
+    return d
+
+
+def _hm(s: int) -> str:
+    m = _mins(s)
+    return f"{m // 60} h {m % 60} min"
+
+
+def written_line(path: str, prov: dict, failed: Sequence[str] = ()) -> str:
+    """`wrote OUT.json: variant <name> (Studio estimate H h M min, G g; baseline H h M min), measured with <preset 1> /
+    <preset 2>`, plus the failed variants."""
+    if prov.get("studio_estimate_s") is not None:
+        nums = f"Studio estimate {_hm(prov['studio_estimate_s'])}, {prov['grams']:.1f} g"
+    else:
+        nums = "not sliced"
+    base = f"baseline {_hm(prov['baseline_s'])}" if prov.get("baseline_s") is not None else "no baseline numbers"
+    used = [str(s.get("preset")) for s in prov.get("measured_with") or [] if s.get("preset")]
+    measured = f", measured with {' / '.join(used)}" if used else ""
+    tail = f"; failed: {', '.join(failed)}" if failed else ""
+    return f"wrote {path}: variant {prov['variant']} ({nums}; {base}){measured}{tail}"
+
+
+def _part_dicts(d: dict) -> list[dict]:
+    out: list[dict] = []
+    for pl in d.get("plates", []):
+        for p in pl.get("parts", []):
+            out.append(p)
+            out += [q for q in p.get("parts") or [] if isinstance(q, dict)]
+    return out
+
+
+def relocate_meshes(spec: dict, out_path: str | Path) -> dict:
+    """Copies every mesh in `_sweep.paths_changed` (a variant's file under `<outdir>/sweep/`) to `<OUT stem>_meshes/`
+    beside the written spec and points the spec at the copy, so the spec does not depend on the sweep folder.
+    `_sweep.paths_changed` then maps each old path to its copy."""
+    import shutil
+
+    changed = (spec.get("_sweep") or {}).get("paths_changed") or []
+    if not changed:
+        return spec
+    out_path = Path(out_path).expanduser()
+    dest = out_path.parent / f"{out_path.stem}_meshes"
+    moved: dict[str, str] = {}
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for i, old in enumerate(changed):
+            src = Path(old).expanduser()
+            data = src.read_bytes()
+            target = dest / src.name
+            k = 0
+            # A name another mesh of this call took, or a file already there, is free only when it holds the same bytes
+            while target.exists() and target.read_bytes() != data:
+                k += 1
+                target = dest / (f"{i}-{src.name}" if k == 1 else f"{i}-{k}-{src.name}")
+            if not target.exists():
+                shutil.copyfile(src, target)
+            moved[old] = str(target.resolve())
+    except OSError as e:
+        raise BuildError(f"cannot copy the variant's mesh into {dest}: {e.strerror or e}") from e
+    for p in _part_dicts(spec):
+        if p.get("path") in moved:
+            p["path"] = moved[p["path"]]
+    spec["_sweep"]["paths_changed"] = [{"from": k, "to": v} for k, v in moved.items()]
+    return spec
+
+
+def _umask() -> int:
+    u = os.umask(0)
+    os.umask(u)
+    return u
+
+
+def check_destination(out: str | Path, spec_path: str | Path, variants_path: str | Path | None = None) -> str | None:
+    """Why `out` must not be written (the input spec or the variants file under another name, a symlink or hard
+    link of one of them), or None. Runs before the sweep, so a refusal costs no slicing."""
+    o = Path(out).expanduser()
+    for label, other in (("the input spec", spec_path), ("the --variants file", variants_path)):
+        if other is None:
+            continue
+        q = Path(other).expanduser()
+        if o.resolve() == q.resolve() or (o.exists() and q.exists() and os.path.samefile(o, q)):
+            return f"--write-spec {out}: that is {label}; write the result to another file"
+    return None
+
+
+def writable_folder(out: str | Path) -> str | None:
+    """Why the folder for `out` cannot take the file, or None: the nearest existing folder up the path must be
+    writable. Checked before the sweep, so a full sweep is never thrown away at the last write."""
+    d = Path(out).expanduser().resolve().parent
+    while not d.exists() and d != d.parent:
+        d = d.parent
+    if not d.is_dir():
+        return f"--write-spec {out}: {d} is not a folder"
+    if not os.access(d, os.W_OK | os.X_OK):
+        return f"--write-spec {out}: cannot write in {d} (permission denied)"
+    return None
+
+
+def write_spec(path: str | Path, spec: dict) -> Path:
+    """Writes through a new, uniquely named temporary file in the same folder (created exclusively, so it can never be
+    an existing file such as the input spec), then renames it over `path`. A crash never leaves half a spec. A failed
+    write or rename removes the temporary file and raises BuildError naming the destination and the reason. The file
+    gets the mode of the file it replaces, else 0666 under the umask (a temporary file starts at 0600)."""
+    p = Path(path).expanduser()
+    tmp: Path | None = None
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(p.stat().st_mode) if p.exists() else 0o666 & ~_umask()
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=p.parent, prefix=f".{p.name}.", suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            f.write(json.dumps(spec, indent=2) + "\n")
+        os.chmod(tmp, mode)
+        tmp.replace(p)
+    except OSError as e:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise BuildError(f"cannot write the spec to {p}: {e.strerror or e}") from e
+    return p

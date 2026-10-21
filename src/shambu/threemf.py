@@ -5,7 +5,10 @@ survives a CLI load and re-export. Format facts come from those files and from b
 Higher-level code uses `patches.PatchSet` (Command objects) rather than calling these methods.
 
 Rules the code follows:
-- Never rewrite 3D/3dmodel.model or the mesh files. Patches touch only Metadata/*.
+- A patch touches only the entries it declares (`touches`, default `Metadata/*`). save() compares every entry
+  with the bytes it loaded and raises when an undeclared entry changed, when a `3D/*` entry was added, removed
+  or reordered, or when a `_rels` entry changed. Only the geometry edits in `edits.py` declare `3D/*` entries:
+  the one named object's sub-model and the transform attributes in 3D/3dmodel.model.
 - Keep the zip entry order and each entry's compression. model_settings.config must stay
   before slice_info.config and filament_sequence.json (the loader applies those to plates
   that model_settings already created).
@@ -18,11 +21,16 @@ Rules the code follows:
 - save() writes a temporary file next to the destination, checks it, then renames it over the
   destination, so a failed save never damages the original.
 - Every patch is idempotent: applying the same patch twice gives the same project.
+- `filament_extruder_variant` and `filament_self_index` stay in block form (one block of variants per filament,
+  paired index by index), and `extruder_nozzle_stats` is never left `[]`: a later CLI slice of such a file exits
+  -100 "No valid nozzle found" (reference 03 section 8).
 """
 
 from __future__ import annotations
 
 import copy
+import fnmatch
+import io
 import json
 import math
 import os
@@ -30,6 +38,9 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +64,60 @@ GCODE_TYPES = {"color_change": 0, "pause": 1, "tool_change": 2, "template": 3, "
 GCODE_TYPE_NAMES = {v: k for k, v in GCODE_TYPES.items()}
 
 
+STATS_NEW, STATS_OLD = "extruder_nozzle_stats_new", "extruder_nozzle_stats"
+
+
+def _entry_count(entry) -> int:
+    """Nozzles in one extruder's stat, `Type#n` or `Type#n|Type#m` (PrintConfig.cpp:751-783 sums them)."""
+    total = 0
+    for part in str(entry).split("|"):
+        _, sep, n = part.partition("#")
+        if sep:
+            try:
+                total += int(n.strip() or 0)
+            except ValueError:
+                continue
+    return total
+
+
+def _stats_bad(v, n_ext: int = 0) -> bool:
+    """A stat list the CLI cannot slice with: empty, shorter than the extruder count, or an extruder with 0 nozzles."""
+    if not isinstance(v, list) or not v or len(v) < n_ext:
+        return True
+    return any(_entry_count(e) <= 0 for e in v)
+
+
+def effective_stats(ps: dict) -> tuple[str, list] | None:
+    """The stat list a CLI run uses, and its key: a non-empty `extruder_nozzle_stats_new` wins, else the plain key
+    (BambuStudio.cpp:4151-4155). None when neither key is in the file: the CLI then derives the stat from
+    `extruder_max_nozzle_count` (4101, 4135-4146)."""
+    if STATS_NEW not in ps and STATS_OLD not in ps:
+        return None
+    new = ps.get(STATS_NEW)
+    if isinstance(new, list) and new:
+        return STATS_NEW, new
+    old = ps.get(STATS_OLD)
+    return STATS_OLD, old if isinstance(old, list) else []
+
+
+def _stats_json(eff: tuple[str, list] | None) -> dict | None:
+    return {"key": eff[0], "value": eff[1]} if eff else None
+
+
+def _slot_stats(ps: dict, i: int) -> dict:
+    """Filament slot i's extruder (the project `filament_map`) and the effective nozzle stat of that extruder, for
+    `inspect`: {"extruder": 1, "nozzle_stats": "Standard#1"}; the stat is None when the file has no stats key (the
+    CLI derives it) or the list is shorter than the extruder index."""
+    fmap = ps.get("filament_map") or []
+    try:
+        ext: int | None = int(fmap[i]) if i < len(fmap) else 1  # no map entry: Studio's default, extruder 1
+    except (TypeError, ValueError):
+        ext = None  # a malformed map is shown as unknown, never guessed
+    eff = effective_stats(ps)
+    stat = eff[1][ext - 1] if eff and ext is not None and 0 < ext <= len(eff[1]) else None
+    return {"extruder": ext, "nozzle_stats": stat}
+
+
 def _float_or(text: str, default: float) -> float:
     try:
         return float(text)
@@ -67,6 +132,8 @@ _FEATURE_CLASS = {
     "Prime tower": "tower",
     "Custom": "other",
 }
+# What a patch may change when it declares nothing (every patch in patches.py): metadata entries only.
+DEFAULT_TOUCHES = frozenset({"Metadata/*"})
 _SLICE_ENTRY = re.compile(r"^Metadata/plate_\d+\.(gcode|gcode\.md5|json)$|^Metadata/plate_\d+\.gcode\.md5$")
 # plate metadata keys that only make sense for a sliced plate (bbs_3mf.cpp _handle_start_config_metadata)
 _SLICE_PLATE_KEYS = {
@@ -139,7 +206,10 @@ class Project:
             raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
         if not self.has(PROJECT_SETTINGS) or not self.has(MODEL_SETTINGS):
             raise ProjectError(f"{path}: no Metadata/project_settings.config or model_settings.config: not a Bambu Studio project")
+        self._loaded = [(e.info.filename, e.data) for e in self._entries]  # the bytes save() compares against
+        self.notes: list[str] = []  # report lines that edits (edits.py) leave for the caller: box reports, WARN lines
         self._dirty: set[str] = set()
+        self._changed = False  # an entry was put or removed (slices invalidated, a new entry): save() must write
         self._ms: ET.Element | None = None  # parsed model_settings root
         self._ps: dict | None = None  # parsed project_settings dict
         self._ps_trailing_nl = False
@@ -164,6 +234,7 @@ class Project:
             raise ProjectError(f"{self.path}: {name} is not valid XML ({e})") from e
 
     def _put(self, name: str, data: bytes, before: tuple[str, ...] = ()) -> None:
+        self._changed = True
         for e in self._entries:
             if e.info.filename == name:
                 e.data = data
@@ -177,9 +248,50 @@ class Project:
                 pos = min(pos, idx[0])
         self._entries.insert(pos, _Entry(info, data))
 
+    def write_entry(self, name: str, data: bytes) -> None:
+        """Replace the bytes of an existing entry (its position, compression and date stay). Raises for a new name:
+        an edit never adds a `3D/*` entry."""
+        if not self.has(name):
+            raise ProjectError(f"{self.path}: no entry {name!r} to rewrite")
+        self._put(name, data)
+
+    def touch_model_settings(self, invalidate: bool = True) -> None:
+        """Mark model_settings.config for writing (after a change to `model_settings`); drops the slice by default."""
+        self._touch_ms(invalidate)
+
+    def touch_project_settings(self) -> None:
+        """Mark project_settings.config for writing (after a change to `project_settings`); drops the slice."""
+        self._touch_ps()
+
+    def changed_entries(self) -> list[str]:
+        """Entry names whose bytes differ from the loaded file, plus added and removed names."""
+        before = dict(self._loaded)
+        now = {e.info.filename: e.data for e in self._entries}
+        changed = [n for n, d in now.items() if n not in before or before[n] != d]
+        return changed + [n for n in before if n not in now]
+
+    def check_touches(self, touches: Iterable[str] | None = None) -> None:
+        """Raise ProjectError when an entry outside `touches` (fnmatch patterns; default DEFAULT_TOUCHES) changed,
+        when a `3D/*` entry was added, removed or reordered, or when a `_rels` entry changed."""
+        allowed = DEFAULT_TOUCHES if touches is None else frozenset(touches)
+        changed = self.changed_entries()
+        bad = [n for n in changed if not any(fnmatch.fnmatchcase(n, pat) for pat in allowed)]
+        if bad:
+            raise ProjectError(
+                f"{self.path}: a patch changed entries it did not declare: {bad} (declared {sorted(allowed)}); nothing written"
+            )
+        rels = [n for n in changed if "_rels/" in n or n.startswith("_rels")]
+        if rels:
+            raise ProjectError(f"{self.path}: a patch changed relationship entries {rels}; nothing written")
+        old3d = [n for n, _ in self._loaded if n.startswith("3D/")]
+        new3d = [n for n in self.names() if n.startswith("3D/")]
+        if old3d != new3d:
+            raise ProjectError(f"{self.path}: a patch added, removed or reordered a 3D/* entry ({old3d} -> {new3d}); nothing written")
+
     def _remove(self, name: str) -> bool:
         n = len(self._entries)
         self._entries = [e for e in self._entries if e.info.filename != name]
+        self._changed = self._changed or len(self._entries) != n
         return len(self._entries) != n
 
     # ------------------------------------------------------------------ parsed parts
@@ -239,6 +351,10 @@ class Project:
             if m.get("name") == "Application":
                 return m.text
         return None
+
+    def object_names(self) -> list[str]:
+        """The objects' names in `model_settings.config` order (the CLI names a conflict log line uses)."""
+        return [_meta(o, "name") or "" for o in self._objects()]
 
     def _objects(self) -> list[ET.Element]:
         return self.model_settings.findall("object")
@@ -501,9 +617,11 @@ class Project:
                     "preset": ps["filament_settings_id"][i],
                     "type": (ps.get("filament_type") or [None] * n_fil)[i] if i < len(ps.get("filament_type", [])) else None,
                     "colour": ps["filament_colour"][i] if i < len(ps.get("filament_colour", [])) else None,
+                    **_slot_stats(ps, i),
                 }
                 for i in range(n_fil)
             ],
+            "nozzle_stats": _stats_json(effective_stats(ps)),
             "filament_map_mode": ps.get("filament_map_mode"),
             "filament_map": ps.get("filament_map"),
             "extruders": {
@@ -515,6 +633,7 @@ class Project:
             "plates": plates,
             "objects": objects,
             "custom_gcode": custom,
+            "reslice_problems": self.reslice_problems(),
         }
 
     # ------------------------------------------------------------------ (b) patches
@@ -588,15 +707,15 @@ class Project:
         if mode not in FILAMENT_MAP_MODES:
             raise ProjectError(f"mode must be one of {FILAMENT_MAP_MODES}")
         ps = self.project_settings
-        # PrintConfig.cpp update_values_to_printer_extruders_for_multiple_filaments looks up, for
-        # filament i, the variant '<extruder_type[map[i]-1]> <nozzle_volume_type[map[i]-1]>' in
-        # filament_extruder_variant. Without it slicing logs 'could not found extruder_type Bowden'
-        # and crashes. The per-filament values stay those of the old variant: re-resolve the
-        # filament preset for that variant if they differ (on the X2D they are equal for PLA/PETG).
-        et, nvt = ps.get("extruder_type", []), ps.get("nozzle_volume_type", [])
-        if et and nvt and "filament_extruder_variant" in ps:
-            ps["filament_extruder_variant"] = [f"{et[v - 1]} {nvt[v - 1]}" for v in nozzle_of_filament]
-            self._touch_ps()
+        if plate is None:
+            ps["filament_map"] = [str(v) for v in nozzle_of_filament]
+        # PrintConfig.cpp update_values_to_printer_extruders_for_multiple_filaments looks up, for filament i, the
+        # variant '<extruder_type[map[i]-1]> <nozzle_volume_type[map[i]-1]>' among the filament_extruder_variant
+        # entries whose filament_self_index is i (index by index, PrintConfig.cpp:8022-8052). The two lists stay in
+        # block form (one block of variants per filament); collapsing the variants to one entry per filament made
+        # filament 2 unfindable ('could not found extruder_type ... filament_index 2', PrintConfig.cpp:8935).
+        if "filament_extruder_variant" in ps:
+            self.repair_extruder_variants()
         if plate is None:
             ps["filament_map"] = [str(v) for v in nozzle_of_filament]
             ps["filament_map_mode"] = mode
@@ -606,6 +725,125 @@ class Project:
             _set_meta(p, "filament_map_mode", mode, after="locked")
             _set_meta(p, "filament_maps", " ".join(str(v) for v in nozzle_of_filament), after="filament_map_mode")
             self._touch_ms()
+
+    # -- the per-extruder keys a CLI re-slice needs (reference 03 section "Re-slicing a CLI export") ------------------
+    def _variant_block(self, slot: int, given: Sequence[Sequence[str]] | None) -> list[str]:
+        """The extruder variants of filament `slot` (1-based): the filament preset's own list when given, else the
+        printer's variant list (the X2D filament presets list the same six variants in the same order)."""
+        ps = self.project_settings
+        if given and slot <= len(given) and given[slot - 1]:
+            return [str(v) for v in given[slot - 1]]
+        pev = ps.get("printer_extruder_variant")
+        if isinstance(pev, list) and pev:
+            return [str(v) for v in pev]
+        evl = ps.get("extruder_variant_list")
+        if isinstance(evl, list) and evl:
+            return [v.strip() for e in evl for v in str(e).split(",") if v.strip()]
+        et, nvt = ps.get("extruder_type") or [], ps.get("nozzle_volume_type") or []
+        return [f"{t} {v}" for t, v in zip(et, nvt, strict=False)]
+
+    def repair_extruder_variants(self, filament_variants: Sequence[Sequence[str]] | None = None) -> bool:
+        """Rewrite `filament_extruder_variant` and `filament_self_index` in block form: per filament, its variant list,
+        with its slot number once per variant. A block that already matches stays as it is. When the file already holds
+        `filament_self_index` blocks, a rebuilt block must keep its length (the 6N value keys follow it). Returns
+        True when something changed. Raises ProjectError when the blocks cannot be rebuilt consistently."""
+        ps = self.project_settings
+        n = self.n_filaments()
+        if n == 0 or ("filament_extruder_variant" not in ps and "filament_self_index" not in ps):
+            return False  # a project without the variant keys (a one-extruder printer) gets none added
+        var = [str(v) for v in ps.get("filament_extruder_variant") or []]
+        idx = [str(v) for v in ps.get("filament_self_index") or []]
+        counts = {i: idx.count(str(i)) for i in range(1, n + 1)}
+        if idx and len(var) == len(idx) and all(counts[i] for i in counts) and len(idx) == sum(counts.values()):
+            return False  # already one consistent block per filament
+        new_var: list[str] = []
+        new_idx: list[str] = []
+        for i in range(1, n + 1):
+            block = self._variant_block(i, filament_variants)
+            if idx and counts.get(i) and counts[i] != len(block):
+                raise ProjectError(
+                    f"filament {i} has {counts[i]} entries in filament_self_index but {len(block)} extruder variants: "
+                    "cannot rebuild filament_extruder_variant; re-export the project"
+                )
+            new_var += block
+            new_idx += [str(i)] * len(block)
+        if new_var == var and new_idx == idx:
+            return False
+        ps["filament_extruder_variant"] = new_var
+        ps["filament_self_index"] = new_idx
+        self._touch_ps()
+        return True
+
+    def repair_nozzle_stats(self) -> bool:
+        """`extruder_nozzle_stats` `[]` (what a CLI export without --slice writes) or a `#0` count makes every later CLI
+        slice of the file exit -100 "No valid nozzle found" (BambuStudio.cpp:4101-4156, ToolOrdering.cpp:1477-1481).
+        The key the CLI reads (`effective_stats`: a non-empty `_new` wins) gets
+        `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` for each empty or zero-count extruder entry only; a
+        valid entry (High Flow included) stays as it is. A repaired `_new` is copied to the plain key so the two agree.
+        Also resize filament_volume_map / filament_nozzle_map to the filament count as Studio does
+        (PresetBundle.cpp:2384-2387). Returns True when something changed."""
+        ps = self.project_settings
+        changed = False
+        nvt = [str(v) for v in ps.get("nozzle_volume_type") or []]
+        eff = effective_stats(ps)
+        if eff is not None and nvt and self.needs_nozzle_stats() and _stats_bad(eff[1], self.extruder_count()):
+            key, cur = eff
+            cnt = [str(v) for v in ps.get("extruder_max_nozzle_count") or []]
+
+            def default(i: int) -> str:
+                # Studio broadcasts the last nozzle_volume_type over the extruders (BambuStudio.cpp:4137-4142); the
+                # nozzle count is the extruder's own (or the last one given)
+                t = nvt[min(i, len(nvt) - 1)]
+                c = cnt[min(i, len(cnt) - 1)] if cnt else "1"
+                return f"{t}#{c if str(c) not in ('', '0') else '1'}"
+
+            n_ext = max(self.extruder_count(), len(cur))
+            want = [str(cur[i]) if i < len(cur) and _entry_count(cur[i]) > 0 else default(i) for i in range(n_ext)]
+            ps[key] = want
+            if key == STATS_NEW and STATS_OLD in ps:
+                ps[STATS_OLD] = list(want)
+            changed = True
+        n = self.n_filaments()
+        for key, fill in (("filament_volume_map", "0"), ("filament_nozzle_map", "0")):
+            v = ps.get(key)
+            if isinstance(v, list) and n and len(v) != n:
+                ps[key] = (list(v) + [fill] * n)[:n]
+                changed = True
+        if changed:
+            self._touch_ps()
+        return changed
+
+    def extruder_count(self) -> int:
+        ps = self.project_settings
+        return max(len(ps.get("nozzle_diameter") or []), len(ps.get("nozzle_volume_type") or []), 1)
+
+    def needs_nozzle_stats(self, extruders: int | None = None) -> bool:
+        """Studio reads the nozzle stats only on a multi-extruder or multi-nozzle machine (BambuStudio.cpp:6648): an
+        empty list is fine on a one-extruder, one-nozzle printer (P1S, A1)."""
+        counts = []
+        for v in self.project_settings.get("extruder_max_nozzle_count") or []:
+            try:
+                counts.append(int(str(v)))
+            except ValueError:
+                continue
+        return (extruders or self.extruder_count()) > 1 or any(c > 1 for c in counts)
+
+    def reslice_problems(self, extruders: int | None = None) -> list[str]:
+        """Why a later CLI run on this file (`--slice`) would fail or use the wrong per-filament values; [] when none.
+        `extruders` is the machine's extruder count (machine facts); the file's own count is used without it."""
+        ps = self.project_settings
+        out = []
+        eff = effective_stats(ps)
+        n_ext = extruders or self.extruder_count()
+        if eff is not None and self.needs_nozzle_stats(n_ext) and _stats_bad(eff[1], n_ext):
+            out.append(f'{eff[0]} {eff[1]} (Studio exits -100 "No valid nozzle found")')
+        var, idx = ps.get("filament_extruder_variant"), ps.get("filament_self_index")
+        if isinstance(var, list) and isinstance(idx, list) and len(var) != len(idx):
+            out.append(
+                f"filament_extruder_variant has {len(var)} entries but filament_self_index {len(idx)} "
+                "(Studio logs 'could not found extruder_type' and slices with the wrong filament values)"
+            )
+        return out
 
     def set_object_setting(self, object_name: str, key: str, value) -> None:
         """Per-object process override, e.g. enable_support, sparse_infill_density ('25%'),
@@ -758,36 +996,60 @@ class Project:
         return removed
 
     # ------------------------------------------------------------------ (c) write
-    def save(self, out_path: str) -> None:
+    def materialise(self) -> None:
+        """Serialise the parsed settings that patches changed into their entries, without writing a file. save() and
+        a dry run share it, so both compare the same bytes."""
         if MODEL_SETTINGS in self._dirty:
             self._put(MODEL_SETTINGS, _xml_bytes(self.model_settings, "  "))
         if PROJECT_SETTINGS in self._dirty:
             s = json.dumps(self.project_settings, indent=4, ensure_ascii=False)
             self._put(PROJECT_SETTINGS, (s + ("\n" if self._ps_trailing_nl else "")).encode("utf-8"))
+
+    def save(self, out_path: str, touches: Iterable[str] | None = None, verify: Callable[[str], None] | None = None) -> None:
+        """Write the project atomically. `touches` are the entry patterns the applied patches declared (default
+        `Metadata/*`); check_touches() runs first, so an undeclared change raises before anything is written.
+        `verify(tmp_path)` runs on the written temporary archive before it replaces `out_path`: when it raises, the
+        destination stays as it was. Nothing changed: the original bytes are kept (a rewrite recompresses every
+        entry); the same path needs no write, another path gets those bytes through the same temp-file path."""
+        raw: bytes | None = None
+        if not self._dirty and not self._changed:
+            if os.path.abspath(out_path) == os.path.abspath(self.path):
+                return
+            with open(self.path, "rb") as src:
+                raw = src.read()
+        self.materialise()
         names = self.names()
         if MODEL_SETTINGS in names:
             ms = names.index(MODEL_SETTINGS)
             for late in (SLICE_INFO, "Metadata/filament_sequence.json"):
                 if late in names and names.index(late) < ms:
                     raise ProjectError(f"{late} must come after {MODEL_SETTINGS} in the zip")
+        self.check_touches(touches)
         # Atomic: write a temporary file in the destination directory (same filesystem), check it,
         # then rename it over out_path. On any failure the original stays as it was.
         out_dir = os.path.dirname(os.path.abspath(out_path))
-        fd, tmp = tempfile.mkstemp(dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(
+            dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp.3mf"
+        )  # Studio reads it by extension (verify)
         try:
             with os.fdopen(fd, "wb") as f:
-                with zipfile.ZipFile(f, "w") as z:
-                    for e in self._entries:
-                        info = zipfile.ZipInfo(e.info.filename, date_time=e.info.date_time)
-                        info.compress_type = e.info.compress_type
-                        info.external_attr = e.info.external_attr
-                        z.writestr(info, e.data)
+                if raw is not None:
+                    f.write(raw)
+                else:
+                    with zipfile.ZipFile(f, "w") as z:
+                        for e in self._entries:
+                            info = zipfile.ZipInfo(e.info.filename, date_time=e.info.date_time)
+                            info.compress_type = e.info.compress_type
+                            info.external_attr = e.info.external_attr
+                            z.writestr(info, e.data)
                 f.flush()
                 os.fsync(f.fileno())
             with zipfile.ZipFile(tmp) as z:
                 bad = z.testzip()
             if bad is not None:
                 raise ProjectError(f"{out_path}: the written zip fails its CRC check at {bad}; original kept")
+            if verify is not None:
+                verify(tmp)
             # mkstemp creates 0600: keep the original's mode, or give a new file the umask default.
             if os.path.exists(out_path):
                 os.chmod(tmp, os.stat(out_path).st_mode & 0o7777)
@@ -802,3 +1064,40 @@ class Project:
             except FileNotFoundError:
                 pass
             raise
+
+
+# ---------------------------------------------------------------------------- streaming read (no Project load)
+_PLATE_GCODE = re.compile(r"Metadata/plate_(\d+)\.gcode")
+
+
+def plate_gcode_names(path: str) -> list[str]:
+    """The `Metadata/plate_N.gcode` entries of a .gcode.3mf, from the zip directory only (nothing is decompressed)."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            return sorted((n for n in z.namelist() if _PLATE_GCODE.fullmatch(n)), key=lambda n: int(_PLATE_GCODE.fullmatch(n).group(1)))  # type: ignore[union-attr]
+    except (zipfile.BadZipFile, OSError, EOFError) as e:
+        raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
+
+
+@contextmanager
+def open_text_entry(path: str, name: str) -> Iterator[io.TextIOWrapper]:
+    """One zip entry as streamed text (UTF-8, bad bytes replaced): a 76 MB plate G-code is read line by line, and no
+    other entry is decompressed. `Project` loads every entry; this does not."""
+    try:
+        z = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError, EOFError) as e:
+        raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
+    try:
+        try:
+            raw = z.open(name)
+        except KeyError as e:
+            raise ProjectError(f"{path}: no entry {name!r} in the zip") from e
+        except (zipfile.BadZipFile, zlib.error, OSError, EOFError, NotImplementedError) as e:
+            raise ProjectError(f"{path}: entry {name!r} cannot be opened ({e})") from e
+        try:
+            with io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="") as f:
+                yield f
+        except (zipfile.BadZipFile, zlib.error, EOFError) as e:  # a corrupt member fails while it is read
+            raise ProjectError(f"{path}: entry {name!r} is corrupt ({e})") from e
+    finally:
+        z.close()

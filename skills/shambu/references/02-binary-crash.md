@@ -291,6 +291,7 @@ The process exit status is `return_code & 0xFF` (for example -2 → 254, -13 →
 | -104 ✔ | 152 | G-code outside of the printable area (support, wipe tower, brim, skirt). |
 | -105 | 151 | G-code in the wrapping detect area. |
 | signal | 139 / -11 | SIGSEGV (sections 1.2, 1.3). `result.json` is NOT written. |
+| signal (one-off) | 139, shambu -139 | SIGSEGV inside tree support generation, not repeatable: once in four identical slices of the plate-14 layout with the prime tower at the front (128, 2), 2026-10-21; the three re-runs passed. Rule: rerun once with the same command; a second -139 is reported with the log path. shambu maps a signal exit (134, 138, 139 or negative) to -139 "crashed (signal)" (`studio.py`). |
 
 `result.json` keys: `error_string, export_time, layer_height, plate_index, prepare_time, return_code, sparse_infill_density, wall_loops`. After a slice it also has `sliced_plates[]` with `feature_type_times, filament_change_times, filaments[] {filament_id, id, main_used_g, total_used_g}, generate_support_material_time, id, infill_time, layer_filament_change, main_predication, make_perimeters_time, obj_cached_cnt, objects[] {bbox {depth,height,width,x,y,z}, id, name, triangle_count}, sliced_time, sliced_time_with_cache, total_predication, triangle_count, warning_message`. Times are in **milliseconds** except `*_predication` (seconds). On an early error `prepare_time` is garbage (`4451762828`), so do not read it.
 

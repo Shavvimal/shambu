@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from conftest import MACHINE, PROCESS, PROCESS_NAME, FakeStudio, make_3mf
+from conftest import MACHINE, PROCESS, PROCESS_NAME, FakeStudio, make_3mf, write_cli_tower
 from shambu.build import Pipeline
 from shambu.spec import Spec
 from shambu.studio import RunResult
@@ -90,7 +90,7 @@ def test_assemble_list_positions_and_merge(tmp_path, stls, resolver, cli_export)
 def test_label_with_filament_2_subpart_is_pushed_into_nozzle_2_reach(tmp_path, stls, resolver, cli_export):
     plan = pipeline(resolver, FakeStudio(cli_export)).plan(make_spec(tmp_path, stls))
     label = next(p for p in plan.plates[0].parts if p.key == "label")
-    assert label.placed.x0 - label.placed.margin >= 20.5
+    assert label.placed.x0 - label.placed.brim >= 20.5
 
 
 def test_command_has_loads_and_export(tmp_path, stls, resolver, cli_export):
@@ -114,6 +114,7 @@ def test_template_method_export_override(tmp_path, stls, resolver, cli_export):
     class NoStudio(Pipeline):
         def export(self, plan, paths, project, timeout, do_slice=False):
             project.write_bytes(cli_export.read_bytes())
+            write_cli_tower(project, self.command(plan, paths, plan.spec.name, do_slice).args())  # what the CLI writes
             return RunResult(["fake"], 0, 0, 0.0, project.with_suffix(".log"), None, project)
 
     r = NoStudio(FakeStudio(), resolver).build(make_spec(tmp_path, stls))
@@ -149,7 +150,7 @@ def test_failed_checks_report_says_nothing_was_exported(tmp_path, stls, resolver
     r = pipeline(resolver, studio).build(make_spec(tmp_path, stls, plates=[{"name": "p", "parts": parts}]), export=True)
     assert not r.plan.ok and r.run is None
     assert [k for k, _ in studio.calls if k == "run"] == []
-    assert "FAIL: a and b overlap" in r.report
+    assert "FAIL body overlap: a (x 20.0..40.0, y 20.0..40.0) and b (x 20.0..40.0, y 20.0..40.0) intersect by 20.0 x 20.0 mm" in r.report
     assert "## Next" in r.report and "nothing was exported" in r.report and "Fix the spec and build again" in r.report
     assert "Owner steps" not in r.report and "Open the project" not in r.report
 
@@ -174,12 +175,13 @@ def test_missing_stl_is_a_problem(tmp_path, stls, resolver):
     assert any("does not exist" in p for p in plan.problems)
 
 
-def test_overfull_plate_is_a_problem(tmp_path, stls, resolver):
+def test_overfull_plate_fails_the_plan_with_one_line(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (200.0, 200.0, 10.0)})
     spec = make_spec(tmp_path, stls)
     spec = Spec.from_json({**spec.to_json(), "plates": [{"name": "p", "parts": [{"path": str(stls["body"]), "count": 2}]}]})
     plan = pipeline(resolver, studio).plan(spec)
-    assert any("need 2 plates" in p for p in plan.problems)
+    assert not plan.ok and not any("plates" in p for p in plan.problems)  # the PLACEMENT NOT DONE line says it once
+    assert any(c.kind == "placement" and "put the parts on 2 plates" in c.text for c in plan.plates[0].checks)
 
 
 def test_bad_filament_map_is_a_problem(tmp_path, stls, resolver):
@@ -219,8 +221,8 @@ def test_overflow_gives_one_fail_line(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (200.0, 200.0, 10.0)})
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], count=3))
     fails = [c.text for c in plan.plates[0].checks if not c.ok]
-    assert len(fails) == 1 and "the parts need 3 plates" in fails[0]  # no repeated overlap and reach failures
-    assert sum("need 3 plates" in p for p in plan.problems) == 1
+    assert len(fails) == 1 and "put the parts on 3 plates" in fails[0]  # no repeated overlap and reach failures
+    assert not any("put the parts on 3 plates" in p for p in plan.problems)  # one line, not a Problem as well
 
 
 def test_orientation_without_flat_contact_is_a_problem(tmp_path, resolver):
@@ -253,9 +255,12 @@ def test_failed_export_without_result_json_keeps_the_old_shape(tmp_path, stls, r
     assert r.export_problem().startswith("export failed: exit -17") and "Studio:" not in r.export_problem()
 
 
-def test_supported_part_gets_the_support_margin(tmp_path, stls, resolver):
+def test_supported_part_gets_the_support_spread(tmp_path, stls, resolver):
     studio = FakeStudio(sizes={"body.stl": (20.0, 20.0, 40.0)})
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"], recipes=["tree-supports"]))
-    assert plan.plates[0].parts[0].placed.margin == pytest.approx(10.0)  # 0.25 x 40, above the 5.2 mm brim
+    p = plan.plates[0].parts[0].placed
+    assert p.brim == pytest.approx(5.2)  # the brim, kept apart from the support spread
+    assert p.spread.sides() == pytest.approx((8.8,) * 4) and p.spread.source == "estimate" and p.spread.tree  # 0.22 x 40
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"]))
-    assert plan.plates[0].parts[0].placed.margin == pytest.approx(5.2)  # no supports: the brim only
+    p = plan.plates[0].parts[0].placed
+    assert p.brim == pytest.approx(5.2) and p.spread.source == "none"  # no supports: the brim only

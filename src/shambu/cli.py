@@ -1,8 +1,8 @@
 """Command line: `shambu <command> ...`. Each subcommand is a small class registered with @command.
 
 Output is human text by default and JSON with `--json` (before or after the command name), so an agent can parse
-it. Exit codes: 0 ok, 1 a check or verification failed or the spec is invalid, 2 bad usage, 3 an environment error
-(binary, config).
+it. Exit codes: 0 ok, 1 a check or verification failed, the spec is invalid or a patch was refused, 2 bad usage, 3 an
+environment error (binary, config, a file that cannot be written), 130 interrupted.
 """
 
 from __future__ import annotations
@@ -10,21 +10,32 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
+import tempfile
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from . import __version__, recipes
-from .errors import BambuError, BuildError, StudioError
+from .edits import (
+    EditError,
+    EditSet,
+    MoveObject,
+    ReplaceMesh,
+    SetTower,
+)
+from .errors import BambuError, BuildError, ProjectError, StudioError
 from .facade import Bambu
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
     AddCustomGcode,
     ClearObjectSetting,
-    PatchSet,
     RenameObject,
     RenamePlate,
+    RepairNozzleStats,
     SetBedType,
     SetBedTypeEverywhere,
     SetExtruder,
@@ -34,7 +45,9 @@ from .patches import (
     SetObjectSetting,
     SetPrintSequence,
 )
+from .report import checks_skipped_lines, estimate_lines
 from .spec import Spec
+from .studio import CliCommand
 
 log = logging.getLogger("shambu")
 _REGISTRY: dict[str, Command] = {}
@@ -133,6 +146,24 @@ def _mismatch_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _probe_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--probe-supports",
+        action="store_true",
+        help="slice each supported part alone (cached under <outdir>/.probe) and use its measured support spread per side "
+        "instead of the estimate (tree 0.22 x height, 8..26 mm, swept from the box; normal 5 mm)",
+    )
+
+
+def _no_probe_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="keep the estimated support spread even when packing with it splits a plate or leaves no tower spot "
+        "(by default shambu then measures the supported parts with a cached solo slice)",
+    )
+
+
 def printer_lines(d: dict, config: dict) -> list[str]:
     """Doctor's 'loaded on the printer' section next to the GUI presets, with a MISMATCH line per differing slot."""
     if "error" in d:
@@ -156,18 +187,68 @@ def printer_lines(d: dict, config: dict) -> list[str]:
     return lines
 
 
-@command("doctor", "Check the Studio install, profiles, config, the X2D machine facts and the spools loaded on the printer")
+def shambu_lines(d: dict) -> list[str]:
+    """doctor's first line: this copy's version and install, against the version the skill text expects."""
+    from .facade import install_command
+
+    head = f"shambu {d['version']} ({d['install']}) at {d['package_path']}"
+    if d.get("expected") is None:
+        return [f"{head}; no expected version given (--expect-version)"]
+    if d.get("match"):
+        return [f"{head}; skill expects {d['expected']}: OK"]
+    return [
+        f"{head}; skill expects {d['expected']}: MISMATCH",
+        f"Fix: {install_command(d['expected'])}   (or /shambu:setup update)",
+    ]
+
+
+def studio_lines(st: dict) -> list[str]:
+    if "error" in st:
+        return [f"Bambu Studio: {st['error']} (tested {st['tested']})"]
+    pids = st["running_pids"]
+    shown = "unknown (pgrep failed)" if pids is None else (pids or "none")
+    lines = [f"Bambu Studio {st['version']} (tested {st['tested']}) at {st['binary']} (running pids: {shown})"]
+    if not st["match"]:
+        lines.append(f"WARN: Bambu Studio {st['version']} is not the tested {st['tested']}; other 02.08.x builds work but are untested")
+    return lines
+
+
+@command(
+    "doctor", "Check the shambu version, the Studio install, profiles, config, the X2D machine facts and the spools loaded on the printer"
+)
 class Doctor(Command):
     def configure(self, p):
         _printer_flags(p)
+        p.add_argument(
+            "--expect-version",
+            metavar="X.Y.Z",
+            help="the shambu version the skill text expects; a different installed version is exit 3 (after every section prints)",
+        )
+        p.add_argument(
+            "--printer-timeout",
+            type=float,
+            default=15.0,
+            metavar="S",
+            help="seconds for the whole printer read: discovery, connect and report (default 15)",
+        )
 
     def run(self, a, app, out):
+        from .facade import VERSION_RE
+
+        if a.expect_version is not None and not VERSION_RE.fullmatch(a.expect_version):
+            return usage(out, f"--expect-version {a.expect_version!r}: give X.Y.Z, for example 0.4.0")
+        if not (math.isfinite(a.printer_timeout) and 0 < a.printer_timeout < threading.TIMEOUT_MAX):
+            return usage(out, f"--printer-timeout {a.printer_timeout:g}: give a finite number of seconds above 0")
         app.printer_ip = a.printer_ip
-        d = app.doctor(printer=not a.no_printer)
-        lines = [
-            f"Bambu Studio {d['studio']['version']} at {d['studio']['binary']} (running pids: {d['studio']['running_pids'] or 'none'})",
-            "profile sources: " + "; ".join(d["profiles"]),
-        ]
+        app.printer_timeout = a.printer_timeout
+        d = app.doctor(
+            printer=not a.no_printer,
+            expected=a.expect_version,
+            progress=lambda name, dt: print(f"doctor: {name} {dt:.1f} s", file=sys.stderr, flush=True),
+        )
+        lines = shambu_lines(d["shambu"]) + studio_lines(d["studio"])
+        prof = d["profiles"]
+        lines.append("profile sources: " + ("; ".join(prof) if isinstance(prof, list) else prof.get("error", "?")))
         c = d.get("config", {})
         lines.append(
             f"GUI presets: machine {c.get('gui_machine_preset')}, process {c.get('gui_process_preset')}, filaments {c.get('gui_filament_presets')}, bed {c.get('gui_bed_type')}"
@@ -184,9 +265,14 @@ class Doctor(Command):
                 lines.append(
                     f"  extruder {e['index']} ({e['type']}, {e['nozzle']} mm): x {e['x'][0]}..{e['x'][1]}, z up to {e['z_max']:.0f}"
                 )
+        elif "error" in m:
+            lines.append(f"machine: {m['error']}")
         lines += printer_lines(d.get("printer", {}), c)
         lines.append("recipes: " + ", ".join(d["recipes"]))
+        lines.append("timings: " + ", ".join(f"{k} {v:.1f} s" for k, v in d["timings_s"].items()))
         out.emit(d, lines)
+        if d["shambu"]["match"] is False or "error" in d["studio"]:
+            return 3  # a version mismatch or no Studio binary: the environment, after every section printed
         return 0
 
 
@@ -289,7 +375,11 @@ class SpecCmd(Command):
         if isinstance(s, int):
             return s
         errs = s.validate()
-        out.emit({"ok": not errs, "problems": errs}, ["spec ok" if not errs else "spec problems:"] + ["- " + e for e in errs])
+        warns = list(s.warnings)
+        out.emit(
+            {"ok": not errs, "problems": errs, "warnings": warns},
+            ["spec ok" if not errs else "spec problems:"] + ["- " + e for e in errs] + ["WARNING: " + w for w in warns],
+        )
         return 0 if not errs else 1
 
 
@@ -342,7 +432,6 @@ class Orient(Command):
 
     @staticmethod
     def _native(a, app, out) -> int:
-        import tempfile
 
         from . import mesh as M
         from .sweep import unit_scale
@@ -499,6 +588,33 @@ class Split(Command):
         return 0
 
 
+def _studio_version(app: Bambu) -> str | None:
+    """Studio's version for the sweep provenance, or None with a WARN on stderr naming why (never silent)."""
+    try:
+        v = app.studio_cli().version()
+    except BambuError as e:
+        log.warning("Bambu Studio's version is unknown (%s): the written spec's provenance records none", e)
+        return None
+    if v is None:
+        log.warning("Bambu Studio did not report its version: the written spec's provenance records none")
+    return v
+
+
+def _sweep_command(a: argparse.Namespace) -> list[str]:
+    """The sweep command line that reproduces the measured variants (paths absolute; not --write-spec or --pick)."""
+    cmd = ["shambu", "sweep", str(Path(a.spec).expanduser().resolve())]
+    if a.variants:
+        cmd += ["--variants", str(Path(a.variants).expanduser().resolve())]
+    for key in a.orientations:
+        cmd += ["--orientations", key]
+    if a.orientations:
+        cmd += ["--top", str(a.top), "--source", a.source, "--threshold", f"{a.threshold:g}"]
+    for flag in ("by_object", "no_slice", "no_baseline", "probe_supports", "no_probe", "allow_filament_mismatch"):
+        if getattr(a, flag, False):
+            cmd.append("--" + flag.replace("_", "-"))
+    return cmd
+
+
 @command("sweep", "Build (and slice) variants of a spec and compare time and filament: orientations, by-object, settings")
 class Sweep(Command):
     def configure(self, p):
@@ -517,8 +633,15 @@ class Sweep(Command):
         p.add_argument("--no-slice", action="store_true", help="only plan and export; no time or filament numbers")
         p.add_argument("--no-baseline", action="store_true")
         p.add_argument("--timeout", type=int, default=1200)
+        p.add_argument(
+            "--write-spec",
+            metavar="OUT.json",
+            help="write the chosen variant as a full spec (the input's outdir, a `_sweep` provenance key); build that file",
+        )
+        p.add_argument("--pick", metavar="NAME", help="with --write-spec: the variant to write (default: the table's first row)")
         _printer_flags(p)
         _mismatch_flag(p)
+        _no_probe_flag(p)
 
     def run(self, a, app, out):
         from . import sweep as S
@@ -547,17 +670,70 @@ class Sweep(Command):
             msg = f"BuildError: {a.spec}: bad spec ({type(e).__name__}: {e})"
             out.emit({"error": msg}, [msg])
             return 1
+        names = ([S.BASELINE] if not a.no_baseline else []) + [str(v["name"]) for v in variants]
+        if a.pick is not None and not a.write_spec:
+            return usage(out, "--pick needs --write-spec OUT.json")
+        if a.write_spec:
+            same = S.check_destination(a.write_spec, a.spec, a.variants)
+            if same:
+                return usage(out, same)
+            cannot = S.writable_folder(a.write_spec)
+            if cannot:  # the environment (exit 3), found before any slicing
+                raise BuildError(cannot)
+            if a.pick is not None and a.pick not in names:
+                return usage(out, f"--pick {a.pick!r}: no such variant (variants: {', '.join(names)})")
+            if a.no_slice and a.pick is None:
+                return usage(out, "--write-spec with --no-slice needs --pick NAME: without a slice there are no numbers to rank")
         results = S.run(
             spec_json,
             variants,
             lambda spec, do_slice: app.build(
-                spec, timeout=a.timeout, do_slice=do_slice, printer=not a.no_printer, allow_filament_mismatch=a.allow_filament_mismatch
+                spec,
+                timeout=a.timeout,
+                do_slice=do_slice,
+                printer=not a.no_printer,
+                allow_filament_mismatch=a.allow_filament_mismatch,
+                probe_dir=Path(str(spec_json.get("outdir") or ".")).expanduser() / ".probe",
+                **({"no_probe": True} if a.no_probe else {}),
             ),
             do_slice=not a.no_slice,
             baseline=not a.no_baseline,
         )
-        out.emit([r.to_json() for r in results], S.table(results))
-        return 0 if all(r.ok for r in results) else 1  # one failed variant is a failed check (exit 1), as for `build`
+        all_ok = all(r.ok for r in results)
+        if not a.write_spec:
+            out.emit([r.to_json() for r in results], S.table(results))
+            return 0 if all_ok else 1  # one failed variant is a failed check (exit 1), as for `build`
+        failed = [r.name for r in results if not r.ok]
+        chosen = S.choose(results, a.pick)
+        written = None
+        if chosen is None:
+            last = "nothing written: no variant passed"
+        elif not chosen.ok:
+            why = chosen.problems[0] if chosen.problems else "failed"
+            last = f"nothing written: variant {chosen.name} failed ({why})"
+        else:
+            by_name = {S.BASELINE: {"name": S.BASELINE}, **{str(v["name"]): v for v in variants}}
+            base = next((r for r in results if r.name == S.BASELINE), None)
+            spec_out = S.written_spec(
+                spec_json,
+                by_name[chosen.name],
+                chosen,
+                str(Path(a.spec).expanduser().resolve()),
+                base,
+                studio_version=_studio_version(app),
+                command=_sweep_command(a),
+            )
+            try:
+                spec_out = S.relocate_meshes(spec_out, a.write_spec)
+                path = S.write_spec(a.write_spec, spec_out)
+            except BambuError as e:  # the measured table is the sweep's result: print it, then the error (exit 3)
+                msg = f"{type(e).__name__}: {e}"
+                out.emit({"results": [r.to_json() for r in results], "written": None, "error": msg}, S.table(results) + [msg])
+                return 3
+            written = {"path": str(path), **{k: v for k, v in spec_out["_sweep"].items() if k != "from"}}
+            last = S.written_line(a.write_spec, spec_out["_sweep"], failed)
+        out.emit({"results": [r.to_json() for r in results], "written": written}, S.table(results) + [last])
+        return 0 if all_ok and written is not None else 1
 
 
 @command("check", "Plan a spec: read the printer's spools, resolve presets, measure STLs, place parts, check limits. No export.")
@@ -566,13 +742,22 @@ class Check(Command):
         p.add_argument("spec")
         _printer_flags(p)
         _mismatch_flag(p)
+        _probe_flag(p)
+        _no_probe_flag(p)
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.spec, out)
         if isinstance(spec, int):
             return spec
         app.printer_ip = a.printer_ip
-        r = app.build(spec, export=False, printer=not a.no_printer, allow_filament_mismatch=a.allow_filament_mismatch)
+        r = app.build(
+            spec,
+            export=False,
+            printer=not a.no_printer,
+            allow_filament_mismatch=a.allow_filament_mismatch,
+            probe_supports=a.probe_supports,
+            **({"no_probe": True} if a.no_probe else {}),
+        )
         out.emit(r.to_json(), r.report.splitlines())
         return 0 if r.plan.ok else 1
 
@@ -587,15 +772,21 @@ class Build(Command):
         p.add_argument(
             "--slice", action="store_true", help="also slice headless: writes <name>.gcode.3mf with G-code and time/filament estimates"
         )
+        p.add_argument("--no-check", action="store_true", help=NO_CHECK_HELP)
         _printer_flags(p)
         _mismatch_flag(p)
+        _probe_flag(p)
+        _no_probe_flag(p)
 
     def run(self, a, app, out):
+        if a.no_check and not a.slice:
+            return usage(out, "--no-check needs --slice: it is a second slicing pass")
         spec = load_spec_or_error(a.spec, out)
         if isinstance(spec, int):
             return spec
         app.listeners.append(lambda ev, d: log.info("%s %s", ev, {k: v for k, v in d.items() if k != "argv"}))
         app.printer_ip = a.printer_ip
+        kw = {"no_check": True} if a.no_check else {}
         r = app.build(
             spec,
             timeout=a.timeout,
@@ -603,10 +794,19 @@ class Build(Command):
             do_slice=a.slice,
             printer=not a.no_printer,
             allow_filament_mismatch=a.allow_filament_mismatch,
+            probe_supports=a.probe_supports,
+            **kw,
+            **({"no_probe": True} if a.no_probe else {}),
         )
-        out.emit(r.to_json(), r.report.splitlines())
+        doc, lines = r.to_json(), r.report.splitlines()
         if a.open and r.run and r.run.ok:
-            app.open_in_studio(r.project)
+            try:  # before the output, so a failed open lands in the one JSON document
+                app.open_in_studio(r.project)
+            except StudioError as e:
+                doc["open_error"] = f"StudioError: {e}"
+                out.emit(doc, [*lines, f"StudioError: {e}"])
+                return 3
+        out.emit(doc, lines)
         return 0 if r.ok else 1
 
 
@@ -622,8 +822,16 @@ class Inspect(Command):
             f"printer {s['printer']}; process {s['process']}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']}); "
             f"print sequence {s.get('print_sequence') or 'not set (by layer)'}",
         ]
+        lines += [f"not re-sliceable by the CLI: {x}" for x in s.get("reslice_problems") or []]
+        ns = s.get("nozzle_stats")
         for f in s["filaments"]:
-            lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}")
+            if ns is None:
+                stat = "nozzle stats from extruder_max_nozzle_count (the file has no stats key)"
+            elif f.get("nozzle_stats") is None:
+                stat = f"{ns['key']} {ns['value']!r} has no entry for extruder {f.get('extruder')}"
+            else:
+                stat = f"{ns['key']} {f['nozzle_stats']}"
+            lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}, extruder {f.get('extruder')}, {stat}")
         for p in s["plates"]:
             lines.append(
                 f"plate {p['id']} '{p['name']}': bed {p['bed_type'] or 'project default'}, map {p['filament_maps'] or 'project default'}, "
@@ -638,8 +846,14 @@ class Inspect(Command):
                 )
         for o in s["objects"]:
             parts = ", ".join(f"{p['name']} (filament {p['extruder'] or o['extruder']}, {p['subtype']})" for p in o["parts"])
+            pos = o.get("position") or {}
+            where = (
+                f"plate {pos['plate']} min corner ({pos['min'][0]:g}, {pos['min'][1]:g}), size {' x '.join(f'{v:g}' for v in pos['size'])} mm, "
+                if "min" in pos
+                else (f"position unknown ({pos['error']}), " if "error" in pos else "")
+            )
             lines.append(
-                f"object {o['name']}: filament {o['extruder']}, settings {o['settings'] or '{}'}, parts [{parts}]"
+                f"object {o['name']}: {where}filament {o['extruder']}, settings {o['settings'] or '{}'}, parts [{parts}]"
                 + (f", height ranges {o['height_ranges']}" if o["height_ranges"] else "")
             )
         for c in s["custom_gcode"]:
@@ -675,27 +889,87 @@ class PatchCmd(Command):
         p.add_argument("--custom-gcode", action="append", default=[], metavar="PLATE:Z:GCODE")
         p.add_argument("--rename-plate", action="append", default=[], metavar="PLATE:NAME")
         p.add_argument("--rename-object", action="append", default=[], metavar="OLD:NEW")
+        p.add_argument(
+            "--repair-nozzle-stats",
+            action="store_true",
+            help="make an unsliced CLI export re-sliceable: extruder_nozzle_stats, filament_extruder_variant blocks, filament maps",
+        )
+        g = p.add_argument_group("project edits (geometry and filaments)")
+        g.add_argument(
+            "--replace-mesh",
+            action="append",
+            default=[],
+            metavar="OBJECT[/PART]=STL",
+            help="swap a part's mesh; keeps the name, settings and plate, checks the box (refuses a size change, a no-op, paint)",
+        )
+        g.add_argument("--rotate-mesh", metavar="X,Y,Z", help="turn the new STL first (degrees, as `shambu rotate`)")
+        g.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="lay this face of the new STL on the bed first")
+        g.add_argument(
+            "--anchor",
+            choices=("frame", "centre", "min"),
+            default="frame",
+            help="frame: the STL frames coincide (Studio's GUI rule, default); centre: keep the old bbox centre; min: keep the min corner",
+        )
+        g.add_argument("--allow-size-change", action="store_true", help="accept a new mesh whose box differs by more than 0.05 mm")
+        g.add_argument("--drop-paint", action="store_true", help="replace a painted mesh and lose its paint")
+        g.add_argument(
+            "--move",
+            action="append",
+            default=[],
+            metavar="OBJECT=X,Y[@PLATE]",
+            help="put the object's bbox MIN corner at X,Y (plate-local mm, as spec `at`), or +DX,+DY to nudge; @PLATE moves it there",
+        )
+        g.add_argument("--strict", action="store_true", help="a --move that breaks a bed, reach or overlap rule fails (default: FAIL line)")
+        g.add_argument("--tower", action="append", default=[], metavar="X,Y[@PLATE]", help="prime tower MIN corner, every plate or one")
+        g.add_argument(
+            "--add-filament",
+            action="append",
+            default=[],
+            metavar="PRESET[:#RRGGBB][@EXTRUDER]",
+            help="append filament slot N+1 (slots 1..N unchanged); colour: the preset's, else the next unused default colour (WARN); extruder 1",
+        )
+        g.add_argument("--allow-duplicate", action="store_true", help="--add-filament may add a preset and colour that a slot already has")
+        g.add_argument("--no-verify", action="store_true", help="skip the verify slice after --add-filament (about 20 s on a full plate)")
         p.add_argument("--dry-run", action="store_true")
 
     def run(self, a, app, out):
         try:
-            ps = self._parse(a)
+            ps = self._parse(a, app)
         except ValueError as e:
             out.emit({"error": f"bad patch option: {e}"}, [f"bad patch option: {e}; see --help for the formats"])
             return 2
+        except ProjectError as e:  # EditError is one: a refused patch is exit 1 whichever module refused it
+            out.emit({"error": f"{type(e).__name__}: {e}"}, [f"{type(e).__name__}: {e}"])
+            return 1
         if not ps.patches:
             out.emit({"patched": []}, ["nothing to do: give at least one patch option"])
             return 2
-        if a.dry_run:
-            out.emit({"would_patch": ps.describe()}, ["would patch:"] + ["- " + d for d in ps.describe()])
-            return 0
-        done = app.patch(a.file, ps, a.out)
-        out.emit({"file": a.out or a.file, "patched": done}, [f"patched {a.out or a.file}:"] + ["- " + d for d in done])
+        try:
+            if a.dry_run:
+                notes = ps.preview(a.file)
+                out.emit(
+                    {"would_patch": ps.describe(), "notes": notes},
+                    ["would patch:"] + ["- " + d for d in ps.describe()] + notes,
+                )
+                return 0
+            done = app.edit(a.file, ps, a.out, verify=not a.no_verify)
+        except ProjectError as e:  # an edits.py or patches.py refusal, or an undeclared entry change at save
+            out.emit({"error": f"{type(e).__name__}: {e}"}, [f"{type(e).__name__}: {e} (the input file is unchanged)"])
+            return 1
+        dest = a.out or a.file
+        out.emit(
+            {"file": dest, "patched": done, "notes": ps.notes},
+            [f"patched {dest}:"] + ["- " + d for d in done] + ps.notes,
+        )
         return 0
 
     @staticmethod
-    def _parse(a) -> PatchSet:
-        ps = PatchSet()
+    def _parse(a, app=None) -> EditSet:
+        ps = EditSet()
+        if len(a.add_filament) > 1:
+            raise ValueError("one --add-filament per call (each new slot is normalised against the project that holds the slots before it)")
+        for x in a.add_filament:  # first, so --extruder, --set and --tower in the same call can use the new slot
+            ps.add(app.add_filament_patch(a.file, x, a.allow_duplicate))
         if a.bed_type:
             ps.add(SetBedTypeEverywhere(a.bed_type))
         for x in a.plate_bed_type:
@@ -738,7 +1012,137 @@ class PatchCmd(Command):
         for x in a.rename_object:
             old, new = x.split(":", 1)
             ps.add(RenameObject(old, new))
+        if a.repair_nozzle_stats:
+            ps.add(RepairNozzleStats())
+        rot: tuple[float, float, float] = _floats(a.rotate_mesh, 3, "--rotate-mesh") if a.rotate_mesh else (0.0, 0.0, 0.0)
+        face: tuple[float, float, float] | None = _floats(a.lay_on_face, 3, "--lay-on-face") if a.lay_on_face else None
+        for x in a.replace_mesh:
+            target, eq, stl = x.partition("=")
+            if not eq or not stl or not target:
+                raise ValueError(f"--replace-mesh {x!r}: use OBJECT[/PART]=PATH.stl")
+            obj, _, part = target.partition("/")
+            ps.add(ReplaceMesh(obj, stl, part or None, rot, face, a.anchor, a.allow_size_change, a.drop_paint))
+        for x in a.move:
+            obj, eq, rest = x.rpartition("=")
+            if not eq or not obj:
+                raise ValueError(f"--move {x!r}: use OBJECT=X,Y[@PLATE] or OBJECT=+DX,+DY")
+            pos, _, plate = rest.partition("@")
+            if pos.count(",") != 1:
+                raise ValueError(f"--move {x!r}: needs two comma-separated numbers after '=' (X,Y or +DX,+DY)")
+            xs, ys = (v.strip() for v in pos.split(","))
+            signed = [v[:1] in ("+", "-") for v in (xs, ys)]
+            if any(signed) and not all(signed):
+                raise ValueError(f"--move {x!r}: a relative move needs a sign on both values (+5,-5); absolute values are the min corner")
+            try:
+                mx, my = _floats(pos, 2, "--move")
+            except ValueError as e:  # quote what the user typed, not a rebuilt "X,Y"
+                raise ValueError(f"--move {x!r}: {str(e).split(': ', 1)[-1]}") from e
+            ps.add(MoveObject(obj, mx, my, all(signed), _plate_arg(plate, "--move"), a.strict))
+        for x in a.tower:
+            ps.add(SetTower(*_tower_arg(x)))
         return ps
+
+
+NO_CHECK_HELP = (
+    "with --slice: when the checked slice exits -101 (G-code path conflicts) or -100 (empty layers, overlap), slice again with "
+    "Studio's --no-check, as the GUI accepts the plate with a serious warning; the report names what the check found"
+)
+
+
+def _floats(text: str, n: int, flag: str) -> tuple:
+    """`n` finite comma-separated numbers, else ValueError (a usage error, exit 2)."""
+    vals = [v.strip() for v in text.split(",")]
+    if len(vals) != n:
+        raise ValueError(f"{flag} {text!r}: needs {n} comma-separated numbers")
+    try:
+        out = tuple(float(v) for v in vals)
+    except ValueError as e:
+        raise ValueError(f"{flag} {text!r}: {e}") from e
+    if not all(math.isfinite(v) for v in out):
+        raise ValueError(f"{flag} {text!r}: the values must be finite numbers")
+    return out
+
+
+def _plate_arg(text: str, flag: str) -> int | None:
+    if not text:
+        return None
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(f"{flag} @{text}: the plate must be a whole number from 1")
+    return int(text)
+
+
+def _tower_arg(text: str) -> tuple[float, float, int | None]:
+    pos, _, plate = text.partition("@")
+    x, y = _floats(pos, 2, "--tower")
+    return (x, y, _plate_arg(plate, "--tower"))
+
+
+@command("slice", "Slice a saved .3mf headless (Studio's CLI) and report time and filament; --no-check as a second pass")
+class Slice(Command):
+    def configure(self, p):
+        p.add_argument("file")
+        p.add_argument("-o", "--out", help="the .gcode.3mf to write (default: <name>.gcode.3mf next to the input)")
+        p.add_argument("--plate", type=int, default=0, help="plate to slice (default 0: every plate)")
+        p.add_argument("--no-check", action="store_true", help=NO_CHECK_HELP.removeprefix("with --slice: "))
+        p.add_argument("--tower", metavar="X,Y[@PLATE]", help="prime tower min corner for this slice (the input file is not changed)")
+        p.add_argument(
+            "--settings-from",
+            metavar="SPEC.json",
+            help="re-apply the spec's resolved machine and process presets (--load-settings); the project's filaments stay",
+        )
+        p.add_argument("--timeout", type=int, default=1200)
+
+    def run(self, a, app, out):
+        try:
+            tower = _tower_arg(a.tower) if a.tower else None
+        except ValueError as e:
+            return usage(out, str(e))
+        spec = None
+        if a.settings_from:
+            spec = load_spec_or_error(a.settings_from, out)
+            if isinstance(spec, int):
+                return spec
+        try:
+            r = app.slice_project(a.file, a.out, plate=a.plate, no_check=a.no_check, tower=tower, settings_from=spec, timeout=a.timeout)
+        except ValueError as e:
+            return usage(out, str(e))
+        except EditError as e:
+            out.emit({"error": f"EditError: {e}"}, [f"EditError: {e}"])
+            return 1
+        lines = [f"slice {r.file.name}: {r.run.summary()}"]
+        for est in r.estimates:
+            lines += estimate_lines(est)
+        lines += checks_skipped_lines(r.checks_skipped)
+        lines += ["- FAIL: " + x for x in r.fails]
+        lines += ["- VERIFY FAIL: " + x for x in r.verify_problems]
+        lines += ["- " + n.strip() for n in r.notes]
+        if r.ok:
+            lines.append(f"- output {r.output}")
+        out.emit(r.to_json(), lines)
+        return 0 if r.ok else 1
+
+
+@command("studio", "Last resort: run Bambu Studio's CLI with raw arguments (`shambu studio -- ARGS`), ruled, logged, unverified")
+class StudioHatch(Command):
+    def configure(self, p):
+        p.add_argument("--out", default=".", help="the run folder goes under DIR/studio-runs/<UTC stamp>/ (default: .)")
+        p.add_argument("--timeout", type=int, default=1200)
+        p.add_argument("raw", nargs=argparse.REMAINDER, help="Studio arguments after --; --export-3mf takes a bare name")
+
+    def run(self, a, app, out):
+        raw = list(a.raw)
+        if raw and raw[0] == "--":
+            raw = raw[1:]
+        if not raw:
+            return usage(out, "give Studio's arguments after --, e.g. shambu studio -- --slice 1 --export-3mf out.3mf in.3mf")
+        try:
+            CliCommand.parse(raw, Path.cwd())  # the rules first: a refusal is a usage error before Studio is needed
+        except StudioError as e:
+            return usage(out, f"refused: {e}")
+        d = app.studio_raw(raw, a.out, a.timeout)  # a missing binary stays an environment error (exit 3)
+        line = f"studio: exit {d['exit']} ({d['meaning']}); run folder {d['run_dir']}; unverified: run `shambu inspect` on the output"
+        out.emit(d, [line])
+        return 0 if d["exit"] == 0 else 1
 
 
 @command("open", "Open a project in Bambu Studio for the user")
@@ -759,7 +1163,19 @@ class Printer(Command):
         p.add_argument("--ip")
         p.add_argument("--serial")
         p.add_argument("--wait", type=float, default=8.0)
-        p.add_argument("--every", type=int, default=300, help="watch interval in seconds")
+        p.add_argument(
+            "--every", type=int, default=300, help="watch interval in seconds (at most 60 near the start and the end of a print)"
+        )
+        p.add_argument("--log", help="watch: append one JSON line per poll to this file (no IP, no serial)")
+        p.add_argument("--gcode3mf", help="watch --log: the sliced .gcode.3mf being printed; its M73 track goes in the log's header line")
+        p.add_argument("--plate", type=int, help="watch --gcode3mf: the plate number (default: the only sliced plate)")
+        p.add_argument("--max-errors", type=int, default=10, help="watch: stop after this many failed reads in a row (default 10)")
+        p.add_argument("--max-polls", type=int, default=2000, help="watch: stop after this many polls (default 2000)")
+        p.add_argument(
+            "--wait-for-start",
+            action="store_true",
+            help="watch: when the printer is idle or shows the last job's end, poll every 60 s until a job starts (bounded by --max-polls)",
+        )
         p.add_argument("--ssdp", type=float, default=0, help="discover: also listen for SSDP this many seconds")
         p.add_argument("--printer-preset", help="filaments: the machine preset to name presets for (default: the GUI's current one)")
         p.add_argument(
@@ -769,8 +1185,10 @@ class Printer(Command):
         )
 
     def run(self, a, app, out):
-        from .printer import ArpProbe, SsdpListen
+        from .printer import READ_TIMEOUT_S, ArpProbe, SsdpListen
 
+        # one read's timeout: 15 s at the default --wait 8, and --wait plus 7 s (connect and grace) above that
+        app.printer_timeout = max(READ_TIMEOUT_S, a.wait + 7)
         svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "discover":
             hits = ArpProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])
@@ -781,7 +1199,7 @@ class Printer(Command):
             )
             return 0 if hits else 1
         if a.action == "raw":
-            print(json.dumps(svc.raw_report(), indent=1, default=str))
+            print(json.dumps(svc.public_report(), indent=1, default=str))
             return 0
         if a.action == "status":
             st = svc.status()
@@ -791,10 +1209,197 @@ class Printer(Command):
             lf = svc.filaments(app.presets(), a.printer_preset or app.gui_machine_preset())
             out.emit(lf.to_json(), lf.lines())
             return 0
-        for st in svc.watch(a.every):
-            out.emit(st.to_json(), st.lines() + [""])
+        return _watch(a, svc, out)
+
+
+def _gcode_track(path: str, plate: int | None):
+    """(M73Track, entry name) of a sliced project's plate G-code, streamed from the zip: no other entry is read.
+    Raises ProjectError when the plate's G-code is missing, CalibrationError when it holds no usable M73 track."""
+    from .calibrate import parse_m73
+    from .errors import ProjectError
+    from .threemf import open_text_entry, plate_gcode_names
+
+    names = plate_gcode_names(path)
+    if plate is not None:
+        names = [n for n in names if n == f"Metadata/plate_{plate}.gcode"]
+    if len(names) != 1:
+        which = f"plate {plate}" if plate is not None else "one sliced plate (pass --plate N)"
+        raise ProjectError(f"{path}: expected the G-code of {which}, found {names or 'none'} (export it with Export Plate Sliced File)")
+    with open_text_entry(path, names[0]) as f:
+        return parse_m73(f), names[0]
+
+
+def _watch(a, svc, out: Output) -> int:
+    """`printer watch`: one document per poll on stdout; with --log, one JSON line per poll (and a header line) in the
+    file. Exit 0 when the print reached a final state or the poll limit, 3 after --max-errors failed reads in a row or
+    when the log cannot be opened or written."""
+    from .calibrate import CalibrationError
+    from .conf import DataFileError
+    from .errors import ProjectError
+    from .printer import WatchError, outward_secrets, scrub_tree, utc_iso
+
+    if a.every < 1 or a.max_errors < 1 or a.max_polls < 1:
+        return usage(out, "--every, --max-errors and --max-polls must be 1 or more")
+    if a.gcode3mf and not a.log:
+        return usage(out, "--gcode3mf ties a --log to the file it watches: give --log too")
+    header: dict | None = None
+    if a.log:
+        header = {"kind": "header", "shambu_version": __version__, "started_at": utc_iso(time.time()), "every_s": a.every}
+        if a.gcode3mf:
+            if not Path(a.gcode3mf).is_file():
+                return usage(out, f"--gcode3mf {a.gcode3mf}: no such file")
+            try:
+                track, entry = _gcode_track(a.gcode3mf, a.plate)
+            except (ProjectError, CalibrationError) as e:
+                msg = f"{type(e).__name__}: {e}"
+                out.emit({"error": msg}, [msg])
+                return 1
+            header.update(gcode3mf=Path(a.gcode3mf).name, gcode=entry, track=track.to_json())
+            # the file name and the G-code's labels are free text: the printer boundary's sanitiser applies to them too
+            header = scrub_tree(header, outward_secrets(getattr(svc, "serial", None) or "", getattr(svc, "ip", None) or ""))
+    log_f = None
+    code = 0
+
+    def write(rec: dict) -> None:
+        if log_f is None:
+            return
+        try:
+            log_f.write(json.dumps(rec, allow_nan=False) + "\n")
+            log_f.flush()
+        except OSError as e:
+            raise DataFileError(f"--log {a.log}: cannot write it ({e.strerror})") from e
+
+    try:
+        if a.log:
+            try:
+                log_f = open(a.log, "a", encoding="utf-8")  # closed below, on both paths
+            except OSError as e:
+                raise DataFileError(f"--log {a.log}: cannot open it for appending ({e.strerror})") from e
+            if header is not None:
+                write(header)
+        for item in svc.watch(a.every, max_polls=a.max_polls, max_errors=a.max_errors, wait_for_start=a.wait_for_start):
+            if isinstance(item, WatchError):
+                log.warning("read failed at %s (%d of %d in a row): %s", item.read_at, item.consecutive, a.max_errors, item.error)
+                if out.as_json:
+                    out.emit(item.log_poll())
+                write({"kind": "error", **item.log_poll()})
+                if item.gave_up:
+                    code = 3
+            else:
+                rec = {"kind": "poll", **item.log_poll()}
+                if item.done:
+                    rec["final"] = True
+                out.emit(item.to_json(), item.lines() + [""])
+                write(rec)
             sys.stdout.flush()
-        return 0
+    except BaseException:
+        if log_f is not None:  # keep the error in flight: a second failure on close must not replace it
+            try:
+                log_f.close()
+            except OSError as e:
+                log.warning("closing --log after an error failed too: %s", e.strerror)
+        raise
+    if log_f is not None:
+        try:
+            log_f.close()
+        except OSError as e:
+            raise DataFileError(f"--log {a.log}: cannot write it ({e.strerror})") from e
+    return code
+
+
+@command("calibrate", "Compare watch logs with Studio's estimate; store measured prints and show the fit per printer and material")
+class Calibrate(Command):
+    def configure(self, p):
+        p.add_argument(
+            "--log", action="append", default=[], help="a `printer watch --log` file made with --gcode3mf (repeat for several prints)"
+        )
+        p.add_argument("--add", action="store_true", help="add the logs' prints to the calibration file")
+        p.add_argument("--show", action="store_true", help="print the stored prints and the fit per printer model and material")
+
+    def run(self, a, app, out):
+        from . import calibrate as C
+        from . import conf
+
+        fits, prints, errors, notes = [], [], [], []
+        for path in a.log:
+            name = Path(path).name
+            try:
+                with open(path, encoding="utf-8") as f:
+                    sessions = C.read_log(f)
+            except OSError as e:
+                errors.append(f"{name}: cannot read it ({e.strerror})")
+                continue
+            except C.CalibrationError as e:
+                errors.append(f"{name}: {e}")
+                continue
+            found = 0
+            for s in sessions:  # each session on its own: one bad or empty session does not hide the others
+                try:
+                    if not any(r["state"] == "RUNNING" for _, r in s.polls):
+                        notes.append(f"{name}: the session at line {s.line} has no RUNNING poll (no print): skipped")
+                        continue
+                    if not s.header or not s.header.get("track"):
+                        raise C.CalibrationError(
+                            f"the session at line {s.line} is not tied to a G-code file: watch with --log and --gcode3mf"
+                        )
+                    track = C.M73Track.from_json(s.header["track"])
+                    fit = C.fit(C.polls_from_session(s, track), s, track)
+                except C.CalibrationError as e:
+                    errors.append(f"{name}: {e}")
+                    continue
+                found += 1
+                fits.append(fit)
+                prints.append(fit.to_print(C.session_fingerprint(s.header, s.polls[0][1], s.polls[-1][1])))
+            if not found and not any(e.startswith(f"{name}: ") for e in errors):
+                errors.append(f"{name}: no session with a RUNNING poll: the log holds no print")
+        added = 0
+        if a.add and prints and not errors:
+
+            def add(stored: list[dict]) -> list[dict]:
+                for p in prints:  # one session is one print, whatever the log file is called
+                    stored = [s for s in stored if s.get("session") != p["session"]]
+                    stored.append(p)
+                return stored
+
+            conf.update_calibration(add)
+            added = len(prints)
+        show = a.show or not a.log
+        stored = conf.load_calibration() if show else []
+        combined = (
+            [C.combine(stored, m, mat) for m, mat in dict.fromkeys((s.get("printer_model"), s.get("material")) for s in stored)]
+            if show
+            else []
+        )
+        lines = [f"ERROR: {e}" for e in errors] + [f"note: {n}" for n in notes]
+        for fit in fits:
+            lines += fit.lines()
+        if a.add:
+            lines.append(
+                f"added {added} print(s) to the calibration file"
+                if added
+                else "added nothing: " + ("a log failed" if errors else "no print")
+            )
+        if show:
+            lines.append(f"{len(stored)} stored print(s)")
+            lines += [
+                f"  {s['date']}  {s['printer_model']}  {s['material']}  Studio {C.hm(s['studio_total_min'])}  {s['kind']}  "
+                f"rate {s['rate'] if s['rate'] is not None else '-'}  offset {s['startup_offset_min'] if s['startup_offset_min'] is not None else '-'}  "
+                f"flags {', '.join(s['flags']) or 'none'}"
+                for s in stored
+            ]
+            for c in combined:
+                lines += c.lines()
+        doc = {
+            "prints": prints,
+            "errors": errors,
+            "notes": notes,
+            "added": added,
+            "stored": stored if show else None,
+            "fits": combined if show else None,
+        }
+        secrets = conf.sensitive_values()  # file names and G-code labels are free text: scrub the serial and code
+        out.emit(json.loads(conf.scrub_text(json.dumps(_jsonable(doc)), secrets)), [conf.scrub_text(x, secrets) for x in lines])
+        return 1 if errors else 0
 
 
 # ---------------------------------------------------------------------------- main

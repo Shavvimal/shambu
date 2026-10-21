@@ -32,7 +32,7 @@ import plistlib
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -60,7 +60,7 @@ RETURN_CODES = {
     -17: "process preset not compatible with the printer (compatible_printers)",
     -18: "invalid values in config (validate failed)",
     -19: "post_process not supported",
-    -21: "arrange failed: an object spilled off the plate",
+    -21: "arrange failed: Studio's arrange could not fit the parts on a plate (it keeps 24 mm between objects when any part has tree supports)",
     -22: "orient failed",
     -24: "3MF version not supported (try --allow-newer-file)",
     -50: "no object fully inside the plate",
@@ -102,6 +102,86 @@ _ACTIONS = {
     "--help",
     *_PRE_SLICE_ACTIONS,
 }
+# `CliCommand.parse` (the `shambu studio --` escape hatch): flags that never take a value (reference 02 recommendation 6),
+# options whose value is a path or a ';' list of paths, options shambu refuses, and the input file types.
+_BARE = {"--no-check", "--help", "--skip-useless-pick", "--allow-mix-temp", "--load-defaultfila", "--allow-newer-file"}
+_PATH_VALUE = {
+    "--load-settings",
+    "--load-filaments",
+    "--load-assemble-list",
+    "--load-custom-gcodes",
+    "--export-settings",
+    "--export-slicedata",
+    "--load-slicedata",
+}
+_REFUSED = ("--pipe", "--datadir", "--uptodate", "--downward")
+_MODEL_EXT = (".3mf", ".stl", ".obj", ".step", ".stp", ".amf")
+
+
+def _assemble_paths_inside(path: Path, inside: Callable[[str, str], str], scratch: Path | None = None) -> str:
+    """Every model path of an assemble list must pass `inside` (the escape hatch's working-tree rule). With `scratch`,
+    write a copy with those resolved absolute paths there and return its path; else return `path`."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise StudioError(f"--load-assemble-list {path}: unreadable JSON ({e})") from e
+    plates = data.get("plates") if isinstance(data, dict) else None
+    for plate in plates if isinstance(plates, list) else []:
+        for o in (plate.get("objects") or []) if isinstance(plate, dict) else []:
+            if isinstance(o, dict) and isinstance(o.get("path"), str):
+                o["path"] = inside(o["path"], f"assemble-list model path in {path.name}:")
+    if scratch is None:
+        return str(path)
+    scratch.mkdir(parents=True, exist_ok=True)
+    copy = scratch / f"assemble-{path.name}"
+    copy.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    return str(copy.resolve())
+
+
+# Log lines of a failed slice (Print.cpp:2434 and BambuStudio.cpp:5477-5485, v02.08.02.61). The names are the CLI's
+# object names (<stem>_<n>, assemble_<k>), before shambu renames them. The conflict line carries no z.
+_CONFLICT = re.compile(r"gcode path conflicts found between (.+?)[ \t]*$", re.M)
+_ARRANGE_FAILED = re.compile(r"arrange failed:.*?plate index (\d+)")
+
+
+def conflicts_in_log(text: str, known: Collection[str] = ()) -> list[tuple[str, str | None]]:
+    """Every object pair of an exit -101 (`gcode path conflicts found between A and B`), in log order, once each.
+    Object names may hold spaces and even " and ", so the rest of the line is split at the " and " where both sides
+    are `known` CLI names; with no known split and exactly one " and ", at that one. A line no rule splits comes back
+    as (rest of the line, None)."""
+    out: list[tuple[str, str | None]] = []
+    for m in _CONFLICT.finditer(text):
+        rest = m.group(1)
+        cuts = [i for i in range(len(rest)) if rest.startswith(" and ", i)]
+        splits = [(rest[:i], rest[i + 5 :]) for i in cuts]
+        good = [s for s in splits if s[0] in known and s[1] in known]
+        pair: tuple[str, str | None]
+        if len(good) == 1:
+            pair = good[0]
+        elif not good and len(splits) == 1:
+            pair = splits[0]
+        else:
+            pair = (rest, None)
+        if pair not in out:
+            out.append(pair)
+    return out
+
+
+def conflict_phrase(a: str, b: str | None) -> str:
+    """One wording for an exit -101 pair, used by `build` (export_fails) and the two-pass slice: "crossing G-code paths
+    between A and B (exit -101)", or the unsplit line when `conflicts_in_log` could not split it (b None)."""
+    if b is None:
+        return f"crossing G-code paths (exit -101) between '{a}', which shambu cannot split into two object names"
+    return f"crossing G-code paths between {a} and {b} (exit -101)"
+
+
+NO_PAIR = "crossing G-code paths (exit -101), and its log names no objects"
+
+
+def arrange_failed_plate(text: str) -> int | None:
+    """The 1-based plate of an exit -21 (`run:arrange failed: ... plate index 0`), or None when the log does not say."""
+    m = _ARRANGE_FAILED.search(text)
+    return int(m.group(1)) + 1 if m else None
 
 
 def signed(status: int) -> int:
@@ -121,6 +201,66 @@ class CliCommand:
     _opts: list[tuple[str, str | None]] = field(default_factory=list)
     _pre: list[tuple[str, str | None]] = field(default_factory=list)
     _slice: int | None = None
+
+    @classmethod
+    def parse(cls, argv: list[str], cwd: str | Path | None = None, scratch: str | Path | None = None) -> CliCommand:
+        """A raw Studio argument list as a checked command, for `shambu studio --`. The builder rules apply: `--flag 1`
+        becomes `--flag=1`, pre-slice actions move before `--slice`, no action is refused (the GUI would open), and
+        `--export-3mf` takes a bare name. Refused: `--pipe`, `--datadir` (shambu owns it), `--uptodate*`,
+        `--downward*`, short options, a malformed `--slice` plate, and any path outside the working tree `cwd`:
+        positional inputs, every `;`-separated path of a path-valued option (symlinks resolved), and the model paths
+        of an assemble list. Relative paths resolve against `cwd`, because the binary runs in its private datadir. Studio
+        reads an assemble list's model paths verbatim from that datadir, so with `scratch` the list is rewritten there
+        with the resolved, checked absolute paths and the command loads that copy (without `scratch`: check only)."""
+        root = Path(cwd or os.getcwd()).resolve()
+
+        def inside(v: str, what: str) -> str:
+            full = (root / v).resolve() if not Path(v).is_absolute() else Path(v).resolve()
+            if not full.is_relative_to(root):
+                raise StudioError(f"{what} {v} is outside the working tree {root}")
+            return str(full)
+
+        cmd = cls()
+        i = 0
+        while i < len(argv):
+            tok = argv[i]
+            if tok.startswith("--"):
+                raw_name, eq, val = tok.partition("=")
+                name = "--" + raw_name[2:].replace("_", "-")
+                if any(name == r or name.startswith(r) for r in _REFUSED):
+                    raise StudioError(
+                        f"{name} is refused by `shambu studio` (shambu owns the datadir; --pipe, --uptodate* and --downward* change files or block)"
+                    )
+                if name == "--outputdir":
+                    raise StudioError("--outputdir is set by `shambu studio` (the run folder); use --out DIR before --")
+                value: str | None = None
+                if eq:
+                    value = val
+                elif name not in _BARE and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                    nxt = argv[i + 1]
+                    if name in _PATH_VALUE or name == "--export-3mf" or not nxt.lower().endswith(_MODEL_EXT):
+                        value = nxt
+                        i += 1
+                if name == "--export-3mf" and (not value or "/" in value):
+                    raise StudioError("--export-3mf wants a bare file name; the CLI joins it to --outputdir (the run folder)")
+                if name in _PATH_VALUE and value:
+                    value = ";".join(inside(v, name) if v else v for v in value.split(";"))
+                if name == "--load-assemble-list" and value:
+                    value = _assemble_paths_inside(Path(value), inside, Path(scratch) if scratch else None)
+                if name == "--slice":
+                    try:
+                        int(value or 0)
+                    except ValueError as e:
+                        raise StudioError(f"--slice {value!r}: the plate must be a whole number (0 = every plate)") from e
+                cmd.option(name, value)
+            elif tok.startswith("-") and tok != "-":
+                raise StudioError(f"{tok}: short options are not passed through; use the --long form")
+            else:
+                cmd.inputs.append(inside(tok, "input"))
+            i += 1
+        if not cmd.has_action():
+            raise StudioError("no action option: the CLI would open the GUI. Add --export-3mf NAME, --slice N, --info, ...")
+        return cmd
 
     def option(self, name: str, value: str | int | float | None = None) -> CliCommand:
         name = "--" + name.lstrip("-").replace("_", "-")
@@ -293,8 +433,28 @@ class RunResult:
             )
         return out
 
+    def slicing_error(self) -> str | None:
+        """On exit -100 the CLI writes the exception text to stderr on its own line after `found slicing or export
+        error for partplate N` (BambuStudio.cpp:7413-7418); result.json holds only a generic message. That line, or
+        None when the log is absent or lacks it."""
+        if self.code != -100 or self.log is None:
+            return None
+        try:
+            lines = Path(self.log).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        for i, line in enumerate(lines):
+            if "found slicing or export error for partplate" in line:
+                for nxt in lines[i + 1 :]:
+                    t = nxt.strip()
+                    if not t:
+                        continue
+                    return None if t.startswith("[") else t  # the next line is a log record: no exception text
+        return None
+
     def summary(self) -> str:
-        s = f"exit {self.code} ({self.meaning()}), {self.seconds:.1f} s, log {self.log}"
+        err = self.slicing_error()
+        s = f"exit {self.code} ({self.meaning()})" + (f": {err}" if err else "") + f", {self.seconds:.1f} s, log {self.log}"
         if self.result:
             s += f", prepare {self.result.get('prepare_time')} ms, export {self.result.get('export_time')} ms"
         if self.output:
@@ -332,7 +492,6 @@ class MeshInfo:
 
 
 _INFO_KEYS = ("size_x", "size_y", "size_z", "min_x", "max_x", "min_y", "max_y", "min_z", "max_z", "manifold")
-_PCT = re.compile(r"percent=(\d+)")
 
 ProgressListener = Callable[[str, dict], None]
 
@@ -360,11 +519,29 @@ class StudioCLI:
 
     # -- facts ------------------------------------------------------------------------------
     def version(self) -> str:
-        with open(self.binary.parents[1] / "Info.plist", "rb") as f:
-            return plistlib.load(f)["CFBundleShortVersionString"]
+        plist = self.binary.parents[1] / "Info.plist"
+        try:
+            with open(plist, "rb") as f:
+                v = plistlib.load(f)["CFBundleShortVersionString"]
+        except (OSError, plistlib.InvalidFileException, ValueError, KeyError, TypeError) as e:
+            raise StudioError(f"cannot read the Studio version from {plist}: {type(e).__name__}: {e}") from e
+        if not isinstance(v, str) or not v:
+            raise StudioError(f"cannot read the Studio version from {plist}: CFBundleShortVersionString is {v!r}")
+        return v
 
-    def running_pids(self) -> list[int]:
-        r = subprocess.run(["pgrep", "-f", str(self.binary)], capture_output=True, text=True)
+    def running_pids(self) -> list[int] | None:
+        """PIDs of running Studio processes; [] when none run (pgrep exit 1); None when pgrep failed or timed out."""
+        try:  # doctor calls this; a stuck process table must not stall it
+            r = subprocess.run(["pgrep", "-f", str(self.binary)], capture_output=True, text=True, timeout=2)
+        except subprocess.TimeoutExpired:
+            log.warning("pgrep gave no answer within 2 s; running Studio processes unknown")
+            return None
+        except OSError as e:
+            log.warning("pgrep failed (%s); running Studio processes unknown", e)
+            return None
+        if r.returncode not in (0, 1):
+            log.warning("pgrep exited with status %s (%s); running Studio processes unknown", r.returncode, (r.stderr or "").strip()[:200])
+            return None
         return [int(p) for p in r.stdout.split() if p.isdigit()]
 
     def datadir(self, name: str) -> Path:
@@ -760,22 +937,6 @@ def parse_orient(text: str) -> list[OrientTable]:
     if cur:
         tables.append(OrientTable(rank_candidates(cur, None), None))
     return tables
-
-
-def progress_from_log(log_path: Path) -> dict:
-    """Last progress hints from a CLI log: percent lines (debug 4) and the last plate/thumbnail line."""
-    pct, last = None, ""
-    try:
-        for line in open(log_path, errors="replace"):
-            m = _PCT.search(line)
-            if m:
-                pct = int(m.group(1))
-            low = line.lower()
-            if "finished" in low or "thumbnail" in low or "plate" in low:
-                last = line.strip()[-160:]
-    except OSError:
-        pass
-    return {"percent": pct, "last": last}
 
 
 # Convenience singletons are avoided on purpose; callers construct StudioCLI() once and pass it on.

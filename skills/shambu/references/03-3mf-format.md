@@ -30,7 +30,9 @@ Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate fr
 | [5. Prototype and patch survival](#5-prototype-and-patch-survival) | The read-and-patch prototype, and which patches survive a Studio reload |
 | [6. Generating a project from STLs with no CLI](#6-generating-a-project-from-stls-with-no-cli) | Writing a project from STLs without the CLI |
 | [7. Gaps and next steps](#7-gaps-and-next-steps) | Open questions and the tests that would close them |
+| [8. Re-slicing a CLI export](#8-re-slicing-a-cli-export) | The per-extruder keys a later `--slice` needs, and the exit -100 chain |
 | [Appendix: `project_settings.config` keys by source](#appendix-project_settingsconfig-keys-by-source) | Each `project_settings.config` key, grouped by preset source |
+| [Project edits](#project-edits-replace-a-mesh-add-a-filament-move-an-object-or-the-tower-shambu-04-editspy) | How `patch --replace-mesh`, `--add-filament`, `--move`, `--tower` and `shambu slice --no-check` change a project, with the Studio rules they follow |
 
 ## 0. Headline findings
 
@@ -52,7 +54,10 @@ Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate fr
    the main trap for a hand-written patch.
 6. **A filament mapped to nozzle 2 also needs `filament_extruder_variant` updated.** Without it,
    slicing logs `could not found extruder_type Bowden, nozzle_volume_type Standard,
-   filament_index 2` and segfaults (rc=139). The prototype now writes it.
+   filament_index 2` and segfaults (rc=139). The prototype now writes it. Correction (2026-10-21):
+   the list must stay in block form, one block per filament, paired index by index with
+   `filament_self_index`. The 0.3 map patch collapsed it to one entry per filament and caused the
+   same message for filament 2 (section 8).
 7. **Generating a project from STLs with no CLI works,** if `project_settings.config` is a
    complete config from a template. With only the five keys the loader needs, the CLI loads the
    file but silently fills the factory defaults (wall_loops 2, nozzle 200 C, one extruder) under
@@ -314,7 +319,9 @@ Keys that matter for this task (fit test values):
 | `filament_map` | `["1"]` | 1-based extruder per filament; also 1 entry only |
 | `filament_map_mode` | `"Auto For Flush"` | `Auto For Flush`, `Auto For Match`, `Manual`, `Nozzle Manual`, `Auto For Quality` (PC:532-538) |
 | `filament_nozzle_map`, `filament_volume_map`, `filament_map_2` | `["1"]` | dual-nozzle internals |
-| `filament_extruder_variant` | `["Direct Drive Standard", "Direct Drive Standard"]` | **must match** `extruder_type[map-1] + " " + nozzle_volume_type[map-1]` for each filament |
+| `filament_extruder_variant` | `["Direct Drive Standard", "Direct Drive Standard"]` (fit test) | one block of variants per filament, index-paired with `filament_self_index`; each filament's block must hold `extruder_type[map-1] + " " + nozzle_volume_type[map-1]` (section 8) |
+| `filament_self_index` | 6 x `"1"` + 6 x `"2"` (X2D) | the filament of each variant slot (and of every 6N value key) |
+| `extruder_nozzle_stats` | `[]` after an export without `--slice`; `["Standard#1","Standard#1"]` after a slice | `<nozzle_volume_type>#<count>` per extruder; `[]` makes a later CLI slice exit -100 (section 8) |
 | `extruder_type` | `["Direct Drive", "Bowden"]` | X2D: extruder 1 direct drive, extruder 2 Bowden |
 | `nozzle_volume_type`, `default_nozzle_volume_type` | `["Standard","Standard"]` | `Standard`, `High Flow`, `TPU High Flow`, `Hybrid`, `E3D High Flow` |
 | `nozzle_diameter` | `["0.4","0.4"]` | required; its length is the extruder count |
@@ -606,6 +613,56 @@ Recommended design for the library:
 - `mode` in `custom_gcode_per_layer.xml` is set to `MultiExtruder` for more than one filament.
   This matches the CLI round trip but the slicer's use of it is unverified.
 
+## 8. Re-slicing a CLI export
+
+Measured 2026-10-21 (X2D, Studio 02.08.02.61, plate 14 and the seed build; source at tag v02.08.02.61).
+
+A CLI export without `--slice` writes `extruder_nozzle_stats: []`. The CLI fills the key only inside the
+per-plate slice loop (BambuStudio.cpp:6648-6686), so an unsliced export keeps the empty default
+(PrintConfig.cpp:4897-4898). When that file is the input of a later CLI run, the chain is:
+
+1. The key is present, so the CLI takes it as authoritative (`has_extruder_nozzle_stats`, BambuStudio.cpp:4101) and
+   builds an empty stat (4135-4156). Only an absent key takes `extruder_max_nozzle_count` (1 per extruder,
+   PresetBundle.cpp:320-333).
+2. In the slice loop (two extruders) the count for Standard becomes 0 (BambuStudio.cpp:6682). The log prints
+   `[nozzle_stats_obj] extruder[0] Standard x0`.
+3. `build_nozzle_groups` finds 0 nozzles (ToolOrdering.cpp:1316-1338, MultiNozzleUtils.cpp:14-29) and
+   `build_filament_group_context` throws "No valid nozzle found. Please check nozzle count." (ToolOrdering.cpp:1481).
+4. The catch maps it to -100 and writes the exception text to stderr on the line after `found slicing or export
+   error for partplate N` (BambuStudio.cpp:7413-7418). `result.json` holds only a generic message.
+
+It is not two-filament specific: a one-filament plate of the same export failed the same way (run S1). The fix is
+one key: `["Standard#1","Standard#1"]`, or no key at all. `--extruder-nozzle-count=1,1
+--extruder-nozzle-volume-type=Standard,Standard` on the command line also works (run R4).
+
+The variant keys. Studio pairs `filament_extruder_variant[i]` with `filament_self_index[i]` (PrintConfig.cpp:8022-8052)
+and looks up `<extruder_type> <nozzle_volume_type>` of the filament's extruder in that filament's block. A miss logs
+`could not found extruder_type ... filament_index 2` (PrintConfig.cpp:8935). It is not fatal, but the filament then
+slices with its first variant's values: PLA Matte got the Direct Drive flow ratio 1.006 instead of the Bowden 0.98
+(runs X4, X5).
+
+| Key | X2D, 2 filaments | If wrong |
+| --- | --- | --- |
+| `extruder_nozzle_stats` | `["Standard#1", "Standard#1"]`, or absent | `[]` or `#0`: -100 "No valid nozzle found" |
+| `extruder_nozzle_stats_new` | absent, or the same (a non-empty value wins, BambuStudio.cpp:4151-4155) | |
+| `filament_extruder_variant` | 12 entries: each filament's 6 variants in order | wrong per-filament values, the PC:8935 message |
+| `filament_self_index` | 12 entries: `1` x 6, `2` x 6 | |
+| `filament_volume_map`, `filament_nozzle_map` | one entry per filament (Studio resizes with 0, PresetBundle.cpp:2384-2387) | tolerated (Print.cpp:2840-2862) |
+| `wipe_tower_x`, `wipe_tower_y` | one value per plate, at a free spot both extruders reach | -101 / -104 |
+
+What shambu does: the `RepairNozzleStats` patch repairs the key the CLI reads (a non-empty `_new` wins, else the
+plain key). It writes `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` for each empty or `#0` extruder entry
+only, so a valid High Flow stat stays byte-identical, and it copies a repaired `_new` to the plain key. It also rebuilds the variant blocks from each filament preset (or the
+printer's `printer_extruder_variant` when no preset is at hand), and resizes the two maps. `shambu build` applies it
+to every unsliced export, `shambu patch --repair-nozzle-stats` to an older file. `Pipeline.verify()` FAILs a file
+with an empty stat, a `#0` count, or variant and self-index lists of different lengths, and `shambu inspect` prints
+`not re-sliceable by the CLI: extruder_nozzle_stats [] (Studio exits -100 "No valid nozzle found")`.
+`RunResult.summary()` appends the stderr line on exit -100.
+
+Live check, the seed build moved to x >= 29: the repaired unsliced export re-sliced through shambu's own
+`--load-settings` command and through a bare `--slice 1` both exit 0 (2 h 12 min) with no `could not found` line.
+The same file with `extruder_nozzle_stats []` exits -100 "No valid nozzle found".
+
 ## Appendix: `project_settings.config` keys by source
 
 Classified against `<project>/plates/config/{process-gridfinity,filament-pla,machine}.json`
@@ -619,3 +676,64 @@ Classified against `<project>/plates/config/{process-gridfinity,filament-pla,mac
 
 **other (defaults or derived): 155 keys.** `accel_to_decel_enable`, `accel_to_decel_factor`, `alternate_extra_wall`, `ams_filament_load_time_ams`, `ams_filament_load_time_ams_lite`, `ams_filament_load_time_n3f_s`, `ams_filament_unload_time_ams`, `ams_filament_unload_time_ams_lite`, `ams_filament_unload_time_n3f_s`, `apply_scarf_seam_on_circles`, `bed_custom_model`, `bed_custom_texture`, `bed_heat_soak_area`, `before_layer_change_gcode`, `bridge_angle`, `counterbore_hole_bridging`, `curr_bed_type`, `default_ams_type`, `default_filament_colour`, `default_jerk`, `detect_narrow_internal_solid_infill`, `different_settings_to_system`, `embedding_wall_into_infill`, `enable_filament_dynamic_map`, `enable_mixed_color_sublayer`, `enable_order_independent_overlap_carving`, `enable_overhang_bridge_fan`, `enable_pressure_advance`, `enforce_support_layers`, `ensure_vertical_shell_thickness`, `exclude_object`, `extruder_ams_count`, `extruder_nozzle_stats`, `filament_change_length_nc`, `filament_colour`, `filament_ids`, `filament_is_mixed`, `filament_map`, `filament_map_2`, `filament_map_mode`, `filament_mixed_components`, `filament_mixed_gradient`, `filament_mixed_gradient_curve`, `filament_mixed_gradient_per_part`, `filament_mixed_gradient_range`, `filament_mixed_sublayer_ratios`, `filament_notes`, `filament_nozzle_map`, `filament_self_index`, `filament_volume_map`, `filter_out_gap_fill`, `first_layer_print_sequence`, `first_x_layer_part_fan_speed`, `flush_into_infill`, `flush_into_objects`, `flush_into_support`, `flush_multiplier`, `flush_multiplier_fast`, `flush_volumes_matrix`, `flush_volumes_vector`, `gcode_add_line_number`, `has_filament_switcher`, `has_scarf_joint_seam`, `independent_support_layer_height`, `infill_jerk`, `inherits_group`, `initial_layer_flow_ratio`, `initial_layer_jerk`, `inner_wall_jerk`, `interlocking_beam`, `interlocking_beam_layer_count`, `interlocking_beam_width`, `interlocking_boundary_avoidance`, `interlocking_depth`, `interlocking_orientation`, `internal_solid_infill_pattern`, `ironing_direction`, `ironing_fan_speed`, `ironing_pattern`, `is_infill_first`, `min_bead_width`, `min_feature_size`, `mmu_segmented_region_interlocking_depth`, `mmu_segmented_region_max_width`, `nozzle_volume_type`, `only_one_wall_first_layer`, `ooze_prevention`, `other_layers_print_sequence`, `other_layers_print_sequence_nums`, `outer_wall_jerk`, `overhang_threshold_participating_cooling`, `post_process`, `precise_outer_wall`, `precise_z_height`, `pressure_advance`, `prime_tower_extra_rib_length`, `prime_tower_fillet_wall`, `prime_tower_infill_gap`, `prime_tower_rib_wall`, `prime_tower_rib_width`, `prime_tower_skip_points`, `prime_volume_mode`, `print_compatible_printers`, `print_flow_ratio`, `printer_notes`, `printing_by_object_gcode`, `process_notes`, `raft_contact_distance`, `raft_expansion`, `raft_first_layer_density`, `raft_first_layer_expansion`, `role_base_wipe_speed`, `seam_gap`, `seam_slope_conditional`, `seam_slope_entire_loop`, `seam_slope_inner_walls`, `seam_slope_steps`, `slice_closing_radius`, `slicing_mode`, `smooth_speed_discontinuity_area`, `sparse_infill_anchor`, `sparse_infill_anchor_max`, `spiral_mode_max_xy_smoothing`, `spiral_mode_smooth`, `start_end_points`, `support_angle`, `support_bottom_interface_spacing`, `support_critical_regions_only`, `support_interface_not_for_body`, `support_object_first_layer_gap`, `support_remove_small_overhang`, `template_custom_gcode`, `thick_bridges`, `thumbnail_size`, `timelapse_type`, `top_area_threshold`, `top_one_wall_type`, `top_surface_jerk`, `top_z_overrides_xy_distance`, `travel_jerk`, `tree_support_branch_diameter_angle`, `tree_support_branch_distance`, `use_firmware_retraction`, `use_relative_e_distances`, `version`, `wall_distribution_count`, `wall_sequence`, `wall_transition_angle`, `wall_transition_filter_deviation`, `wall_transition_length`, `wipe_speed`, `wipe_tower_rotation_angle`, `wipe_tower_x`, `wipe_tower_y`, `wrapping_detection_layers`
 
+
+
+## Project edits: replace a mesh, add a filament, move an object or the tower (shambu 0.4, `edits.py`)
+
+Verified against Studio 02.08.02.61 (source at tag v02.08.02.61) and live CLI runs on copies of real projects.
+
+**Placement.** An object's world position is `<build><item transform>` composed with `<component transform>`
+(bbs_3mf.cpp:4396, 4439). The 12 numbers are in column order `r00 r10 r20 r01 r11 r21 r02 r12 r22 tx ty tz`, in mm.
+A GUI save puts the placement on the item (component identity); a shambu build puts it on the component (item
+identity); a CLI re-export folds a one-part object into the item. The part `matrix`, `source_offset_*`,
+`<assemble_item>` and `plate_N.json` are not authoritative: moving an object changes the item translation only.
+Plates after the first sit at world offsets `(col * W * 1.2, -row * D * 1.2)`, `cols = compute_colum_count(n)`
+(PartPlate.cpp:4536-4548, PartPlate.hpp:38-50); `--move X,Y@PLATE` gives the plate-local min corner.
+
+**Meshes.** Each sub-mesh is written re-centred on its bbox centre (bbs_3mf.cpp:5366); `source_offset_*` of the part is
+that centre in the STL's own frame. The GUI's "replace with STL" keeps the volume transform and shifts it by
+`R * (c_new - c_old)` so the two STL frames coincide (Plater.cpp:11302-11411), then calls `ensure_on_bed` only when the
+object is not sinking (Plater.cpp:11375, 11397). `face_count` and `mesh_stat face_count` are written, never read
+(bbs_3mf.cpp:8218, 8306). Studio shares one mesh resource between identical volumes (bbs_3mf.cpp:7353-7367; loaded at
+5271-5313): two components (of two objects, or of one object) name the same `p:path` and `objectid`, or a part carries the
+`mesh_shared` metadata the reader follows (bbs_3mf.cpp:5282-5313), and `--replace-mesh` refuses such an
+object. A raw STL and a shambu-oriented copy of it are in different frames (the oriented copy sits on its min corner):
+with `--anchor frame` the raw STL turned by `--rotate-mesh 0,0,90` moves the housing 91.74 mm, so the patch refuses
+it and names `--anchor centre`.
+
+**Filaments.** `--load-filaments` on a 3MF replaces slots and keeps the project's filament count
+(BambuStudio.cpp:2036). An export loaded with N+1 filaments writes the per-filament keys in slot order but the loaded
+preset's variant block FIRST and `filament_self_index` all `"1"` (live: `nozzle_temperature` 220 x 6 then 255 x 6 for
+a PETG slot 1 and a PLA slot 2). So `--add-filament` reads the new slot's normalised values from a scratch export
+loaded with the new preset ALONE (slot 1 there), the flush matrix from a second scratch export with every slot and
+colour, and appends slot N+1 itself. The per-variant keys are Studio's `filament_options_with_variant`
+(PrintConfig.cpp:7464); a block's length comes from its preset's `filament_extruder_variant`. A one-entry vector means
+"every slot uses entry 0" (Config.hpp:681-685) and is written out before the append. The verify step slices plate 1:
+the variant lookup (`could not found extruder_type`, PrintConfig.cpp:8935) runs when a slice applies the config, not on
+a plain export. The colour: `PRESET:#RRGGBB` sets it; without one the slot takes the preset's own colour, and
+when the preset has none, the next default colour no slot uses, with a WARN line that names it. `@EXTRUDER` maps
+the slot to a nozzle (default extruder 1). A preset and colour that a slot already has is refused unless
+`--allow-duplicate`; `--no-verify` skips the verify slice (about 20 s on a full plate).
+
+**Prime tower.** `wipe_tower_x/y` are per-plate vectors of the tower's MIN corner, plate-local (BambuStudio.cpp:4481-4486,
+Print.cpp:2423). The CLI estimates the footprint as `x - brim .. x + width + brim`; `--tower` checks
+`x - 8 .. x + max(prime_tower_width, 35) + 8` against the bed, x against extruder 2's reach when a filament maps to it,
+and every object on the plate as `check` places the tower (`tower.FootprintClearance`: within the 1 mm line allowance
+of an outline is an error, inside an estimated support spread a WARN note). `--move` and `--replace-mesh` report the
+same pair rule as `check` (`layout.pair_check` on silhouettes from the project's meshes, the bounding box with a WARN
+when a mesh does not rasterise); `--strict` turns a FAIL line into an error.
+
+**`--no-check`.** It skips the conflict check (-101), the support-necessity check and the -100 exit on empty-layer or
+overlap warnings; -102..-105 and validate errors still exit (BambuStudio.cpp:6192, 6418, 6974, 7185-7212). Studio exits
+on the first conflicting plate (BambuStudio.cpp:7105-7109), and -100 is also the generic exception exit
+(BambuStudio.cpp:7413-7418): only a -100 whose log has `found slicing warnings:` is skippable. A checked slice of a BBL
+3MF without `--load-filaments` resets `filament_prime_volume` to 45, a `--no-check` one does not
+(BambuStudio.cpp:6886-6894); `shambu slice` pins the project's values in every pass. Each pass writes its log and
+`result.json` into its own folder `<name>.slice-<random>/<name>.passes/{checked[-plate-N],checked-all,nocheck}/` next to
+the output (a fresh folder per run, never an existing one); the export replaces the output only after it reads back, and
+an output that is the input is refused.
+
+**The touches contract.** Every patch declares the entries it changes, including what `invalidate_slices` removes
+(`Metadata/plate_N.gcode`, `.md5`, `plate_N.json`, the `slice_info.config` plates) and rewrites
+(`model_settings.config`). `Project.save()` refuses an undeclared change, addition or deletion, a `3D/*` entry added,
+removed or reordered, and any `_rels` change.

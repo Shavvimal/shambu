@@ -6,6 +6,104 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-21
+
+Post-mortem fixes for the G2 rev E plates (2026-10-20 to 10-21): a checker that refused a plate Studio printed, an
+uncalibrated time estimate, no verb to edit a project, a two-filament slice that never ran, three versions of one tool.
+
+### Changed
+- Layout: the support margin is a per-side `Spread` (tree estimate `min(26, max(8, 0.22 x height))` mm, normal 5 mm,
+  measured 20.9 mm on the housing's one side; `--probe-supports` measures each supported part with a solo slice and
+  keeps a support mask, cached under `<outdir>/.probe/`). A pair needs the larger spread of the two plus a 1 mm line
+  allowance, not the sum. Footprints are raster silhouettes of the oriented mesh (0.5 mm), not bounding boxes.
+  `BottomLeftPacker` places by-layer plates (fewest plates, pocket candidates); `ShelfPacker` stays for
+  print-by-object. Known limit: the five plate-14 parts without `at` pack on two plates even with measured spreads;
+  the printed one-plate layout needs `at` for the feeler and the cradle (Studio's own arrange exits -21 on them). Brims are clipped by Studio and no longer fail a pair, the bed edge or the reach (`WARN brim`).
+  Raft and enforced layers count as support (`needs_support`).
+- Report: every check line carries a kind: `FAIL body overlap`, `WARN margin rule` (shambu's estimate, the slice
+  decides), `WARN brim`, `PLACEMENT NOT DONE` (the packer gave up; no part is printed at the origin), a plate-split
+  line naming which parts went where. An unplaced part never reaches Studio, even with `--keep-going`. Studio exit
+  -101 names the two objects by spec key; -21 means Studio's own arrange could not fit the parts.
+- Two filaments: `effective_filaments` counts a process-level `support_interface_filament` / `support_filament`, so the
+  right nozzle's reach (x >= 20.5 plus the interface spread) is checked and the tower reserve applies. `ExtruderReach`
+  is the one reach rule. Every unsliced export is re-sliceable: `RepairNozzleStats` fills an empty
+  `extruder_nozzle_stats` (the cause of Studio exit -100 "No valid nozzle found" on every re-slice of a shambu
+  export), `set_filament_map` keeps `filament_extruder_variant` in blocks, and verify refuses a file that is not
+  re-sliceable. `RunResult.summary()` shows the stderr line behind exit -100.
+- Prime tower: `wipe_tower` per plate (`"auto"`, a spot `{x, y, width, rib_wall, brim}`, or `false`) replaces the fixed
+  (208, 208). `tower.py` ports Studio's size estimate (depth from the tallest part: 41.4 mm square plus 8 mm brim at
+  218 mm; narrower is deeper) and places the tower on the silhouettes inside both nozzles' reach, one size per
+  project, falling back to no rib wall and widths 35..20; `TowerClear` FAILs name the blocking part. The seed
+  dual-material build that exited -102 now gets a pre-slice FAIL.
+- Time: every estimate line reads "Studio estimate H h M min"; a measured range or a calibrated time appears only from
+  `shambu calibrate` data with its sample count. The two measured prints disagree (0.75 and 1.05 x Studio), so there
+  is no correction factor yet.
+- doctor: a `shambu` section first (version from `__version__`, install kind from `direct_url.json`, commit),
+  `--expect-version X.Y.Z` (exit 3 on a mismatch with a Fix line; the skills run `shambu --version` first),
+  `--printer-timeout` (default 15 s), per-step timings; the Studio plist and profile errors no longer abort the
+  report. Printer discovery is bounded: `arp -an` with a 2 s timeout, parallel port probes scaled to the host count,
+  a 3 s MQTT connect, the whole read on a daemon thread with per-read state; failures are logged, never swallowed.
+- Privacy: `printer status --json`, `printer filaments --json`, `printer raw` and every watch error show no IP, no
+  serial and no wifi field; the watch log and the calibration file never hold an identifier.
+- Spec: `at` is documented as the min corner; `brim_margin` replaces both computed margins; new per-part
+  `support_spread: [mx, px, my, py]`; unknown keys are warned about in `spec`, `check` and `build`.
+- REVIEW-RUBRIC: items 4, 5, 10, 11 and 13 rewritten for the new modules and the `touches` contract.
+- Final review round: a filament group's spread is the per-side maximum of its members and keeps their probe masks;
+  `patch` classifies filaments as `check` does (height-range wall, infill, support and interface keys; support slots
+  only with support on; an interface-only slot grows by the interface spread); the packer bounds each filament by its
+  own growth (an interface-only nozzle no longer refuses a plate the checker accepts); `patch --tower` and
+  `slice --tower` size the tower with `tower.py` (Smooth timelapse included) and test it against the plate's outlines;
+  `--add-filament` repairs `extruder_nozzle_stats []` before the new slot; `slice` refuses an export without G-code;
+  printer job and file names, watch headers and `printer raw` drop the serial and access code; a refused patch is
+  exit 1 and a file that cannot be written exit 3 with one JSON document; packer results read as the packer's answer,
+  not a proof; two meshes of one name no longer overwrite each other under `sweep --write-spec`.
+- Empirical replay (2026-10-21): the tree spread estimate is `min(26, max(8, 0.22 x height))` and is swept from the
+  bounding box (a packed plate-14b and plate-11 sliced -101 at the old estimate swept from the outline); `slice` names
+  the -101 pair; `--add-filament` tests the project's tower spot; `inspect` prints each object's min corner and size;
+  `calibrate` needs 20 layers and 30 minutes for a rate (`span_too_short`) and names a pre-0.4.0 log; a fixed part
+  off the bed says `at` is the min corner; a two-filament estimate shows the tower minutes and the measured options.
+  The tower is sized per plate from the filaments its objects use; per-volume and height-range filament keys follow
+  Studio's scope; the watch header is scrubbed as a structure; `slice` refuses an export missing a requested plate.
+- The spread estimate is advisory: when packing with it splits a plate or leaves no tower spot, `check`, `build` and
+  `sweep` measure that plate's supported parts with the cached solo-slice probe, place again with the measurements
+  and report a `Spreads measured:` line; `--no-probe` keeps the estimate's answer.
+
+### Added
+- `shambu patch --replace-mesh OBJECT[/PART]=STL` (anchors frame|centre|min, `--rotate-mesh`, `--lay-on-face`, a no-op
+  guard on canonical triangles, a size guard with the 90-degree hint, shared-mesh and `mesh_shared` refusal, paint and
+  height-range checks, verify before the atomic replace), `--add-filament "PRESET[:#RRGGBB][@EXTRUDER]"` (append-only,
+  slots 1..N byte-identical, the new slot normalised by a scratch Studio export, explicit vector schema, verified by a
+  slice; a colour default with a WARN when the preset has none), `--move OBJECT=X,Y[@PLATE]` (min corner, `+DX,+DY`
+  relative, resolved before applying, verified on reopen, silhouette clearance FAIL/WARN lines), `--tower X,Y[@PLATE]`,
+  `--repair-nozzle-stats`, `--dry-run`. Each patch declares `touches` and `Project.save()` raises on an undeclared
+  changed, added or removed entry.
+- `shambu slice FILE.3mf [--plate N] [--no-check] [--tower X,Y[@P]] [--settings-from SPEC] [-o OUT]`: slice a saved
+  project through shambu's rules (nozzle stats repaired, prime volumes pinned, a fresh run folder, replace only after
+  the export reads back). `build --slice --no-check` and `slice --no-check` run a checked pass per plate first and
+  reslice without checks only after a -101 or a warning -100, with `Checks skipped:` lines in the report and
+  `checks_skipped` in result.json.
+- `shambu studio [--out DIR] -- ARGS`: the logged escape hatch; the args pass through `CliCommand.parse` (no action,
+  flag order, path containment, refused flags), the command, log and exit meaning land in a run folder.
+- `shambu sweep --write-spec OUT.json [--pick NAME]`: writes the winning variant as a full spec with a `_sweep`
+  provenance key (resolved spools, Studio version, command), meshes copied beside it.
+- `shambu printer watch --log FILE --gcode3mf PROJECT [--plate N] [--wait-for-start] [--max-errors N] [--max-polls N]`:
+  timestamped polls (`read_at` UTC, speed level and percent, stages, task id), 60 s polling at the start and the end,
+  the final state recorded, errors as fixed-text categories. `shambu calibrate --log FILE... [--add] [--show]`: fits
+  a layer-11-and-up rate and a startup offset per printer model and material, flags paused, failed, non-Standard,
+  disagreeing and unlogged prints, stores a fingerprinted print in `~/Library/Application Support/shambu/calibration.json`
+  under a file lock, and offers a point estimate only from three qualifying prints within 0.15.
+- `Status` fields `read_at`, `speed_level`, `speed_percent`, `stages`, `task_id`; `ends_at` is a dated UTC time.
+- `shambu inspect` prints each filament's extruder and nozzle stat and a "not re-sliceable" line when it applies.
+- Skills: `doctor --expect-version 0.4.0` after `shambu --version`; the setup skill installs the matching tag and
+  refreshes the marketplace before `/plugin update`; a hand-back gate with a "Cause: not established" rule; eight
+  evals from the post-mortem; `docs/errors/2026-10-21-three-plates-and-uncalibrated-estimates.md`.
+
+### Fixed
+- `patch --map` collapsed `filament_extruder_variant` to one entry per filament, which made Studio log
+  "could not found extruder_type ... filament_index 2" and slice filament 2 with filament 1's flow ratio.
+- `printer status --json` printed the printer's IP address.
+- `doctor --json` could not be wrapped in `timeout` on macOS (there is none); the skill says so.
+
 ## [0.3.0] - 2026-10-16
 
 ### Added

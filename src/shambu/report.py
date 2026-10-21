@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from . import conf
 from . import layout as L
-from .errors import BuildError
+from .errors import BambuError, BuildError
 
 if TYPE_CHECKING:
     from .build import BuildResult, PlannedPart
@@ -20,13 +21,36 @@ STANDING_WARNINGS = (
 FEATURE_TIME_ROLES = ("Support", "Support interface", "Prime tower", "Flush", "Travel")
 
 
-def estimate_lines(sl: dict) -> list[str]:
+def checks_skipped_lines(cs: dict | None) -> list[str]:
+    """The `--no-check` record (build.two_pass_slice) as report lines under the estimates: one `Checks skipped:` line
+    per plate whose checked pass found a skippable problem, or the one line that says why no unchecked pass ran."""
+    if not cs:
+        return []
+    if not cs.get("skipped"):
+        return ["- " + cs["report_line"]]
+    recs = [r for r in cs.get("plates", []) if r.get("kind") == "skippable"]
+    per_plate = any(r["plate"] for r in cs.get("plates", []))
+    out = []
+    for r in recs:
+        where = f"plate {r['plate']}" if r["plate"] else ("all plates together" if per_plate else "plate 1")
+        out.append(
+            f"- {where}: Checks skipped: {r['reason']}. Exported with --no-check as the GUI would: the conflict and "
+            "support-necessity checks did not run on this G-code, so look at that spot in the preview before printing."
+        )
+    return out
+
+
+def estimate_lines(sl: dict, calibration: list[dict] | None = None, printer_model: str | None = None) -> list[str]:
     """Report lines for one entry of BuildResult.estimates(). Each number names its source: slice_info.config,
     result.json (seconds per feature, tower plus flush grams) or the G-code parser (support grams, filament changes
-    as tool switches, and everything by feature when the run left no result.json)."""
+    as tool switches, and everything by feature when the run left no result.json). The time is always "Studio
+    estimate"; `calibration` (the stored measured prints) adds their range, or a calibrated time (startup offset + rate x Studio) when n >= 3 eligible prints agree."""
+    from .calibrate import handback, material_key
+
     n = sl["plate"]
+    cal = handback(calibration or [], printer_model, material_key(f["type"] for f in sl["filaments"]), sl["prediction_s"])
     out = [
-        f"- plate {n} estimate: {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min, {sl['weight_g']:.1f} g ("
+        f"- plate {n}: Studio estimate {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min{cal}, {sl['weight_g']:.1f} g ("
         + ", ".join(f"filament {f['id']} {f['type']} {f['used_g']:.1f} g" for f in sl["filaments"])
         + ")"
         + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")
@@ -57,12 +81,52 @@ def estimate_lines(sl: dict) -> list[str]:
         shown = [f"{k.lower()} {times[k] / 60:.1f} min" for k in FEATURE_TIME_ROLES if times.get(k)]
         if shown:
             out.append(f"- plate {n} time by feature (result.json): " + ", ".join(shown))
+        tower_s = times.get("Prime tower")
+        if tower_s and len(sl["filaments"]) >= 2:
+            out.append(tower_options_line(n, tower_s, changes))
     elif ft:
         out.append(
             f"- plate {n} filament by feature (G-code parser, no result.json grams): model {ft['model_g']:.1f} g, support {ft['support_g']:.1f} g, "
             f"prime tower {ft['tower_g']:.1f} g, flush {ft['flush_g']:.1f} g; {ft['filament_changes']} filament change(s)"
         )
     return out
+
+
+# Measured on plate 14 (PETG part, PLA interface, n=1 each; reference 06 section 10 and the 2026-10-21 replay):
+# the auto 35 mm tower 24 h 13 min, a 22 mm tower without the rib wall 19 h 15, no tower 18 h 48
+TOWER_OPTIONS = (
+    ('`wipe_tower` {"width": 22, "rib_wall": false}', "19 h 15 min against 24 h 13 with the 35 mm tower"),
+    ('`"wipe_tower": false`', "18 h 48 min; the idle nozzle is then not wiped before the interface layers"),
+)
+
+
+def tower_options_line(n: int, tower_s: float, changes: int | None) -> str:
+    """The prime tower's cost on a two-filament plate and the two measured alternatives, for the estimate section."""
+    swaps = f", {changes} filament change(s)" if changes is not None else ""
+    opts = "; ".join(f"{k}: {v}" for k, v in TOWER_OPTIONS)
+    return f"- plate {n} prime tower: {tower_s / 60:.0f} min{swaps} (result.json). Options measured on plate 14 (n=1): {opts}"
+
+
+def check_line(c: L.Check) -> str:
+    """One check as a report line, its kind first so a reader (and the skill) can sort them: `PLACEMENT NOT DONE:`
+    (the packer gave up, no position exists), `FAIL body overlap:` (the parts themselves meet), `FAIL margin rule:`
+    (a measured or spec margin, the bodies are apart), `WARN margin rule:` (an estimate; the slice decides),
+    `WARN brim:` (a brim Studio will clip at the bed edge or a nozzle's reach), `WARN outline:` (the box stands in for
+    a mesh that did not rasterise),
+    `FAIL:` and `OK:` for the rest."""
+    if c.kind == "measured":
+        return c.text  # "Spreads measured: ...": the plan re-ran with the support probe
+    if c.kind == "placement" and not c.ok:
+        return "PLACEMENT NOT DONE: " + c.text
+    if c.kind in ("margin", L.REACH_ESTIMATE):
+        return ("WARN margin rule: " if c.ok else "FAIL margin rule: ") + c.text
+    if c.kind == "brim" and c.ok:
+        return "WARN brim: " + c.text
+    if c.kind == "outline" and c.ok:
+        return "WARN outline: " + c.text
+    if c.kind == "body" and not c.ok:
+        return "FAIL body overlap: " + c.text
+    return ("OK: " if c.ok else "FAIL: ") + c.text
 
 
 def _vec(v) -> str:
@@ -164,7 +228,7 @@ def render(r: BuildResult) -> str:
                         f"    - {m.key}: filament {m.placed.filament}, {sx:.1f} x {sy:.1f} x {sz:.1f} mm, "
                         f"at x {dx:.1f} y {dy:.1f} in the group (bed x {m.placed.x0:.1f} y {m.placed.y0:.1f}){turned}"
                     )
-        out += [("- OK: " if c.ok else "- FAIL: ") + c.text for c in p.checks]
+        out += ["- " + check_line(c) for c in p.checks]
     if pl.problems:
         out += ["", "## Problems"] + ["- " + x for x in pl.problems]
     if pl.warnings:
@@ -174,6 +238,7 @@ def render(r: BuildResult) -> str:
         ep = r.export_problem()
         if ep:
             out.append("- " + ep)
+        out += ["- FAIL: " + x for x in r.export_fails()]
         for w in r.slicer_warnings():
             out.append(f"- slicer warning: {w}")
         out += ["- patched: " + x for x in r.patches]
@@ -182,8 +247,14 @@ def render(r: BuildResult) -> str:
                 "- verified: bed type (project and plates), process name and every override, filament presets, colours and map, "
                 "plate and object counts, object names, machine start/end/filament-change G-code" + (", G-code present" if r.sliced else "")
             )
+        try:
+            cal = conf.load_calibration() if r.estimates() else []
+        except BambuError:  # an unreadable calibration file must not hide the estimate; its path stays out of the report
+            cal = []
+            out.append("- calibration file not read: `shambu calibrate --show` names the problem")
         for sl in r.estimates():
-            out += estimate_lines(sl)
+            out += estimate_lines(sl, cal, pl.facts.get("printer_model"))
+        out += checks_skipped_lines(r.checks_skipped)
         out += ["- VERIFY FAIL: " + x for x in (r.verify_problems or [])]
     if r.run is not None and not r.run.ok:
         out += ["", "## Next", "- The export failed (above): nothing to open. Fix the spec or the part and build again."]
@@ -194,7 +265,10 @@ def render(r: BuildResult) -> str:
             "",
             "## Next",
             "- The checks failed (see Problems and the FAIL lines above): nothing was exported, so there is no new project to open. "
-            "Fix the spec and build again.",
+            "Fix the spec and build again."
+            + (
+                f" `--keep-going` never exports a plate with parts that have no position ({', '.join(pl.unplaced)})." if pl.unplaced else ""
+            ),
         ]
         out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
         return "\n".join(out) + "\n"

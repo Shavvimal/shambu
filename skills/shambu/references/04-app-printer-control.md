@@ -26,6 +26,7 @@ Source references below use a sparse clone of `bambulab/BambuStudio` master at `
 | [Recommended command set for the wrapper](#recommended-command-set-for-the-wrapper) | The proposed read-only subcommands |
 | [Citations](#citations) | Source links for the claims above |
 | [Artefacts in $S](#artefacts-in-s) | Files the investigation left in the scratch workspace |
+| [Track 7 - Time and job fields, and the watch log](#track-7---time-and-job-fields-and-the-watch-log-2026-10-21) | The report's time, speed and stage keys, and `printer watch --log` with `--gcode3mf` for `shambu calibrate` |
 
 ## TL;DR
 
@@ -392,3 +393,78 @@ Never implement: print start, pause, stop, resume, gcode send, upload, light/fan
 ## Artefacts in $S
 
 `menus.applescript`, `menus.txt`, `btns.applescript`, `ax-entire.txt`, `conf-shape.txt` (serial masked; no access code), `ssdp.txt`, `ssdp-120.txt`, `tools/conf_shape.py`, `tools/ssdp_listen.py`, `tools/uvprobe.py`, `bs/` (sparse BambuStudio clone), `web/obapi/*`, `web/pybambu/*`, `web/Process.cpp`.
+
+## Track 7 - Time and job fields, and the watch log (2026-10-21)
+
+Source: the live X2D report (firmware `ver 20018`, `shambu printer raw`, 2026-10-21), Studio's MQTT parser
+(`DeviceManager.cpp` v02.08.02.61: `mc_remaining_time` :3081, `mc_percent` :3060, `layer_num` :3199, `stg` :3314,
+`stg_cur` :3324, `spd_mag` :3304; stage names `get_stage_string` :124-283) and `StatusPanel.cpp` :5524-5534 (speed
+levels). shambu reads these into `Status` (`printer.py`).
+
+| Key | `Status` field | Meaning |
+| --- | --- | --- |
+| `mc_remaining_time` (duplicate `remain_time`) | `remaining_min` | The printer's remaining minutes. On the E7a print it equalled Studio's M73 `R` at every poll (ratio 1.000 to 1.002). On the D.7 print it ran at 0.74 to 0.81 x M73 `R` and still predicted the end to within 9 min. When it departs from M73 `R`, the print is not running at the pace Studio simulated. |
+| `mc_percent` (duplicate `percent`) | `percent` | Equals M73 `P` (6 of 7 E7a polls; the seventh was 1 ahead). |
+| `spd_lvl` | `speed_level` | Speed level: 1 silent, 2 standard, 3 sport, 4 ludicrous. Live: 2. Not logged on D.7, the likely cause of its 0.75. |
+| `spd_mag` | `speed_percent` | The speed level's percent. Live: 100. Community figures (not official): silent 50, sport 124 to 125, ludicrous 166. |
+| `stg` | `stages` | The startup stages this job runs, as a list of ids. Live: `[29, 2, 13, 74, 11, 73, 75, 4, 8, 14, 54, 1, 3, 255, 51]`. |
+| `stg_cur` | `stage` | The current stage; 0 = printing. |
+| `task_id` (else `subtask_id`) | `task_id` | The job id. Also present: `subtask_id`, `job_id`, `project_id`, `profile_id`, `model_id`, `print_type` (live: "cloud"), `plate_idx`. |
+| (none) | `read_at` | shambu's own UTC stamp (`2026-10-21T14:23:55Z`), set when the report is decoded. |
+
+The 15 stage ids of the live job, with Studio's text and what toggles each (from `M1002 gcode_claim_action` in the
+X2D start G-code; research C):
+
+| Id | Studio's text | When it runs |
+| --- | --- | --- |
+| 29 | Cooling chamber (`M191 S0`) | when `overall_chamber_temperature < 40` |
+| 2 | Heatbed preheating | always |
+| 13 | Homing toolhead | always |
+| 74 | Heatbed surface foreign object detection | always in the G-code |
+| 11 | Identifying build plate type | always in the G-code |
+| 73 | Build plate alignment detection | always in the G-code |
+| 75 | Heatbed underside foreign object detection (`G3811`) | when `max_print_z >= 145` |
+| 4 | Changing filament | always |
+| 8 | Calibrating dynamic flow (`M983.3`) | the send option `flow_cali` (`extrude_cali_flag`) |
+| 14 | Cleaning nozzle tip | always |
+| 54 | Waiting for heatbed to reach target temperature | always |
+| 1 | Auto bed leveling (`G29`) | the send option `bed_leveling` (`g29_before_print_flag`) |
+| 3 | Vibration compensation (`M970.3`, `M974`) | always in the X2D start G-code |
+| 255 | (Studio's table has no text for 255) | in the live list |
+| 51 | Printing calibration lines | always |
+
+Stage 39 (nozzle offset calibration, `auto_cali_toolhead_offset_flag`) was not in the live list. The toggles are
+print-job options sent with the job, not 3MF settings. shambu never sends them (read-only); it can only log `stg`.
+
+**No start time and no total estimate.** The report has no `gcode_start_time`, start timestamp or total. The only
+keys with "time" in the name are `mc_remaining_time` and `remain_time`; `job.stage[].est_time` and `2D.bs.total_time`
+are 0 on this firmware. Studio reads no start time either. So the watch log stamps each poll itself, and it bounds
+the start by the first RUNNING poll and the end by the first FINISH poll.
+
+**`shambu printer watch --log FILE [--gcode3mf PATH [--plate N]] [--every S] [--max-errors N] [--max-polls N] [--wait-for-start]`.**
+
+- **Poll lines.** One JSON line per poll: `read_at`, `task`, `task_id`, `state` (the raw `gcode_state`), `percent`,
+  `layer`, `total_layers`, `remaining_min`, `speed_level`, `speed_percent`, `stage`, `stages` and `print_error`. The
+  last poll (FINISH, FAILED or IDLE) carries `"final": true`.
+- **Failed reads.** A failed read is a line with a `category` (timeout, tls, login, discovery, identity, report,
+  connect, setup, other) and that category's fixed `error` text. It never quotes the exception, because the lower
+  layers name the IP, the host and the masked serial. The watch goes on until the print leaves RUNNING/PAUSE or N
+  reads in a row fail (default 10, then exit 3). After a failure, the next poll keeps the interval of the last good
+  poll.
+- **Interval.** `--every`, but at most 60 s while preparing, during the first 15 minutes of RUNNING, and while fewer
+  than 15 minutes remain. The start window applies only when the watch saw the start: a PREPARE poll, or a first
+  RUNNING poll before layer 2 that is the first poll or follows IDLE, FINISH or FAILED. No sleep follows the last
+  permitted poll.
+- **`--wait-for-start`.** A watch that finds the printer IDLE, or still showing the last job's FINISH, keeps polling
+  every 60 s until a job starts. It is bounded by `--max-polls`. Without the flag, the watch stops at once.
+- **`--gcode3mf`.** Writes a header line with the file's name (not its path) and its M73 track, so the log is tied to
+  the file it watched. The plate G-code is streamed from the zip, and no other entry is read. A project sent from the
+  GUI holds no G-code: export the plate with Export Plate Sliced File and pass that `.gcode.3mf`.
+- **Sessions.** Each watch run appends its own header, so a log can hold several sessions. `shambu calibrate` fits
+  each session against its own track.
+- **Identifiers.** The log never holds the IP, the serial (masked or not) or the access code. `printer status
+  --json` shows the IP as `<ip>`, only the masked serial, and `ends_at` as a dated UTC time. `printer raw` drops
+  `_topic` (it names the full serial), `net`, `wifi_signal`, `ipcam` (its URL holds the IP) and serial keys. It
+  redacts secret-looking keys and any text that names the IP or the serial.
+- **Errors.** A log that cannot be opened, written or closed is exit 3. A Studio config problem (no printer
+  selected, no access code) is one `setup` line, and the watch stops at once with exit 3.

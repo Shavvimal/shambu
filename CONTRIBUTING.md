@@ -19,7 +19,7 @@ binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a 
 |---|---|---|
 | A new print recipe | `src/shambu/recipes.py` | `skills/shambu/references/07-print-recipes.md` |
 | A new 3MF patch | `src/shambu/patches.py` + `threemf.py` | `references/03-3mf-format.md` |
-| A new limit rule or placer | `src/shambu/layout.py` | `references/01-source-cli.md` section 2 and 8 |
+| A new limit rule or placer | `src/shambu/layout.py` | `references/06-slicer-rules.md`, `08-optimisation.md` section 11 and `00-findings.md` section 10 |
 | CLI flag handling | `src/shambu/studio.py` (`CliCommand`) | `references/01-source-cli.md` section 1 |
 | Printer fields | `src/shambu/printer.py` | `references/04-app-printer-control.md` |
 | Skill text | `skills/shambu/SKILL.md`, `skills/setup/SKILL.md` | the plugin docs |

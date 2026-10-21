@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 
-from . import conf, presets, recipes
+from . import conf, presets, recipes, runs
 from .build import BuildResult, Listener, Pipeline, load_spec
-from .errors import BambuError
+from .edits import AddFilament, EditSet
+from .errors import BambuError, StudioError
 from .loaded import FilamentResolution, reconcile
 from .patches import PatchSet
 from .printer import LoadedFilaments, PrinterService, Status
@@ -18,12 +24,69 @@ from .studio import MeshInfo, StudioCLI
 from .threemf import Project
 
 DEFAULT_MACHINE = "Bambu Lab X2D 0.4 nozzle"
-_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+TESTED_STUDIO = "02.08.02.61"  # the Studio build every rule in this package was reverse engineered and tested on
+REPO = "https://github.com/Shavvimal/shambu"
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+")  # used with fullmatch: "0.4.0\n" is not a version
+_TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
 
 
-def redact_ip(text: str) -> str:
-    """A printer error names the host it tried; the report file must not (CONTRIBUTING: never commit an IP address)."""
-    return _IPV4.sub("<ip>", text)
+redact_ip = conf.redact_ip  # one detector: conf.py
+
+
+def install_kind(direct_url: dict | None, installer: str | None = None) -> tuple[str, str | None]:
+    """How this copy of shambu was installed, from its `direct_url.json` (PEP 610), and the commit when a VCS install
+    names one. A git install names its tag in `vcs_info.requested_revision`; a folder install is a snapshot unless
+    `dir_info.editable` is true. `installer` ("uv tool") leads the text only when the caller has proof of it."""
+    lead = f"{installer}, " if installer else ""
+    if not isinstance(direct_url, dict):
+        return "other", None
+    vcs = direct_url.get("vcs_info")
+    if isinstance(vcs, dict):
+        commit = str(vcs["commit_id"])[:7] if vcs.get("commit_id") else None
+        rev = vcs.get("requested_revision")
+        if not rev:
+            return f"{lead}git (no tag)", commit
+        return (f"{lead}git tag {rev}" if _TAG_RE.fullmatch(str(rev)) else f"{lead}git revision {rev}"), commit
+    d = direct_url.get("dir_info")
+    if isinstance(d, dict):
+        return ("editable checkout" if d.get("editable") else f"{lead}local folder (snapshot)"), None
+    return "other", None
+
+
+def _installer() -> str | None:
+    """ "uv tool" when this interpreter's environment holds uv's tool receipt (`uv-receipt.toml`), else None."""
+    return "uv tool" if (Path(sys.prefix) / "uv-receipt.toml").is_file() else None
+
+
+def _direct_url() -> dict | None:
+    try:
+        text = metadata.distribution("shambu").read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return None
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
+
+
+def shambu_section(expected: str | None, direct_url: dict | None = None) -> dict:
+    """doctor's first section. The version is `shambu.__version__`, never the installed metadata: an editable install
+    keeps the version it had when it was first built (0.1.0 metadata under a 0.3.0 checkout, 2026-10-21)."""
+    import shambu
+
+    install, commit = install_kind(direct_url if direct_url is not None else _direct_url(), _installer())
+    return {
+        "version": shambu.__version__,
+        "package_path": str(Path(shambu.__file__).resolve().parent),
+        "install": install,
+        "commit": commit,
+        "expected": expected,
+        "match": None if expected is None else expected == shambu.__version__,
+    }
+
+
+def install_command(version: str) -> str:
+    return f'uv tool install --reinstall "shambu @ git+{REPO}@v{version}"'
 
 
 @dataclass
@@ -33,6 +96,8 @@ class Bambu:
     listeners: list[Listener] = field(default_factory=list)
     printer_ip: str | None = None  # `--ip` for the printer reads that check/build/doctor make
     printer_wait: float = 8.0
+    printer_timeout: float | None = 15.0  # timeout for one whole printer read (discovery, connect, report); None: none
+    printer_progress: Callable[[str, float], None] | None = field(default=None, repr=False)  # hears each read step
     _loaded_cache: dict[str, LoadedFilaments | BambuError] = field(default_factory=dict, init=False, repr=False)
 
     def presets(self) -> presets.PresetResolver:
@@ -53,14 +118,38 @@ class Bambu:
         except BambuError:
             return DEFAULT_MACHINE
 
-    def doctor(self, printer: bool = True) -> dict:
-        st = self.studio_cli()
-        d: dict = {"studio": {"binary": str(st.binary), "version": st.version(), "running_pids": st.running_pids()}}
-        d["profiles"] = [getattr(s, "label", str(s)) for s in self.presets().source.sources]
+    def doctor(self, printer: bool = True, expected: str | None = None, progress: Callable[[str, float], None] | None = None) -> dict:
+        """Every section, in order, each timed. A failing section holds `{"error": ...}` and the others still run."""
+        timings: dict[str, float] = {}
+
+        def step(name: str, t0: float) -> None:
+            timings[name] = round(time.monotonic() - t0, 2)
+            if progress is not None:
+                progress(name, timings[name])
+
+        t0 = time.monotonic()
+        d: dict = {"shambu": shambu_section(expected)}
+        try:
+            st = self.studio_cli()
+            v = st.version()
+            d["studio"] = {"binary": str(st.binary), "version": v, "tested": TESTED_STUDIO, "match": v == TESTED_STUDIO}
+            d["studio"]["running_pids"] = st.running_pids()
+        except BambuError as e:  # version() turns an unreadable or bad plist into StudioError
+            d["studio"] = {"error": f"{type(e).__name__}: {e}", "tested": TESTED_STUDIO}
+        step("studio", t0)
+        t0 = time.monotonic()
+        try:
+            d["profiles"] = [getattr(s, "label", str(s)) for s in self.presets().source.sources]
+        except (BambuError, OSError, ValueError) as e:  # a missing or unreadable profile tree
+            d["profiles"] = {"error": f"{type(e).__name__}: {e}"}
+        step("profiles", t0)
+        t0 = time.monotonic()
         try:
             d["config"] = conf.summary()
         except Exception as e:  # noqa: BLE001
             d["config"] = {"error": str(e)}
+        step("config", t0)
+        t0 = time.monotonic()
         machine_name = d["config"].get("gui_machine_preset") or DEFAULT_MACHINE
         try:
             m = self.presets().for_cli("machine", machine_name)
@@ -68,14 +157,28 @@ class Bambu:
             d["machine"]["start_gcode_chars"] = len(m.get("machine_start_gcode", ""))
         except Exception as e:  # noqa: BLE001
             d["machine"] = {"error": str(e)}
+        step("machine", t0)
         if printer:
+            t0 = time.monotonic()
+            outer = self.printer_progress
+
+            def sub(name: str, dt: float) -> None:
+                timings[f"printer.{name}"] = dt
+                if progress is not None:
+                    progress(f"printer {name}", dt)
+
+            self.printer_progress = sub
             try:
                 d["printer"] = self.loaded_filaments(machine_name).to_json()
             except BambuError as e:
-                d["printer"] = {"error": f"{type(e).__name__}: {e}"}
+                d["printer"] = {"error": redact_ip(f"{type(e).__name__}: {e}")}
+            finally:
+                self.printer_progress = outer
+            step("printer", t0)
         else:
             d["printer"] = {"error": "skipped (--no-printer)"}
         d["recipes"] = [r.name for r in recipes.RECIPES]
+        d["timings_s"] = timings
         return d
 
     # ---- meshes and presets
@@ -138,30 +241,92 @@ class Bambu:
         do_slice: bool = False,
         printer: bool = True,
         allow_filament_mismatch: bool = False,
+        probe_supports: bool = False,
+        no_check: bool = False,
+        no_probe: bool = False,
+        probe_dir: str | Path | None = None,
     ) -> BuildResult:
+        """`no_check` (with `do_slice`): a --no-check pass after a checked slice exits -101 or -100 (build.two_pass_slice)."""
         if not isinstance(spec, Spec):
             spec = load_spec(spec)
         pipeline = self.pipeline()  # a missing Studio binary is the environment error to report first
+        if probe_dir is not None:  # sweep: one probe cache for every variant (its key holds orientation and settings)
+            pipeline.probe_dir = Path(probe_dir).expanduser()
         res = self.resolve_filaments(spec, printer=printer, allow_mismatch=allow_filament_mismatch)
-        return pipeline.build(spec, export=export, timeout=timeout, keep_going=keep_going, do_slice=do_slice, filaments=res)
+        kw: dict = {"no_check": True} if no_check else {}
+        if no_probe:
+            kw["no_probe"] = True
+        return pipeline.build(
+            spec,
+            export=export,
+            timeout=timeout,
+            keep_going=keep_going,
+            do_slice=do_slice,
+            filaments=res,
+            probe_supports=probe_supports,
+            **kw,
+        )
 
     def inspect(self, path: str | Path, features: bool = True) -> dict:
-        """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature."""
-        return Project(str(path)).summary(features=features)
+        """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature.
+        Each object carries its `position` (plate, min corner and size in plate-local mm, `edits.object_positions`)."""
+        from . import edits
+
+        pr = Project(str(path))
+        s = pr.summary(features=features)
+        pos = edits.object_positions(pr)
+        for o in s["objects"]:
+            o["position"] = pos.get(o["name"])
+        return s
 
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)
 
+    # ---- project edits, slice and the escape hatch (runs.py does the Studio runs)
+    def studio_or_none(self) -> StudioCLI | None:
+        """The Studio adapter, or None when the binary is absent (the edits then work without its normalisation)."""
+        try:
+            return self.studio_cli()
+        except StudioError:
+            return None
+
+    def add_filament_patch(self, path: str | Path, arg: str, allow_duplicate: bool = False) -> AddFilament:
+        return runs.add_filament_patch(self.studio_or_none(), self.presets(), str(path), arg, allow_duplicate)
+
+    def edit(self, path: str | Path, edits: EditSet, out: str | Path | None = None, verify: bool = True) -> list[str]:
+        """Apply an EditSet; an added filament gets the verify slice on the temporary archive when Studio is present."""
+        return runs.apply_edits(self.studio_or_none() if verify else None, str(path), edits, str(out) if out else None, verify)
+
+    def slice_project(self, path: str | Path, out: str | Path | None = None, **kw) -> runs.SliceResult:
+        return runs.slice_project(self.studio_cli(), self.presets(), str(path), str(out) if out else None, **kw)
+
+    def studio_raw(self, raw: list[str], out_dir: str | Path = ".", timeout: int = 1200) -> dict:
+        return runs.studio_raw(self.studio_cli(), raw, Path.cwd(), Path(out_dir), timeout)
+
     def open_in_studio(self, path: str | Path) -> None:
-        """Opens the project for the user. With single_instance off this starts a second Studio process."""
-        subprocess.run(["open", "-a", "BambuStudio", str(Path(path).resolve())], check=True)
+        """Opens the project for the user. With single_instance off this starts a second Studio process. StudioError
+        when `open` fails or is missing (exit 3 at the CLI, not a traceback)."""
+        try:
+            subprocess.run(["open", "-a", "BambuStudio", str(Path(path).resolve())], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or b"").decode("utf-8", "replace").strip()[:200]
+            raise StudioError(f"`open -a BambuStudio` exited {e.returncode}" + (f": {err}" if err else "")) from e
+        except OSError as e:
+            raise StudioError(f"`open -a BambuStudio` could not run ({e.strerror or e})") from e
 
     # ---- printer (read-only)
     def printer(
         self, ip: str | None = None, serial: str | None = None, wait: float | None = None, insecure: bool = False
     ) -> PrinterService:
         """Read-only printer access. `insecure=True` skips TLS verification: the access code then travels to an unverified endpoint."""
-        return PrinterService(ip or self.printer_ip, serial, wait if wait is not None else self.printer_wait, insecure=insecure)
+        return PrinterService(
+            ip or self.printer_ip,
+            serial,
+            wait if wait is not None else self.printer_wait,
+            insecure=insecure,
+            timeout_s=self.printer_timeout,
+            on_step=self.printer_progress,
+        )
 
     def printer_status(self, ip: str | None = None) -> Status:
         return self.printer(ip).status()

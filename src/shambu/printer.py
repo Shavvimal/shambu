@@ -29,28 +29,40 @@ the two external spools are `print.vir_slot[]` with ids "254" (feeds the main/le
 (Bambu's filament id, e.g. GFG99 = Generic PETG, GFG00 = Bambu PETG Basic; the installed filament presets carry the
 same value as `filament_id`), `tray_sub_brands`, `remain` and `k`. Each extruder's `snow` ("slot now") packs the tray
 it holds: (ams id << 8) | slot, 0xFFFF for none; the capture showed left snow 0xFE00 (= 254) and right 0xFF00 (= 255).
+
+Time fields (live X2D report, firmware 20018, 2026-10-21; Studio's DeviceManager.cpp): the report carries no start time
+and no total estimate, only `mc_remaining_time` (min). So `Status.read_at` stamps each read in UTC when the report is
+decoded, and `watch` polls more often near the start and the end of a print, where the times matter. `spd_lvl` is the
+speed level (1 silent, 2 standard, 3 sport, 4 ludicrous), `spd_mag` its percent, `stg` the list of startup stages this
+job runs and `stg_cur` the current one (0 = printing); names in `STAGE_NAMES`. No output of this module names the IP:
+`Status.to_json` redacts it and keeps only the masked serial, and `Status.log_poll` (a `watch --log` line) holds
+neither the IP nor the serial.
 """
 
 from __future__ import annotations
 
+import calendar
 import copy
 import json
 import logging
+import math
 import re
 import socket
 import ssl
 import subprocess
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from . import conf
-from .errors import PrinterError
+from .errors import ConfError, PrinterError
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 CA_FILE = Path("/Applications/BambuStudio.app/Contents/Resources/cert/printer.cer")
 PUSHALL = {"pushing": {"sequence_id": "1", "command": "pushall", "version": 1, "push_target": 1}}
@@ -70,7 +82,41 @@ ACTIVE_STATES = ("printing", "paused", "preparing", "slicing")
 DONE_STATES = ("idle", "finished", "failed")  # watch() stops only on these; unknown or offline keeps it polling
 EXTRUDER_NAMES = {0: "auxiliary (right)", 1: "main (left)"}
 HMS_LEVELS = {1: "fatal", 2: "serious", 3: "common", 4: "info"}
+# Network bounds for one read (doctor timings, 2026-10-21): TCP connect, TLS handshake, MQTT keepalive, and the
+# timeout for the whole read (discovery + connect + report) unless the caller gives another.
+CONNECT_S = 3.0
+HANDSHAKE_S = 5.0
+KEEPALIVE_S = 10
+READ_TIMEOUT_S = 15.0
 TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
+SPEED_LEVELS = {1: "silent", 2: "standard", 3: "sport", 4: "ludicrous"}  # `spd_lvl`; Studio StatusPanel.cpp
+# `stg` / `stg_cur` ids -> Studio's text (DeviceManager.cpp get_stage_string, v02.08.02.61). Every id the live X2D job
+# listed on 2026-10-21 is here; 255 is in that list, but Studio's table has no text for it.
+STAGE_NAMES = {
+    0: "printing",
+    1: "auto bed levelling",
+    2: "heatbed preheating",
+    3: "vibration compensation",
+    4: "changing filament",
+    7: "heating nozzle",
+    8: "calibrating dynamic flow",
+    11: "identifying build plate type",
+    13: "homing toolhead",
+    14: "cleaning nozzle tip",
+    29: "cooling chamber",
+    39: "nozzle offset calibration",
+    51: "printing calibration lines",
+    54: "waiting for the heatbed to reach its target",
+    73: "build plate alignment detection",
+    74: "heatbed surface foreign object detection",
+    75: "heatbed underside foreign object detection",
+    255: "no name in Studio's table",
+}
+REDACTED_IP = "<ip>"
+# watch(): at most FAST_POLL_S between polls near the start and the end of a print, where Studio's model is worst.
+FAST_POLL_S = 60
+START_WINDOW_S = 15 * 60
+END_WINDOW_MIN = 15
 # External spools on a dual-nozzle printer: virtual tray id -> the extruder id it feeds (live X2D, 2026-10-16; each
 # extruder's `snow` confirmed it). Single-nozzle printers report one external spool as `vt_tray` with tray_now 254.
 EXTERNAL_TRAY_EXTRUDER = {254: 1, 255: 0}
@@ -95,10 +141,19 @@ COLOUR_NAMES = {
 
 # ---------------------------------------------------------------------------------- discovery
 class Discovery(Protocol):
+    """A way to propose printer IPs. `with_deadline(seconds)` gives a copy that finishes within that time (one copy per
+    read, so its `timings` and `shortfall` belong to that read). After `find()`, `timings` holds its steps in seconds
+    and `shortfall` says what it could not cover in time (None when it covered everything)."""
+
+    timings: dict[str, float]
+    shortfall: str | None
+
+    def with_deadline(self, seconds: float | None) -> Discovery: ...
+
     def find(self) -> list[dict]: ...
 
 
-def port_open(ip: str, port: int = 8883, timeout: float = 0.7) -> bool:
+def port_open(ip: str, port: int = 8883, timeout: float = 0.5) -> bool:
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
@@ -106,16 +161,118 @@ def port_open(ip: str, port: int = 8883, timeout: float = 0.7) -> bool:
         return False
 
 
+_ARP_IP = re.compile(r"\((\d+\.\d+\.\d+\.\d+)\)")
+
+
+def arp_hosts(text: str) -> list[str]:
+    """IPv4 hosts from `arp -an` output, in table order, once each. Skips multicast and broadcast addresses and
+    `(incomplete)` entries (no host answered ARP there, so nothing answers on 8883 either)."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = _ARP_IP.search(line)
+        if not m or "incomplete" in line:
+            continue
+        ip = m.group(1)
+        if ip.startswith(("224.", "239.", "255.")) or ip in out:
+            continue
+        out.append(ip)
+    return out
+
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
 @dataclass
 class ArpProbe:
-    """Hosts in the ARP table that answer on 8883. On a home LAN only Bambu printers do."""
+    """Hosts in the ARP table that answer on 8883. On a home LAN only Bambu printers do.
 
-    timeout: float = 0.7
+    Bounds (a slow resolver or a large LAN must not stall a check): `arp -an` (numeric, so no reverse DNS per entry)
+    with a 2 s timeout, then the 8883 probe on min(`workers`, hosts) threads, `timeout` s per host. The probe window
+    is max(`probe_window_s`, rounds x `timeout`), so every host gets its turn on a large LAN, and never longer than
+    the deadline `with_deadline` set. A host not probed when the window ends counts as closed, and `shortfall` says how
+    many were probed. The probe threads are daemons: a probe still blocked at the end never holds up the process exit."""
+
+    timeout: float = 0.5
+    probe_window_s: float = 2.0
+    workers: int = 64
+    arp_timeout: float = 2.0
+    deadline_s: float | None = None  # the most this find() may take; None: only its own bounds
+    runner: Runner = field(default=subprocess.run, repr=False)  # injectable: tests pass a fake
+    probe: Callable[[str, int, float], bool] = field(default=port_open, repr=False)
+    timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    shortfall: str | None = field(default=None, init=False, repr=False)
+
+    def with_deadline(self, seconds: float | None) -> ArpProbe:
+        return replace(self, deadline_s=seconds)
+
+    def hosts(self) -> list[str]:
+        try:
+            r = self.runner(["arp", "-an"], capture_output=True, text=True, timeout=self.arp_timeout)
+        except subprocess.TimeoutExpired:
+            log.warning("arp -an gave no answer within %g s; no ARP discovery", self.arp_timeout)
+            return []
+        except OSError as e:
+            log.warning("arp -an failed (%s); no ARP discovery", e)
+            return []
+        if r.returncode != 0:
+            log.warning("arp -an exited with status %s (%s); reading what it printed", r.returncode, (r.stderr or "").strip()[:200])
+        return arp_hosts(r.stdout or "")
+
+    def window(self, n_hosts: int, limit: float | None = None) -> float:
+        threads = max(1, min(self.workers, n_hosts))
+        w = max(self.probe_window_s, math.ceil(n_hosts / threads) * self.timeout)
+        return w if limit is None else max(0.0, min(w, limit))
+
+    def probe_hosts(self, hosts: list[str], limit: float | None = None) -> list[dict]:
+        self.shortfall = None
+        if not hosts:
+            return []
+        todo = list(hosts)
+        open_: set[str] = set()
+        lock = threading.Lock()
+        probed = [0]
+        finished = threading.Event()
+        window = self.window(len(hosts), limit)
+        deadline = time.monotonic() + window
+
+        def worker() -> None:
+            while True:
+                with lock:
+                    if not todo or time.monotonic() >= deadline:
+                        return
+                    h = todo.pop(0)
+                try:
+                    ok = bool(self.probe(h, 8883, self.timeout))
+                except Exception as e:  # noqa: BLE001 - the probe is injectable; a closed port is False, anything else is logged
+                    log.warning("port probe of %s raised %s: %s; counted as closed", h, type(e).__name__, e)
+                    ok = False
+                with lock:
+                    if ok:
+                        open_.add(h)
+                    probed[0] += 1
+                    if probed[0] == len(hosts):
+                        finished.set()
+
+        for i in range(max(1, min(self.workers, len(hosts)))):
+            threading.Thread(target=worker, name=f"shambu-probe-{i}", daemon=True).start()
+        finished.wait(window)
+        with lock:
+            found, n = set(open_), probed[0]
+        if n < len(hosts):
+            self.shortfall = f"{n} of {len(hosts)} hosts probed before the {window:g} s probe window ended"
+            log.warning("port probe: %s", self.shortfall)
+        return [{"ip": h, "method": "arp+8883"} for h in hosts if h in found]  # ARP order, not finish order
 
     def find(self) -> list[dict]:
-        out = subprocess.run(["arp", "-a"], capture_output=True, text=True).stdout
-        hosts = [m for m in re.findall(r"\((\d+\.\d+\.\d+\.\d+)\)", out) if not m.startswith(("224.", "239.", "255."))]
-        return [{"ip": h, "method": "arp+8883"} for h in hosts if port_open(h, 8883, self.timeout)]
+        self.timings = {}
+        t0 = time.monotonic()
+        hosts = self.hosts()
+        self.timings["arp"] = round(time.monotonic() - t0, 2)
+        left = None if self.deadline_s is None else self.deadline_s - (time.monotonic() - t0)
+        t1 = time.monotonic()
+        hits = self.probe_hosts(hosts, left)
+        self.timings["probe"] = round(time.monotonic() - t1, 2)
+        return hits
 
 
 @dataclass
@@ -124,8 +281,20 @@ class SsdpListen:
     because the Studio GUI holds 2021 while it runs."""
 
     seconds: float = 10.0
+    timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    shortfall: str | None = field(default=None, init=False, repr=False)
+
+    def with_deadline(self, seconds: float | None) -> SsdpListen:
+        return self if seconds is None else replace(self, seconds=max(0.0, min(self.seconds, seconds)))
 
     def find(self) -> list[dict]:
+        t_start = time.monotonic()
+        try:
+            return self._listen()
+        finally:
+            self.timings = {"ssdp": round(time.monotonic() - t_start, 2)}
+
+    def _listen(self) -> list[dict]:
         found: dict[str, dict] = {}
         socks = []
         for port in (2021, 1990):
@@ -192,7 +361,14 @@ class PinnedSSLSocket(ssl.SSLSocket):
     """Runs `check_identity` right after the handshake, so it runs before paho sends CONNECT with the access code."""
 
     def do_handshake(self, block: bool = False) -> None:
-        super().do_handshake(block)
+        # paho sets the socket timeout to its keepalive (10 s) before the handshake and cannot change keepalive on an
+        # open connection, so the handshake bound lives here: HANDSHAKE_S, then the keepalive timeout again.
+        prev = self.gettimeout()
+        self.settimeout(HANDSHAKE_S if prev is None else min(prev, HANDSHAKE_S))
+        try:
+            super().do_handshake(block)
+        finally:
+            self.settimeout(prev)
         serial = getattr(self.context, "expected_serial", "")
         if self.context.verify_mode != ssl.CERT_NONE:
             try:
@@ -355,8 +531,9 @@ class MqttReader:
             # insecure: tell paho not to call ssl.match_hostname (gone in 3.12). Verified: keeps check_hostname=True.
             c.tls_insecure_set(self.insecure)
             c.on_connect, c.on_message = on_connect, on_message
+            c.connect_timeout = CONNECT_S  # paho's default is 5 s; an unroutable --ip then fails in 3 s
             try:
-                c.connect(self.ip, 8883, keepalive=10)
+                c.connect(self.ip, 8883, keepalive=KEEPALIVE_S)
             except ssl.SSLError as e:
                 raise PrinterError(f"TLS verification failed for printer {conf.mask(self.serial)} at {self.ip}: {self._clean(e)}") from None
             except OSError as e:
@@ -450,6 +627,11 @@ class Status:
     wifi: str | None
     stage: int | None
     tls_verified: bool | None
+    read_at: str | None = None  # UTC ISO 8601 with seconds, set when the report is decoded
+    speed_level: int | None = None  # spd_lvl: 1 silent, 2 standard, 3 sport, 4 ludicrous
+    speed_percent: int | None = None  # spd_mag
+    stages: list[int] | None = None  # stg: the startup stages of this job, as the printer sends them
+    task_id: str | None = None
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -462,19 +644,53 @@ class Status:
         return self.state in DONE_STATES
 
     def ends_at(self) -> str | None:
+        """Local HH:MM of the forecast end, for the text lines."""
         if self.remaining_min is None or not self.busy:
             return None
         return time.strftime("%H:%M", time.localtime(time.time() + self.remaining_min * 60))
 
+    @property
+    def speed_name(self) -> str | None:
+        return None if self.speed_level is None else SPEED_LEVELS.get(self.speed_level, f"level {self.speed_level}")
+
+    def ends_at_utc(self) -> str | None:
+        """The printer's forecast end as a dated UTC timestamp: `read_at` plus the remaining minutes."""
+        if self.remaining_min is None or not self.busy or not self.read_at:
+            return None
+        return utc_iso(calendar.timegm(time.strptime(self.read_at, "%Y-%m-%dT%H:%M:%SZ")) + self.remaining_min * 60)
+
     def to_json(self) -> dict:
+        """Every field but `raw`, with the IP redacted (CONTRIBUTING: an IP never lands in a file) and the serial masked.
+        `ends_at` is the dated UTC forecast (`ends_at_utc`); the text lines show the local clock time."""
         d = {k: v for k, v in self.__dict__.items() if k != "raw"}
-        d["ends_at"] = self.ends_at()
+        d["ip"] = REDACTED_IP
+        d["ends_at"] = self.ends_at_utc()
+        d["speed"] = self.speed_name
         return d
+
+    def log_poll(self) -> dict:
+        """One `watch --log` poll line: the time and job fields only. No IP, no serial (not even masked), no wifi."""
+        return {
+            "read_at": self.read_at,
+            "task": self.task,
+            "task_id": self.task_id,
+            "state": self.raw_state,
+            "percent": self.percent,
+            "layer": self.layer,
+            "total_layers": self.total_layers,
+            "remaining_min": self.remaining_min,
+            "speed_level": self.speed_level,
+            "speed_percent": self.speed_percent,
+            "stage": self.stage,
+            "stages": self.stages,
+            "print_error": self.print_error,
+        }
 
     def lines(self) -> list[str]:
         out = [
-            f"printer {self.serial_masked} at {self.ip}: {self.state} ({self.raw_state})"
+            f"printer {self.serial_masked}: {self.state} ({self.raw_state})"
             + ("" if self.tls_verified else ", TLS unverified")
+            + (f", read {self.read_at}" if self.read_at else "")
         ]
         if self.task:
             out.append(f"job: {self.task}" + (f"  file {self.file}" if self.file and self.file != self.task else ""))
@@ -485,6 +701,10 @@ class Status:
             if self.remaining_min is not None:
                 prog += f", {self.remaining_min // 60} h {self.remaining_min % 60} min left, ends about {self.ends_at()}"
             out.append(prog)
+        if self.speed_level is not None and self.busy:
+            out.append(f"speed {self.speed_name}" + (f" ({self.speed_percent} %)" if self.speed_percent is not None else ""))
+        if self.stage and self.busy:
+            out.append(f"stage {self.stage}: {STAGE_NAMES.get(self.stage, 'no name in this table')}")
         for n in self.nozzles:
             tgt = f" -> {n['target_c']:.0f}" if n.get("target_c") else ""
             out.append(
@@ -507,12 +727,30 @@ class Status:
         return out
 
 
+def utc_iso(t: float) -> str:
+    """Epoch seconds -> '2026-10-21T14:23:55Z'."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _int_or_none(v) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class StatusDecoder:
-    def __init__(self, hms_table: dict | None = None):
+    """Raw report -> Status. `now` is the clock for `read_at`, injected so that tests can fix it."""
+
+    def __init__(self, hms_table: dict | None = None, now: Callable[[], float] = time.time):
         self.hms_table = hms_table or {}
+        self.now = now
 
     def decode(self, report: dict, serial: str, ip: str) -> Status:
         p = report.get("print", {})
+        secrets = outward_secrets(serial, ip)
         dev = p.get("device", {}) or {}
         nozzles = []
         noz_infos = {n.get("id"): n for n in ((dev.get("nozzle") or {}).get("info") or [])}
@@ -557,6 +795,9 @@ class StatusDecoder:
         if cham is None and "chamber_temper" in p:
             cham = float(p["chamber_temper"])
         raw_state = str(p.get("gcode_state", "UNKNOWN"))
+        stg = p.get("stg")
+        stages = [s for s in (_int_or_none(x) for x in stg) if s is not None] if isinstance(stg, list) else None
+        task_id = p.get("task_id") if p.get("task_id") not in (None, "") else p.get("subtask_id")
         return Status(
             conf.mask(serial),
             ip,
@@ -566,8 +807,8 @@ class StatusDecoder:
             p.get("mc_remaining_time"),
             p.get("layer_num"),
             p.get("total_layer_num"),
-            p.get("subtask_name"),
-            p.get("gcode_file"),
+            scrub(p.get("subtask_name"), secrets),  # free text: the user can name a job after anything
+            scrub(p.get("gcode_file"), secrets),
             bed_c,
             bed_t or None,
             cham,
@@ -578,7 +819,12 @@ class StatusDecoder:
             p.get("wifi_signal"),
             p.get("stg_cur"),
             report.get("_tls_verified"),
-            report,
+            read_at=utc_iso(self.now()),
+            speed_level=_int_or_none(p.get("spd_lvl")),
+            speed_percent=_int_or_none(p.get("spd_mag")),
+            stages=stages,
+            task_id=None if task_id in (None, "") else scrub(str(task_id), secrets),
+            raw=report,
         )
 
 
@@ -706,7 +952,7 @@ class LoadedFilaments:
     def to_json(self) -> dict:
         return {
             "serial_masked": self.serial_masked,
-            "ip": self.ip,
+            "ip": REDACTED_IP,
             "read_at": self.read_at,
             "read_epoch": self.read_epoch,
             "tls_verified": self.tls_verified,
@@ -717,7 +963,7 @@ class LoadedFilaments:
 
     def lines(self) -> list[str]:
         out = [
-            f"printer {self.serial_masked} at {self.ip}: filaments read at {self.read_at}"
+            f"printer {self.serial_masked}: filaments read at {self.read_at}"
             + ("" if self.tls_verified else ", TLS unverified")
             + (f"; presets for {self.printer_preset}" if self.printer_preset else "")
         ]
@@ -839,11 +1085,29 @@ class FilamentDecoder:
 
 # ---------------------------------------------------------------------------------- service
 @dataclass
+class _Attempt:
+    """One read's state: the step it is in, its step times, and whether the caller gave up on it."""
+
+    step: str = "start"
+    started: float = field(default_factory=time.monotonic)
+    timings: dict[str, float] = field(default_factory=dict)
+    abandoned: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass
 class PrinterService:
     """Facade: serial and access code from Studio's config, IP from discovery or the caller.
 
     `insecure=True` turns off TLS verification for every read (the CLI's `--insecure`). Leave it off: a verified read
-    proves the host at the IP is the selected printer before the access code leaves this machine."""
+    proves the host at the IP is the selected printer before the access code leaves this machine.
+
+    `timeout_s` bounds one whole read (credentials, discovery, MQTT): the read runs in a worker thread, and when the
+    timeout runs out the caller gets `PrinterError("timed out after 15 s in <step>")`. The expired attempt's thread is not
+    stopped: it is a daemon, it finishes or dies with the process, and it never calls `on_step` or writes `timings`
+    again. That is fine for the CLI; a long-lived caller keeps such a thread until its socket times out.
+    `on_step(name, seconds)` hears each step of the current read as it ends (`credentials`, `arp`, `probe`, `mqtt`);
+    `timings` holds the steps of the last read."""
 
     ip: str | None = None
     serial: str | None = None
@@ -851,57 +1115,318 @@ class PrinterService:
     discovery: tuple[Discovery, ...] = (ArpProbe(),)
     reader_factory: Callable[[str, str, str, float, bool], MqttReader] | None = None  # injectable transport; None = MqttReader at call time
     insecure: bool = False
+    timeout_s: float | None = READ_TIMEOUT_S
+    on_step: Callable[[str, float], None] | None = field(default=None, repr=False)
+    timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _local: threading.local = field(default_factory=threading.local, init=False, repr=False)
+
+    def _attempt(self) -> _Attempt:
+        a = getattr(self._local, "attempt", None)
+        if a is None:  # resolve() or _read() called directly, outside _bounded
+            a = self._local.attempt = _Attempt()
+            self.timings = a.timings
+        return a
+
+    def _record(self, a: _Attempt, name: str, dt: float) -> None:
+        with a.lock:
+            if a.abandoned:  # an expired attempt reports nothing: the caller gave up on it
+                return
+            a.timings[name] = dt
+            if self.on_step is not None:
+                try:
+                    self.on_step(name, dt)
+                except Exception as e:  # noqa: BLE001 - the caller's progress printer must never fail the read
+                    log.warning("progress callback for step %s raised %s: %s", name, type(e).__name__, e)
+
+    @contextmanager
+    def _timed(self, name: str) -> Iterator[None]:
+        a = self._attempt()
+        a.step = name
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            self._record(a, name, round(time.monotonic() - t0, 2))
+
+    def _bounded(self, fn: Callable[[], T]) -> T:
+        """`fn()` within `timeout_s` in a worker thread with its own attempt state, or PrinterError naming the step it
+        was in. No timeout: the same attempt state, in the caller's thread."""
+        attempt = _Attempt()
+        self.timings = attempt.timings
+        box: dict = {}
+
+        def work() -> None:
+            self._local.attempt = attempt
+            try:
+                box["value"] = fn()
+            except BaseException as e:  # noqa: BLE001 - re-raised in the caller's thread
+                box["error"] = e
+            finally:
+                self._local.attempt = None
+
+        if not self.timeout_s or self.timeout_s <= 0:
+            work()
+        else:
+            t = threading.Thread(target=work, name="shambu-printer-read", daemon=True)
+            t.start()
+            t.join(self.timeout_s)
+            if t.is_alive():
+                with attempt.lock:
+                    attempt.abandoned = True
+                    self.timings = dict(attempt.timings)  # the steps that ended in time, frozen
+                raise PrinterError(f"timed out after {self.timeout_s:g} s in {attempt.step}")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
     def resolve(self) -> tuple[str, str, str]:
         """IP, serial, code. Discovery only proposes a host: the TLS name check (or, insecure, the report topic) in
         `MqttReader.read` confirms it is the selected printer. An SSDP hit that names the serial wins over other hits."""
-        c = conf.load()
-        serial = self.serial or conf.selected_serial(c)
-        if not serial:
-            raise PrinterError("no printer selected in Bambu Studio (Device tab)")
-        code = conf.access_code(serial, c)
+        with self._timed("credentials"):  # serial and access code from Studio's config
+            c = conf.load()
+            serial = self.serial or conf.selected_serial(c)
+            if not serial:
+                raise PrinterError("no printer selected in Bambu Studio (Device tab)")
+            code = conf.access_code(serial, c)
         ip = self.ip
+        gaps: list[str] = []
         if not ip:
-            for d in self.discovery:
+            a = self._attempt()
+            for proto in self.discovery:
+                d = proto.with_deadline(self._discovery_deadline(a))
+                a.step = "discovery"
                 hits = d.find()
+                for name, dt in d.timings.items():
+                    self._record(a, name, dt)
+                if d.shortfall:
+                    gaps.append(d.shortfall)
                 if hits:
                     named = [h for h in hits if h.get("serial") == serial]
                     ip = (named or hits)[0]["ip"]
                     break
         if not ip:
-            raise PrinterError("no host on this LAN answers on port 8883. Is the printer on and on this network? Pass --ip.")
+            why = f" ({'; '.join(gaps)})" if gaps else ""
+            raise PrinterError(f"no host on this LAN answers on port 8883{why}. Is the printer on and on this network? Pass --ip.")
         return ip, serial, code
+
+    def _discovery_deadline(self, a: _Attempt) -> float | None:
+        """What is left of the read's timeout once the connect and the TLS handshake are kept back; None: no timeout."""
+        if not self.timeout_s or self.timeout_s <= 0:
+            return None
+        return max(0.5, self.timeout_s - (time.monotonic() - a.started) - CONNECT_S - HANDSHAKE_S)
 
     def _read(self, ip: str, serial: str, code: str) -> dict:
         if self.insecure:
             log.warning("TLS verification is off: the access code goes to whatever answers at %s", ip)
-        report = (self.reader_factory or MqttReader)(ip, serial, code, self.wait, self.insecure).read()
+        with self._timed("mqtt"):
+            report = (self.reader_factory or MqttReader)(ip, serial, code, self.wait, self.insecure).read()
         if self.insecure and report.get("_topic", f"device/{serial}/report") != f"device/{serial}/report":
             raise PrinterError(f"host {ip} answered for another device, not printer {conf.mask(serial)}")
         return report
 
+    def _resolve_and_read(self) -> tuple[str, str, dict]:
+        ip, serial, code = self.resolve()
+        return ip, serial, self._read(ip, serial, code)
+
     def raw_report(self) -> dict:
-        return self._read(*self.resolve())
+        """The merged report as the printer sent it, with shambu's transport keys. Internal: print `public_report`."""
+        return self._bounded(self._resolve_and_read)[2]
+
+    def public_report(self) -> dict:
+        """The report for `printer raw`: `public_raw()` of one read, which removes the transport metadata (`_topic`
+        names the full serial), the network and wifi fields, secret-looking keys, and any text naming the IP or the
+        serial."""
+        ip, serial, report = self._bounded(self._resolve_and_read)
+        return public_raw(report, ip, serial)
 
     def status(self) -> Status:
-        ip, serial, code = self.resolve()
-        report = self._read(ip, serial, code)
+        ip, serial, report = self._bounded(self._resolve_and_read)
         return StatusDecoder(conf.hms_table(serial[:3])).decode(report, serial, ip)
 
     def filaments(self, resolver=None, printer_preset: str | None = None) -> LoadedFilaments:
         """The spools in each nozzle and slot, from the same single `pushall` as `status()`. Read-only."""
-        ip, serial, code = self.resolve()
-        report = self._read(ip, serial, code)
+        ip, serial, report = self._bounded(self._resolve_and_read)
         return FilamentDecoder(resolver, printer_preset).decode(report, serial, ip)
 
-    def watch(self, every_s: int = 300, until_idle: bool = True, max_polls: int = 200):
-        """Generator of Status every `every_s` seconds; stops on a final state (idle, finished, failed) or after
-        `max_polls`. An unknown or unrecognised state is not final: it logs a warning and keeps polling."""
-        for _ in range(max_polls):
-            st = self.status()
+    def watch(
+        self,
+        every_s: float = 300,
+        until_idle: bool = True,
+        max_polls: int = 200,
+        max_errors: int | None = None,
+        wait_for_start: bool = False,
+        sleep: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        now: Callable[[], float] | None = None,
+    ) -> Iterator[Status | WatchError]:
+        """Generator of Status, one per poll; stops on a final state (idle, finished, failed) or after `max_polls`.
+        An unknown or unrecognised state is not final: it logs a warning and keeps polling.
+
+        The interval is `poll_interval()`: `every_s`, but at most 60 s while preparing, in the first 15 minutes of
+        RUNNING when this watch saw the job start (a PREPARE poll, or a first RUNNING poll before layer 2 that is the
+        watch's first poll or follows an idle or final state), and while fewer than 15 minutes remain.
+        `wait_for_start=True`: a final state seen before any job is active does not stop the watch; it polls every
+        60 s (at most `every_s`) until a job starts, still bounded by `max_polls`.
+        `max_errors=None` lets a failed read raise. With a number, a failed read yields a `WatchError` (a category
+        and a fixed message, no endpoint text) and the watch goes on; after `max_errors` failures in a row the last
+        `WatchError` has `gave_up=True` and the generator ends. After a failure the next poll follows the interval of
+        the last good poll. There is no sleep after the last permitted poll.
+        `sleep`, `clock` (monotonic) and `now` (epoch, for an error's `read_at`) are injectable for tests."""
+        sleep = sleep or time.sleep
+        clock = clock or time.monotonic
+        now = now or time.time
+        running_since: float | None = None  # clock() at the first RUNNING poll, when this watch saw the start
+        prev: str | None = None  # the raw state of the last good poll
+        decided = False  # the start window is decided (seen, or the watch joined mid-print)
+        active_seen = False
+        last: Status | None = None
+        errors = 0
+        for n in range(max_polls):
+            remaining = n + 1 < max_polls
+            try:
+                st = self.status()
+            except (PrinterError, ConfError) as e:
+                if max_errors is None:
+                    raise
+                errors += 1
+                gave_up = errors >= max_errors or isinstance(e, ConfError)  # a config problem does not heal by waiting
+                yield WatchError(utc_iso(now()), *error_category(e), consecutive=errors, gave_up=gave_up)
+                if gave_up:
+                    return
+                if remaining:
+                    sleep(self._interval(every_s, last, running_since, clock) if last else every_s)
+                continue
+            errors = 0
+            if st.raw_state == "RUNNING" and not decided:
+                decided = True
+                if prev == "PREPARE" or ((st.layer or 0) <= 1 and (prev is None or prev in ("IDLE", "FINISH", "FAILED"))):
+                    running_since = clock()
+            active_seen = active_seen or st.busy
+            prev, last = st.raw_state, st
             yield st
-            if until_idle and st.done:
+            waiting = wait_for_start and not active_seen
+            if until_idle and st.done and not waiting:
                 return
             if not st.busy and not st.done:
                 log.warning("printer state %s (%s) is not final; still watching", st.state, st.raw_state)
-            time.sleep(every_s)
+            if remaining:
+                sleep(min(every_s, FAST_POLL_S) if waiting else self._interval(every_s, st, running_since, clock))
+
+    @staticmethod
+    def _interval(every_s: float, st: Status, running_since: float | None, clock: Callable[[], float]) -> float:
+        return poll_interval(every_s, st, None if running_since is None else clock() - running_since)
+
+
+ERROR_CATEGORIES = (  # (category, words in the PrinterError text, the fixed message a watch log holds)
+    ("timeout", ("timed out",), "the read timed out"),
+    ("tls", ("TLS", "certificate", "CA bundle"), "the TLS check of the printer failed"),
+    ("login", ("refused the MQTT login",), "the printer refused the MQTT login (check the LAN access code in Studio)"),
+    ("discovery", ("no host on this LAN",), "no printer answered on port 8883 on this LAN"),
+    ("identity", ("another device",), "the host answered for another device"),
+    ("report", ("no full report", "no report"), "the printer sent no full report in time"),
+    ("connect", ("cannot connect",), "the connection to the printer failed"),
+    ("setup", ("paho-mqtt missing", "no printer selected", "no access code"), "shambu or Bambu Studio is not set up for the printer"),
+)
+
+
+def error_category(e: BaseException) -> tuple[str, str]:
+    """(category, fixed message) for a failed read. The message never quotes the exception: the lower layers put the
+    IP, the host name, the masked serial and the TLS names in their text, and a watch log must hold none of them."""
+    if isinstance(e, ConfError):  # Studio's config: no printer selected, no access code (its text names the serial)
+        return "setup", "shambu or Bambu Studio is not set up for the printer"
+    text = str(e)
+    for cat, words, msg in ERROR_CATEGORIES:
+        if any(w in text for w in words):
+            return cat, msg
+    return "other", f"the read failed ({type(e).__name__})"
+
+
+@dataclass(frozen=True)
+class WatchError:
+    """One failed poll of `PrinterService.watch`: a category and its fixed message (see `error_category`).
+    `consecutive` counts the failures in a row; `gave_up` is True on the failure that reached `max_errors`."""
+
+    read_at: str
+    category: str
+    error: str
+    consecutive: int = 1
+    gave_up: bool = False
+
+    def log_poll(self) -> dict:
+        return {
+            "read_at": self.read_at,
+            "error": self.error,
+            "category": self.category,
+            "consecutive": self.consecutive,
+            "gave_up": self.gave_up,
+        }
+
+
+def outward_secrets(serial: str = "", ip: str = "") -> list[str]:
+    """Every value no printer output or log may carry: the known serials, their masks and the access codes
+    (`conf.sensitive_values`), plus this printer's serial, masked serial and endpoint."""
+    vals = set(conf.sensitive_values()) | {v for v in (serial, conf.mask(serial) if serial else "", ip) if v and len(v) >= 4}
+    return sorted(vals, key=len, reverse=True)
+
+
+def scrub(text: str | None, secrets: list[str]) -> str | None:
+    """`text` with every value in `secrets` replaced by '<redacted>' (None stays None). The one sanitiser at the printer
+    output and log boundary: job names, file names and G-code labels are free text."""
+    if text is None:
+        return None
+    for v in secrets:
+        text = text.replace(v, "<redacted>")
+    return text
+
+
+def scrub_tree(x, secrets: list[str]):
+    """A structured record (a watch header) with every string value cleaned: the known secrets (`scrub`), then any IP
+    address, LAN host name or masked serial (`conf.redact_identifiers`). Numbers and keys are never touched, so a code
+    that happens to be digits inside a float cannot corrupt the record (it was once scrubbed as JSON text)."""
+    if isinstance(x, dict):
+        return {k: scrub_tree(v, secrets) for k, v in x.items()}
+    if isinstance(x, list):
+        return [scrub_tree(v, secrets) for v in x]
+    if isinstance(x, str):
+        return conf.redact_identifiers(scrub(x, secrets) or "")
+    return x
+
+
+RAW_SECRET = ("access", "password", "passwd", "token", "ticket", "secret", "auth")
+RAW_DROP = ("net", "wifi_signal", "ipcam", "sn", "dev_id", "serial")  # network, camera URL (holds the IP), serial keys
+
+
+def public_raw(report: dict, ip: str, serial: str) -> dict:
+    """A deep copy of a raw report for output: transport keys (`_topic` holds the full serial) removed except
+        `_tls_verified`, the RAW_DROP keys removed at any depth, secret-looking keys redacted (RAW_SECRET; not `conf.redact`,
+    whose "code" would hide `gcode_state`), and any text
+        that names the IP, the serial or the masked serial replaced by '<redacted>'."""
+    masked = conf.mask(serial)
+    secrets = outward_secrets(serial, ip)  # a known access code under an ordinary key too
+
+    def clean(x):
+        if isinstance(x, dict):
+            return {
+                k: ("<redacted>" if any(s in k.lower() for s in RAW_SECRET) else clean(v))
+                for k, v in x.items()
+                if not (k.startswith("_") and k != "_tls_verified") and k not in RAW_DROP
+            }
+        if isinstance(x, list):
+            return [clean(v) for v in x]
+        if isinstance(x, str) and ((ip and ip in x) or (serial and serial in x) or masked in x or any(v in x for v in secrets)):
+            return "<redacted>"
+        return x
+
+    return clean(report)
+
+
+def poll_interval(every_s: float, st: Status, running_for_s: float | None) -> float:
+    """Seconds to the next poll. At most FAST_POLL_S while the printer prepares, in the first START_WINDOW_S of
+    RUNNING (`running_for_s` is None when the watch did not see the start), and while fewer than END_WINDOW_MIN
+    minutes remain: Studio's model is worst at the start and the end, and these polls bound the real start and end."""
+    fast = st.raw_state == "PREPARE"
+    if st.raw_state == "RUNNING" and running_for_s is not None and running_for_s < START_WINDOW_S:
+        fast = True
+    if st.raw_state in ("RUNNING", "PAUSE") and st.remaining_min is not None and st.remaining_min < END_WINDOW_MIN:
+        fast = True
+    return min(every_s, FAST_POLL_S) if fast else every_s

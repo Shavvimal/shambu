@@ -18,5 +18,10 @@
   {"query": "what is PETG and how is it different from PLA for outdoor parts?", "should_trigger": false},
   {"query": "install Bambu Studio on my new mac, the dmg won't open", "should_trigger": false},
   {"query": "write a python script that parses a gcode file and plots the extrusion per layer with matplotlib", "should_trigger": false},
-  {"query": "my bambu printer shows HMS error 0300_0100_0001_0001, what does it mean and how do I fix the hardware?", "should_trigger": false}
+  {"query": "my bambu printer shows HMS error 0300_0100_0001_0001, what does it mean and how do I fix the hardware?", "should_trigger": false},
+  {"query": "calibrate my printer's extruder, the flow rate looks off on the X2D", "should_trigger": false},
+  {"query": "replace the mesh in my CAD model with the new bracket body and re-export the STEP", "should_trigger": false},
+  {"query": "swap the housing mesh in all-on-one.3mf for housing_v2.stl, same spot on the plate", "should_trigger": true},
+  {"query": "move the prime tower in my 3mf to the back right corner, it's sitting on top of a part", "should_trigger": true},
+  {"query": "the printer just finished, how accurate was Bambu Studio's time estimate for that print?", "should_trigger": true}
 ]

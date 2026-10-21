@@ -27,12 +27,20 @@ JSON shape:
                          "lay_on_face": [0, 0, 1], "rotate": [0, 0, 45],   # optional: turn the STL before placing it
                          # or "orientation": "auto": Studio's auto-orient picks the face (single-file parts; a merged
                          # part uses shambu's own best candidate). Not together with lay_on_face or rotate.
-                         "at": [10, 10]},
+                         "at": [10, 10],                    # optional: the bbox min corner on the bed
+                         "support_spread": [21, 0.5, 0.5, 3]},  # optional: mm of support past the box on -x, +x, -y, +y
+                                            # (else a solo slice with --probe-supports, else an estimate); "brim_margin": 5.2
+                                            # replaces brim and support spread on every side
                         {"name": "label", "parts": [{"path": "/abs/label.stl", "filament": 1},
                                                     {"path": "/abs/text.stl", "filament": 2}]}],
               "pause_at_z": [4.2],
-              "colour_changes": [{"z": 10.2, "filament": 2}]}]
+              "colour_changes": [{"z": 10.2, "filament": 2}],
+              "wipe_tower": "auto"}]                   # two-filament plates: "auto" (default) finds a free spot both
+                                                       # nozzles reach; {"x": 172, "y": 150, "width": 22,
+                                                       # "rib_wall": false, "brim": 2} fixes it; false = no tower (WARN).
+                                                       # width, rib_wall and brim are one value per project in Studio.
 }
+Unknown keys are dropped with a warning (`shambu spec` lists them), so a typo such as "brim_margn" shows.
 """
 
 from __future__ import annotations
@@ -44,11 +52,62 @@ from typing import Any
 
 from .errors import BuildError
 from .mesh import Orientation
+from .tower import WIDTH_RANGE, TowerSettings
 
 BED_TYPES = ("Default Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Textured PEI Plate", "Supertack Plate")
 SUBTYPES = ("normal_part", "negative_part", "modifier_part", "support_enforcer", "support_blocker")
 PRINT_SEQUENCES = ("by layer", "by object")
 COLOUR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+# The keys each JSON object may hold. Anything else is dropped with a warning (Spec.warnings), never silently.
+KNOWN_KEYS = {
+    "spec": {"name", "outdir", "printer", "process", "filaments", "plates", "bed_type", "filament_map", "aux_x_limit", "layout",
+             "_sweep"},  # _sweep: the provenance `sweep --write-spec` writes
+    "process": {"base", "name", "recipes", "set"},
+    "filament": {"preset", "colour", "name", "set", "colour_note"},
+    "layout": {"gap", "edge"},
+    "plate": {"name", "parts", "pause_at_z", "colour_changes", "colour_change", "print_sequence", "group_by_filament", "wipe_tower"},
+    "part": {
+        "path", "parts", "name", "filament", "count", "subtype", "recipes", "set", "height_ranges", "at", "brim_margin", "support_spread",
+        "lay_on_face", "rotate", "orientation",
+    },
+    "file": {"path", "filament", "subtype"},
+    "height_range": {"min_z", "max_z", "set", "range_params"},
+    "colour_change": {"z", "filament", "colour"},
+    "wipe_tower": {"x", "y", "width", "rib_wall", "brim"},
+}  # fmt: skip
+
+
+def unknown_keys(d, kind: str, where: str) -> list[str]:
+    """One warning per key of `d` that a `kind` object does not read."""
+    if not isinstance(d, dict):
+        return []
+    extra = sorted(str(k) for k in d if k not in KNOWN_KEYS[kind])
+    return [f"{where}: unknown key {k!r} ignored (known: {', '.join(sorted(KNOWN_KEYS[kind]))})" for k in extra]
+
+
+def spec_warnings(d: dict) -> list[str]:
+    """Every unknown key in a spec document, per object, in document order."""
+    out = unknown_keys(d, "spec", "spec")
+    out += unknown_keys(d.get("process") or {}, "process", "process")
+    out += unknown_keys(d.get("layout") or {}, "layout", "layout")
+    for i, f in enumerate(d.get("filaments") or [], 1):
+        out += unknown_keys(f, "filament", f"filament {i}")
+    for pi, pl in enumerate(d.get("plates") or [], 1):
+        if not isinstance(pl, dict):
+            continue
+        out += unknown_keys(pl, "plate", f"plate {pi}")
+        out += unknown_keys(pl.get("wipe_tower"), "wipe_tower", f"plate {pi} wipe_tower")
+        for c in pl.get("colour_changes", pl.get("colour_change")) or []:
+            out += unknown_keys(c, "colour_change", f"plate {pi} colour change")
+        for si, part in enumerate(pl.get("parts") or [], 1):
+            if not isinstance(part, dict):
+                continue
+            out += unknown_keys(part, "part", f"plate {pi} part {si}")
+            for fi, f in enumerate(part.get("parts") or [], 1):
+                out += unknown_keys(f, "file", f"plate {pi} part {si} file {fi}")
+            for r in part.get("height_ranges") or []:
+                out += unknown_keys(r, "height_range", f"plate {pi} part {si} height range")
+    return out
 
 
 def _strs(d: dict | None) -> dict[str, str]:
@@ -60,6 +119,19 @@ def recipe_ranges(name: str) -> list[HeightRangeSpec]:
 
     r = by_name().get(name)
     return [HeightRangeSpec(float(h["min_z"]), float(h["max_z"]), _strs(h["set"])) for h in (r.height_ranges if r else ())]
+
+
+def _support_spread(v) -> tuple[float, float, float, float] | None:
+    """A part's `support_spread`: four non-negative numbers [mx, px, my, py] (mm past the box on -x, +x, -y, +y)."""
+    if v is None:
+        return None
+    try:
+        out = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        out = ()
+    if len(out) != 4 or any(x < 0 for x in out) or isinstance(v, (str, dict)):
+        raise BuildError(f"support_spread must be four non-negative numbers [mx, px, my, py] in mm, got {v!r}")
+    return (out[0], out[1], out[2], out[3])
 
 
 @dataclass(frozen=True)
@@ -99,6 +171,7 @@ class PartSpec:
     at: tuple[float, float] | None = None
     brim_margin: float | None = None
     orientation: Orientation = field(default_factory=Orientation)
+    support_spread: tuple[float, float, float, float] | None = None  # mm past the box on -x, +x, -y, +y (layout.Spread)
 
     def files(self) -> list[FileRef]:
         if self.parts:
@@ -138,6 +211,7 @@ class PartSpec:
             (float(d["at"][0]), float(d["at"][1])) if d.get("at") else None,
             float(d["brim_margin"]) if d.get("brim_margin") is not None else None,
             Orientation.from_json(d),
+            _support_spread(d.get("support_spread")),
         )
 
     def to_json(self) -> dict:
@@ -161,7 +235,72 @@ class PartSpec:
         if self.brim_margin is not None:
             d["brim_margin"] = self.brim_margin
         d.update(self.orientation.to_json())
+        if self.support_spread is not None:
+            d["support_spread"] = list(self.support_spread)
         return d
+
+
+def _num_field(v, what: str) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise BuildError(f"{what} must be a number, got {v!r}")
+    return float(v)
+
+
+@dataclass(frozen=True)
+class WipeTowerSpec:
+    """A plate's prime tower. `mode` "auto" (the default for a plate with two or more filaments) lets shambu find a
+    free spot both extruders reach; "fixed" puts it at (x, y); "off" writes enable_prime_tower 0 (a WARN line).
+    width, rib_wall and brim are None for the process value; Studio keeps one value of each per project."""
+
+    mode: str = "auto"
+    x: float | None = None
+    y: float | None = None
+    width: float | None = None
+    rib_wall: bool | None = None
+    brim: float | None = None
+
+    @classmethod
+    def from_json(cls, v, plate_no: int) -> WipeTowerSpec:
+        where = f"plate {plate_no} wipe_tower"
+        if v is None or v == "auto" or v is True:
+            return cls("auto")
+        if v is False:
+            return cls("off")
+        if not isinstance(v, dict):
+            raise BuildError(f'{where} must be "auto", false or {{"x", "y", "width", "rib_wall", "brim"}}, got {v!r}')
+        for k in ("x", "y"):
+            if k not in v:
+                raise BuildError(f"{where} needs '{k}' (or use \"auto\")")
+        width = _num_field(v["width"], f"{where} width") if v.get("width") is not None else None
+        if width is not None and not WIDTH_RANGE[0] <= width <= WIDTH_RANGE[1]:
+            raise BuildError(f"{where} width {width:g} is outside {WIDTH_RANGE[0]:g}..{WIDTH_RANGE[1]:g} mm")
+        rib = v.get("rib_wall")
+        if rib is not None and not isinstance(rib, bool):
+            raise BuildError(f"{where} rib_wall must be true or false, got {rib!r}")
+        brim = _num_field(v["brim"], f"{where} brim") if v.get("brim") is not None else None
+        if brim is not None and brim < 0:
+            raise BuildError(f"{where} brim {brim:g} must be 0 or more (leave it out for Studio's auto brim)")
+        return cls("fixed", _num_field(v["x"], f"{where} x"), _num_field(v["y"], f"{where} y"), width, rib, brim)
+
+    def to_json(self):
+        if self.mode == "auto":
+            return "auto"
+        if self.mode == "off":
+            return False
+        d: dict[str, Any] = {"x": self.x, "y": self.y}
+        for k in ("width", "rib_wall", "brim"):
+            if getattr(self, k) is not None:
+                d[k] = getattr(self, k)
+        return d
+
+    def settings(self, base: TowerSettings) -> TowerSettings:
+        """The process settings with this spec's width, rib wall and brim on top."""
+        return replace(
+            base,
+            width=self.width if self.width is not None else base.width,
+            rib_wall=self.rib_wall if self.rib_wall is not None else base.rib_wall,
+            brim=self.brim if self.brim is not None else base.brim,
+        )
 
 
 @dataclass(frozen=True)
@@ -172,6 +311,7 @@ class PlateSpec:
     colour_changes: tuple[ColourChange, ...] = ()
     print_sequence: str | None = None  # None = the process preset's print_sequence (by layer unless the user set it)
     group_by_filament: bool = False  # by object: merge single-file parts with one filament and identical settings into one object
+    wipe_tower: WipeTowerSpec = field(default_factory=WipeTowerSpec)  # used only when the plate prints two or more filaments
 
     @property
     def by_object(self) -> bool:
@@ -193,6 +333,7 @@ class PlateSpec:
             ),
             str(d["print_sequence"]).replace("_", " ") if d.get("print_sequence") else None,
             bool(d.get("group_by_filament", False)),
+            WipeTowerSpec.from_json(d.get("wipe_tower"), i),
         )
 
     def to_json(self) -> dict:
@@ -201,6 +342,8 @@ class PlateSpec:
             d["print_sequence"] = self.print_sequence
         if self.group_by_filament:
             d["group_by_filament"] = True
+        if self.wipe_tower.mode != "auto":
+            d["wipe_tower"] = self.wipe_tower.to_json()
         if self.pause_at_z:
             d["pause_at_z"] = list(self.pause_at_z)
         if self.colour_changes:
@@ -251,6 +394,7 @@ class Spec:
     filament_map: tuple[int, ...] | None = None
     aux_x_limit: float | None = None
     layout: LayoutSpec = LayoutSpec()
+    warnings: tuple[str, ...] = field(default=(), compare=False)  # unknown keys dropped while parsing
 
     @classmethod
     def from_json(cls, d: dict, recipe_sets: dict[str, dict[str, str]] | None = None) -> Spec:
@@ -269,6 +413,8 @@ class Spec:
             pset.update(recipe_sets[r])
         pset.update(_strs(pr.get("set")))
         lay = d.get("layout", {})
+        # Different tower sizes on two plates are a plan problem, compared after resolving against the process
+        plates = tuple(PlateSpec.from_json(p, i, recipe_sets) for i, p in enumerate(d["plates"], 1))
         return cls(
             str(d["name"]),
             Path(d["outdir"]),
@@ -278,11 +424,12 @@ class Spec:
                 FilamentSpec(str(f.get("preset") or LOADED), f.get("colour"), f.get("name"), _strs(f.get("set")), f.get("colour_note"))
                 for f in d["filaments"]
             ),
-            tuple(PlateSpec.from_json(p, i, recipe_sets) for i, p in enumerate(d["plates"], 1)),
+            plates,
             d.get("bed_type", "Textured PEI Plate"),
             tuple(int(x) for x in d["filament_map"]) if d.get("filament_map") else None,
             float(d["aux_x_limit"]) if d.get("aux_x_limit") is not None else None,
             LayoutSpec(float(lay.get("gap", 5.0)), float(lay.get("edge", 2.0))),
+            tuple(spec_warnings(d)),
         )
 
     def to_json(self) -> dict:
@@ -424,8 +571,19 @@ class SpecBuilder:
         colour_changes: tuple[ColourChange, ...] = (),
         print_sequence: str | None = None,
         group_by_filament: bool = False,
+        wipe_tower: WipeTowerSpec | None = None,
     ) -> SpecBuilder:
-        self._plates.append(PlateSpec(name, tuple(parts), tuple(pause_at_z), tuple(colour_changes), print_sequence, group_by_filament))
+        self._plates.append(
+            PlateSpec(
+                name,
+                tuple(parts),
+                tuple(pause_at_z),
+                tuple(colour_changes),
+                print_sequence,
+                group_by_filament,
+                wipe_tower or WipeTowerSpec(),
+            )
+        )
         return self
 
     @staticmethod

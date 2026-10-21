@@ -211,3 +211,67 @@ def test_recipes_have_unique_names_and_string_values():
 def test_recipes_describe_filters_scope():
     assert len(R.describe("object")) == sum(r.scope == "object" for r in R.RECIPES)
     assert R.recipe_settings()["solid-part"]["sparse_infill_density"] == "100%"
+
+
+# ---------------------------------------------------------------------------- wipe_tower and unknown keys
+X2D_FACTS = {
+    "bed": {"x": (0.0, 256.0), "y": (0.0, 256.0)},
+    "extruders": [{"index": 1, "x": (0.0, 256.0), "y": (0.0, 256.0)}, {"index": 2, "x": (20.5, 256.0), "y": (0.0, 256.0)}],
+}
+
+
+def test_wipe_tower_parses_a_spot_auto_and_false(tmp_path):
+    d = spec_json(tmp_path)
+    d["plates"][0]["wipe_tower"] = {"x": 172, "y": 150, "width": 22, "rib_wall": False, "brim": 2}
+    wt = Spec.from_json(d).plates[0].wipe_tower
+    assert (wt.mode, wt.x, wt.y, wt.width, wt.rib_wall, wt.brim) == ("fixed", 172.0, 150.0, 22.0, False, 2.0)
+    assert Spec.from_json(Spec.from_json(d).to_json()).plates[0].wipe_tower == wt  # round trip
+    d["plates"][0]["wipe_tower"] = "auto"
+    assert Spec.from_json(d).plates[0].wipe_tower.mode == "auto"
+    d["plates"][0]["wipe_tower"] = False
+    assert Spec.from_json(d).plates[0].wipe_tower.mode == "off"
+    del d["plates"][0]["wipe_tower"]
+    assert Spec.from_json(d).plates[0].wipe_tower.mode == "auto"  # the default
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ({"x": "172", "y": 150}, "plate 1 wipe_tower x must be a number"),
+        ({"y": 150}, "plate 1 wipe_tower needs 'x'"),
+        ({"x": 172, "y": 150, "width": 70}, "width 70 is outside 10..60"),
+        ({"x": 172, "y": 150, "rib_wall": "no"}, "rib_wall must be true or false"),
+        ("left", 'plate 1 wipe_tower must be "auto", false'),
+    ],
+)
+def test_wipe_tower_rejects_bad_values(tmp_path, value, match):
+    d = spec_json(tmp_path)
+    d["plates"][0]["wipe_tower"] = value
+    with pytest.raises(BuildError, match=match):
+        Spec.from_json(d)
+
+
+def test_unknown_keys_are_warnings_not_errors(tmp_path):
+    d = spec_json(tmp_path)
+    d["plates"][0]["parts"][0]["brim_margn"] = 3
+    d["plates"][0]["wipe_tower"] = {"x": 172, "y": 150, "widht": 22}
+    d["colour"] = "#000000"
+    s = Spec.from_json(d)
+    assert s.validate() == []
+    assert any(w.startswith("plate 1 part 1: unknown key 'brim_margn' ignored") for w in s.warnings)
+    assert any(w.startswith("plate 1 wipe_tower: unknown key 'widht' ignored") for w in s.warnings)
+    assert any(w.startswith("spec: unknown key 'colour' ignored") for w in s.warnings)
+    assert Spec.from_json(spec_json(tmp_path)).warnings == ()
+
+
+def test_support_spread_is_a_known_part_key(tmp_path):
+    d = spec_json(tmp_path)
+    d["plates"][0]["parts"][0]["support_spread"] = [21, 0.5, 0.5, 3]
+    s = Spec.from_json(d)
+    assert s.warnings == () and s.plates[0].parts[0].support_spread == (21.0, 0.5, 0.5, 3.0)
+
+
+def test_a_written_specs_sweep_provenance_is_not_an_unknown_key(tmp_path):
+    d = spec_json(tmp_path)
+    d["_sweep"] = {"variant": "fast", "studio_estimate_s": 100}
+    assert Spec.from_json(d).warnings == ()

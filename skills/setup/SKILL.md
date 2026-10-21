@@ -27,20 +27,28 @@ ls /Applications/BambuStudio.app/Contents/MacOS/BambuStudio && defaults read /Ap
 ## 2. Install or update the CLI
 
 ```
-uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu"
-shambu --version
+uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@v0.4.0"
+shambu --version        # must print: shambu 0.4.0
 ```
 
-If `shambu` is not found afterwards, run `uv tool update-shell` and open a new shell (the uv tool bin dir must be
-on PATH). Alternative without a persistent install: `uvx --from "git+https://github.com/Shavvimal/shambu" shambu doctor`.
+The tag matches this setup text, and the `/shambu` skill text expects the same version. If `shambu` is not found
+afterwards, run `uv tool update-shell` and open a new shell (the uv tool bin dir must be on PATH). Alternative
+without a persistent install: `uvx --from "git+https://github.com/Shavvimal/shambu@v0.4.0" shambu doctor --expect-version 0.4.0`.
+
+Install from the tag above, not from a local checkout: `uv tool install .` copies the code once and does not follow
+the plugin (that is how a 0.2.1 CLI ran under a 0.3.0 plugin). A checkout is for development only.
 
 ## 3. Check the machine
 
 ```
-shambu doctor
+shambu --version                        # must print: shambu 0.4.0
+shambu doctor --expect-version 0.4.0
 ```
 
-Expected: the Bambu Studio version and binary, the profile sources (Application Support copy first, then the app
+Run `shambu --version` first: every release prints it. If it shows another number, step 2 did not take: run it
+again and open a new shell. A usage error on `--expect-version` (`unrecognized arguments`) means the installed CLI
+predates 0.4.0: run step 2. Exit 3 with `skill expects 0.4.0: MISMATCH` means the same. Expected:
+the shambu version and how it was installed, the Bambu Studio version and binary, the profile sources (Application Support copy first, then the app
 bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is stored
 (the code itself is never printed), the machine's bed and per-extruder reach, the spools loaded on the printer
 (`loaded on the printer (read HH:MM ...)`, one line per nozzle with the resolved preset name, and a `MISMATCH`
@@ -68,8 +76,12 @@ endpoint.
 
 ## 5. Updating
 
-After `/plugin update shambu@shambu`, run `uv tool upgrade shambu` (or the install line above) so the CLI matches
-the plugin version, then `/reload-plugins`. `shambu doctor` prints the installed version.
+1. `/plugin marketplace update shambu` (refreshes the local copy of the repo; without it, `/plugin update` finds nothing new).
+2. `/plugin update shambu@shambu`, then `/reload-plugins`.
+3. Run `/shambu:setup install` again: the new setup text pins the matching tag in step 2. Not `uv tool upgrade
+   shambu`: it keeps the old source (a tag or a local folder). The line it runs is
+   `uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@vX.Y.Z"` with the new version.
+4. `shambu doctor --expect-version 0.4.0` exits 0.
 
 ## Troubleshooting
 
@@ -77,3 +89,7 @@ the plugin version, then `/reload-plugins`. `shambu doctor` prints the installed
 - `StudioError: Bambu Studio binary not found`: Bambu Studio is not in `/Applications`.
 - `PrinterError: no access code stored`: open the printer once in Bambu Studio's Device tab so the code is saved.
 - `paho-mqtt missing`: reinstall with the `--reinstall` line above.
+- `PresetError: filament preset 'loaded' not found`: the CLI is older than 0.3.0. Run step 2.
+- `unrecognized arguments: --expect-version`: the CLI is older than 0.4.0. Run step 2.
+- `doctor` exit 3 with `MISMATCH`: the CLI and the plugin differ. Run step 2; if `shambu --version` still shows the
+  old number, `which -a shambu` lists the other copy on PATH.

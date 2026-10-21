@@ -35,3 +35,8 @@ class PrinterError(BambuError):
 
 class BuildError(BambuError):
     """A plate spec is invalid or the pipeline could not finish."""
+
+
+class FileError(BambuError):
+    """A file or folder shambu had to create, write or replace could not be: the operation and the path, from the
+    OSError at the orchestration boundary (exit 3 at the CLI, one JSON document with --json)."""

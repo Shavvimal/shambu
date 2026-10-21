@@ -511,3 +511,11 @@ def test_sweep_carries_the_fallback_warning_and_the_sources(capsys, tmp_path, st
     _, out, _ = run(capsys, "--json", "sweep", str(p), "--by-object", "--no-slice")
     j = json.loads(out)
     assert all(r["warnings"][0].startswith("WARNING: printer not read") and r["filaments"].startswith("Filaments: WARNING") for r in j)
+
+
+def test_one_identifier_detector_for_the_facade_and_calibrate():
+    from shambu import calibrate, conf, facade
+
+    assert facade.redact_ip is conf.redact_ip and calibrate.identifying is conf.identifying
+    assert conf.redact_ip("Studio 02.08.02.61 at fd00:1234:abcd::42 and printer.local") == "Studio 02.08.02.61 at <ip> and <host>"
+    assert conf.identifying("[fd00::42]:8883") and conf.identifying("printer.local") and not conf.identifying("v02.08.02.61")
