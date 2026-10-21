@@ -26,6 +26,7 @@ Rules the code follows:
 from __future__ import annotations
 
 import copy
+import io
 import json
 import math
 import os
@@ -33,7 +34,8 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -976,3 +978,35 @@ class Project:
             except FileNotFoundError:
                 pass
             raise
+
+
+# ---------------------------------------------------------------------------- streaming read (no Project load)
+_PLATE_GCODE = re.compile(r"Metadata/plate_(\d+)\.gcode")
+
+
+def plate_gcode_names(path: str) -> list[str]:
+    """The `Metadata/plate_N.gcode` entries of a .gcode.3mf, from the zip directory only (nothing is decompressed)."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            return sorted((n for n in z.namelist() if _PLATE_GCODE.fullmatch(n)), key=lambda n: int(_PLATE_GCODE.fullmatch(n).group(1)))  # type: ignore[union-attr]
+    except (zipfile.BadZipFile, OSError, EOFError) as e:
+        raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
+
+
+@contextmanager
+def open_text_entry(path: str, name: str) -> Iterator[io.TextIOWrapper]:
+    """One zip entry as streamed text (UTF-8, bad bytes replaced): a 76 MB plate G-code is read line by line, and no
+    other entry is decompressed. `Project` loads every entry; this does not."""
+    try:
+        z = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError, EOFError) as e:
+        raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
+    try:
+        try:
+            raw = z.open(name)
+        except KeyError as e:
+            raise ProjectError(f"{path}: no entry {name!r} in the zip") from e
+        with io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="") as f:
+            yield f
+    finally:
+        z.close()
