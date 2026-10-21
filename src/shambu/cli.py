@@ -27,6 +27,7 @@ from .patches import (
     PatchSet,
     RenameObject,
     RenamePlate,
+    RepairNozzleStats,
     SetBedType,
     SetBedTypeEverywhere,
     SetExtruder,
@@ -355,7 +356,11 @@ class SpecCmd(Command):
         if isinstance(s, int):
             return s
         errs = s.validate()
-        out.emit({"ok": not errs, "problems": errs}, ["spec ok" if not errs else "spec problems:"] + ["- " + e for e in errs])
+        warns = list(s.warnings)
+        out.emit(
+            {"ok": not errs, "problems": errs, "warnings": warns},
+            ["spec ok" if not errs else "spec problems:"] + ["- " + e for e in errs] + ["WARNING: " + w for w in warns],
+        )
         return 0 if not errs else 1
 
 
@@ -767,6 +772,7 @@ class Inspect(Command):
             f"printer {s['printer']}; process {s['process']}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']}); "
             f"print sequence {s.get('print_sequence') or 'not set (by layer)'}",
         ]
+        lines += [f"not re-sliceable by the CLI: {x}" for x in s.get("reslice_problems") or []]
         for f in s["filaments"]:
             lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}")
         for p in s["plates"]:
@@ -820,6 +826,11 @@ class PatchCmd(Command):
         p.add_argument("--custom-gcode", action="append", default=[], metavar="PLATE:Z:GCODE")
         p.add_argument("--rename-plate", action="append", default=[], metavar="PLATE:NAME")
         p.add_argument("--rename-object", action="append", default=[], metavar="OLD:NEW")
+        p.add_argument(
+            "--repair-nozzle-stats",
+            action="store_true",
+            help="make an unsliced CLI export re-sliceable: extruder_nozzle_stats, filament_extruder_variant blocks, filament maps",
+        )
         p.add_argument("--dry-run", action="store_true")
 
     def run(self, a, app, out):
@@ -883,6 +894,8 @@ class PatchCmd(Command):
         for x in a.rename_object:
             old, new = x.split(":", 1)
             ps.add(RenameObject(old, new))
+        if a.repair_nozzle_stats:
+            ps.add(RepairNozzleStats())
         return ps
 
 

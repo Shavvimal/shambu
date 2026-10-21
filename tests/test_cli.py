@@ -69,7 +69,7 @@ def write_spec(tmp_path, **over):
 
 def test_spec_validate_ok(capsys, tmp_path):
     code, out, _ = run(capsys, "--json", "spec", str(write_spec(tmp_path)))
-    assert (code, one_json(out)) == (0, {"ok": True, "problems": []})
+    assert (code, one_json(out)) == (0, {"ok": True, "problems": [], "warnings": []})
 
 
 def test_spec_validate_problems_exit_1(capsys, tmp_path):
@@ -588,3 +588,33 @@ def test_install_kind_names_the_installer_only_with_proof(monkeypatch, tmp_path)
     assert facade._installer() is None
     (tmp_path / "uv-receipt.toml").write_text("[tool]\n")
     assert facade._installer() == "uv tool"
+
+
+def test_inspect_flags_an_export_the_cli_cannot_reslice(capsys, tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[])
+    code, out, _ = run(capsys, "inspect", str(f))
+    assert code == 0
+    assert 'not re-sliceable by the CLI: extruder_nozzle_stats [] (Studio exits -100 "No valid nozzle found")' in out
+
+
+def test_patch_repair_nozzle_stats_flag(capsys, tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[], extruder_max_nozzle_count=["1", "1"])
+    code, out, _ = run(capsys, "--json", "patch", str(f), "--repair-nozzle-stats")
+    assert code == 0 and one_json(out)["patched"][0].startswith("extruder_nozzle_stats")
+    code, out, _ = run(capsys, "inspect", str(f))
+    assert "not re-sliceable" not in out
+
+
+def test_spec_lists_unknown_keys_as_warnings(capsys, tmp_path, stls):
+    spec = {
+        "name": "s",
+        "outdir": str(tmp_path),
+        "printer": "P",
+        "process": {"base": "B"},
+        "filaments": [{"preset": "F"}],
+        "plates": [{"name": "p", "parts": [{"path": str(stls["body"]), "brim_margn": 2}]}],
+    }
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(spec))
+    code, out, _ = run(capsys, "--json", "spec", str(f))
+    assert code == 0 and one_json(out)["warnings"][0].startswith("plate 1 part 1: unknown key 'brim_margn'")

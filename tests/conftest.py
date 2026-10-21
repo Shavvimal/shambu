@@ -403,6 +403,38 @@ SLICED_PLATES: list[dict] = [
 ]
 
 
+TOWER_PROCESS_KEYS = ("prime_tower_width", "prime_tower_rib_wall", "prime_tower_brim_width", "enable_prime_tower")
+
+
+def write_cli_tower(project: Path, args: list[str]) -> None:
+    """What the real CLI writes into the exported project for the tower: `--wipe-tower-x/y` vectors and the tower
+    keys of the loaded process JSON. Without it a fixture could not pass the tower verification."""
+    from shambu.threemf import PROJECT_SETTINGS, Project
+
+    found: dict = {}
+    for a in args:
+        for axis in ("x", "y"):
+            if a.startswith(f"--wipe-tower-{axis}="):
+                found[f"wipe_tower_{axis}"] = a.split("=", 1)[1].split(",")
+    for i, a in enumerate(args):
+        if a == "--load-settings" and i + 1 < len(args):
+            value = args[i + 1]
+        elif a.startswith("--load-settings="):
+            value = a.split("=", 1)[1]
+        else:
+            continue
+        for path in value.split(";"):
+            if path.endswith("process.json") and Path(path).is_file():
+                proc = json.loads(Path(path).read_text(encoding="utf-8"))
+                found.update({k: proc[k] for k in TOWER_PROCESS_KEYS if k in proc})
+    if not found:
+        return
+    p = Project(str(project))
+    p.project_settings.update(found)
+    p._dirty.add(PROJECT_SETTINGS)  # no slice invalidation: the fake writes what the export itself holds
+    p.save(str(project))
+
+
 @dataclass
 class FakeStudio:
     """Same surface as StudioCLI. `run()` copies `fixture` to the expected output, or fails with `code`; `result` adds
@@ -478,6 +510,7 @@ class FakeStudio:
             log.write_text("$ fake\n", encoding="utf-8")
         if self.code == 0 and expect_output is not None and self.fixture is not None:
             shutil.copyfile(self.fixture, expect_output)
+            write_cli_tower(expect_output, args)
         res = (
             {"return_code": self.code, **self.result}
             if self.result is not None

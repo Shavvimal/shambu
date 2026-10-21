@@ -153,9 +153,19 @@ RECIPES: tuple[Recipe, ...] = (
             "thick_bridges": "0",
             "enable_prime_tower": "1",
         },
-        "PETG part with PLA interface or PLA part with PETG interface; they barely bond. Expect a prime tower.",
-        "notes / research 08 (Studio's support_recommended_params.json, which the headless CLI never applies)",
-        "Filament 2 must be the other material on nozzle 2 (filament_map 1,2); supported features must sit at x >= 20.5. "
+        "PETG part with PLA interface or PLA part with PETG interface; they barely bond. The plate counts as two filaments even "
+        "though only the supports use filament 2, so Studio builds a prime tower sized by the tallest part (with the rib wall: "
+        "41 mm square plus an 8 mm brim for a 218 mm part, 35 mm plus 2.6 mm for a 32 mm part). Give the plate a wipe_tower "
+        "spot both extruders reach (x >= 20.5), or let "
+        '"auto" find one; if no spot fits, use rib_wall false and a 22 mm width.',
+        "notes / research 08 (Studio's support_recommended_params.json, which the headless CLI never applies); "
+        "plate 14 and seed runs 2026-10-21 (reference 06, prime tower; reference 03, re-slicing a CLI export)",
+        "Filament 2 must be the other material on nozzle 2 (filament_map 1,2). Every supported part must sit at x >= 20.5 plus "
+        "its interface spread (brim margin plus 3 mm), because extruder 2 (right nozzle) prints the interface (2.2 mm past "
+        "the part box measured, n=1; "
+        "the seed build exited -102 at x 14.3). Measured on plate 14 (n=1): the tower adds 27 min and 71 g over no tower "
+        "(19.25 h against 18.8 h). An unsliced export without the RepairNozzleStats patch exits -100 when re-sliced with "
+        '`--slice 1` ("No valid nozzle found"): `shambu build` applies it, `shambu patch --repair-nozzle-stats` fixes an older file. '
         "Bed temperature follows the hotter filament (PETG 70 C under a PLA part). Bambu prints PLA interface at 230 C and PETG HF "
         "interface at 265 C with a 10 mm3/s cap; the slicer's own table also sets support_interface_speed 50, a per-nozzle array left alone here.",
     ),

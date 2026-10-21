@@ -98,11 +98,96 @@ def test_bad_colours_raise(project_file, colours):
         apply(project_file, X.SetFilamentColours(colours))
 
 
-def test_set_filament_map_project_updates_variant(project_file):
+def test_set_filament_map_project_writes_variant_blocks(project_file):
+    """The conftest fixture holds the short form (one variant per filament, no filament_self_index). The map patch
+    writes one block of extruder variants per filament with a matching filament_self_index, never one entry each."""
     s = apply(project_file, X.SetFilamentMap((1, 2)))
     assert (s["filament_map"], s["filament_map_mode"]) == (["1", "2"], "Manual")
     ps = Project(str(project_file)).project_settings
-    assert ps["filament_extruder_variant"] == ["Direct Drive Standard", "Bowden Standard"]
+    block = ["Direct Drive Standard", "Bowden Standard"]
+    assert ps["filament_extruder_variant"] == block + block
+    assert ps["filament_self_index"] == ["1", "1", "2", "2"]
+
+
+X2D_VARIANTS = [
+    "Direct Drive Standard",
+    "Direct Drive High Flow",
+    "Direct Drive E3D High Flow",
+    "Bowden Standard",
+    "Bowden High Flow",
+    "Bowden E3D High Flow",
+]
+# What an unsliced X2D export held after the old map patch (plate 14): 12 self-index entries, 2 variants, empty stats
+UNSLICED_X2D = {
+    "extruder_nozzle_stats": [],
+    "extruder_max_nozzle_count": ["1", "1"],
+    "printer_extruder_variant": X2D_VARIANTS,
+    "filament_extruder_variant": ["Direct Drive Standard", "Bowden Standard"],
+    "filament_self_index": ["1"] * 6 + ["2"] * 6,
+    "filament_volume_map": ["0"],
+    "filament_nozzle_map": ["1"],
+    "filament_map": ["1", "2"],
+}
+
+
+def test_set_filament_map_keeps_the_x2d_blocks(tmp_path):
+    """Studio pairs filament_extruder_variant with filament_self_index index by index (PrintConfig.cpp:8022-8052):
+    a collapsed list left filament 2 unfindable ('could not found extruder_type ... filament_index 2')."""
+    f = make_3mf(tmp_path / "x2d.3mf", **{**UNSLICED_X2D, "filament_extruder_variant": X2D_VARIANTS * 2})
+    apply(f, X.SetFilamentMap((1, 2)))
+    ps = Project(str(f)).project_settings
+    assert ps["filament_extruder_variant"] == X2D_VARIANTS * 2
+    assert ps["filament_self_index"] == ["1"] * 6 + ["2"] * 6
+    f2 = make_3mf(tmp_path / "x2d-short.3mf", **UNSLICED_X2D)
+    apply(f2, X.SetFilamentMap((1, 2)))  # a collapsed file is rebuilt from the printer's variant list
+    assert Project(str(f2)).project_settings["filament_extruder_variant"] == X2D_VARIANTS * 2
+
+
+def test_repair_nozzle_stats_makes_an_unsliced_export_resliceable(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **UNSLICED_X2D)
+    pr = Project(str(f))
+    assert pr.reslice_problems() and pr.summary()["reslice_problems"][0].startswith("extruder_nozzle_stats []")
+    done = X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert done == [X.RepairNozzleStats().describe()]
+    ps = Project(str(f)).project_settings
+    assert ps["extruder_nozzle_stats"] == ["Standard#1", "Standard#1"]
+    assert ps["filament_extruder_variant"] == X2D_VARIANTS * 2 and len(ps["filament_self_index"]) == 12
+    assert ps["filament_volume_map"] == ["0", "0"] and ps["filament_nozzle_map"] == ["1", "0"]
+    assert Project(str(f)).reslice_problems() == []
+
+
+def test_repair_nozzle_stats_takes_the_filament_preset_variants(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **UNSLICED_X2D)
+    own = tuple(reversed(X2D_VARIANTS))
+    X.PatchSet().add(X.RepairNozzleStats((tuple(X2D_VARIANTS), own))).apply(str(f))
+    assert Project(str(f)).project_settings["filament_extruder_variant"] == X2D_VARIANTS + list(own)
+
+
+def test_repair_nozzle_stats_is_idempotent_and_keeps_the_zip(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#0", "Standard#0"]})
+    ps_set = X.PatchSet().add(X.RepairNozzleStats())
+    first = ps_set.apply(str(f))
+    once = Project(str(f)).read(PROJECT_SETTINGS)
+    with zipfile.ZipFile(f) as z:
+        order = [(i.filename, i.compress_type) for i in z.infolist()]
+    assert ps_set.apply(str(f)) == first
+    assert Project(str(f)).read(PROJECT_SETTINGS) == once
+    with zipfile.ZipFile(f) as z:
+        assert z.testzip() is None
+        assert [(i.filename, i.compress_type) for i in z.infolist()] == order
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["Standard#1", "Standard#1"]
+
+
+def test_repair_refuses_a_block_it_cannot_rebuild(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **{**UNSLICED_X2D, "filament_self_index": ["1"] * 6 + ["2"] * 4})
+    with pytest.raises(ProjectError, match="filament 2 has 4 entries"):
+        X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+
+
+def test_reslice_problems_flags_mismatched_variant_lengths(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#1", "Standard#1"]})
+    (msg,) = Project(str(f)).reslice_problems()
+    assert msg.startswith("filament_extruder_variant has 2 entries but filament_self_index 12")
 
 
 def test_set_filament_map_plate(project_file):
@@ -420,3 +505,170 @@ def test_real_cli_export_round_trip(tmp_path):
     with zipfile.ZipFile(p) as z:
         assert [(i.filename, i.compress_type) for i in z.infolist()] == before
         assert z.testzip() is None
+
+
+# ---------------------------------------------------------------------------- stats precedence (_new wins when non-empty)
+def test_conflicting_stats_keys_repair_the_one_studio_reads(tmp_path):
+    """BambuStudio.cpp:4151-4155: a non-empty extruder_nozzle_stats_new wins over the plain key."""
+    f = make_3mf(
+        tmp_path / "c.3mf",
+        **{
+            **UNSLICED_X2D,
+            "extruder_nozzle_stats": ["Standard#1", "Standard#1"],
+            "extruder_nozzle_stats_new": ["Standard#0", "Standard#0"],
+        },
+    )
+    (msg,) = [m for m in Project(str(f)).reslice_problems() if "nozzle_stats" in m]
+    assert msg.startswith("extruder_nozzle_stats_new ['Standard#0', 'Standard#0']")
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert ps["extruder_nozzle_stats_new"] == ["Standard#1", "Standard#1"] == ps["extruder_nozzle_stats"]
+    assert Project(str(f)).reslice_problems() == []
+
+
+def test_valid_new_key_wins_over_an_empty_plain_key(tmp_path):
+    f = make_3mf(tmp_path / "n.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats_new": ["Standard#1", "Standard#1"]})
+    assert not [m for m in Project(str(f)).reslice_problems() if "nozzle_stats" in m]  # Studio reads _new
+
+
+def test_valid_high_flow_stats_are_byte_identical_after_the_patch(tmp_path):
+    hf = {
+        **UNSLICED_X2D,
+        "nozzle_volume_type": ["High Flow", "Standard"],
+        "extruder_nozzle_stats": ["High Flow#1", "Standard#1|High Flow#1"],
+        "filament_extruder_variant": X2D_VARIANTS * 2,
+        "filament_volume_map": ["0", "0"],
+        "filament_nozzle_map": ["1", "0"],
+    }
+    f = make_3mf(tmp_path / "hf.3mf", **hf)
+    with zipfile.ZipFile(f) as z:
+        before = z.read(PROJECT_SETTINGS)
+    assert X.PatchSet().add(X.RepairNozzleStats()).apply(str(f)) == [X.RepairNozzleStats().describe()]
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["High Flow#1", "Standard#1|High Flow#1"]
+    assert Project(str(f)).read(PROJECT_SETTINGS) == before
+
+
+def test_repair_keeps_a_valid_entry_and_fixes_only_the_zero_one(tmp_path):
+    f = make_3mf(
+        tmp_path / "z.3mf",
+        **{**UNSLICED_X2D, "nozzle_volume_type": ["High Flow", "Standard"], "extruder_nozzle_stats": ["High Flow#1", "Standard#0"]},
+    )
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["High Flow#1", "Standard#1"]
+
+
+def test_repair_then_map_leaves_no_reslice_problem(tmp_path):
+    f = make_3mf(tmp_path / "m.3mf", **UNSLICED_X2D)
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    X.PatchSet().add(X.SetFilamentMap((2, 1))).apply(str(f))
+    assert Project(str(f)).reslice_problems() == []
+    assert Project(str(f)).project_settings["filament_extruder_variant"] == X2D_VARIANTS * 2
+
+
+# ---------------------------------------------------------------------------- review round 2
+P1S = {
+    "filament_settings_id": ["Test PLA"],
+    "filament_type": ["PLA"],
+    "nozzle_diameter": ["0.4"],
+    "extruder_type": ["Direct Drive"],
+    "nozzle_volume_type": ["Standard"],
+    "extruder_max_nozzle_count": ["1"],
+    "extruder_nozzle_stats": [],
+    "filament_extruder_variant": ["Direct Drive Standard"],
+    "filament_self_index": ["1"],
+}
+
+
+def test_empty_stats_are_fine_on_a_one_extruder_printer(tmp_path):
+    """Studio initialises the nozzle stats only on a multi-extruder or multi-nozzle machine (BambuStudio.cpp:6648)."""
+    f = make_3mf(tmp_path / "p1s.3mf", **P1S)
+    assert Project(str(f)).reslice_problems() == []
+    with zipfile.ZipFile(f) as z:
+        before = z.read(PROJECT_SETTINGS)
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).read(PROJECT_SETTINGS) == before
+
+
+def test_a_one_entry_stat_is_too_short_for_the_x2d(tmp_path):
+    f = make_3mf(tmp_path / "x2d.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#1"]})
+    assert any(m.startswith("extruder_nozzle_stats ['Standard#1']") for m in Project(str(f)).reslice_problems())
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["Standard#1", "Standard#1"]
+
+
+def test_only_a_zero_count_new_key_is_found_and_repaired(tmp_path):
+    over = {k: v for k, v in UNSLICED_X2D.items() if k != "extruder_nozzle_stats"}
+    f = make_3mf(tmp_path / "new.3mf", **over, extruder_nozzle_stats_new=["Standard#0", "Standard#0"])
+    assert any(m.startswith("extruder_nozzle_stats_new ['Standard#0', 'Standard#0']") for m in Project(str(f)).reslice_problems())
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert ps["extruder_nozzle_stats_new"] == ["Standard#1", "Standard#1"] and "extruder_nozzle_stats" not in ps
+    assert Project(str(f)).reslice_problems() == []
+
+
+def test_repair_never_adds_variant_keys_to_a_project_without_them(tmp_path):
+    f = make_3mf(tmp_path / "plain.3mf")
+    p = Project(str(f))
+    p.project_settings.pop("filament_extruder_variant")
+    p._touch_ps()
+    p.save(str(f))
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert "filament_extruder_variant" not in ps and "filament_self_index" not in ps
+
+
+def test_untouched_correct_archive_is_byte_identical_after_repair(tmp_path, capsys):
+    from shambu import cli
+
+    f = make_3mf(tmp_path / "ok.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#1", "Standard#1"]})
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))  # make it correct (blocks, maps)
+    before = f.read_bytes()
+    assert cli.main(["patch", str(f), "--repair-nozzle-stats"]) == 0
+    assert f.read_bytes() == before
+    out = tmp_path / "copy.3mf"
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f), str(out))
+    assert out.read_bytes() == before
+
+
+def test_preset_aware_repair_runs_before_the_map_patch(tmp_path):
+    """A collapsed project whose filament presets have two variants each: the map patch alone would rebuild the
+    blocks from the six-variant printer list and refuse; the build's order (preset-aware repair first) works."""
+    two = ("Direct Drive Standard", "Bowden Standard")
+    f = make_3mf(tmp_path / "c.3mf", **{**UNSLICED_X2D, "filament_self_index": ["1", "1", "2", "2"]})
+    with pytest.raises(ProjectError):
+        X.PatchSet().add(X.SetFilamentMap((1, 2))).apply(str(f))
+    X.PatchSet().add(X.RepairNozzleStats((two, two)), X.SetFilamentMap((1, 2))).apply(str(f))
+    ps = Project(str(f)).project_settings
+    assert ps["filament_extruder_variant"] == list(two) * 2 and ps["filament_self_index"] == ["1", "1", "2", "2"]
+
+
+# ---------------------------------------------------------------------------- review round 3
+def test_unchanged_copy_to_another_path_is_atomic(tmp_path, monkeypatch):
+    """The no-op save to a new path goes through the temp file and os.replace: a failed write keeps the destination."""
+    f = make_3mf(tmp_path / "ok.3mf")
+    dest = tmp_path / "dest.3mf"
+    dest.write_bytes(b"existing destination")
+
+    def full(_fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError, match="No space left"):
+        Project(str(f)).save(str(dest))
+    assert dest.read_bytes() == b"existing destination"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dest.3mf", "ok.3mf"]  # no temp file left behind
+    monkeypatch.undo()
+    Project(str(f)).save(str(dest))
+    assert dest.read_bytes() == f.read_bytes()
+
+
+def test_repair_covers_every_extruder_when_volume_types_are_short(tmp_path):
+    """nozzle_diameter has two entries, nozzle_volume_type one: Studio broadcasts the last volume type."""
+    f = make_3mf(
+        tmp_path / "short.3mf",
+        **{**UNSLICED_X2D, "nozzle_volume_type": ["High Flow"], "extruder_max_nozzle_count": ["1", "2"]},
+    )
+    assert Project(str(f)).reslice_problems()
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["High Flow#1", "High Flow#2"]
+    assert not [m for m in Project(str(f)).reslice_problems() if "nozzle_stats" in m]

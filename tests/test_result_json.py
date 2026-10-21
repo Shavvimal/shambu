@@ -303,3 +303,25 @@ def test_sweep_waste_mixes_native_and_parser_per_plate():
     r = S.VariantResult("v", True, "/p", True, [p1, p2])
     assert r.waste_g() == pytest.approx(7.0)
     assert S.VariantResult("v", True, "/p", True, [p1, {"plate": 2, "filaments": [{"id": "1", "used_g": 8.0}]}]).waste_g() is None
+
+
+# ---------------------------------------------------------------------------- exit -100: the exception text
+NOZZLE_LOG = """$ BambuStudio --slice 0 in.3mf
+
+[2026-10-21 15:26:59.033478] [0x1] [info]    update_values_to_printer_extruders_for_multiple_filaments, Line 8896
+[2026-10-21 15:26:59.033883] [0x1] [error]   found slicing or export error for partplate 1
+
+No valid nozzle found. Please check nozzle count.
+[2026-10-21 15:26:59.033905] [0x1] [info]    record_exit_reson:512 Slicer_Info_Report: plate_id=1, return_code=-100
+"""
+
+
+def test_summary_on_exit_100_carries_the_exception_line(tmp_path):
+    log = tmp_path / "run.log"
+    log.write_text(NOZZLE_LOG)
+    rr = RunResult(["BambuStudio"], 156, -100, 1.0, log, {"return_code": -100})
+    assert rr.slicing_error() == "No valid nozzle found. Please check nozzle count."
+    assert rr.summary().startswith("exit -100 (slicing error or critical warning (empty layers / overlap)): No valid nozzle found.")
+    log.write_text(NOZZLE_LOG.replace("\nNo valid nozzle found. Please check nozzle count.", ""))
+    assert rr.slicing_error() is None and ": No valid" not in rr.summary()
+    assert RunResult(["BambuStudio"], 155, -101, 1.0, log, None).slicing_error() is None

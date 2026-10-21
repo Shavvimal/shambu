@@ -69,7 +69,7 @@ def test_effective_filaments_resolves_every_override(stls):
         {
             "path": str(stls["body"]),
             "filament": 1,
-            "set": {"extruder": "2", "support_interface_filament": "3", "support_filament": "0"},
+            "set": {"extruder": "2", "enable_support": "1", "support_interface_filament": "3", "support_filament": "0"},
             "height_ranges": [{"min_z": 0, "max_z": 1, "set": {"extruder": "4"}}],
         }
     )
@@ -103,7 +103,15 @@ def test_support_filament_override_is_checked_against_its_reach(tmp_path, stls, 
         [
             {
                 "name": "p",
-                "parts": [{"path": str(stls["body"]), "filament": 1, "set": {"support_filament": "2"}, "at": [5, 30], "brim_margin": 0}],
+                "parts": [
+                    {
+                        "path": str(stls["body"]),
+                        "filament": 1,
+                        "set": {"enable_support": "1", "support_filament": "2"},
+                        "at": [5, 30],
+                        "brim_margin": 0,
+                    }
+                ],
             }
         ],
     )
@@ -122,13 +130,22 @@ def test_tpu_through_set_extruder_on_aux_fails(tmp_path, stls, resolver):
     assert any("TPU" in t for t in fails(plan))
 
 
-def test_override_filament_makes_the_plate_multi_and_reserves_the_tower(tmp_path, stls, resolver):
+def test_override_filament_makes_the_plate_multi_and_places_a_tower_clear_of_it(tmp_path, stls, resolver):
     plan = plan_of(
         tmp_path,
         resolver,
-        [{"name": "p", "parts": [{"path": str(stls["body"]), "set": {"support_filament": "2"}, "at": [210, 210], "brim_margin": 0}]}],
+        [
+            {
+                "name": "p",
+                "parts": [
+                    {"path": str(stls["body"]), "set": {"enable_support": "1", "support_filament": "2"}, "at": [210, 210], "brim_margin": 0}
+                ],
+            }
+        ],
     )
-    assert any("prime-tower reserve" in t for t in fails(plan))
+    tower = plan.plates[0].tower  # the plate is multi: an "auto" tower lands clear of the part (tower.py)
+    assert tower is not None and tower.footprint is not None
+    assert not L.overlaps(tower.footprint.rect, plan.plates[0].parts[0].placed.rect())
 
 
 # ---------------------------------------------------------------------------- 2. multipart geometry
@@ -302,13 +319,6 @@ def test_inside_bed_counts_the_brim_margin_as_a_clipped_brim():
     assert w.warn and "the 3.0 mm brim reaches x -2.0..24.0" in w.text and "will be clipped at x 0.0..24.0" in w.text
 
 
-def test_reserve_rule_flags_a_fixed_part_in_the_tower_corner():
-    p = L.Placed("a", mesh("a.stl"), 1, 210.0, 210.0, fixed=True)
-    ctx = L.Context(FACTS, reserve=(203.0, 203.0, 256.0, 256.0))
-    assert any("prime-tower reserve" in c.text for c in L.LimitChecker().check([p], ctx) if not c.ok)
-    assert all(c.ok for c in L.LimitChecker().check([p], L.Context(FACTS)))
-
-
 # ---------------------------------------------------------------------------- 8. assemble.validate
 def test_validate_accepts_per_copy_assemble_index(stls):
     al = A.AssembleList(
@@ -345,7 +355,8 @@ def test_any_placer_receives_the_reach_limits(tmp_path, stls, resolver):
 
 def test_report_lists_effective_filaments(tmp_path, stls, resolver):
     r = Pipeline(FakeStudio(), resolver).build(
-        spec(tmp_path, [{"name": "p", "parts": [{"path": str(stls["body"]), "set": {"support_filament": "2"}}]}]), export=False
+        spec(tmp_path, [{"name": "p", "parts": [{"path": str(stls["body"]), "set": {"enable_support": "1", "support_filament": "2"}}]}]),
+        export=False,
     )
     assert "prints with filament(s) 1, 2" in r.report
     json.dumps(r.to_json())

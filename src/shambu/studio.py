@@ -328,8 +328,28 @@ class RunResult:
             )
         return out
 
+    def slicing_error(self) -> str | None:
+        """On exit -100 the CLI writes the exception text to stderr on its own line after `found slicing or export
+        error for partplate N` (BambuStudio.cpp:7413-7418); result.json holds only a generic message. That line, or
+        None when the log is absent or lacks it."""
+        if self.code != -100 or self.log is None:
+            return None
+        try:
+            lines = Path(self.log).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        for i, line in enumerate(lines):
+            if "found slicing or export error for partplate" in line:
+                for nxt in lines[i + 1 :]:
+                    t = nxt.strip()
+                    if not t:
+                        continue
+                    return None if t.startswith("[") else t  # the next line is a log record: no exception text
+        return None
+
     def summary(self) -> str:
-        s = f"exit {self.code} ({self.meaning()}), {self.seconds:.1f} s, log {self.log}"
+        err = self.slicing_error()
+        s = f"exit {self.code} ({self.meaning()})" + (f": {err}" if err else "") + f", {self.seconds:.1f} s, log {self.log}"
         if self.result:
             s += f", prepare {self.result.get('prepare_time')} ms, export {self.result.get('export_time')} ms"
         if self.output:

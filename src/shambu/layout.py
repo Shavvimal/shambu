@@ -642,14 +642,13 @@ def pair_check(a: Placed, b: Placed) -> Check | None:
 
 @dataclass
 class Context:
-    """What the rules need: machine facts, the filament->extruder map, TPU slots, extra limits, and the
-    prime-tower reserve of the plate being checked (None when the plate uses one filament)."""
+    """What the rules need: machine facts, the filament->extruder map, TPU slots and extra limits. The prime tower
+    of a plate is checked by `tower.TowerClear`, which build.py adds to the rule list."""
 
     facts: dict
     filament_extruder: dict[int, int] = field(default_factory=dict)
     tpu_filaments: set[int] = field(default_factory=set)
     aux_x_limit: float | None = None
-    reserve: Rect | None = None
     by_object: bool = False  # the plate prints one object at a time: head clearance and height limits apply
     skirt_extra: float = 0.0  # per-object skirt width (distance + loops x line), added to the by-object gap
 
@@ -737,23 +736,6 @@ class InsideBed:
                     f"{p.key}: the {m:.1f} mm brim reaches x {gb[0]:.1f}..{gb[2]:.1f} y {gb[1]:.1f}..{gb[3]:.1f} and will be clipped "
                     f"at x {clip[0]:.1f}..{clip[2]:.1f} y {clip[1]:.1f}..{clip[3]:.1f} (the bed {size})",
                     "brim",
-                )
-
-
-class ReserveClear:
-    """Nothing (packed or fixed) may cover the prime-tower reserve of a plate that uses two or more filaments."""
-
-    def check(self, placed, ctx):
-        if ctx.reserve is None:
-            return
-        for p in _on_bed(placed):
-            if overlaps(p.rect(with_margin=True), ctx.reserve):
-                r = ctx.reserve
-                yield Check(
-                    False,
-                    f"{p.key} overlaps the prime-tower reserve x {r[0]:.0f}..{r[2]:.0f} y {r[1]:.0f}..{r[3]:.0f} "
-                    f"(the plate uses more than one filament)",
-                    "tower",
                 )
 
 
@@ -901,7 +883,6 @@ class SequentialClearance:
 DEFAULT_RULES: tuple[Rule, ...] = (
     Clearance(),
     InsideBed(),
-    ReserveClear(),
     ExtruderReach(),
     TpuOnMain(),
     MeshSane(),

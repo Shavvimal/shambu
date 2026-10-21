@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -21,9 +22,18 @@ from . import layout as L
 from . import mesh as M
 from . import presets as P
 from . import recipes as R
+from . import tower as T
 from .errors import BambuError, BuildError
 from .loaded import FilamentResolution
-from .patches import AddCustomGcode, PatchSet, RenameObject, SetBedTypeEverywhere, SetFilamentColours, SetFilamentMap
+from .patches import (
+    AddCustomGcode,
+    PatchSet,
+    RenameObject,
+    RepairNozzleStats,
+    SetBedTypeEverywhere,
+    SetFilamentColours,
+    SetFilamentMap,
+)
 from .probe import ProbeRequest, SpreadProbe, StudioProbe
 from .spec import FileRef, LayoutSpec, PartSpec, Spec
 from .studio import CliCommand, MeshInfo, OrientResult, RunResult, SlicedPlate, StudioCLI, arrange_failed_plate, conflicts_in_log
@@ -32,8 +42,7 @@ from .threemf import Project
 log = logging.getLogger(__name__)
 Listener = Callable[[str, dict], None]
 DEFAULT_COLOURS = ("#1A1A1A", "#F0F0F0", "#00AE42", "#0A2989")  # used when the spec gives none; slicing needs one per filament
-WIPE_TOWER_XY = (208.0, 208.0)  # the CLI default (15, 220) runs off the bed (return code -104)
-WIPE_TOWER_RESERVE: L.Rect = (203.0, 203.0, 256.0, 256.0)  # keep parts out of this corner when a plate uses two filaments
+WIPE_TOWER_XY = (208.0, 208.0)  # plates without a tower of their own: the CLI default (15, 220) runs off the bed (-104)
 # Object/region keys that choose a filament slot. 0 means "the object's own filament". The CLI applies print_params
 # after `filaments`, so `extruder` there overrides the file's filament (01-source-cli.md section 2.4 step 3).
 FILAMENT_KEYS = (
@@ -44,7 +53,13 @@ FILAMENT_KEYS = (
     "support_filament",
     "support_interface_filament",
 )
-PRINTING_SUBTYPES = ("normal_part", "modifier_part")  # sub-parts whose filament reaches the nozzle
+PRINTING_SUBTYPES = ("normal_part", "modifier_part")
+TOWER_KEYS = (
+    "prime_tower_width",
+    "prime_tower_rib_wall",
+    "prime_tower_brim_width",
+    "enable_prime_tower",
+)  # set by tower planning  # sub-parts whose filament reaches the nozzle
 UNRESOLVED_FILAMENT = "loaded (unresolved)"  # placeholder preset name for a "loaded" slot the printer did not fill
 FileRefs = Sequence[tuple[Path, int, str]]
 
@@ -56,12 +71,25 @@ def _slot(value: str, where: str) -> int:
         raise BuildError(f"{where} = {value!r} is not a filament slot number") from None
 
 
-def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None) -> set[int]:
+SUPPORT_FILAMENT_KEYS = ("support_filament", "support_interface_filament")
+WALL_INFILL_KEYS = ("wall_filament", "sparse_infill_filament", "solid_infill_filament")
+
+
+def _support_on(settings: Mapping) -> bool:
+    """Studio's "has support material" (support, enforced support layers or a raft): `tower.needs_support`."""
+    return T.needs_support(settings)
+
+
+def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, process: Mapping | None = None) -> set[int]:
     """Every filament slot an object prints with, after all overrides.
 
     A single file prints with its `filament` unless `set.extruder` replaces it. A merged object prints with
     the filaments of its normal and modifier sub-parts (plus `set.extruder`, kept as a conservative extra).
     Support, wall and infill filament keys in `set` and every height range's filament keys add their slot.
+    With `process` (the resolved process: recipes and process.set included), its wall and infill filament keys
+    add their slot for every part, and its support and support-interface filament keys for every part with
+    `enable_support` on: the `dual-material-interface` recipe sets support_interface_filament 2 at process level,
+    and a checker that missed it passed a plate that exited -102 (reference 06 section 5).
     Raises BuildError for a value that is not an integer. Slots are not range-checked here.
     """
     refs = list(files) if files is not None else [(f.path, f.filament, f.subtype) for f in part_spec.files()]
@@ -73,13 +101,37 @@ def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None) -> s
         out |= {fil for _, fil, sub in refs if sub in PRINTING_SUBTYPES}
         if ext:
             out.add(ext)
+    support = _support_on({**(process or {}), **part_spec.set})
     for k in FILAMENT_KEYS[1:]:
+        if k in SUPPORT_FILAMENT_KEYS and not support:
+            continue  # Studio prints no support (or raft) for this part: its support slots are unused
         if k in part_spec.set and (v := _slot(part_spec.set[k], f"set.{k}")):
             out.add(v)
     for r in part_spec.height_ranges:
         for k in FILAMENT_KEYS:
             if k in r.set and (v := _slot(r.set[k], f"height range {r.min_z}..{r.max_z} {k}")):
                 out.add(v)
+    if process is not None:
+        keys = WALL_INFILL_KEYS + (SUPPORT_FILAMENT_KEYS if support else ())
+        for k in keys:
+            if k not in part_spec.set and k in process and (v := _slot(process[k], f"process {k}")):
+                out.add(v)
+    return out
+
+
+def interface_uses(part_spec: PartSpec, process: Mapping, key: str, brim_margin: float, own: int = 0) -> list[T.InterfaceUse]:
+    """The support and support-interface slots a supported part prints with (part `set` first, then the process),
+    for `tower.InterfaceReach`. A slot 0 (the part's own filament) and `own` (the part's main slot) are left out.
+    Raises BuildError for a value that is not a slot number."""
+    if not _support_on({**process, **part_spec.set}):
+        return []
+    out = []
+    for k in SUPPORT_FILAMENT_KEYS:
+        src = "part" if k in part_spec.set else "process"
+        raw = part_spec.set.get(k, process.get(k, "0"))
+        slot = _slot(str(raw).strip() or "0", f"{src} {k}")
+        if slot and slot != own:
+            out.append(T.InterfaceUse(key, k, slot, brim_margin + T.INTERFACE_SPREAD, src))
     return out
 
 
@@ -160,6 +212,7 @@ class PlannedPlate:
     parts: list[PlannedPart]
     checks: list[L.Check] = field(default_factory=list)
     print_sequence: str = "by layer"
+    tower: T.TowerPlan | None = None  # the prime tower of a plate that prints two or more filaments by layer
 
 
 @dataclass
@@ -477,6 +530,7 @@ class Pipeline:
         workdir.mkdir(parents=True, exist_ok=True)
         problems: list[str] = list(resolution.problems) if resolution else []
         warnings: list[str] = list(resolution.warnings) if resolution else []
+        warnings += [w for w in spec.warnings if w not in warnings]  # unknown keys: `check` and `build` warn as `spec` does
         problems += spec.validate()
         machine = self.resolver.for_cli("machine", spec.printer)
         process = self.resolver.for_cli("process", spec.process.base, spec.process.set, spec.process.name)
@@ -541,6 +595,7 @@ class Pipeline:
 
         alist = A.AssembleList()
         plates: list[PlannedPlate] = []
+        requests: list[T.TowerRequest | None] = []  # one per plate; planned together after the loop (one size per project)
         used_keys: set[str] = set()
         k = 0  # assemble_index: unique across the project, as object names are global
         # Native orientation (pass 1) loads the same machine and process JSON as the export (pass 2), so Studio's
@@ -575,10 +630,30 @@ class Pipeline:
                         f"plate {pi} '{pspec.name}': print-by-object, so Studio builds no prime tower; the idle nozzle is not wiped between objects"
                     )
             multi = len({f for p in parts for f in p.placed.filaments}) > 1 and not sequential
-            pctx = replace(ctx, reserve=WIPE_TOWER_RESERVE if multi else None, by_object=sequential)
+            # Smooth timelapse needs a tower on a one-filament plate too (PartPlate.cpp:2222-2223)
+            multi = multi or (T.smooth_timelapse(process) and not sequential)
+            try:
+                uses = tuple(
+                    u
+                    for p in parts
+                    for u in interface_uses(p.spec, process, p.key, L.brim_margin({**process, **p.spec.set}), p.placed.filament)
+                )
+            except BuildError as e:
+                problems.append(f"plate {pi} '{pspec.name}': {e}")
+                uses = ()
+            spread = {u.key: u.interface_spread for u in uses}
+            for p in parts:  # the interface prints past the part box on every side: pack and check with that margin
+                if p.key in spread:
+                    p.placed.brim = max(p.placed.brim, spread[p.key])
             fixed = [p.placed for p in parts if p.placed.fixed]
             free = [p.placed for p in parts if not p.placed.fixed]
-            obstacles = [WIPE_TOWER_RESERVE] if multi else []
+            # The tower footprint (fixed spot, or a provisional back-right corner for "auto") keeps packed parts out;
+            # TowerClear checks the final footprint after every plate is planned.
+            reserve, tower_base = self._tower_reserve(
+                pspec, pi, multi, parts, bool(free), process, filaments, facts, spec, problems, warnings
+            )
+            pctx = replace(ctx, by_object=sequential)
+            obstacles = [reserve] if reserve else []
             placement_checks: list[L.Check] = []
             overflow = False
             if free:
@@ -603,7 +678,10 @@ class Pipeline:
                     )
             for p in parts:
                 p.place_members()
-            checks = placement_checks + self.checker.check([p.placed for p in parts], pctx)
+            requests.append(self._tower_request(pspec, pi, multi, parts, tower_base, facts, spec) if not overflow else None)
+            extra: tuple = (T.InterfaceReach(uses),) if uses else ()  # TowerClear runs after every plate is planned
+            checker = replace(self.checker, rules=self.checker.rules + extra) if isinstance(self.checker, L.LimitChecker) else self.checker
+            checks = placement_checks + checker.check([p.placed for p in parts], pctx)
             checks += self._subpart_checks([p for p in parts if p.placed.placed], pctx)
             plate = A.Plate(
                 name=pspec.name or f"plate {pi}",
@@ -672,9 +750,98 @@ class Pipeline:
                 )
             alist.plates.append(plate)
             plates.append(PlannedPlate(plate.name, parts, checks, seq))
+        self._plan_towers(plates, requests, spec)
+        problems += self._tower_globals(plates, process)
         warnings += self._name_objects([x for p in plates for x in p.parts])
         problems += A.validate(alist.to_json(), known_keys=known, filament_count=len(filaments))
         return Plan(spec, outdir, workdir, machine, process, filaments, facts, fmap, plates, alist, problems, warnings, resolution)
+
+    # ---------------------------------------------------------------- prime tower (tower.py)
+    @staticmethod
+    def _tower_reserve(
+        pspec, pi: int, multi: bool, parts: list[PlannedPart], has_free: bool, process: dict, filaments: list[dict], facts: dict,
+        spec: Spec, problems: list[str], warnings: list[str],
+    ) -> tuple[L.Rect | None, T.TowerSettings | None]:  # fmt: skip
+        """The rect packed parts must avoid on a two-filament plate, and the plate's tower settings (None: no tower)."""
+        if not multi:
+            return None, None
+        wt = pspec.wipe_tower
+        if wt.mode == "off" or str(process.get("enable_prime_tower", "1")).lower() in ("0", "false"):
+            warnings.append(T.off_warning(pi))
+            return None, None
+        n_fil = len({f for p in parts for f in p.placed.filaments})
+        base = wt.settings(T.TowerSettings.from_config(process, filaments, n_fil, len(facts["extruders"])))
+        height = max((p.placed.info.size[2] for p in parts), default=0.0)
+        if wt.mode == "fixed" and wt.x is not None and wt.y is not None:
+            return T.footprint(base, height, wt.x, wt.y).rect, base  # TowerClear reports a bad spot (once)
+        if not has_free:
+            return None, base
+        area = T.shared_reach(facts["extruders"], facts["bed"], spec.aux_x_limit)
+        w, d = base.size(height)
+        b, c = base.brim_at(height), T.PART_CLEARANCE  # grown by the clearance the auto search keeps to parts
+        return (area[2] - w - 2 * b - c, area[3] - d - 2 * b - c, area[2], area[3]), base
+
+    @staticmethod
+    def _tower_request(
+        pspec, pi: int, multi: bool, parts: list[PlannedPart], base: T.TowerSettings | None, facts: dict, spec: Spec
+    ) -> T.TowerRequest | None:
+        """The plate's tower question after packing (None: the plate needs no tower)."""
+        if not multi:
+            return None
+        bed = facts["bed"]
+        bed_r = (bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1])
+        area = T.shared_reach(facts["extruders"], bed, spec.aux_x_limit)
+        height = max((p.placed.info.size[2] for p in parts), default=0.0)
+        obstacles = tuple((p.key, p.placed.rect()) for p in parts if p.placed.placed)
+        wt = pspec.wipe_tower
+        if base is None:
+            return T.TowerRequest(pi, "off", T.TowerSettings(), height, obstacles, area, bed_r)
+        mode = "fixed" if wt.mode == "fixed" and wt.x is not None and wt.y is not None else "auto"
+        return T.TowerRequest(pi, mode, base, height, obstacles, area, bed_r, wt.x, wt.y)
+
+    @staticmethod
+    def _plan_towers(plates: list[PlannedPlate], requests: list[T.TowerRequest | None], spec: Spec) -> None:
+        """Every plate's tower with one project-wide size (tower.plan_project); each plate gets its TowerClear check."""
+        asked = [r for r in requests if r is not None]
+        if not asked:
+            return
+        # A tower size the user set in process.set stays as it is: no fallback to smaller widths
+        fallback = not any(k in spec.process.set for k in ("prime_tower_width", "prime_tower_rib_wall", "prime_tower_brim_width"))
+        by_plate = {t.plate: t for t in T.plan_project(asked, fallback=fallback)}
+        for pi, plate in enumerate(plates, 1):
+            plate.tower = by_plate.get(pi)
+            if plate.tower is not None and plate.tower.mode != "off":
+                plate.checks += list(T.TowerClear(plate.tower).check([], None))
+
+    @staticmethod
+    def _tower_globals(plates: list[PlannedPlate], process: dict) -> list[str]:
+        """Width, rib wall, brim and enable_prime_tower are one value per project in Studio: write the chosen tower's
+        values into the process (they reach process.json and the file), or report plates that disagree."""
+        towers = [p.tower for p in plates if p.tower is not None]
+        chosen = [(t.plate, t.footprint.settings) for t in towers if t.footprint is not None]
+        sizes = {(st.width, st.rib_wall, st.brim) for _, st in chosen}
+        problems = []
+        if len(sizes) > 1:
+            problems.append(
+                "prime tower size is per project: the plates need different towers ("
+                + "; ".join(f"plate {n}: {st.describe()}" for n, st in chosen)
+                + "). Give every plate the same wipe_tower width, rib_wall and brim"
+            )
+        off = [t.plate for t in towers if t.mode == "off"]
+        on = [t.plate for t in towers if t.mode != "off"]
+        if off and on:
+            problems.append(
+                f"prime tower on/off is per project (enable_prime_tower): plates {off} set wipe_tower false, plates {on} need a tower"
+            )
+        if len(sizes) == 1:
+            st = chosen[0][1]
+            process["prime_tower_width"] = f"{st.width:g}"
+            process["prime_tower_rib_wall"] = "1" if st.rib_wall else "0"
+            process["prime_tower_brim_width"] = f"{st.brim:g}"
+            process["enable_prime_tower"] = "1"
+        elif off and not on:
+            process["enable_prime_tower"] = "0"
+        return problems
 
     def _measure(
         self,
@@ -748,7 +915,7 @@ class Pipeline:
             if len(ok_infos) != len(files):
                 continue
             try:
-                eff = effective_filaments(ps, files)
+                eff = effective_filaments(ps, files, process)
             except BuildError as e:
                 problems.append(f"{where} ({ps.key()}): {e}")
                 continue
@@ -1077,11 +1244,14 @@ class Pipeline:
         )
         if plan.map_applies:
             cmd.setting("filament_map_mode", "Manual").setting("filament_map", plan.filament_map)
-        if len(plan.filaments) > 1:
-            # wipe_tower_x/y are per-plate vectors: a scalar moves the tower on plate 1 only, and every later plate keeps
-            # the CLI default (15, 220), inside the right nozzle's dead strip (exit -102) or under a part (exit -101)
-            n = len(plan.plates)
-            cmd.setting("wipe_tower_x", [WIPE_TOWER_XY[0]] * n).setting("wipe_tower_y", [WIPE_TOWER_XY[1]] * n)
+        if len(plan.filaments) > 1 or any(p.tower is not None and p.tower.footprint is not None for p in plan.plates):
+            # (a one-filament plate gets a tower too with Smooth timelapse.) wipe_tower_x/y are per-plate vectors: a scalar moves the tower on plate 1 only, and every later plate keeps
+            # the CLI default (15, 220), inside the right nozzle's dead strip (exit -102) or under a part (exit -101).
+            # A plate with a planned tower gets its spot; any other plate keeps WIPE_TOWER_XY.
+            spots = [p.tower.footprint if p.tower is not None else None for p in plan.plates]
+            xs = [float(fp.x) if fp else WIPE_TOWER_XY[0] for fp in spots]
+            ys = [float(fp.y) if fp else WIPE_TOWER_XY[1] for fp in spots]
+            cmd.setting("wipe_tower_x", xs).setting("wipe_tower_y", ys)
         if do_slice:
             if "custom_gcodes" in paths:
                 cmd.option("load-custom-gcodes", str(paths["custom_gcodes"]))
@@ -1108,6 +1278,9 @@ class Pipeline:
         if not sliced:
             ps.add(SetBedTypeEverywhere(plan.spec.bed_type))
             ps.add(SetFilamentColours(tuple(f["filament_colour"][0] for f in plan.filaments)))
+            # A CLI export without --slice leaves extruder_nozzle_stats [] and every later CLI slice exits -100. The
+            # preset-aware variant repair runs first, so the map patch finds the blocks consistent.
+            ps.add(RepairNozzleStats(tuple(tuple(f.get("filament_extruder_variant") or ()) for f in plan.filaments)))
             if plan.map_applies:
                 ps.add(SetFilamentMap(tuple(plan.filament_map)))
         for old, new in _rename_steps([(p.cli_name, p.key) for p in plan.parts if p.rename and p.cli_name and p.cli_name != p.key]):
@@ -1165,6 +1338,8 @@ class Pipeline:
             got_seq = pl.get("print_sequence") or str(ps.get("print_sequence") or "by layer")
             if want_seq != got_seq:
                 probs.append(f"plate {pl['id']} print_sequence is {got_seq!r}, expected {want_seq!r}")
+        probs += [f"not re-sliceable by the CLI: {x}" for x in pr.reslice_problems(len(plan.facts["extruders"]))]
+        probs += self._verify_tower(plan, ps)
         if s["process"] != plan.process["name"]:
             probs.append(f"process in file is {s['process']}, expected {plan.process['name']}")
         if len(s["filaments"]) != len(plan.filaments):
@@ -1188,11 +1363,53 @@ class Pipeline:
             if got != exp:
                 probs.append(f"{k} in file ({len(got)} chars) differs from the resolved machine preset ({len(exp)} chars)")
         for k, v in plan.spec.process.set.items():
+            v = plan.process.get(k, v) if k in TOWER_KEYS else v  # tower planning may override the spec value
             if k not in ps:
                 probs.append(f"process setting {k} is missing from the file, spec says {v!r}")
             elif str(ps[k]) != str(v):
                 probs.append(f"process setting {k} is {ps[k]!r} in the file, spec says {v!r}")
         self.emit("verified", problems=probs)
+        return probs
+
+    @staticmethod
+    def _verify_tower(plan: Plan, ps: dict) -> list[str]:
+        """The tower size and on/off planning wrote into the process, and each planned plate's spot, in the file. Every
+        key planning wrote must be in the file with a finite number; `wipe_tower_x/y` must hold one value per plate
+        (Studio's `get_at` falls back to the FIRST value for a short vector, so a short vector misplaces later towers)."""
+        probs: list[str] = []
+        if not any(p.tower is not None for p in plan.plates):
+            return probs
+
+        def num(v) -> float | None:
+            try:
+                f = float(str(v))
+            except (TypeError, ValueError):
+                return None
+            return f if math.isfinite(f) else None
+
+        for k in TOWER_KEYS:
+            if k not in plan.process:
+                continue
+            got, want = ps.get(k), plan.process[k]
+            g = num(got)
+            if k not in ps:
+                probs.append(f"{k} is missing from the file, the tower plan wrote {want!r}")
+            elif g is None or g != num(want):
+                probs.append(f"{k} in file is {got!r}, the tower plan wrote {want!r}")
+        active = [(i, p.tower.footprint) for i, p in enumerate(plan.plates) if p.tower is not None and p.tower.footprint is not None]
+        if not active:
+            return probs
+        for axis in ("x", "y"):
+            key = f"wipe_tower_{axis}"
+            vec = ps.get(key)
+            if not isinstance(vec, list) or len(vec) < len(plan.plates):
+                probs.append(f"{key} in file is {vec!r}: it needs one value per plate ({len(plan.plates)})")
+                continue
+            for i, fp in active:
+                want_v = fp.x if axis == "x" else fp.y
+                got_v = num(vec[i])
+                if got_v is None or abs(got_v - want_v) > 0.01:
+                    probs.append(f"plate {i + 1} {key} in file is {vec!r}, the tower plan put it at {want_v:g}")
         return probs
 
     def report(self, r: BuildResult) -> str:
