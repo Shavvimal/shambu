@@ -140,3 +140,28 @@ status pushes are exempt from Bambu's Authorization Control, so no Developer Mod
 | `07-print-recipes.md` | Key scopes, defaults, the tip table | adding a recipe or a per-object key |
 | `08-optimisation.md` | Orientation, print-by-object source rules, supports, time, finish, headless metrics, the GUI workflow, ClassCAD | changing `mesh.py`, `layout.py`, `sweep.py`, or explaining a choice |
 | `09-user-notes.md` | The user's own finish and fit notes (personal tools, materials) | the hand-back for this user |
+
+
+## 10. Two-filament plates and CLI re-slicing (2026-10-21)
+
+Evidence: the plate-14 runs (X2D, PETG part, PLA matte interface) and the seed build, Studio source at tag
+v02.08.02.61. Details and the run table: `03-3mf-format.md` section 8 and `06-slicer-rules.md` sections 5 and 10.
+
+- **Exit 156 is -100, and its cause is one key.** An export without `--slice` writes `extruder_nozzle_stats: []`.
+  A later CLI run on that file reads the present key as authoritative, counts 0 nozzles and throws "No valid nozzle
+  found. Please check nozzle count." (BambuStudio.cpp:4101-4156, ToolOrdering.cpp:1477-1481). It is not space and
+  not the second filament: a one-filament plate of the same export failed the same way. The `RepairNozzleStats`
+  patch writes `Standard#1` per extruder; `shambu build` applies it, `shambu patch --repair-nozzle-stats` fixes an
+  older file, and verify FAILs a file that still has `[]` or `#0`.
+- **The -100 text is on stderr only.** The line after `found slicing or export error for partplate N` holds the
+  exception (BambuStudio.cpp:7413-7418); `result.json` has a generic message. `RunResult.summary()` now appends it.
+- **`filament_extruder_variant` is block form.** One block of variants per filament, paired index by index with
+  `filament_self_index` (PrintConfig.cpp:8022-8052). shambu 0.3's map patch cut it to one entry per filament, which
+  gave `could not found extruder_type ... filament_index 2` and the first variant's values for filament 2.
+- **A process-level interface filament makes the plate two-filament.** `dual-material-interface` sets
+  `support_interface_filament 2` in the process. The checker read only part keys, so it passed a cradle at x 9.2
+  that Studio refused with -102 (right-nozzle interface at x 14.3). `effective_filaments` now counts the process
+  keys, and `InterfaceReach` grows a supported part by its brim margin plus 3 mm for the interface extruder.
+- **The tower is sized by the tallest part.** 41.39 mm square plus an 8 mm brim at H 218 with the rib wall
+  (Studio's own log). The fixed (208, 208) spot overlapped a part and left the bed (-101). The `wipe_tower` spec key
+  (`"auto"`, a spot, or `false`) and `tower.py` replace it; width, rib wall and brim are one value per project.

@@ -30,6 +30,7 @@ Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate fr
 | [5. Prototype and patch survival](#5-prototype-and-patch-survival) | The read-and-patch prototype, and which patches survive a Studio reload |
 | [6. Generating a project from STLs with no CLI](#6-generating-a-project-from-stls-with-no-cli) | Writing a project from STLs without the CLI |
 | [7. Gaps and next steps](#7-gaps-and-next-steps) | Open questions and the tests that would close them |
+| [8. Re-slicing a CLI export](#8-re-slicing-a-cli-export) | The per-extruder keys a later `--slice` needs, and the exit -100 chain |
 | [Appendix: `project_settings.config` keys by source](#appendix-project_settingsconfig-keys-by-source) | Each `project_settings.config` key, grouped by preset source |
 
 ## 0. Headline findings
@@ -52,7 +53,10 @@ Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate fr
    the main trap for a hand-written patch.
 6. **A filament mapped to nozzle 2 also needs `filament_extruder_variant` updated.** Without it,
    slicing logs `could not found extruder_type Bowden, nozzle_volume_type Standard,
-   filament_index 2` and segfaults (rc=139). The prototype now writes it.
+   filament_index 2` and segfaults (rc=139). The prototype now writes it. Correction (2026-10-21):
+   the list must stay in block form, one block per filament, paired index by index with
+   `filament_self_index`. The 0.3 map patch collapsed it to one entry per filament and caused the
+   same message for filament 2 (section 8).
 7. **Generating a project from STLs with no CLI works,** if `project_settings.config` is a
    complete config from a template. With only the five keys the loader needs, the CLI loads the
    file but silently fills the factory defaults (wall_loops 2, nozzle 200 C, one extruder) under
@@ -314,7 +318,9 @@ Keys that matter for this task (fit test values):
 | `filament_map` | `["1"]` | 1-based extruder per filament; also 1 entry only |
 | `filament_map_mode` | `"Auto For Flush"` | `Auto For Flush`, `Auto For Match`, `Manual`, `Nozzle Manual`, `Auto For Quality` (PC:532-538) |
 | `filament_nozzle_map`, `filament_volume_map`, `filament_map_2` | `["1"]` | dual-nozzle internals |
-| `filament_extruder_variant` | `["Direct Drive Standard", "Direct Drive Standard"]` | **must match** `extruder_type[map-1] + " " + nozzle_volume_type[map-1]` for each filament |
+| `filament_extruder_variant` | `["Direct Drive Standard", "Direct Drive Standard"]` (fit test) | one block of variants per filament, index-paired with `filament_self_index`; each filament's block must hold `extruder_type[map-1] + " " + nozzle_volume_type[map-1]` (section 8) |
+| `filament_self_index` | 6 x `"1"` + 6 x `"2"` (X2D) | the filament of each variant slot (and of every 6N value key) |
+| `extruder_nozzle_stats` | `[]` after an export without `--slice`; `["Standard#1","Standard#1"]` after a slice | `<nozzle_volume_type>#<count>` per extruder; `[]` makes a later CLI slice exit -100 (section 8) |
 | `extruder_type` | `["Direct Drive", "Bowden"]` | X2D: extruder 1 direct drive, extruder 2 Bowden |
 | `nozzle_volume_type`, `default_nozzle_volume_type` | `["Standard","Standard"]` | `Standard`, `High Flow`, `TPU High Flow`, `Hybrid`, `E3D High Flow` |
 | `nozzle_diameter` | `["0.4","0.4"]` | required; its length is the extruder count |
@@ -605,6 +611,55 @@ Recommended design for the library:
   seen here, but the library should re-resolve them from the filament preset.
 - `mode` in `custom_gcode_per_layer.xml` is set to `MultiExtruder` for more than one filament.
   This matches the CLI round trip but the slicer's use of it is unverified.
+
+## 8. Re-slicing a CLI export
+
+Measured 2026-10-21 (X2D, Studio 02.08.02.61, plate 14 and the seed build; source at tag v02.08.02.61).
+
+A CLI export without `--slice` writes `extruder_nozzle_stats: []`. The CLI fills the key only inside the
+per-plate slice loop (BambuStudio.cpp:6648-6686), so an unsliced export keeps the empty default
+(PrintConfig.cpp:4897-4898). When that file is the input of a later CLI run, the chain is:
+
+1. The key is present, so the CLI takes it as authoritative (`has_extruder_nozzle_stats`, BambuStudio.cpp:4101) and
+   builds an empty stat (4135-4156). Only an absent key takes `extruder_max_nozzle_count` (1 per extruder,
+   PresetBundle.cpp:320-333).
+2. In the slice loop (two extruders) the count for Standard becomes 0 (BambuStudio.cpp:6682). The log prints
+   `[nozzle_stats_obj] extruder[0] Standard x0`.
+3. `build_nozzle_groups` finds 0 nozzles (ToolOrdering.cpp:1316-1338, MultiNozzleUtils.cpp:14-29) and
+   `build_filament_group_context` throws "No valid nozzle found. Please check nozzle count." (ToolOrdering.cpp:1481).
+4. The catch maps it to -100 and writes the exception text to stderr on the line after `found slicing or export
+   error for partplate N` (BambuStudio.cpp:7413-7418). `result.json` holds only a generic message.
+
+It is not two-filament specific: a one-filament plate of the same export failed the same way (run S1). The fix is
+one key: `["Standard#1","Standard#1"]`, or no key at all. `--extruder-nozzle-count=1,1
+--extruder-nozzle-volume-type=Standard,Standard` on the command line also works (run R4).
+
+The variant keys. Studio pairs `filament_extruder_variant[i]` with `filament_self_index[i]` (PrintConfig.cpp:8022-8052)
+and looks up `<extruder_type> <nozzle_volume_type>` of the filament's extruder in that filament's block. A miss logs
+`could not found extruder_type ... filament_index 2` (PrintConfig.cpp:8935). It is not fatal, but the filament then
+slices with its first variant's values: PLA Matte got the Direct Drive flow ratio 1.006 instead of the Bowden 0.98
+(runs X4, X5).
+
+| Key | X2D, 2 filaments | If wrong |
+| --- | --- | --- |
+| `extruder_nozzle_stats` | `["Standard#1", "Standard#1"]`, or absent | `[]` or `#0`: -100 "No valid nozzle found" |
+| `extruder_nozzle_stats_new` | absent, or the same (a non-empty value wins, BambuStudio.cpp:4151-4155) | |
+| `filament_extruder_variant` | 12 entries: each filament's 6 variants in order | wrong per-filament values, the PC:8935 message |
+| `filament_self_index` | 12 entries: `1` x 6, `2` x 6 | |
+| `filament_volume_map`, `filament_nozzle_map` | one entry per filament (Studio resizes with 0, PresetBundle.cpp:2384-2387) | tolerated (Print.cpp:2840-2862) |
+| `wipe_tower_x`, `wipe_tower_y` | one value per plate, at a free spot both nozzles reach | -101 / -104 |
+
+What shambu does: the `RepairNozzleStats` patch writes `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>`
+per extruder when the stat is empty or holds `#0`, rebuilds the variant blocks from each filament preset (or the
+printer's `printer_extruder_variant` when no preset is at hand), and resizes the two maps. `shambu build` applies it
+to every unsliced export, `shambu patch --repair-nozzle-stats` to an older file. `Pipeline.verify()` FAILs a file
+with an empty stat, a `#0` count, or variant and self-index lists of different lengths, and `shambu inspect` prints
+`not re-sliceable by the CLI: extruder_nozzle_stats [] (Studio exits -100 "No valid nozzle found")`.
+`RunResult.summary()` appends the stderr line on exit -100.
+
+Live check, the seed build moved to x >= 29: the repaired unsliced export re-sliced through shambu's own
+`--load-settings` command and through a bare `--slice 1` both exit 0 (2 h 12 min) with no `could not found` line.
+The same file with `extruder_nozzle_stats []` exits -100 "No valid nozzle found".
 
 ## Appendix: `project_settings.config` keys by source
 
