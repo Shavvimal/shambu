@@ -604,11 +604,60 @@ def test_verify_compares_the_tower_size_and_spot(tmp_path, stls, resolver):
     good = _fixture_for(tmp_path, plan, wipe_tower_x=["172"], wipe_tower_y=["150"])
     r = Pipeline(FakeStudio(good), resolver).build(sp)
     assert not [p for p in r.verify_problems or [] if "tower" in p], r.verify_problems
-    bad = _fixture_for(tmp_path, plan, wipe_tower_x=["208"], wipe_tower_y=["150"], prime_tower_width="35")
-    r = Pipeline(FakeStudio(bad), resolver).build(sp)
-    probs = r.verify_problems or []
+    ps = {k: plan.process[k] for k in ("prime_tower_width", "prime_tower_rib_wall", "prime_tower_brim_width", "enable_prime_tower")}
+    probs = Pipeline._verify_tower(plan, {**ps, "wipe_tower_x": ["208"], "wipe_tower_y": ["150"], "prime_tower_width": "35"})
     assert any(p.startswith("plate 1 wipe_tower_x in file is ['208']") for p in probs)
     assert any(p.startswith("prime_tower_width in file is '35', the tower plan wrote '22'") for p in probs)
+    missing = Pipeline._verify_tower(plan, {k: v for k, v in ps.items() if k != "prime_tower_brim_width"})
+    assert "prime_tower_brim_width is missing from the file, the tower plan wrote '2'" in missing
+    assert any(p.startswith("wipe_tower_x in file is None: it needs one value per plate") for p in missing)
+
+
+@pytest.mark.parametrize("vec", [[], ["garbage"], ["NaN"], ["inf"]])
+def test_verify_rejects_empty_garbage_and_nan_tower_vectors(tmp_path, stls, resolver, vec):
+    plates = [
+        {
+            "name": "p",
+            "wipe_tower": {"x": 172, "y": 150, "width": 22},
+            "parts": [{"path": str(stls["body"]), "at": [60, 40]}, {"path": str(stls["text"]), "filament": 2, "at": [120, 40]}],
+        }
+    ]
+    plan = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, plates))
+    ps = {k: plan.process[k] for k in ("prime_tower_width", "prime_tower_rib_wall", "prime_tower_brim_width", "enable_prime_tower")}
+    probs = Pipeline._verify_tower(plan, {**ps, "wipe_tower_x": vec, "wipe_tower_y": ["150"]})
+    assert any("wipe_tower_x in file is" in p for p in probs), probs
+    assert not any("wipe_tower_y" in p for p in probs)
+
+
+def test_verify_rejects_a_short_tower_vector(tmp_path, stls, resolver):
+    """Studio's get_at() falls back to the FIRST value: a one-entry vector would put plate 2's tower at plate 1's spot."""
+    t = {"x": 172, "y": 150, "width": 22, "rib_wall": False, "brim": 2}
+    plan = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, two_plates(stls, t, {**t, "x": 120})))
+    ps = {k: plan.process[k] for k in ("prime_tower_width", "prime_tower_rib_wall", "prime_tower_brim_width", "enable_prime_tower")}
+    probs = Pipeline._verify_tower(plan, {**ps, "wipe_tower_x": ["172"], "wipe_tower_y": ["150", "150"]})
+    assert probs == ["wipe_tower_x in file is ['172']: it needs one value per plate (2)"]
+    assert Pipeline._verify_tower(plan, {**ps, "wipe_tower_x": ["172", "120"], "wipe_tower_y": ["150", "150"]}) == []
+
+
+def test_one_filament_smooth_timelapse_tower_is_written(tmp_path, stls, resolver):
+    sp = Spec.from_json(
+        {
+            "name": "smooth",
+            "outdir": str(tmp_path / "out"),
+            "printer": MACHINE,
+            "process": {"base": PROCESS, "name": PROCESS_NAME, "set": {"timelapse_type": "1"}},
+            "filaments": [{"preset": "Test PLA", "colour": "#000000"}],
+            "plates": [{"name": "p", "parts": [{"path": str(stls["body"]), "name": "body_1"}]}],
+        }
+    )
+    studio = FakeStudio(
+        make_3mf(tmp_path / "one.3mf", filament_settings_id=["Test PLA"], filament_type=["PLA"], change_filament_gcode="M600")
+    )
+    r = Pipeline(studio, resolver).build(sp, keep_going=True)
+    fp = r.plan.plates[0].tower.footprint
+    assert fp is not None
+    args = next(a for kind, a in studio.calls if kind == "run")
+    assert f"--wipe-tower-x={float(fp.x)}" in args and f"--wipe-tower-y={float(fp.y)}" in args
 
 
 def test_spec_warnings_reach_the_plan(tmp_path, stls, resolver):
@@ -684,3 +733,11 @@ def test_slicing_error_without_a_log_file(tmp_path):
 
     rr = RunResult(["BambuStudio"], 156, -100, 1.0, tmp_path / "missing.log", None)
     assert rr.slicing_error() is None and rr.summary().startswith("exit -100 (")
+
+
+def test_column_narrowing_keeps_rects_inside_the_scoring_radius():
+    c = T.BoxClearance((("near", (110.0, 0.0, 120.0, 10.0)), ("far", (130.0, 0.0, 140.0, 10.0))))
+    kept = [n for n, _ in c.narrow(0.0, 104.0).obstacles]
+    assert kept == ["near"]  # 6 mm away: it still lowers the clearance score (capped at 10 mm)
+    assert c.narrow(0.0, 104.0).gap((90.0, 0.0, 104.0, 10.0)) == pytest.approx(6.0)
+    assert c.grown is c.grown  # computed once

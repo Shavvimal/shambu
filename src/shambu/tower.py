@@ -253,19 +253,20 @@ class Clearance(Protocol):
 @dataclass(frozen=True)
 class BoxClearance:
     """Part rects (margin-grown, `Placed.rect()`) plus `margin` mm on every side. The grown rects are computed once;
-    `narrow()` keeps only the rects that can touch one x band, so the grid scan stays fast with many parts."""
+    `narrow()` keeps only the rects within the scoring radius of one x band, so the grid scan stays fast with many
+    parts and the clearance score (up to CLEARANCE_CAP) still sees every rect that can lower it."""
 
     obstacles: tuple[tuple[str, Rect], ...]
     margin: float = PART_CLEARANCE
+    grown: tuple[tuple[str, Rect, Rect], ...] = ()  # (name, rect, rect grown by margin), filled in __post_init__
 
-    @property
-    def grown(self) -> tuple[tuple[str, Rect, Rect], ...]:
+    def __post_init__(self) -> None:
         m = self.margin
-        return tuple((n, o, (o[0] - m, o[1] - m, o[2] + m, o[3] + m)) for n, o in self.obstacles)
+        object.__setattr__(self, "grown", tuple((n, o, (o[0] - m, o[1] - m, o[2] + m, o[3] + m)) for n, o in self.obstacles))
 
     def narrow(self, x0: float, x1: float) -> BoxClearance:
-        m = self.margin
-        return BoxClearance(tuple((n, o) for n, o in self.obstacles if o[2] + m > x0 and o[0] - m < x1), m)
+        r = max(self.margin, CLEARANCE_CAP)
+        return BoxClearance(tuple((n, o) for n, o in self.obstacles if o[2] + r > x0 and o[0] - r < x1), self.margin)
 
     def clear(self, rect: Rect) -> bool:
         # The grown rect is a quick reject; a corner needs the exact (Euclidean) gap

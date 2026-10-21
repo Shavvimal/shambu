@@ -640,3 +640,35 @@ def test_preset_aware_repair_runs_before_the_map_patch(tmp_path):
     X.PatchSet().add(X.RepairNozzleStats((two, two)), X.SetFilamentMap((1, 2))).apply(str(f))
     ps = Project(str(f)).project_settings
     assert ps["filament_extruder_variant"] == list(two) * 2 and ps["filament_self_index"] == ["1", "1", "2", "2"]
+
+
+# ---------------------------------------------------------------------------- review round 3
+def test_unchanged_copy_to_another_path_is_atomic(tmp_path, monkeypatch):
+    """The no-op save to a new path goes through the temp file and os.replace: a failed write keeps the destination."""
+    f = make_3mf(tmp_path / "ok.3mf")
+    dest = tmp_path / "dest.3mf"
+    dest.write_bytes(b"existing destination")
+
+    def full(_fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError, match="No space left"):
+        Project(str(f)).save(str(dest))
+    assert dest.read_bytes() == b"existing destination"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dest.3mf", "ok.3mf"]  # no temp file left behind
+    monkeypatch.undo()
+    Project(str(f)).save(str(dest))
+    assert dest.read_bytes() == f.read_bytes()
+
+
+def test_repair_covers_every_extruder_when_volume_types_are_short(tmp_path):
+    """nozzle_diameter has two entries, nozzle_volume_type one: Studio broadcasts the last volume type."""
+    f = make_3mf(
+        tmp_path / "short.3mf",
+        **{**UNSLICED_X2D, "nozzle_volume_type": ["High Flow"], "extruder_max_nozzle_count": ["1", "2"]},
+    )
+    assert Project(str(f)).reslice_problems()
+    X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["High Flow#1", "High Flow#2"]
+    assert not [m for m in Project(str(f)).reslice_problems() if "nozzle_stats" in m]

@@ -30,7 +30,6 @@ import json
 import math
 import os
 import re
-import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
@@ -717,10 +716,14 @@ class Project:
             cnt = [str(v) for v in ps.get("extruder_max_nozzle_count") or []]
 
             def default(i: int) -> str:
-                return f"{nvt[i]}#{cnt[i] if i < len(cnt) and str(cnt[i]) not in ('', '0') else '1'}"
+                # Studio broadcasts the last nozzle_volume_type over the extruders (BambuStudio.cpp:4137-4142); the
+                # nozzle count is the extruder's own (or the last one given)
+                t = nvt[min(i, len(nvt) - 1)]
+                c = cnt[min(i, len(cnt) - 1)] if cnt else "1"
+                return f"{t}#{c if str(c) not in ('', '0') else '1'}"
 
-            n_ext = max(len(nvt), len(cur))
-            want = [str(cur[i]) if i < len(cur) and _entry_count(cur[i]) > 0 else default(min(i, len(nvt) - 1)) for i in range(n_ext)]
+            n_ext = max(self.extruder_count(), len(cur))
+            want = [str(cur[i]) if i < len(cur) and _entry_count(cur[i]) > 0 else default(i) for i in range(n_ext)]
             ps[key] = want
             if key == STATS_NEW and STATS_OLD in ps:
                 ps[STATS_OLD] = list(want)
@@ -919,11 +922,14 @@ class Project:
 
     # ------------------------------------------------------------------ (c) write
     def save(self, out_path: str) -> None:
+        raw: bytes | None = None
         if not self._dirty and not self._changed:
-            # Nothing changed: keep the original bytes (a rewrite recompresses every entry)
-            if os.path.abspath(out_path) != os.path.abspath(self.path):
-                shutil.copyfile(self.path, out_path)
-            return
+            # Nothing changed: keep the original bytes (a rewrite recompresses every entry). The same path needs no
+            # write; another path gets those bytes through the same temp-file-and-replace path as a real save.
+            if os.path.abspath(out_path) == os.path.abspath(self.path):
+                return
+            with open(self.path, "rb") as src:
+                raw = src.read()
         if MODEL_SETTINGS in self._dirty:
             self._put(MODEL_SETTINGS, _xml_bytes(self.model_settings, "  "))
         if PROJECT_SETTINGS in self._dirty:
@@ -941,12 +947,15 @@ class Project:
         fd, tmp = tempfile.mkstemp(dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
-                with zipfile.ZipFile(f, "w") as z:
-                    for e in self._entries:
-                        info = zipfile.ZipInfo(e.info.filename, date_time=e.info.date_time)
-                        info.compress_type = e.info.compress_type
-                        info.external_attr = e.info.external_attr
-                        z.writestr(info, e.data)
+                if raw is not None:
+                    f.write(raw)
+                else:
+                    with zipfile.ZipFile(f, "w") as z:
+                        for e in self._entries:
+                            info = zipfile.ZipInfo(e.info.filename, date_time=e.info.date_time)
+                            info.compress_type = e.info.compress_type
+                            info.external_attr = e.info.external_attr
+                            z.writestr(info, e.data)
                 f.flush()
                 os.fsync(f.fileno())
             with zipfile.ZipFile(tmp) as z:

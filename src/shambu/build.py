@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -1054,8 +1055,8 @@ class Pipeline:
         )
         if plan.map_applies:
             cmd.setting("filament_map_mode", "Manual").setting("filament_map", plan.filament_map)
-        if len(plan.filaments) > 1:
-            # wipe_tower_x/y are per-plate vectors: a scalar moves the tower on plate 1 only, and every later plate keeps
+        if len(plan.filaments) > 1 or any(p.tower is not None and p.tower.footprint is not None for p in plan.plates):
+            # (a one-filament plate gets a tower too with Smooth timelapse.) wipe_tower_x/y are per-plate vectors: a scalar moves the tower on plate 1 only, and every later plate keeps
             # the CLI default (15, 220), inside the right nozzle's dead strip (exit -102) or under a part (exit -101).
             # A plate with a planned tower gets its spot; any other plate keeps WIPE_TOWER_XY.
             spots = [p.tower.footprint if p.tower is not None else None for p in plan.plates]
@@ -1183,38 +1184,43 @@ class Pipeline:
 
     @staticmethod
     def _verify_tower(plan: Plan, ps: dict) -> list[str]:
-        """The tower size and on/off planning wrote into the process, and each planned plate's spot, in the file. A key
-        the file does not hold is not checked (every Studio export holds them; minimal test fixtures do not)."""
+        """The tower size and on/off planning wrote into the process, and each planned plate's spot, in the file. Every
+        key planning wrote must be in the file with a finite number; `wipe_tower_x/y` must hold one value per plate
+        (Studio's `get_at` falls back to the FIRST value for a short vector, so a short vector misplaces later towers)."""
         probs: list[str] = []
-        towers = [p.tower for p in plan.plates if p.tower is not None]
-        if not towers:
+        if not any(p.tower is not None for p in plan.plates):
             return probs
+
+        def num(v) -> float | None:
+            try:
+                f = float(str(v))
+            except (TypeError, ValueError):
+                return None
+            return f if math.isfinite(f) else None
+
         for k in TOWER_KEYS:
-            if k not in plan.process or k not in ps:
+            if k not in plan.process:
                 continue
             got, want = ps.get(k), plan.process[k]
-            try:
-                same = got is not None and float(str(got)) == float(str(want))
-            except ValueError:
-                same = str(got) == str(want)
-            if not same:
+            g = num(got)
+            if k not in ps:
+                probs.append(f"{k} is missing from the file, the tower plan wrote {want!r}")
+            elif g is None or g != num(want):
                 probs.append(f"{k} in file is {got!r}, the tower plan wrote {want!r}")
+        active = [(i, p.tower.footprint) for i, p in enumerate(plan.plates) if p.tower is not None and p.tower.footprint is not None]
+        if not active:
+            return probs
         for axis in ("x", "y"):
-            vec = ps.get(f"wipe_tower_{axis}")
-            if vec is None:
+            key = f"wipe_tower_{axis}"
+            vec = ps.get(key)
+            if not isinstance(vec, list) or len(vec) < len(plan.plates):
+                probs.append(f"{key} in file is {vec!r}: it needs one value per plate ({len(plan.plates)})")
                 continue
-            vals = vec if isinstance(vec, list) else [vec]
-            for i, p in enumerate(plan.plates):
-                fp = p.tower.footprint if p.tower is not None else None
-                if fp is None:
-                    continue
+            for i, fp in active:
                 want_v = fp.x if axis == "x" else fp.y
-                try:
-                    got_v = float(str(vals[i] if i < len(vals) else vals[-1]))
-                except (TypeError, ValueError, IndexError):
-                    got_v = float("nan")
-                if abs(got_v - want_v) > 0.01:
-                    probs.append(f"plate {i + 1} wipe_tower_{axis} in file is {vec!r}, the tower plan put it at {want_v:g}")
+                got_v = num(vec[i])
+                if got_v is None or abs(got_v - want_v) > 0.01:
+                    probs.append(f"plate {i + 1} {key} in file is {vec!r}, the tower plan put it at {want_v:g}")
         return probs
 
     def report(self, r: BuildResult) -> str:

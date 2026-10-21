@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from conftest import MACHINE, PROCESS, PROCESS_NAME, FakeStudio, make_3mf
+from conftest import MACHINE, PROCESS, PROCESS_NAME, FakeStudio, make_3mf, write_cli_tower
 from shambu.build import Pipeline
 from shambu.spec import Spec
 from shambu.studio import RunResult
@@ -114,6 +114,7 @@ def test_template_method_export_override(tmp_path, stls, resolver, cli_export):
     class NoStudio(Pipeline):
         def export(self, plan, paths, project, timeout, do_slice=False):
             project.write_bytes(cli_export.read_bytes())
+            write_cli_tower(project, self.command(plan, paths, plan.spec.name, do_slice).args())  # what the CLI writes
             return RunResult(["fake"], 0, 0, 0.0, project.with_suffix(".log"), None, project)
 
     r = NoStudio(FakeStudio(), resolver).build(make_spec(tmp_path, stls))
