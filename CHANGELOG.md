@@ -47,6 +47,15 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
 - Spec: `at` is documented as the min corner; `brim_margin` replaces both computed margins; new per-part
   `support_spread: [mx, px, my, py]`; unknown keys are warned about in `spec`, `check` and `build`.
 - REVIEW-RUBRIC: items 4, 5, 10, 11 and 13 rewritten for the new modules and the `touches` contract.
+- Final review round: a filament group's spread is the per-side maximum of its members and keeps their probe masks;
+  `patch` classifies filaments as `check` does (height-range wall, infill, support and interface keys; support slots
+  only with support on; an interface-only slot grows by the interface spread); the packer bounds each filament by its
+  own growth (an interface-only nozzle no longer refuses a plate the checker accepts); `patch --tower` and
+  `slice --tower` size the tower with `tower.py` (Smooth timelapse included) and test it against the plate's outlines;
+  `--add-filament` repairs `extruder_nozzle_stats []` before the new slot; `slice` refuses an export without G-code;
+  printer job and file names, watch headers and `printer raw` drop the serial and access code; a refused patch is
+  exit 1 and a file that cannot be written exit 3 with one JSON document; packer results read as the packer's answer,
+  not a proof; two meshes of one name no longer overwrite each other under `sweep --write-spec`.
 
 ### Added
 - `shambu patch --replace-mesh OBJECT[/PART]=STL` (anchors frame|centre|min, `--rotate-mesh`, `--lay-on-face`, a no-op

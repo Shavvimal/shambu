@@ -144,7 +144,7 @@ the spool in that nozzle with its colour, and a pinned preset that is not loaded
 presets stand in.
 
 Add `--json` to any command for machine-readable output (`printer watch --json` prints one document per poll).
-Exit codes: 0 ok, 1 a check or verification failed, 2 usage, 3 environment (binary, config, printer).
+Exit codes: 0 ok, 1 a check or verification failed or a patch was refused, 2 usage, 3 environment (binary, config, printer, a file that cannot be written), 130 interrupted.
 
 ## Safety
 
