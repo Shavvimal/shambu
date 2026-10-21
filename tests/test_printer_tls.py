@@ -344,7 +344,7 @@ def test_probe_pool_is_bounded_and_parallel():
 
     hosts = [f"10.0.1.{i}" for i in range(48)]
     t0 = time.monotonic()
-    hits = printer.ArpProbe(probe=slow).probe_hosts(hosts)
+    hits = printer.ArpProbe(probe=slow, workers=16).probe_hosts(hosts)
     assert [h["ip"] for h in hits] == ["10.0.1.7"]
     assert 1 < peak[0] <= 16  # a pool of 16, never one thread per host, never one host at a time
     assert time.monotonic() - t0 < 48 * 0.05 / 2  # 3 rounds of 16, not 48 in sequence
@@ -356,7 +356,9 @@ def test_probe_sweep_ends_at_its_bound():
         return True
 
     t0 = time.monotonic()
-    assert printer.ArpProbe(probe=hang, sweep_s=0.1).probe_hosts(["10.0.0.1", "10.0.0.2"]) == []  # late counts as closed
+    assert (
+        printer.ArpProbe(probe=hang, probe_window_s=0.1, timeout=0.1).probe_hosts(["10.0.0.1", "10.0.0.2"]) == []
+    )  # late counts as closed
     assert time.monotonic() - t0 < 0.5
 
 
@@ -409,18 +411,18 @@ class _Hang:
 def test_read_budget_names_the_step(monkeypatch, tmp_path):
     _service_conf(monkeypatch, tmp_path)
     steps = []
-    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=_Hang, budget_s=0.3, on_step=lambda n, dt: steps.append(n))
+    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=_Hang, timeout_s=0.3, on_step=lambda n, dt: steps.append(n))
     t0 = time.monotonic()
     with pytest.raises(PrinterError) as e:
         svc.status()
     assert str(e.value) == "timed out after 0.3 s in mqtt"
     assert time.monotonic() - t0 < 1
     time.sleep(1.5)
-    assert steps == ["config"]  # the abandoned read sends no progress line after the caller gave up
+    assert steps == ["credentials"]  # the abandoned read sends no progress line after the caller gave up
 
 
 def test_read_budget_default_is_15_s():
-    assert printer.PrinterService().budget_s == 15.0 == printer.BUDGET_S
+    assert printer.PrinterService().timeout_s == 15.0 == printer.READ_TIMEOUT_S
 
 
 def test_read_times_each_discovery_step(monkeypatch, tmp_path):
@@ -439,7 +441,7 @@ def test_read_times_each_discovery_step(monkeypatch, tmp_path):
     arp = printer.ArpProbe(runner=runner, probe=lambda ip, port, t: ip == "10.0.0.9")
     svc = printer.PrinterService(discovery=(arp,), reader_factory=Ok)
     assert svc.status().ip == "10.0.0.9"
-    assert list(svc.timings) == ["config", "arp", "probe", "mqtt"]
+    assert list(svc.timings) == ["credentials", "arp", "probe", "mqtt"]
 
 
 # ---------------------------------------------------------------------------- review follow-ups (Codex, 2026-10-21)
@@ -449,7 +451,7 @@ def test_a_blocked_probe_never_holds_up_the_process_exit():
         "import time\n"
         "from shambu import printer\n"
         "t0 = time.monotonic()\n"
-        "hits = printer.ArpProbe(probe=lambda ip, port, t: time.sleep(3) or True, sweep_s=0.05).probe_hosts(['10.0.0.1'])\n"
+        "hits = printer.ArpProbe(probe=lambda ip, port, t: time.sleep(3) or True, probe_window_s=0.05, timeout=0.05).probe_hosts(['10.0.0.1'])\n"
         "assert hits == [] and time.monotonic() - t0 < 0.5\n"
     )
     t0 = time.monotonic()
@@ -495,14 +497,142 @@ def test_an_expired_read_does_not_touch_the_next_one(monkeypatch, tmp_path):
             return full()
 
     events = []
-    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=SlowThenFast, budget_s=0.2, on_step=lambda s, dt: events.append(s))
+    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=SlowThenFast, timeout_s=0.2, on_step=lambda s, dt: events.append(s))
     with pytest.raises(PrinterError, match="in mqtt"):
         svc.status()
-    assert events == ["config"]
+    assert events == ["credentials"]
     events.clear()
-    svc.budget_s = 2.0
+    svc.timeout_s = 2.0
     svc.status()  # the second read starts while the first attempt's thread is still asleep
     second = dict(svc.timings)
     time.sleep(0.7)  # the first attempt wakes and finishes its mqtt step now
-    assert events == ["config", "mqtt"]  # only the second read's own steps
+    assert events == ["credentials", "mqtt"]  # only the second read's own steps
     assert svc.timings == second and second["mqtt"] < 0.5
+
+
+def test_a_stalled_read_never_holds_up_the_process_exit(tmp_path):
+    """The read's worker thread is a daemon: a reader stalled for 3 s must not keep the process alive past its budget."""
+    conf_path = tmp_path / "BambuStudio.conf"
+    conf_path.write_text(json.dumps({"app": {"user_last_selected_machine": SERIAL}, "access_code": {SERIAL: SENTINEL}}))
+    code = (
+        "import sys, time, pathlib\n"
+        "from shambu import conf, printer\n"
+        "from shambu.errors import PrinterError\n"
+        "conf.CONF = pathlib.Path(sys.argv[1]); conf.APPSUPPORT = pathlib.Path(sys.argv[2])\n"
+        "class Stall:\n"
+        "    def __init__(self, *a): pass\n"
+        "    def read(self): time.sleep(3); return {}\n"
+        "try:\n"
+        "    printer.PrinterService(ip='10.0.0.9', reader_factory=Stall, timeout_s=0.1).status()\n"
+        "except PrinterError as e:\n"
+        "    print(e)\n"
+    )
+    t0 = time.monotonic()
+    r = subprocess.run([sys.executable, "-c", code, str(conf_path), str(tmp_path)], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "timed out after 0.1 s in mqtt"
+    assert time.monotonic() - t0 < 2.5  # interpreter start and import included; a joined reader would take 3 s or more
+
+
+# ---------------------------------------------------------------------------- rubric review follow-ups (2026-10-21)
+class _Ok:
+    thread = None
+
+    def __init__(self, *a):
+        pass
+
+    def read(self):
+        _Ok.thread = threading.current_thread()
+        return full()
+
+
+def test_a_large_lan_is_probed_to_the_end():
+    hosts = [f"10.0.3.{i}" for i in range(1, 100)]  # 99 hosts, the printer last
+
+    def probe(ip, port, timeout):
+        time.sleep(0.01)
+        return ip == "10.0.3.99"
+
+    a = printer.ArpProbe(probe=probe)
+    assert a.probe_hosts(hosts) == [{"ip": "10.0.3.99", "method": "arp+8883"}]
+    assert a.shortfall is None
+
+
+def test_probe_window_scales_with_the_host_count_and_respects_the_limit():
+    a = printer.ArpProbe()
+    assert a.window(10) == 2.0  # one round of 0.5 s, the 2 s floor
+    assert a.window(99) == 2.0  # 64 threads, 2 rounds = 1 s, the 2 s floor
+    assert a.window(300) == 2.5  # 5 rounds of 0.5 s
+    assert a.window(300, limit=1.0) == 1.0  # never past the read's deadline
+
+
+def test_an_expired_probe_window_names_the_unprobed_count(monkeypatch, tmp_path, caplog):
+    _service_conf(monkeypatch, tmp_path)
+    hosts = "".join(f"? (10.0.4.{i}) at 0:1:2:3:4:{i} on en0 ifscope [ethernet]\n" for i in range(1, 11))
+
+    def runner(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, hosts, "")
+
+    def slow(ip, port, timeout):
+        time.sleep(0.5)
+        return False
+
+    arp = printer.ArpProbe(runner=runner, probe=slow, workers=2, probe_window_s=0.1, timeout=0.05)
+    with caplog.at_level("WARNING", logger="shambu.printer"), pytest.raises(PrinterError) as e:
+        printer.PrinterService(discovery=(arp,), reader_factory=_Ok, timeout_s=None).status()
+    assert "(0 of 10 hosts probed before the 0.25 s probe window ended)" in str(e.value)  # 5 rounds of 0.05 s
+    assert any("0 of 10 hosts probed" in r.getMessage() for r in caplog.records)
+
+
+def test_discovery_goes_through_the_protocol(monkeypatch, tmp_path):
+    _service_conf(monkeypatch, tmp_path)
+    seen = []
+
+    class FakeDiscovery:
+        timings: dict = {}
+        shortfall = None
+
+        def with_deadline(self, seconds):
+            seen.append(seconds)
+            d = FakeDiscovery()
+            d.timings = {"fake": 0.1}
+            return d
+
+        def find(self):
+            return [{"ip": "10.0.0.9", "method": "fake"}]
+
+    svc = printer.PrinterService(discovery=(FakeDiscovery(),), reader_factory=_Ok)
+    assert svc.status().ip == "10.0.0.9"
+    assert 6.0 < seen[0] <= 15.0 - printer.CONNECT_S - printer.HANDSHAKE_S  # the read's timeout, less connect and handshake
+    assert list(svc.timings) == ["credentials", "fake", "mqtt"]
+    printer.PrinterService(discovery=(FakeDiscovery(),), reader_factory=_Ok, timeout_s=None).status()
+    assert seen[1] is None
+
+
+def test_a_raising_progress_callback_is_logged_and_the_read_completes(monkeypatch, tmp_path, caplog):
+    _service_conf(monkeypatch, tmp_path)
+
+    def bad(name, dt):
+        raise ValueError("printer of progress lines broke")
+
+    with caplog.at_level("WARNING", logger="shambu.printer"):
+        st = printer.PrinterService(ip="10.0.0.9", reader_factory=_Ok, on_step=bad).status()
+    assert st.state == "printing"
+    assert any("ValueError: printer of progress lines broke" in r.getMessage() for r in caplog.records)
+
+
+def test_arp_oserror_gives_no_hosts_and_a_warning(caplog):
+    def runner(argv, **kw):
+        raise FileNotFoundError("arp")
+
+    with caplog.at_level("WARNING", logger="shambu.printer"):
+        assert printer.ArpProbe(runner=runner).hosts() == []
+    assert any("arp -an failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_read_without_a_timeout_runs_in_the_callers_thread(monkeypatch, tmp_path):
+    _service_conf(monkeypatch, tmp_path)
+    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=_Ok, timeout_s=None)
+    assert svc.status().state == "printing"
+    assert _Ok.thread is threading.current_thread()
+    assert list(svc.timings) == ["credentials", "mqtt"]

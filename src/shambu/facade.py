@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,10 +35,11 @@ def redact_ip(text: str) -> str:
     return _IPV4.sub("<ip>", text)
 
 
-def install_kind(direct_url: dict | None) -> tuple[str, str | None]:
+def install_kind(direct_url: dict | None, installer: str | None = None) -> tuple[str, str | None]:
     """How this copy of shambu was installed, from its `direct_url.json` (PEP 610), and the commit when a VCS install
     names one. A git install names its tag in `vcs_info.requested_revision`; a folder install is a snapshot unless
-    `dir_info.editable` is true."""
+    `dir_info.editable` is true. `installer` ("uv tool") leads the text only when the caller has proof of it."""
+    lead = f"{installer}, " if installer else ""
     if not isinstance(direct_url, dict):
         return "other", None
     vcs = direct_url.get("vcs_info")
@@ -45,12 +47,17 @@ def install_kind(direct_url: dict | None) -> tuple[str, str | None]:
         commit = str(vcs["commit_id"])[:7] if vcs.get("commit_id") else None
         rev = vcs.get("requested_revision")
         if not rev:
-            return "uv tool, git (no tag)", commit
-        return (f"uv tool, git tag {rev}" if _TAG_RE.fullmatch(str(rev)) else f"uv tool, git revision {rev}"), commit
+            return f"{lead}git (no tag)", commit
+        return (f"{lead}git tag {rev}" if _TAG_RE.fullmatch(str(rev)) else f"{lead}git revision {rev}"), commit
     d = direct_url.get("dir_info")
     if isinstance(d, dict):
-        return ("editable checkout" if d.get("editable") else "uv tool, local folder (snapshot)"), None
+        return ("editable checkout" if d.get("editable") else f"{lead}local folder (snapshot)"), None
     return "other", None
+
+
+def _installer() -> str | None:
+    """ "uv tool" when this interpreter's environment holds uv's tool receipt (`uv-receipt.toml`), else None."""
+    return "uv tool" if (Path(sys.prefix) / "uv-receipt.toml").is_file() else None
 
 
 def _direct_url() -> dict | None:
@@ -69,7 +76,7 @@ def shambu_section(expected: str | None, direct_url: dict | None = None) -> dict
     keeps the version it had when it was first built (0.1.0 metadata under a 0.3.0 checkout, 2026-10-21)."""
     import shambu
 
-    install, commit = install_kind(direct_url if direct_url is not None else _direct_url())
+    install, commit = install_kind(direct_url if direct_url is not None else _direct_url(), _installer())
     return {
         "version": shambu.__version__,
         "package_path": str(Path(shambu.__file__).resolve().parent),
@@ -91,7 +98,7 @@ class Bambu:
     listeners: list[Listener] = field(default_factory=list)
     printer_ip: str | None = None  # `--ip` for the printer reads that check/build/doctor make
     printer_wait: float = 8.0
-    printer_timeout: float | None = 15.0  # budget for one whole printer read (discovery, connect, report); None: none
+    printer_timeout: float | None = 15.0  # timeout for one whole printer read (discovery, connect, report); None: none
     printer_progress: Callable[[str, float], None] | None = field(default=None, repr=False)  # hears each read step
     _loaded_cache: dict[str, LoadedFilaments | BambuError] = field(default_factory=dict, init=False, repr=False)
 
@@ -129,15 +136,13 @@ class Bambu:
             v = st.version()
             d["studio"] = {"binary": str(st.binary), "version": v, "tested": TESTED_STUDIO, "match": v == TESTED_STUDIO}
             d["studio"]["running_pids"] = st.running_pids()
-        except BambuError as e:
+        except BambuError as e:  # version() turns an unreadable or bad plist into StudioError
             d["studio"] = {"error": f"{type(e).__name__}: {e}", "tested": TESTED_STUDIO}
-        except OSError as e:  # Info.plist unreadable
-            d["studio"] = {"error": f"cannot read the Studio version: {e}", "tested": TESTED_STUDIO}
         step("studio", t0)
         t0 = time.monotonic()
         try:
             d["profiles"] = [getattr(s, "label", str(s)) for s in self.presets().source.sources]
-        except BambuError as e:
+        except (BambuError, OSError, ValueError) as e:  # a missing or unreadable profile tree
             d["profiles"] = {"error": f"{type(e).__name__}: {e}"}
         step("profiles", t0)
         t0 = time.monotonic()
@@ -266,7 +271,7 @@ class Bambu:
             serial,
             wait if wait is not None else self.printer_wait,
             insecure=insecure,
-            budget_s=self.printer_timeout,
+            timeout_s=self.printer_timeout,
             on_step=self.printer_progress,
         )
 

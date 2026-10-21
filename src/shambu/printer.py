@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 import socket
 import ssl
@@ -44,7 +45,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, TypeVar
 
@@ -72,12 +73,12 @@ ACTIVE_STATES = ("printing", "paused", "preparing", "slicing")
 DONE_STATES = ("idle", "finished", "failed")  # watch() stops only on these; unknown or offline keeps it polling
 EXTRUDER_NAMES = {0: "auxiliary (right)", 1: "main (left)"}
 HMS_LEVELS = {1: "fatal", 2: "serious", 3: "common", 4: "info"}
-# Network bounds for one read (doctor timings, 2026-10-21): TCP connect, TLS handshake, MQTT keepalive, and the whole
-# read (discovery + connect + report) unless the caller gives another budget.
+# Network bounds for one read (doctor timings, 2026-10-21): TCP connect, TLS handshake, MQTT keepalive, and the
+# timeout for the whole read (discovery + connect + report) unless the caller gives another.
 CONNECT_S = 3.0
 HANDSHAKE_S = 5.0
 KEEPALIVE_S = 10
-BUDGET_S = 15.0
+READ_TIMEOUT_S = 15.0
 TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
 # External spools on a dual-nozzle printer: virtual tray id -> the extruder id it feeds (live X2D, 2026-10-16; each
 # extruder's `snow` confirmed it). Single-nozzle printers report one external spool as `vt_tray` with tray_now 254.
@@ -103,6 +104,15 @@ COLOUR_NAMES = {
 
 # ---------------------------------------------------------------------------------- discovery
 class Discovery(Protocol):
+    """A way to propose printer IPs. `with_deadline(seconds)` gives a copy that finishes within that time (one copy per
+    read, so its `timings` and `shortfall` belong to that read). After `find()`, `timings` holds its steps in seconds
+    and `shortfall` says what it could not cover in time (None when it covered everything)."""
+
+    timings: dict[str, float]
+    shortfall: str | None
+
+    def with_deadline(self, seconds: float | None) -> Discovery: ...
+
     def find(self) -> list[dict]: ...
 
 
@@ -140,16 +150,23 @@ class ArpProbe:
     """Hosts in the ARP table that answer on 8883. On a home LAN only Bambu printers do.
 
     Bounds (a slow resolver or a large LAN must not stall a check): `arp -an` (numeric, so no reverse DNS per entry)
-    with a 2 s timeout, then the 8883 probe in a pool of `workers` threads, `timeout` s per host and `sweep_s` for the
-    whole probe. A host that has not answered when the sweep ends counts as closed. The probe threads are daemons: a
-    probe still blocked when the sweep ends never holds up the process exit."""
+    with a 2 s timeout, then the 8883 probe on min(`workers`, hosts) threads, `timeout` s per host. The probe window
+    is max(`probe_window_s`, rounds x `timeout`), so every host gets its turn on a large LAN, and never longer than
+    the deadline `with_deadline` set. A host not probed when the window ends counts as closed, and `shortfall` says how
+    many were probed. The probe threads are daemons: a probe still blocked at the end never holds up the process exit."""
 
     timeout: float = 0.5
-    sweep_s: float = 2.0
-    workers: int = 16
+    probe_window_s: float = 2.0
+    workers: int = 64
     arp_timeout: float = 2.0
+    deadline_s: float | None = None  # the most this find() may take; None: only its own bounds
     runner: Runner = field(default=subprocess.run, repr=False)  # injectable: tests pass a fake
     probe: Callable[[str, int, float], bool] = field(default=port_open, repr=False)
+    timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    shortfall: str | None = field(default=None, init=False, repr=False)
+
+    def with_deadline(self, seconds: float | None) -> ArpProbe:
+        return replace(self, deadline_s=seconds)
 
     def hosts(self) -> list[str]:
         try:
@@ -164,15 +181,22 @@ class ArpProbe:
             log.warning("arp -an exited with status %s (%s); reading what it printed", r.returncode, (r.stderr or "").strip()[:200])
         return arp_hosts(r.stdout or "")
 
-    def probe_hosts(self, hosts: list[str]) -> list[dict]:
+    def window(self, n_hosts: int, limit: float | None = None) -> float:
+        threads = max(1, min(self.workers, n_hosts))
+        w = max(self.probe_window_s, math.ceil(n_hosts / threads) * self.timeout)
+        return w if limit is None else max(0.0, min(w, limit))
+
+    def probe_hosts(self, hosts: list[str], limit: float | None = None) -> list[dict]:
+        self.shortfall = None
         if not hosts:
             return []
         todo = list(hosts)
         open_: set[str] = set()
         lock = threading.Lock()
-        left = [len(hosts)]
+        probed = [0]
         finished = threading.Event()
-        deadline = time.monotonic() + self.sweep_s
+        window = self.window(len(hosts), limit)
+        deadline = time.monotonic() + window
 
         def worker() -> None:
             while True:
@@ -182,25 +206,36 @@ class ArpProbe:
                     h = todo.pop(0)
                 try:
                     ok = bool(self.probe(h, 8883, self.timeout))
-                except Exception as e:  # noqa: BLE001 - a closed port is False; anything else is worth a warning
+                except Exception as e:  # noqa: BLE001 - the probe is injectable; a closed port is False, anything else is logged
                     log.warning("port probe of %s raised %s: %s; counted as closed", h, type(e).__name__, e)
                     ok = False
                 with lock:
                     if ok:
                         open_.add(h)
-                    left[0] -= 1
-                    if left[0] == 0:
+                    probed[0] += 1
+                    if probed[0] == len(hosts):
                         finished.set()
 
         for i in range(max(1, min(self.workers, len(hosts)))):
             threading.Thread(target=worker, name=f"shambu-probe-{i}", daemon=True).start()
-        finished.wait(self.sweep_s)
+        finished.wait(window)
         with lock:
-            found = set(open_)
+            found, n = set(open_), probed[0]
+        if n < len(hosts):
+            self.shortfall = f"{n} of {len(hosts)} hosts probed before the {window:g} s probe window ended"
+            log.warning("port probe: %s", self.shortfall)
         return [{"ip": h, "method": "arp+8883"} for h in hosts if h in found]  # ARP order, not finish order
 
     def find(self) -> list[dict]:
-        return self.probe_hosts(self.hosts())
+        self.timings = {}
+        t0 = time.monotonic()
+        hosts = self.hosts()
+        self.timings["arp"] = round(time.monotonic() - t0, 2)
+        left = None if self.deadline_s is None else self.deadline_s - (time.monotonic() - t0)
+        t1 = time.monotonic()
+        hits = self.probe_hosts(hosts, left)
+        self.timings["probe"] = round(time.monotonic() - t1, 2)
+        return hits
 
 
 @dataclass
@@ -209,8 +244,20 @@ class SsdpListen:
     because the Studio GUI holds 2021 while it runs."""
 
     seconds: float = 10.0
+    timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    shortfall: str | None = field(default=None, init=False, repr=False)
+
+    def with_deadline(self, seconds: float | None) -> SsdpListen:
+        return self if seconds is None else replace(self, seconds=max(0.0, min(self.seconds, seconds)))
 
     def find(self) -> list[dict]:
+        t_start = time.monotonic()
+        try:
+            return self._listen()
+        finally:
+            self.timings = {"ssdp": round(time.monotonic() - t_start, 2)}
+
+    def _listen(self) -> list[dict]:
         found: dict[str, dict] = {}
         socks = []
         for port in (2021, 1990):
@@ -936,6 +983,7 @@ class _Attempt:
     """One read's state: the step it is in, its step times, and whether the caller gave up on it."""
 
     step: str = "start"
+    started: float = field(default_factory=time.monotonic)
     timings: dict[str, float] = field(default_factory=dict)
     abandoned: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -948,11 +996,11 @@ class PrinterService:
     `insecure=True` turns off TLS verification for every read (the CLI's `--insecure`). Leave it off: a verified read
     proves the host at the IP is the selected printer before the access code leaves this machine.
 
-    `budget_s` bounds one whole read (config, discovery, MQTT): the read runs in a worker thread, and when the budget
-    runs out the caller gets `PrinterError("timed out after 15 s in <step>")`. The expired attempt's thread is not
+    `timeout_s` bounds one whole read (credentials, discovery, MQTT): the read runs in a worker thread, and when the
+    timeout runs out the caller gets `PrinterError("timed out after 15 s in <step>")`. The expired attempt's thread is not
     stopped: it is a daemon, it finishes or dies with the process, and it never calls `on_step` or writes `timings`
     again. That is fine for the CLI; a long-lived caller keeps such a thread until its socket times out.
-    `on_step(name, seconds)` hears each step of the current read as it ends (`config`, `arp`, `probe`, `mqtt`);
+    `on_step(name, seconds)` hears each step of the current read as it ends (`credentials`, `arp`, `probe`, `mqtt`);
     `timings` holds the steps of the last read."""
 
     ip: str | None = None
@@ -961,7 +1009,7 @@ class PrinterService:
     discovery: tuple[Discovery, ...] = (ArpProbe(),)
     reader_factory: Callable[[str, str, str, float, bool], MqttReader] | None = None  # injectable transport; None = MqttReader at call time
     insecure: bool = False
-    budget_s: float | None = BUDGET_S
+    timeout_s: float | None = READ_TIMEOUT_S
     on_step: Callable[[str, float], None] | None = field(default=None, repr=False)
     timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _local: threading.local = field(default_factory=threading.local, init=False, repr=False)
@@ -973,6 +1021,17 @@ class PrinterService:
             self.timings = a.timings
         return a
 
+    def _record(self, a: _Attempt, name: str, dt: float) -> None:
+        with a.lock:
+            if a.abandoned:  # an expired attempt reports nothing: the caller gave up on it
+                return
+            a.timings[name] = dt
+            if self.on_step is not None:
+                try:
+                    self.on_step(name, dt)
+                except Exception as e:  # noqa: BLE001 - the caller's progress printer must never fail the read
+                    log.warning("progress callback for step %s raised %s: %s", name, type(e).__name__, e)
+
     @contextmanager
     def _timed(self, name: str) -> Iterator[None]:
         a = self._attempt()
@@ -981,19 +1040,11 @@ class PrinterService:
         try:
             yield
         finally:
-            dt = round(time.monotonic() - t0, 2)
-            with a.lock:
-                if not a.abandoned:  # an expired attempt reports nothing: the caller gave up on it
-                    a.timings[name] = dt
-                    if self.on_step is not None:
-                        try:
-                            self.on_step(name, dt)
-                        except Exception:  # noqa: BLE001 - a progress printer must never fail the read
-                            pass
+            self._record(a, name, round(time.monotonic() - t0, 2))
 
     def _bounded(self, fn: Callable[[], T]) -> T:
-        """`fn()` within `budget_s` in a worker thread with its own attempt state, or PrinterError naming the step it was
-        in. No budget: the same attempt state, in the caller's thread."""
+        """`fn()` within `timeout_s` in a worker thread with its own attempt state, or PrinterError naming the step it
+        was in. No timeout: the same attempt state, in the caller's thread."""
         attempt = _Attempt()
         self.timings = attempt.timings
         box: dict = {}
@@ -1007,17 +1058,17 @@ class PrinterService:
             finally:
                 self._local.attempt = None
 
-        if not self.budget_s or self.budget_s <= 0:
+        if not self.timeout_s or self.timeout_s <= 0:
             work()
         else:
             t = threading.Thread(target=work, name="shambu-printer-read", daemon=True)
             t.start()
-            t.join(self.budget_s)
+            t.join(self.timeout_s)
             if t.is_alive():
                 with attempt.lock:
                     attempt.abandoned = True
                     self.timings = dict(attempt.timings)  # the steps that ended in time, frozen
-                raise PrinterError(f"timed out after {self.budget_s:g} s in {attempt.step}")
+                raise PrinterError(f"timed out after {self.timeout_s:g} s in {attempt.step}")
         if "error" in box:
             raise box["error"]
         return box["value"]
@@ -1025,30 +1076,38 @@ class PrinterService:
     def resolve(self) -> tuple[str, str, str]:
         """IP, serial, code. Discovery only proposes a host: the TLS name check (or, insecure, the report topic) in
         `MqttReader.read` confirms it is the selected printer. An SSDP hit that names the serial wins over other hits."""
-        with self._timed("config"):
+        with self._timed("credentials"):  # serial and access code from Studio's config
             c = conf.load()
             serial = self.serial or conf.selected_serial(c)
             if not serial:
                 raise PrinterError("no printer selected in Bambu Studio (Device tab)")
             code = conf.access_code(serial, c)
         ip = self.ip
+        gaps: list[str] = []
         if not ip:
-            for d in self.discovery:
-                if isinstance(d, ArpProbe):
-                    with self._timed("arp"):
-                        hosts = d.hosts()
-                    with self._timed("probe"):
-                        hits = d.probe_hosts(hosts)
-                else:
-                    with self._timed(type(d).__name__.lower()):
-                        hits = d.find()
+            a = self._attempt()
+            for proto in self.discovery:
+                d = proto.with_deadline(self._discovery_deadline(a))
+                a.step = "discovery"
+                hits = d.find()
+                for name, dt in d.timings.items():
+                    self._record(a, name, dt)
+                if d.shortfall:
+                    gaps.append(d.shortfall)
                 if hits:
                     named = [h for h in hits if h.get("serial") == serial]
                     ip = (named or hits)[0]["ip"]
                     break
         if not ip:
-            raise PrinterError("no host on this LAN answers on port 8883. Is the printer on and on this network? Pass --ip.")
+            why = f" ({'; '.join(gaps)})" if gaps else ""
+            raise PrinterError(f"no host on this LAN answers on port 8883{why}. Is the printer on and on this network? Pass --ip.")
         return ip, serial, code
+
+    def _discovery_deadline(self, a: _Attempt) -> float | None:
+        """What is left of the read's timeout once the connect and the TLS handshake are kept back; None: no timeout."""
+        if not self.timeout_s or self.timeout_s <= 0:
+            return None
+        return max(0.5, self.timeout_s - (time.monotonic() - a.started) - CONNECT_S - HANDSHAKE_S)
 
     def _read(self, ip: str, serial: str, code: str) -> dict:
         if self.insecure:

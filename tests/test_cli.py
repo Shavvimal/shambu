@@ -373,11 +373,11 @@ def test_threshold_and_top_defaults_and_help(capsys):
     [
         (
             {"url": "https://github.com/x/shambu", "vcs_info": {"vcs": "git", "requested_revision": "v0.4.0", "commit_id": "69519ac0123"}},
-            "uv tool, git tag v0.4.0",
+            "git tag v0.4.0",
             "69519ac",
         ),
         ({"url": "file:///src/shambu", "dir_info": {"editable": True}}, "editable checkout", None),
-        ({"url": "file:///src/shambu", "dir_info": {}}, "uv tool, local folder (snapshot)", None),
+        ({"url": "file:///src/shambu", "dir_info": {}}, "local folder (snapshot)", None),
         ({"url": "https://example.org/shambu.whl", "archive_info": {}}, "other", None),
         (None, "other", None),
     ],
@@ -394,7 +394,7 @@ def test_shambu_section_takes_the_package_version_and_compares():
 
     d = shambu_section("9.9.9", {"url": "file:///x", "dir_info": {}})
     assert d["version"] == shambu.__version__
-    assert (d["install"], d["expected"], d["match"]) == ("uv tool, local folder (snapshot)", "9.9.9", False)
+    assert (d["install"], d["expected"], d["match"]) == ("local folder (snapshot)", "9.9.9", False)
     assert shambu_section(None, {})["match"] is None
     assert shambu_section(shambu.__version__, {})["match"] is True
 
@@ -466,9 +466,12 @@ def test_doctor_without_the_binary_still_prints_and_exits_3(capsys, monkeypatch,
 
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(resolver=resolver))
     monkeypatch.setattr(studio_mod.StudioCLI, "__post_init__", missing)
-    code, out, _ = run(capsys, "--json", "doctor", "--no-printer")
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer", "--expect-version", "9.9.9")
     j = one_json(out)
-    assert code == 3 and "binary not found" in j["studio"]["error"] and j["shambu"]["version"]
+    assert code == 3 and "binary not found" in j["studio"]["error"]
+    assert next(iter(j)) == "shambu" and (j["shambu"]["expected"], j["shambu"]["match"]) == ("9.9.9", False)
+    code, out, _ = run(capsys, "doctor", "--no-printer", "--expect-version", "9.9.9")
+    assert code == 3 and out.splitlines()[0].endswith("MISMATCH") and out.splitlines()[1].startswith("Fix: ")
 
 
 @pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "-1", "1e300"])
@@ -487,7 +490,7 @@ def test_doctor_expect_version_with_a_trailing_newline_is_exit_2(capsys):
 def test_install_kind_names_a_branch_as_a_revision():
     from shambu.facade import install_kind
 
-    assert install_kind({"vcs_info": {"vcs": "git", "requested_revision": "main"}})[0] == "uv tool, git revision main"
+    assert install_kind({"vcs_info": {"vcs": "git", "requested_revision": "main"}})[0] == "git revision main"
 
 
 def test_malformed_info_plist_is_a_studio_error(tmp_path, capsys, monkeypatch, resolver):
@@ -534,3 +537,54 @@ def test_doctor_shows_unknown_pids(capsys, monkeypatch):
     monkeypatch.setattr(FakeStudio, "running_pids", lambda self: None)
     code, out, _ = run(capsys, "doctor", "--no-printer")
     assert code == 0 and "(running pids: unknown (pgrep failed))" in out.splitlines()[1]
+
+
+@pytest.mark.parametrize("argv, timeout", [([], 15.0), (["--wait", "20"], 27.0)])
+def test_printer_command_read_timeout_follows_wait(capsys, monkeypatch, argv, timeout):
+    from shambu.errors import PrinterError
+
+    seen = {}
+
+    class Svc:
+        def status(self):
+            raise PrinterError("no printer in tests")
+
+    def fake_printer(self, *a, **k):
+        seen["timeout"] = self.printer_timeout
+        return Svc()
+
+    monkeypatch.setattr(Bambu, "printer", fake_printer)
+    assert cli.main(["printer", "status", "--ip", "10.0.0.9", *argv]) == 3
+    assert seen["timeout"] == timeout
+
+
+def test_direct_url_without_a_distribution_or_with_bad_json(monkeypatch):
+    from importlib import metadata
+
+    from shambu import facade
+
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(facade.metadata, "distribution", missing)
+    assert facade._direct_url() is None
+
+    class Dist:
+        def read_text(self, name):
+            return "{not json"
+
+    monkeypatch.setattr(facade.metadata, "distribution", lambda name: Dist())
+    assert facade._direct_url() is None
+    assert facade.shambu_section(None)["install"] == "other"
+
+
+def test_install_kind_names_the_installer_only_with_proof(monkeypatch, tmp_path):
+    from shambu import facade
+
+    vcs = {"vcs_info": {"vcs": "git", "requested_revision": "v0.4.0"}}
+    assert facade.install_kind(vcs, "uv tool")[0] == "uv tool, git tag v0.4.0"
+    assert facade.install_kind(vcs)[0] == "git tag v0.4.0"
+    monkeypatch.setattr(facade.sys, "prefix", str(tmp_path))
+    assert facade._installer() is None
+    (tmp_path / "uv-receipt.toml").write_text("[tool]\n")
+    assert facade._installer() == "uv tool"

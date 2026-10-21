@@ -41,10 +41,13 @@ the plugin (that is how a 0.2.1 CLI ran under a 0.3.0 plugin). A checkout is for
 ## 3. Check the machine
 
 ```
+shambu --version                        # must print: shambu 0.4.0
 shambu doctor --expect-version 0.4.0
 ```
 
-Exit 3 with `skill expects 0.4.0: MISMATCH` means step 2 did not take: run it again and open a new shell. Expected:
+Run `shambu --version` first: every release prints it. If it shows another number, step 2 did not take: run it
+again and open a new shell. A usage error on `--expect-version` (`unrecognized arguments`) means the installed CLI
+predates 0.4.0: run step 2. Exit 3 with `skill expects 0.4.0: MISMATCH` means the same. Expected:
 the shambu version and how it was installed, the Bambu Studio version and binary, the profile sources (Application Support copy first, then the app
 bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is stored
 (the code itself is never printed), the machine's bed and per-extruder reach, the spools loaded on the printer
@@ -87,5 +90,6 @@ endpoint.
 - `PrinterError: no access code stored`: open the printer once in Bambu Studio's Device tab so the code is saved.
 - `paho-mqtt missing`: reinstall with the `--reinstall` line above.
 - `PresetError: filament preset 'loaded' not found`: the CLI is older than 0.3.0. Run step 2.
+- `unrecognized arguments: --expect-version`: the CLI is older than 0.4.0. Run step 2.
 - `doctor` exit 3 with `MISMATCH`: the CLI and the plugin differ. Run step 2; if `shambu --version` still shows the
   old number, `which -a shambu` lists the other copy on PATH.
