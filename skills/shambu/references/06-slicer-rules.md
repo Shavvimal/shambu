@@ -121,20 +121,40 @@ chamfer, a bore that wants a coupon, a show face that wants matte filament.
 ## 10. Studio's time estimate versus the printer
 
 Source: research C (2026-10-21), from two watched X2D prints, Studio's `GCodeProcessor.cpp` (v02.08.02.61) and five
-outside reports. This section replaces the "slicer estimate wins" line in section 8: show the Studio estimate, and
-show a measured ratio only from `shambu calibrate` data, with n.
+outside reports. This section replaces the "slicer estimate wins" line in section 8. Show the Studio estimate. Show a
+measured rate or a calibrated time only from `shambu calibrate` data, with n.
 
-**The two measured pairs disagree.** Both prints used Generic PETG, a 0.4 HS01 nozzle and the X2D 0.4 profile.
+**The two measured prints disagree.** Both prints used Generic PETG, a 0.4 HS01 nozzle and the X2D 0.4 profile.
 
-| Print | Span | Studio | Real | Ratio | Resolution |
+| Print | Span | Studio | Real | Rate | Resolution |
 | --- | --- | --- | --- | --- | --- |
 | Bracket D.7, 2026-10-16 | layers 11 to 620 | 281 min | 211 min | 0.751 | about ±0.01 (±1 min per end) |
-| Bracket D.7, whole print | start to end (both rebuilt) | 410 min (6 h 50) | about 5 h 0 to 5 h 30 | about 0.8 | ±15 min: neither the start nor the end was logged |
+| Bracket D.7, whole print | start to end (both rebuilt) | 410 min (6 h 50) | about 5 h 0 to 5 h 30 | about 0.75 to 0.80 (whole-print ratio) | ±15 min: neither the start nor the end was logged |
 | E7a cradle, 2026-10-21 | layers 135 to 182 | 57.5 min | 60.6 min | 1.054 | ±0.03 (one layer is about 1.5 min of Studio time) |
 | E7a cradle, send to layer 135 | upper bound | 289.3 min | at most 298.4 min | at most 1.031 | upper bound only |
 
-So no single ratio exists for this printer yet (n=2, 0.75 to 1.05). `shambu calibrate` reports the range, and it
-offers a point estimate only with n >= 3 prints, all logged at Standard speed, whose ratios lie within 0.15.
+So no single rate exists for this printer yet (n=2, 0.75 to 1.05). The speed level was logged on neither print.
+
+**What `shambu calibrate` fits.** Each print has two terms, fitted apart:
+
+- **Rate.** Real minutes per Studio minute between the first and the last poll at layer 11 and up. The first-layer
+  slow-down does not bias it.
+- **Startup offset.** When the watch saw the start, the real minutes from the first RUNNING poll that the rate does
+  not explain (the intercept).
+
+A whole-print prediction is `offset + rate x Studio minutes`. A single ratio applied to Studio's total would
+count the startup as if it scaled with the print. The whole-print ratio (real start to end over Studio's total) is
+stored only to describe the print. The report shows the range of rates ("measured prints ran at A to B x Studio
+(n=N)"). It shows "calibrated about H h M min (n=N)" only when at least 3 prints of that printer model and material
+qualify, and their rates span less than 0.15. A print qualifies when all of these hold:
+
+- it finished (FINISH), and the log shows its start;
+- every poll was at Standard speed and 100 %;
+- the printer's remaining time stayed within 5 % of Studio's M73 R;
+- it was never paused.
+
+A paused print has its paused time removed and is flagged. A log whose clock goes back, whose `task_id` changes or
+whose layer goes back is refused.
 
 **Corrections to the D.7 post-mortem.**
 
@@ -142,21 +162,25 @@ offers a point estimate only with n >= 3 prints, all logged at Standard speed, w
 - HS01 is a standard-flow hardened-steel nozzle, not high flow: Studio reads character 2 of the type as the flow
   (`S` standard, `H`/`E` high flow) and characters 3 to 4 as the material (`01` hardened steel)
   (`DevNozzleSystem.cpp` :637-670). The "Standard" preset was correct.
-- 0.75 is the mid-print ratio (layers 11 to 620). The whole print is about 0.8, because the startup took longer than
-  Studio allowed.
-- The D.7 times are local time (BST), not UTC: `Status.ends_at()` uses the local clock.
+- 0.75 is the mid-print rate (layers 11 to 620). The whole print is about 0.75 to 0.80, because the startup took
+  longer than Studio allowed.
+- The D.7 times are local time (BST), not UTC: the old `Status.ends_at()` used the local clock.
 - The printer's countdown on D.7 ran at 0.74 to 0.81 x Studio's M73 `R`. On E7a it equalled M73 `R`. The speed level
-  was not logged on D.7; a level other than Standard is the most likely cause. The watch log now records it.
+  was not logged on D.7. A level other than Standard is the most likely cause. The watch log now records it.
 
 **What Studio counts as 0 s.** Studio simulates the G-code's moves against the machine limits and adds a few fixed
-times. Heat waits (`M109`, `M190`) count 0 s. The calibration commands have no handler, so they count 0 s too:
-`M983` dynamic flow, `M970`/`M974` vibration compensation, `G383`/`G3811` foreign-object and underside detection,
-plate detection, nozzle wipe and Z-offset calibration. `G29` (bed levelling) counts a fixed 260 s
-(`machine_prepare_compensation_time`), and only inside an `M622 J1` block. `M191 S` above 40 adds 720 s. `G4`,
-`M400 S/P` and `SYNC T` add their stated time. Studio counts both branches of an `M622 J1`/`J2` flag block, whichever
-the printer runs. No code path scales the result per printer. The startup is therefore the part Studio cannot model,
-and `shambu calibrate` fits it as an offset (minutes from the first RUNNING poll to Studio's time at the first logged
-layer).
+times.
+
+- Heat waits (`M109`, `M190`) count 0 s.
+- The calibration commands have no handler, so they count 0 s too: `M983` dynamic flow, `M970`/`M974` vibration
+  compensation, `G383`/`G3811` foreign-object and underside detection, plate detection, nozzle wipe and Z-offset
+  calibration.
+- `G29` (bed levelling) counts a fixed 260 s (`machine_prepare_compensation_time`), and only inside an `M622 J1`
+  block. `M191 S` above 40 adds 720 s. `G4`, `M400 S/P` and `SYNC T` add their stated time.
+- Studio counts both branches of an `M622 J1`/`J2` flag block, whichever the printer runs.
+- No code path scales the result per printer.
+
+The startup is therefore the part Studio cannot model, and the startup offset carries it.
 
 **Outside reports.**
 
@@ -177,8 +201,10 @@ layer).
 No Bambu statement gives a ratio. The community sees about -5 % to +20 %, mostly from multi-colour work and profile
 slow-downs. D.7's 0.75 is an outlier, and a non-Standard speed level explains it better than any slicer cause.
 
-**How to add a measured print.** Export the plate as a `.gcode.3mf`. Start
-`shambu printer watch --log print.jsonl --gcode3mf plate.gcode.3mf` right after sending the print, while it
-prepares (a watch that finds the printer idle stops at once), and leave it until it logs FINISH. Then run `shambu calibrate --log print.jsonl --add`. `shambu calibrate --show` prints the
-stored prints and the fit per printer model and material. The build report then adds "measured prints ran at A to B x
-Studio (n=N)", or "calibrated about H h M min (n=N)" when the fit allows a point estimate.
+**How to add a measured print.**
+
+1. Export the plate as a `.gcode.3mf`.
+2. Run `shambu printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf` before or right after
+   sending the print, and leave it until it logs FINISH.
+3. Run `shambu calibrate --log print.jsonl --add`. The calibration file stores the log's file name, not its path.
+4. Run `shambu calibrate --show` to print the stored prints and the fit per printer model and material.

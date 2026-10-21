@@ -35,12 +35,13 @@ and no total estimate, only `mc_remaining_time` (min). So `Status.read_at` stamp
 decoded, and `watch` polls more often near the start and the end of a print, where the times matter. `spd_lvl` is the
 speed level (1 silent, 2 standard, 3 sport, 4 ludicrous), `spd_mag` its percent, `stg` the list of startup stages this
 job runs and `stg_cur` the current one (0 = printing); names in `STAGE_NAMES`. No output of this module names the IP:
-`Status.to_json` redacts it and keeps only the masked serial, and `Status.log_record` (a `watch --log` line) holds
+`Status.to_json` redacts it and keeps only the masked serial, and `Status.log_poll` (a `watch --log` line) holds
 neither the IP nor the serial.
 """
 
 from __future__ import annotations
 
+import calendar
 import copy
 import json
 import logging
@@ -89,7 +90,6 @@ KEEPALIVE_S = 10
 READ_TIMEOUT_S = 15.0
 TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
 SPEED_LEVELS = {1: "silent", 2: "standard", 3: "sport", 4: "ludicrous"}  # `spd_lvl`; Studio StatusPanel.cpp
-STANDARD_SPEED = 2
 # `stg` / `stg_cur` ids -> Studio's text (DeviceManager.cpp get_stage_string, v02.08.02.61). Every id the live X2D job
 # listed on 2026-10-21 is here; 255 is in that list, but Studio's table has no text for it.
 STAGE_NAMES = {
@@ -644,6 +644,7 @@ class Status:
         return self.state in DONE_STATES
 
     def ends_at(self) -> str | None:
+        """Local HH:MM of the forecast end, for the text lines."""
         if self.remaining_min is None or not self.busy:
             return None
         return time.strftime("%H:%M", time.localtime(time.time() + self.remaining_min * 60))
@@ -652,16 +653,23 @@ class Status:
     def speed_name(self) -> str | None:
         return None if self.speed_level is None else SPEED_LEVELS.get(self.speed_level, f"level {self.speed_level}")
 
+    def ends_at_utc(self) -> str | None:
+        """The printer's forecast end as a dated UTC timestamp: `read_at` plus the remaining minutes."""
+        if self.remaining_min is None or not self.busy or not self.read_at:
+            return None
+        return utc_iso(calendar.timegm(time.strptime(self.read_at, "%Y-%m-%dT%H:%M:%SZ")) + self.remaining_min * 60)
+
     def to_json(self) -> dict:
-        """Every field but `raw`, with the IP redacted (CONTRIBUTING: an IP never lands in a file) and the serial masked."""
+        """Every field but `raw`, with the IP redacted (CONTRIBUTING: an IP never lands in a file) and the serial masked.
+        `ends_at` is the dated UTC forecast (`ends_at_utc`); the text lines show the local clock time."""
         d = {k: v for k, v in self.__dict__.items() if k != "raw"}
         d["ip"] = REDACTED_IP
-        d["ends_at"] = self.ends_at()
+        d["ends_at"] = self.ends_at_utc()
         d["speed"] = self.speed_name
         return d
 
-    def log_record(self) -> dict:
-        """One `watch --log` line: the time and job fields only. No IP, no serial (not even masked), no wifi."""
+    def log_poll(self) -> dict:
+        """One `watch --log` poll line: the time and job fields only. No IP, no serial (not even masked), no wifi."""
         return {
             "read_at": self.read_at,
             "task": self.task,
@@ -1220,7 +1228,15 @@ class PrinterService:
         return ip, serial, self._read(ip, serial, code)
 
     def raw_report(self) -> dict:
+        """The merged report as the printer sent it, with shambu's transport keys. Internal: print `public_report`."""
         return self._bounded(self._resolve_and_read)[2]
+
+    def public_report(self) -> dict:
+        """The report for `printer raw`: `public_raw()` of one read, which removes the transport metadata (`_topic`
+        names the full serial), the network and wifi fields, secret-looking keys, and any text naming the IP or the
+        serial."""
+        ip, serial, report = self._bounded(self._resolve_and_read)
+        return public_raw(report, ip, serial)
 
     def status(self) -> Status:
         ip, serial, report = self._bounded(self._resolve_and_read)
@@ -1237,6 +1253,7 @@ class PrinterService:
         until_idle: bool = True,
         max_polls: int = 200,
         max_errors: int | None = None,
+        wait_for_start: bool = False,
         sleep: Callable[[float], None] | None = None,
         clock: Callable[[], float] | None = None,
         now: Callable[[], float] | None = None,
@@ -1244,18 +1261,27 @@ class PrinterService:
         """Generator of Status, one per poll; stops on a final state (idle, finished, failed) or after `max_polls`.
         An unknown or unrecognised state is not final: it logs a warning and keeps polling.
 
-        The interval is `poll_interval()`: `every_s`, but at most 60 s in the first 15 minutes of RUNNING (when this
-        watch saw the print start) and while less than 15 minutes remain. `max_errors=None` lets a failed read raise
-        (the old behaviour). With a number, a failed read yields a `WatchError` and the watch goes on; after
-        `max_errors` failures in a row the last `WatchError` has `gave_up=True` and the generator ends.
+        The interval is `poll_interval()`: `every_s`, but at most 60 s while preparing, in the first 15 minutes of
+        RUNNING when this watch saw the job start (a PREPARE poll, or a first RUNNING poll before layer 2 that is the
+        watch's first poll or follows an idle or final state), and while fewer than 15 minutes remain.
+        `wait_for_start=True`: a final state seen before any job is active does not stop the watch; it polls every
+        60 s (at most `every_s`) until a job starts, still bounded by `max_polls`.
+        `max_errors=None` lets a failed read raise. With a number, a failed read yields a `WatchError` (a category
+        and a fixed message, no endpoint text) and the watch goes on; after `max_errors` failures in a row the last
+        `WatchError` has `gave_up=True` and the generator ends. After a failure the next poll follows the interval of
+        the last good poll. There is no sleep after the last permitted poll.
         `sleep`, `clock` (monotonic) and `now` (epoch, for an error's `read_at`) are injectable for tests."""
         sleep = sleep or time.sleep
         clock = clock or time.monotonic
         now = now or time.time
         running_since: float | None = None  # clock() at the first RUNNING poll, when this watch saw the start
-        seen_any = joined_mid_print = False
+        prev: str | None = None  # the raw state of the last good poll
+        decided = False  # the start window is decided (seen, or the watch joined mid-print)
+        active_seen = False
+        last: Status | None = None
         errors = 0
-        for _ in range(max_polls):
+        for n in range(max_polls):
+            remaining = n + 1 < max_polls
             try:
                 st = self.status()
             except PrinterError as e:
@@ -1263,52 +1289,107 @@ class PrinterService:
                     raise
                 errors += 1
                 gave_up = errors >= max_errors
-                yield WatchError(utc_iso(now()), redact_ip(f"{type(e).__name__}: {e}"), errors, gave_up)
+                yield WatchError(utc_iso(now()), *error_category(e), consecutive=errors, gave_up=gave_up)
                 if gave_up:
                     return
-                sleep(every_s)
+                if remaining:
+                    sleep(self._interval(every_s, last, running_since, clock) if last else every_s)
                 continue
             errors = 0
-            if st.raw_state == "RUNNING" and running_since is None and not joined_mid_print:
-                if seen_any or (st.layer or 0) <= 1:
+            if st.raw_state == "RUNNING" and not decided:
+                decided = True
+                if prev == "PREPARE" or ((st.layer or 0) <= 1 and (prev is None or prev in ("IDLE", "FINISH", "FAILED"))):
                     running_since = clock()
-                else:
-                    joined_mid_print = True  # the first poll found the print past layer 1: its start is not ours
-            seen_any = True
+            active_seen = active_seen or st.busy
+            prev, last = st.raw_state, st
             yield st
-            if until_idle and st.done:
+            waiting = wait_for_start and not active_seen
+            if until_idle and st.done and not waiting:
                 return
             if not st.busy and not st.done:
                 log.warning("printer state %s (%s) is not final; still watching", st.state, st.raw_state)
-            sleep(poll_interval(every_s, st, None if running_since is None else clock() - running_since))
+            if remaining:
+                sleep(min(every_s, FAST_POLL_S) if waiting else self._interval(every_s, st, running_since, clock))
+
+    @staticmethod
+    def _interval(every_s: float, st: Status, running_since: float | None, clock: Callable[[], float]) -> float:
+        return poll_interval(every_s, st, None if running_since is None else clock() - running_since)
 
 
-_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+ERROR_CATEGORIES = (  # (category, words in the PrinterError text, the fixed message a watch log holds)
+    ("timeout", ("timed out",), "the read timed out"),
+    ("tls", ("TLS", "certificate", "CA bundle"), "the TLS check of the printer failed"),
+    ("login", ("refused the MQTT login",), "the printer refused the MQTT login (check the LAN access code in Studio)"),
+    ("discovery", ("no host on this LAN",), "no printer answered on port 8883 on this LAN"),
+    ("identity", ("another device",), "the host answered for another device"),
+    ("report", ("no full report", "no report"), "the printer sent no full report in time"),
+    ("connect", ("cannot connect",), "the connection to the printer failed"),
+    ("setup", ("paho-mqtt missing", "no printer selected", "no access code"), "shambu or Bambu Studio is not set up for the printer"),
+)
 
 
-def redact_ip(text: str) -> str:
-    """A read error names the host it tried; a watch log or stdout must not (CONTRIBUTING: never commit an IP)."""
-    return _IPV4.sub(REDACTED_IP, text)
+def error_category(e: BaseException) -> tuple[str, str]:
+    """(category, fixed message) for a failed read. The message never quotes the exception: the lower layers put the
+    IP, the host name, the masked serial and the TLS names in their text, and a watch log must hold none of them."""
+    text = str(e)
+    for cat, words, msg in ERROR_CATEGORIES:
+        if any(w in text for w in words):
+            return cat, msg
+    return "other", f"the read failed ({type(e).__name__})"
 
 
 @dataclass(frozen=True)
 class WatchError:
-    """One failed poll of `PrinterService.watch`. `error` has the IP redacted; `consecutive` counts the failures in a
-    row; `gave_up` is True on the failure that reached `max_errors`."""
+    """One failed poll of `PrinterService.watch`: a category and its fixed message (see `error_category`).
+    `consecutive` counts the failures in a row; `gave_up` is True on the failure that reached `max_errors`."""
 
     read_at: str
+    category: str
     error: str
-    consecutive: int
+    consecutive: int = 1
     gave_up: bool = False
 
-    def log_record(self) -> dict:
-        return {"read_at": self.read_at, "error": self.error, "consecutive": self.consecutive, "gave_up": self.gave_up}
+    def log_poll(self) -> dict:
+        return {
+            "read_at": self.read_at,
+            "error": self.error,
+            "category": self.category,
+            "consecutive": self.consecutive,
+            "gave_up": self.gave_up,
+        }
+
+
+RAW_SECRET = ("access", "password", "passwd", "token", "ticket", "secret", "auth")
+RAW_DROP = ("net", "wifi_signal", "ipcam", "sn", "dev_id", "serial")  # network, camera URL (holds the IP), serial keys
+
+
+def public_raw(report: dict, ip: str, serial: str) -> dict:
+    """A deep copy of a raw report for output: transport keys (`_topic` holds the full serial) removed except
+        `_tls_verified`, the RAW_DROP keys removed at any depth, secret-looking keys redacted (RAW_SECRET; not `conf.redact`,
+    whose "code" would hide `gcode_state`), and any text
+        that names the IP, the serial or the masked serial replaced by '<redacted>'."""
+    masked = conf.mask(serial)
+
+    def clean(x):
+        if isinstance(x, dict):
+            return {
+                k: ("<redacted>" if any(s in k.lower() for s in RAW_SECRET) else clean(v))
+                for k, v in x.items()
+                if not (k.startswith("_") and k != "_tls_verified") and k not in RAW_DROP
+            }
+        if isinstance(x, list):
+            return [clean(v) for v in x]
+        if isinstance(x, str) and ((ip and ip in x) or (serial and serial in x) or masked in x):
+            return "<redacted>"
+        return x
+
+    return clean(report)
 
 
 def poll_interval(every_s: float, st: Status, running_for_s: float | None) -> float:
     """Seconds to the next poll. At most FAST_POLL_S while the printer prepares, in the first START_WINDOW_S of
-    RUNNING (`running_for_s` is None when the watch joined mid-print), and while fewer than END_WINDOW_MIN minutes
-    remain: Studio's model is worst at the start and the end, and these polls bound the real start and end."""
+    RUNNING (`running_for_s` is None when the watch did not see the start), and while fewer than END_WINDOW_MIN
+    minutes remain: Studio's model is worst at the start and the end, and these polls bound the real start and end."""
     fast = st.raw_state == "PREPARE"
     if st.raw_state == "RUNNING" and running_for_s is not None and running_for_s < START_WINDOW_S:
         fast = True

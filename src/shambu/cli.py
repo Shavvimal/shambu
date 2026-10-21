@@ -895,6 +895,11 @@ class Printer(Command):
         p.add_argument("--plate", type=int, help="watch --gcode3mf: the plate number (default: the only sliced plate)")
         p.add_argument("--max-errors", type=int, default=10, help="watch: stop after this many failed reads in a row (default 10)")
         p.add_argument("--max-polls", type=int, default=2000, help="watch: stop after this many polls (default 2000)")
+        p.add_argument(
+            "--wait-for-start",
+            action="store_true",
+            help="watch: when the printer is idle or shows the last job's end, poll every 60 s until a job starts (bounded by --max-polls)",
+        )
         p.add_argument("--ssdp", type=float, default=0, help="discover: also listen for SSDP this many seconds")
         p.add_argument("--printer-preset", help="filaments: the machine preset to name presets for (default: the GUI's current one)")
         p.add_argument(
@@ -918,7 +923,7 @@ class Printer(Command):
             )
             return 0 if hits else 1
         if a.action == "raw":
-            print(json.dumps(svc.raw_report(), indent=1, default=str))
+            print(json.dumps(svc.public_report(), indent=1, default=str))
             return 0
         if a.action == "status":
             st = svc.status()
@@ -932,28 +937,28 @@ class Printer(Command):
 
 
 def _gcode_track(path: str, plate: int | None):
-    """(M73Track, entry name) of a sliced project's plate G-code. Raises ProjectError when there is no G-code."""
-    import io
-    import re
-
+    """(M73Track, entry name) of a sliced project's plate G-code, streamed from the zip: no other entry is read.
+    Raises ProjectError when the plate's G-code is missing, CalibrationError when it holds no usable M73 track."""
     from .calibrate import parse_m73
     from .errors import ProjectError
-    from .threemf import Project
+    from .threemf import open_text_entry, plate_gcode_names
 
-    pr = Project(path)
-    names = sorted(n for n in pr.names() if re.fullmatch(r"Metadata/plate_\d+\.gcode", n))
+    names = plate_gcode_names(path)
     if plate is not None:
         names = [n for n in names if n == f"Metadata/plate_{plate}.gcode"]
     if len(names) != 1:
-        which = f"plate {plate}" if plate is not None else "one sliced plate"
+        which = f"plate {plate}" if plate is not None else "one sliced plate (pass --plate N)"
         raise ProjectError(f"{path}: expected the G-code of {which}, found {names or 'none'} (export it with Export Plate Sliced File)")
-    with io.TextIOWrapper(io.BytesIO(pr.read(names[0])), encoding="utf-8", errors="replace") as f:
+    with open_text_entry(path, names[0]) as f:
         return parse_m73(f), names[0]
 
 
 def _watch(a, svc, out: Output) -> int:
     """`printer watch`: one document per poll on stdout; with --log, one JSON line per poll (and a header line) in the
-    file. Exit 0 when the print reached a final state or the poll limit, 3 after --max-errors failed reads in a row."""
+    file. Exit 0 when the print reached a final state or the poll limit, 3 after --max-errors failed reads in a row or
+    when the log cannot be opened or written."""
+    from .calibrate import CalibrationError
+    from .conf import DataFileError
     from .errors import ProjectError
     from .printer import WatchError, utc_iso
 
@@ -961,43 +966,53 @@ def _watch(a, svc, out: Output) -> int:
         return usage(out, "--every, --max-errors and --max-polls must be 1 or more")
     if a.gcode3mf and not a.log:
         return usage(out, "--gcode3mf ties a --log to the file it watches: give --log too")
-    log_f = None
+    header: dict | None = None
     if a.log:
-        header: dict = {"kind": "header", "shambu_version": __version__, "started_at": utc_iso(time.time()), "every_s": a.every}
+        header = {"kind": "header", "shambu_version": __version__, "started_at": utc_iso(time.time()), "every_s": a.every}
         if a.gcode3mf:
             if not Path(a.gcode3mf).is_file():
                 return usage(out, f"--gcode3mf {a.gcode3mf}: no such file")
             try:
                 track, entry = _gcode_track(a.gcode3mf, a.plate)
-            except ProjectError as e:
-                msg = f"ProjectError: {e}"
+            except (ProjectError, CalibrationError) as e:
+                msg = f"{type(e).__name__}: {e}"
                 out.emit({"error": msg}, [msg])
                 return 1
-            header.update(gcode3mf=str(Path(a.gcode3mf).resolve()), gcode=entry, track=track.to_json())
-        try:
-            log_f = open(a.log, "a", encoding="utf-8")  # held open for the whole watch, closed below
-        except OSError as e:
-            return usage(out, f"--log {a.log}: cannot open it for appending ({e.strerror})")
-        log_f.write(json.dumps(header) + "\n")
-        log_f.flush()
+            header.update(gcode3mf=Path(a.gcode3mf).name, gcode=entry, track=track.to_json())
+    log_f = None
     code = 0
+
+    def write(rec: dict) -> None:
+        if log_f is None:
+            return
+        try:
+            log_f.write(json.dumps(rec, allow_nan=False) + "\n")
+            log_f.flush()
+        except OSError as e:
+            raise DataFileError(f"--log {a.log}: cannot write it ({e.strerror})") from e
+
     try:
-        for item in svc.watch(a.every, max_polls=a.max_polls, max_errors=a.max_errors):
-            rec = {"kind": "error" if isinstance(item, WatchError) else "poll", **item.log_record()}
+        if a.log:
+            try:
+                log_f = open(a.log, "a", encoding="utf-8")  # closed in the finally below
+            except OSError as e:
+                raise DataFileError(f"--log {a.log}: cannot open it for appending ({e.strerror})") from e
+            if header is not None:
+                write(header)
+        for item in svc.watch(a.every, max_polls=a.max_polls, max_errors=a.max_errors, wait_for_start=a.wait_for_start):
             if isinstance(item, WatchError):
-                text = f"read failed at {item.read_at} ({item.consecutive} of {a.max_errors} in a row): {item.error}"
-                log.warning("%s", text)
+                log.warning("read failed at %s (%d of %d in a row): %s", item.read_at, item.consecutive, a.max_errors, item.error)
                 if out.as_json:
-                    out.emit(item.log_record())
+                    out.emit(item.log_poll())
+                write({"kind": "error", **item.log_poll()})
                 if item.gave_up:
                     code = 3
             else:
+                rec = {"kind": "poll", **item.log_poll()}
                 if item.done:
                     rec["final"] = True
                 out.emit(item.to_json(), item.lines() + [""])
-            if log_f is not None:
-                log_f.write(json.dumps(rec) + "\n")
-                log_f.flush()
+                write(rec)
             sys.stdout.flush()
     finally:
         if log_f is not None:
@@ -1005,74 +1020,79 @@ def _watch(a, svc, out: Output) -> int:
     return code
 
 
-@command("calibrate", "Compare watch logs with Studio's estimate; store measured prints and show the ratio per printer and material")
+@command("calibrate", "Compare watch logs with Studio's estimate; store measured prints and show the fit per printer and material")
 class Calibrate(Command):
     def configure(self, p):
         p.add_argument(
             "--log", action="append", default=[], help="a `printer watch --log` file made with --gcode3mf (repeat for several prints)"
         )
-        p.add_argument("--add", action="store_true", help="append the logs' prints to the calibration file")
+        p.add_argument("--add", action="store_true", help="add the logs' prints to the calibration file")
         p.add_argument("--show", action="store_true", help="print the stored prints and the fit per printer model and material")
 
     def run(self, a, app, out):
         from . import calibrate as C
         from . import conf
 
-        prints, errors = [], []
+        fits, prints, errors = [], [], []
         for path in a.log:
+            name = Path(path).name
             try:
                 with open(path, encoding="utf-8") as f:
-                    lines = f.readlines()
-                header, records = C.read_log(lines)
-                if not header or not header.get("track"):
-                    raise C.CalibrationError("not tied to a G-code file: watch it with --log and --gcode3mf")
-                track = C.M73Track.from_json(header["track"])
-                fit = C.fit(C.pairs_from_log(records, track), track)
-            except (OSError, C.CalibrationError) as e:
-                errors.append(f"{path}: {e}")
-                continue
-            task = next((r.get("task") for r in records if r.get("task")), None)
-            prints.append((fit, fit.record(log=str(Path(path).resolve()), gcode3mf=header.get("gcode3mf"), task=task)))
+                    sessions = C.read_log(f)
+                if not sessions:
+                    raise C.CalibrationError("the log is empty")
+                for s in sessions:
+                    if not s.header or not s.header.get("track"):
+                        raise C.CalibrationError(
+                            f"the session at line {s.line} is not tied to a G-code file: watch with --log and --gcode3mf"
+                        )
+                    track = C.M73Track.from_json(s.header["track"])
+                    fit = C.fit(C.polls_from_session(s, track), s, track)
+                    fits.append(fit)
+                    prints.append(fit.to_print(name))
+            except OSError as e:
+                errors.append(f"{name}: cannot read it ({e.strerror})")
+            except C.CalibrationError as e:
+                errors.append(f"{name}: {e}")
         added = 0
         if a.add and prints and not errors:
-            stored = conf.load_calibration()
-            for _, rec in prints:
-                stored = [s for s in stored if (s.get("log"), s.get("first_read_at")) != (rec["log"], rec["first_read_at"])]
-                stored.append(rec)
-                added += 1
-            conf.save_calibration(stored)
+
+            def add(stored: list[dict]) -> list[dict]:
+                for p in prints:
+                    stored = [s for s in stored if (s.get("log"), s.get("first_read_at")) != (p["log"], p["first_read_at"])]
+                    stored.append(p)
+                return stored
+
+            conf.update_calibration(add)
+            added = len(prints)
         show = a.show or not a.log
         stored = conf.load_calibration() if show else []
-        fits = []
-        if show:
-            for model, material in dict.fromkeys((s.get("printer_model"), s.get("material")) for s in stored):
-                fits.append(C.combine(stored, model, material))
+        combined = (
+            [C.combine(stored, m, mat) for m, mat in dict.fromkeys((s.get("printer_model"), s.get("material")) for s in stored)]
+            if show
+            else []
+        )
         lines = [f"ERROR: {e}" for e in errors]
-        for f, _ in prints:
-            lines += f.lines()
+        for fit in fits:
+            lines += fit.lines()
         if a.add:
             lines.append(
-                f"added {added} print(s) to {conf.CALIBRATION}"
+                f"added {added} print(s) to the calibration file"
                 if added
-                else "added nothing: " + ("a log failed" if errors else "no log given")
+                else "added nothing: " + ("a log failed" if errors else "no print")
             )
         if show:
-            lines.append(f"{len(stored)} stored print(s) in {conf.CALIBRATION}")
+            lines.append(f"{len(stored)} stored print(s)")
             lines += [
-                f"  {s.get('date')}  {s.get('printer_model')}  {s.get('material')}  Studio {C.hm(float(s.get('studio_total_min') or 0))}  "
-                f"{s.get('kind')} {s.get('ratio')} x  layers {s.get('layers')}  flags {', '.join(s.get('flags') or []) or 'none'}"
+                f"  {s['date']}  {s['printer_model']}  {s['material']}  Studio {C.hm(s['studio_total_min'])}  {s['kind']}  "
+                f"rate {s['rate'] if s['rate'] is not None else '-'}  offset {s['startup_offset_min'] if s['startup_offset_min'] is not None else '-'}  "
+                f"flags {', '.join(s['flags']) or 'none'}"
                 for s in stored
             ]
-            for fit in fits:
-                lines += fit.lines()
+            for c in combined:
+                lines += c.lines()
         out.emit(
-            {
-                "prints": [r for _, r in prints],
-                "errors": errors,
-                "added": added,
-                "stored": stored if show else None,
-                "fits": fits if show else None,
-            },
+            {"prints": prints, "errors": errors, "added": added, "stored": stored if show else None, "fits": combined if show else None},
             lines,
         )
         return 1 if errors else 0

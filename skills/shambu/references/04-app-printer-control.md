@@ -440,13 +440,29 @@ keys with "time" in the name are `mc_remaining_time` and `remain_time`; `job.sta
 are 0 on this firmware. Studio reads no start time either. So the watch log stamps each poll itself, and it bounds
 the start by the first RUNNING poll and the end by the first FINISH poll.
 
-**`shambu printer watch --log FILE [--gcode3mf PATH] [--every S] [--max-errors N]`.** It appends one JSON line per
-poll: `read_at`, `task`, `task_id`, `state` (the raw `gcode_state`), `percent`, `layer`, `total_layers`,
-`remaining_min`, `speed_level`, `speed_percent`, `stage`, `stages` and `print_error`. The last poll (FINISH, FAILED or
-IDLE) carries `"final": true`. A failed read is a line with `error` (the IP redacted to `<ip>`), and the watch
-goes on until the print leaves RUNNING/PAUSE or N reads in a row fail (default 10, then exit 3). The interval is
-`--every`, but at most 60 s during the first 15 minutes of RUNNING (when the watch saw the start) and while fewer
-than 15 minutes remain. `--gcode3mf` writes a header line with the file's path and its M73 track (percent and
-remaining per layer), so the log is tied to the file it watched. A project sent from the GUI holds no G-code: export
-the plate with Export Plate Sliced File and pass that `.gcode.3mf`. The log never holds the IP, the serial (masked
-or not) or the access code; `printer status --json` shows the IP as `<ip>` and only the masked serial.
+**`shambu printer watch --log FILE [--gcode3mf PATH [--plate N]] [--every S] [--max-errors N] [--max-polls N] [--wait-for-start]`.**
+
+- **Poll lines.** One JSON line per poll: `read_at`, `task`, `task_id`, `state` (the raw `gcode_state`), `percent`,
+  `layer`, `total_layers`, `remaining_min`, `speed_level`, `speed_percent`, `stage`, `stages` and `print_error`. The
+  last poll (FINISH, FAILED or IDLE) carries `"final": true`.
+- **Failed reads.** A failed read is a line with a `category` (timeout, tls, login, discovery, identity, report,
+  connect, setup, other) and that category's fixed `error` text. It never quotes the exception, because the lower
+  layers name the IP, the host and the masked serial. The watch goes on until the print leaves RUNNING/PAUSE or N
+  reads in a row fail (default 10, then exit 3). After a failure, the next poll keeps the interval of the last good
+  poll.
+- **Interval.** `--every`, but at most 60 s while preparing, during the first 15 minutes of RUNNING, and while fewer
+  than 15 minutes remain. The start window applies only when the watch saw the start: a PREPARE poll, or a first
+  RUNNING poll before layer 2 that is the first poll or follows IDLE, FINISH or FAILED. No sleep follows the last
+  permitted poll.
+- **`--wait-for-start`.** A watch that finds the printer IDLE, or still showing the last job's FINISH, keeps polling
+  every 60 s until a job starts. It is bounded by `--max-polls`. Without the flag, the watch stops at once.
+- **`--gcode3mf`.** Writes a header line with the file's name (not its path) and its M73 track, so the log is tied to
+  the file it watched. The plate G-code is streamed from the zip, and no other entry is read. A project sent from the
+  GUI holds no G-code: export the plate with Export Plate Sliced File and pass that `.gcode.3mf`.
+- **Sessions.** Each watch run appends its own header, so a log can hold several sessions. `shambu calibrate` fits
+  each session against its own track.
+- **Identifiers.** The log never holds the IP, the serial (masked or not) or the access code. `printer status
+  --json` shows the IP as `<ip>`, only the masked serial, and `ends_at` as a dated UTC time. `printer raw` drops
+  `_topic` (it names the full serial), `net`, `wifi_signal`, `ipcam` (its URL holds the IP) and serial keys. It
+  redacts secret-looking keys and any text that names the IP or the serial.
+- **Errors.** A log that cannot be opened or written is exit 3.

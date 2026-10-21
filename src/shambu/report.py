@@ -25,13 +25,13 @@ def estimate_lines(sl: dict, calibration: list[dict] | None = None, printer_mode
     """Report lines for one entry of BuildResult.estimates(). Each number names its source: slice_info.config,
     result.json (seconds per feature, tower plus flush grams) or the G-code parser (support grams, filament changes
     as tool switches, and everything by feature when the run left no result.json). The time is always "Studio
-    estimate"; `calibration` (the stored measured prints) adds their range, or a calibrated time when n >= 3 agree."""
+    estimate"; `calibration` (the stored measured prints) adds their range, or a calibrated time (startup offset + rate x Studio) when n >= 3 eligible prints agree."""
     from .calibrate import handback, material_key
 
     n = sl["plate"]
     cal = handback(calibration or [], printer_model, material_key(f["type"] for f in sl["filaments"]), sl["prediction_s"])
     out = [
-        f"- plate {n} estimate: Studio estimate {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min{cal}, {sl['weight_g']:.1f} g ("
+        f"- plate {n}: Studio estimate {sl['prediction_s'] // 3600} h {sl['prediction_s'] % 3600 // 60} min{cal}, {sl['weight_g']:.1f} g ("
         + ", ".join(f"filament {f['id']} {f['type']} {f['used_g']:.1f} g" for f in sl["filaments"])
         + ")"
         + (f"; slicer warnings: {sl['warnings']}" if sl["warnings"] else "")

@@ -648,20 +648,35 @@ def _timed(state, layer=None, remaining=None):
     return printer.StatusDecoder().decode({"print": p}, SERIAL, "10.0.0.9")
 
 
+def _service(items):
+    """A PrinterService whose status() plays `items` (an Exception item is raised)."""
+    items = list(items)
+    svc = printer.PrinterService(ip="10.0.0.9")
+
+    def status():
+        x = items.pop(0)
+        if isinstance(x, Exception):
+            raise x
+        return x
+
+    svc.status = status  # type: ignore[method-assign]
+    return svc
+
+
 def test_poll_interval_is_fast_near_the_start_and_the_end():
     every = 300
     assert printer.poll_interval(every, _timed("PREPARE"), None) == 60
     assert printer.poll_interval(every, _timed("RUNNING", 1, 400), 0) == 60
     assert printer.poll_interval(every, _timed("RUNNING", 30, 380), 14 * 60) == 60
     assert printer.poll_interval(every, _timed("RUNNING", 60, 360), 16 * 60) == 300
-    assert printer.poll_interval(every, _timed("RUNNING", 500, 300), None) == 300  # joined mid-print: no start window
+    assert printer.poll_interval(every, _timed("RUNNING", 500, 300), None) == 300  # the start was not seen: no window
     assert printer.poll_interval(every, _timed("RUNNING", 800, 14), None) == 60
     assert printer.poll_interval(20, _timed("RUNNING", 800, 14), None) == 20  # never slower than --every
 
 
 def test_watch_sleeps_follow_the_print():
     """Start window from the first RUNNING poll, `every` mid-print, fast again in the last 15 minutes."""
-    seq = iter(
+    svc = _service(
         [
             _timed("PREPARE", 0, 400),
             _timed("RUNNING", 0, 400),
@@ -671,8 +686,6 @@ def test_watch_sleeps_follow_the_print():
         ]
     )
     ticks = iter([0.0, 0.0, 1200.0, 5000.0])
-    svc = printer.PrinterService(ip="10.0.0.9")
-    svc.status = lambda: next(seq)  # type: ignore[method-assign]
     sleeps: list[float] = []
     states = [st.raw_state for st in svc.watch(every_s=300, sleep=sleeps.append, clock=lambda: next(ticks))]
     assert states == ["PREPARE", "RUNNING", "RUNNING", "RUNNING", "FINISH"]
@@ -680,48 +693,80 @@ def test_watch_sleeps_follow_the_print():
 
 
 def test_watch_joined_mid_print_has_no_start_window():
-    seq = iter([_timed("RUNNING", 500, 300), _timed("FINISH", 900, 0)])
-    svc = printer.PrinterService(ip="10.0.0.9")
-    svc.status = lambda: next(seq)  # type: ignore[method-assign]
+    svc = _service([_timed("RUNNING", 500, 300), _timed("FINISH", 900, 0)])
     sleeps: list[float] = []
     list(svc.watch(every_s=300, sleep=sleeps.append, clock=lambda: 0.0))
     assert sleeps == [300]
 
 
-def test_watch_yields_a_redacted_error_and_goes_on():
-    items = [_timed("RUNNING", 5, 300), PrinterError("connect to 10.0.0.9 refused"), _timed("FINISH", 9, 0)]
+def test_an_unknown_or_paused_poll_is_not_a_seen_start():
+    svc = _service([_timed("UNKNOWN"), _timed("RUNNING", 1, 300), _timed("FINISH", 900, 0)])
+    sleeps: list[float] = []
+    list(svc.watch(every_s=300, sleep=sleeps.append, clock=lambda: 0.0))
+    assert sleeps == [300, 300]  # no start window: the job may have run before the UNKNOWN poll
 
-    def status():
-        x = items.pop(0)
-        if isinstance(x, Exception):
-            raise x
-        return x
 
-    svc = printer.PrinterService(ip="10.0.0.9")
-    svc.status = status  # type: ignore[method-assign]
+def test_watch_yields_a_categorised_error_and_goes_on():
+    err = PrinterError("cannot connect to 10.0.0.9:8883: printer 00X…999 at [fd00::42] refused")
+    svc = _service([_timed("RUNNING", 5, 300), err, _timed("FINISH", 9, 0)])
     got = list(svc.watch(every_s=1, max_errors=2, sleep=lambda s: None, now=lambda: 0.0))
-    assert isinstance(got[1], printer.WatchError)
-    assert got[1].error == "PrinterError: connect to <ip> refused" and got[1].read_at == "1970-01-01T00:00:00Z"
-    assert not got[1].gave_up and got[-1].raw_state == "FINISH"
+    e = got[1]
+    assert isinstance(e, printer.WatchError)
+    assert (e.category, e.error, e.read_at, e.gave_up) == ("connect", "the connection to the printer failed", "1970-01-01T00:00:00Z", False)
+    assert "00X" not in json.dumps(e.log_poll(), ensure_ascii=False) and "fd00" not in json.dumps(e.log_poll())
+    assert got[-1].raw_state == "FINISH"
+
+
+@pytest.mark.parametrize(
+    ("text", "category"),
+    [
+        ("timed out after 15 s in mqtt", "timeout"),
+        ("TLS verification failed for printer 00X…999 at 10.0.0.9: x", "tls"),
+        ("printer 00X…999 at 10.0.0.9 refused the MQTT login (5): check", "login"),
+        ("no host on this LAN answers on port 8883", "discovery"),
+        ("host 10.0.0.9 answered for another device, not printer 00X…999", "identity"),
+        ("connected to 10.0.0.9 but no report on device/00X…999/report within 8 s", "report"),
+        ("something new at printer.local", "other"),
+    ],
+)
+def test_error_categories_have_fixed_messages(text, category):
+    cat, msg = printer.error_category(PrinterError(text))
+    assert cat == category
+    for s in ("10.0.0.9", "00X", "printer.local"):
+        assert s not in msg
 
 
 def test_watch_gives_up_after_max_errors_in_a_row():
-    svc = printer.PrinterService(ip="10.0.0.9")
-
-    def status():
-        raise PrinterError("no host on this LAN answers")
-
-    svc.status = status  # type: ignore[method-assign]
+    svc = _service([PrinterError("no host on this LAN answers")] * 3)
     got = list(svc.watch(every_s=1, max_errors=3, sleep=lambda s: None))
     assert [g.consecutive for g in got] == [1, 2, 3] and got[-1].gave_up
 
 
 def test_watch_without_max_errors_still_raises():
-    svc = printer.PrinterService(ip="10.0.0.9")
-
-    def status():
-        raise PrinterError("boom")
-
-    svc.status = status  # type: ignore[method-assign]
+    svc = _service([PrinterError("boom")])
     with pytest.raises(PrinterError):
         list(svc.watch(every_s=1, sleep=lambda s: None))
+
+
+def test_a_failed_read_near_the_end_keeps_the_fast_interval():
+    svc = _service([_timed("RUNNING", 900, 10), PrinterError("timed out after 15 s in mqtt"), _timed("FINISH", 900, 0)])
+    sleeps: list[float] = []
+    list(svc.watch(every_s=300, max_errors=3, sleep=sleeps.append, clock=lambda: 0.0))
+    assert sleeps == [60, 60]
+
+
+def test_no_sleep_after_the_last_permitted_poll():
+    sleeps: list[float] = []
+    list(_service([_timed("RUNNING", 500, 300)]).watch(every_s=300, max_polls=1, sleep=sleeps.append))
+    assert sleeps == []
+    list(_service([PrinterError("boom")]).watch(every_s=300, max_polls=1, max_errors=5, sleep=sleeps.append))
+    assert sleeps == []
+
+
+def test_wait_for_start_polls_an_idle_printer_until_a_job_runs():
+    svc = _service([_timed("IDLE"), _timed("FINISH"), _timed("PREPARE", 0, 100), _timed("RUNNING", 0, 100), _timed("FINISH", 30, 0)])
+    sleeps: list[float] = []
+    got = [st.raw_state for st in svc.watch(every_s=300, wait_for_start=True, sleep=sleeps.append, clock=lambda: 0.0)]
+    assert got == ["IDLE", "FINISH", "PREPARE", "RUNNING", "FINISH"]
+    assert sleeps == [60, 60, 60, 60]
+    assert [st.raw_state for st in _service([_timed("IDLE")]).watch(every_s=300, sleep=lambda s: None)] == ["IDLE"]  # default: stop

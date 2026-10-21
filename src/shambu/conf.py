@@ -7,19 +7,22 @@ printed or written to disk by callers.
 
 shambu's own data file lives beside it: `~/Library/Application Support/shambu/calibration.json`
 (`CALIBRATION`), the measured prints `shambu calibrate --add` stores. `load_calibration()` and
-`save_calibration()` read and write it (atomic: a temp file, then `os.replace`). It holds a list of
-prints (date, printer model, material, Studio total, ratio, flags, log path) and never an IP, a
-serial or an access code: `save_calibration` refuses a record with an `ip`, `serial` or secret key.
+`save_calibration()` read and write it (atomic: a temp file, then `os.replace`), and
+`update_calibration()` does load-change-save under a file lock. It holds a list of prints with the
+fixed fields of `calibrate.validate_print` (date, printer model, material, Studio total, rate,
+startup offset, flags, the log's file name) and never an IP, a serial, an access code or a path.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
-from .errors import ConfError
+from .errors import BambuError, ConfError
 
 APPSUPPORT = Path.home() / "Library/Application Support/BambuStudio"
 CONF = APPSUPPORT / "BambuStudio.conf"
@@ -96,48 +99,91 @@ def redact(obj):
     return obj
 
 
-def load_calibration(path: Path | None = None) -> list[dict]:
-    """The stored prints; [] when the file does not exist. A file that is not shambu's calibration JSON raises."""
-    p = path or CALIBRATION
+class DataFileError(BambuError):
+    """A shambu data file (a watch log, the calibration file) cannot be opened, written, locked or replaced."""
+
+
+def _read_calibration(p: Path) -> list[dict]:
+    from .calibrate import CalibrationError, validate_print
+
     if not p.is_file():
         return []
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+    except OSError as e:
+        raise DataFileError(f"{p}: cannot read it ({e.strerror})") from e
+    except ValueError as e:
         raise ConfError(f"{p} is not readable JSON: {e}") from e
-    if not isinstance(d, dict) or not isinstance(d.get("prints"), list):
-        raise ConfError(f'{p} is not a shambu calibration file (no "prints" list)')
-    return [r for r in d["prints"] if isinstance(r, dict)]
+    if not isinstance(d, dict) or set(d) != {"version", "prints"} or not isinstance(d.get("prints"), list):
+        raise ConfError(f'{p} is not a shambu calibration file (want {{"version": {CALIBRATION_VERSION}, "prints": [...]}})')
+    if d.get("version") != CALIBRATION_VERSION:
+        raise ConfError(f"{p} has calibration version {d.get('version')!r}; this shambu reads version {CALIBRATION_VERSION}")
+    for i, r in enumerate(d["prints"], 1):
+        try:
+            validate_print(r)
+        except CalibrationError as e:
+            raise ConfError(f"{p}: print {i} does not match the calibration schema ({e})") from e
+    return d["prints"]
 
 
-def _identifying_keys(record: dict) -> list[str]:
-    # not SECRET_RE: its "code" would match `gcode3mf`
-    return [
-        k
-        for k in record
-        if k.lower() in ("ip", "serial", "serial_masked", "printer_id", "access_code")
-        or any(s in k.lower() for s in ("token", "ticket", "password", "secret"))
-    ]
+def load_calibration(path: Path | None = None) -> list[dict]:
+    """The stored prints; [] when the file does not exist. Raises ConfError for a file that is not version-1
+    calibration JSON or holds a print that does not match the schema, DataFileError when it cannot be read."""
+    return _read_calibration(path or CALIBRATION)
 
 
-def save_calibration(prints: list[dict], path: Path | None = None) -> Path:
-    """Write the prints atomically. Refuses a record that carries an IP, a serial or a secret-looking key."""
-    p = path or CALIBRATION
+def _write_calibration(p: Path, prints: list[dict]) -> None:
+    from .calibrate import CalibrationError, validate_print
+
     for r in prints:
-        bad = _identifying_keys(r)
-        if bad:
-            raise ConfError(f"refusing to store a calibration record with {bad}: the file never holds an IP, a serial or a secret")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".calibration-", suffix=".json")
+        try:
+            validate_print(r)
+        except CalibrationError as e:
+            raise ConfError(str(e)) from None  # a fixed text: it never echoes the refused content
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".calibration-", suffix=".json")
+    except OSError as e:
+        raise DataFileError(f"{p.parent}: cannot write there ({e.strerror})") from e
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"version": CALIBRATION_VERSION, "prints": prints}, f, indent=1)
+            json.dump({"version": CALIBRATION_VERSION, "prints": prints}, f, indent=1, allow_nan=False)
             f.write("\n")
         os.replace(tmp, p)
+    except OSError as e:
+        Path(tmp).unlink(missing_ok=True)
+        raise DataFileError(f"{p}: cannot write it ({e.strerror})") from e
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def save_calibration(prints: list[dict], path: Path | None = None) -> Path:
+    """Write the prints atomically (temp file, then `os.replace`). Refuses a print that does not match the schema."""
+    p = path or CALIBRATION
+    _write_calibration(p, prints)
     return p
+
+
+def update_calibration(change: Callable[[list[dict]], list[dict]], path: Path | None = None) -> list[dict]:
+    """Load, `change`, save, under an exclusive `fcntl.flock` on `calibration.json.lock` beside the file, so two
+    `calibrate --add` runs never lose one addition. Returns the saved prints."""
+    p = path or CALIBRATION
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(p.with_name(p.name + ".lock"), "a")  # closed in the finally below
+    except OSError as e:
+        raise DataFileError(f"{p}: cannot create its lock file ({e.strerror})") from e
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            raise DataFileError(f"{p}: cannot lock it ({e.strerror})") from e
+        prints = change(_read_calibration(p))
+        _write_calibration(p, prints)
+        return prints
+    finally:
+        lock.close()  # closing the file releases the lock
 
 
 def hms_table(serial_prefix: str = "20P", lang: str = "en") -> dict:
