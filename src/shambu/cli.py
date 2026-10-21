@@ -556,6 +556,28 @@ class Split(Command):
         return 0
 
 
+def _studio_version(app: Bambu) -> str | None:
+    try:
+        return app.studio_cli().version()
+    except BambuError:
+        return None
+
+
+def _sweep_command(a: argparse.Namespace) -> list[str]:
+    """The sweep command line that reproduces the measured variants (paths absolute; not --write-spec or --pick)."""
+    cmd = ["shambu", "sweep", str(Path(a.spec).expanduser().resolve())]
+    if a.variants:
+        cmd += ["--variants", str(Path(a.variants).expanduser().resolve())]
+    for key in a.orientations:
+        cmd += ["--orientations", key]
+    if a.orientations:
+        cmd += ["--top", str(a.top), "--source", a.source, "--threshold", f"{a.threshold:g}"]
+    for flag in ("by_object", "no_slice", "no_baseline", "probe_supports", "allow_filament_mismatch"):
+        if getattr(a, flag, False):
+            cmd.append("--" + flag.replace("_", "-"))
+    return cmd
+
+
 @command("sweep", "Build (and slice) variants of a spec and compare time and filament: orientations, by-object, settings")
 class Sweep(Command):
     def configure(self, p):
@@ -614,8 +636,12 @@ class Sweep(Command):
         if a.pick is not None and not a.write_spec:
             return usage(out, "--pick needs --write-spec OUT.json")
         if a.write_spec:
-            if Path(a.write_spec).expanduser().resolve() == Path(a.spec).expanduser().resolve():
-                return usage(out, f"--write-spec {a.write_spec}: that is the input spec; write the result to another file")
+            same = S.check_destination(a.write_spec, a.spec, a.variants)
+            if same:
+                return usage(out, same)
+            cannot = S.writable_folder(a.write_spec)
+            if cannot:  # the environment (exit 3), found before any slicing
+                raise BuildError(cannot)
             if a.pick is not None and a.pick not in names:
                 return usage(out, f"--pick {a.pick!r}: no such variant (variants: {', '.join(names)})")
             if a.no_slice and a.pick is None:
@@ -644,7 +670,16 @@ class Sweep(Command):
         else:
             by_name = {S.BASELINE: {"name": S.BASELINE}, **{str(v["name"]): v for v in variants}}
             base = next((r for r in results if r.name == S.BASELINE), None)
-            spec_out = S.written_spec(spec_json, by_name[chosen.name], chosen, str(Path(a.spec).expanduser().resolve()), base)
+            spec_out = S.written_spec(
+                spec_json,
+                by_name[chosen.name],
+                chosen,
+                str(Path(a.spec).expanduser().resolve()),
+                base,
+                studio_version=_studio_version(app),
+                command=_sweep_command(a),
+            )
+            spec_out = S.relocate_meshes(spec_out, a.write_spec)
             path = S.write_spec(a.write_spec, spec_out)
             written = {"path": str(path), **{k: v for k, v in spec_out["_sweep"].items() if k != "from"}}
             last = S.written_line(a.write_spec, spec_out["_sweep"], failed)
@@ -861,10 +896,10 @@ class Printer(Command):
         )
 
     def run(self, a, app, out):
-        from .printer import BUDGET_S, ArpProbe, SsdpListen
+        from .printer import READ_TIMEOUT_S, ArpProbe, SsdpListen
 
-        # one read's budget: 15 s at the default --wait 8, and --wait plus 7 s (connect and grace) above that
-        app.printer_timeout = max(BUDGET_S, a.wait + 7)
+        # one read's timeout: 15 s at the default --wait 8, and --wait plus 7 s (connect and grace) above that
+        app.printer_timeout = max(READ_TIMEOUT_S, a.wait + 7)
         svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "discover":
             hits = ArpProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])
