@@ -76,8 +76,28 @@ class SetFilamentMap:
 
     def describe(self) -> str:
         return f"filament -> extruder map {list(self.extruders)} ({self.mode}" + (
-            f", plate {self.plate})" if self.plate else ", project; filament_extruder_variant updated)"
+            f", plate {self.plate})" if self.plate else ", project; filament_extruder_variant kept in block form)"
         )
+
+
+@dataclass(frozen=True)
+class RepairNozzleStats:
+    """Make a CLI export re-sliceable by the CLI (reference 03 section "Re-slicing a CLI export"):
+    - `extruder_nozzle_stats` `[]` or a `#0` count becomes `<nozzle_volume_type>#<extruder_max_nozzle_count>` per
+      extruder (an empty stat exits -100 "No valid nozzle found");
+    - `filament_extruder_variant` / `filament_self_index` become one block per filament (each filament's variants,
+      from `filament_variants` when given, else the printer's variant list);
+    - `filament_volume_map` and `filament_nozzle_map` get one entry per filament.
+    Idempotent: a repaired file is left as it is."""
+
+    filament_variants: tuple[tuple[str, ...], ...] = ()  # per filament slot, its preset's filament_extruder_variant
+
+    def apply(self, p: Project) -> None:
+        p.repair_nozzle_stats()
+        p.repair_extruder_variants(self.filament_variants or None)
+
+    def describe(self) -> str:
+        return "extruder_nozzle_stats, filament_extruder_variant blocks and filament maps made re-sliceable (CLI --slice)"
 
 
 @dataclass(frozen=True)

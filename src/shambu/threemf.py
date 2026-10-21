@@ -18,6 +18,9 @@ Rules the code follows:
 - save() writes a temporary file next to the destination, checks it, then renames it over the
   destination, so a failed save never damages the original.
 - Every patch is idempotent: applying the same patch twice gives the same project.
+- `filament_extruder_variant` and `filament_self_index` stay in block form (one block of variants per filament,
+  paired index by index), and `extruder_nozzle_stats` is never left `[]`: a later CLI slice of such a file exits
+  -100 "No valid nozzle found" (reference 03 section 8).
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +55,13 @@ FILAMENT_MAP_MODES = ("Auto For Flush", "Auto For Match", "Manual", "Nozzle Manu
 # CustomGCode.hpp: enum Type { ColorChange, PausePrint, ToolChange, Template, Custom, Unknown }
 GCODE_TYPES = {"color_change": 0, "pause": 1, "tool_change": 2, "template": 3, "custom": 4}
 GCODE_TYPE_NAMES = {v: k for k, v in GCODE_TYPES.items()}
+
+
+def _stats_bad(v) -> bool:
+    """An `extruder_nozzle_stats` value the CLI cannot slice with: empty, or a `Type#0` count."""
+    if not isinstance(v, list) or not v:
+        return True
+    return any(str(e).rpartition("#")[2].strip() in ("", "0") for e in v)
 
 
 def _float_or(text: str, default: float) -> float:
@@ -515,6 +526,7 @@ class Project:
             "plates": plates,
             "objects": objects,
             "custom_gcode": custom,
+            "reslice_problems": self.reslice_problems(),
         }
 
     # ------------------------------------------------------------------ (b) patches
@@ -588,15 +600,15 @@ class Project:
         if mode not in FILAMENT_MAP_MODES:
             raise ProjectError(f"mode must be one of {FILAMENT_MAP_MODES}")
         ps = self.project_settings
-        # PrintConfig.cpp update_values_to_printer_extruders_for_multiple_filaments looks up, for
-        # filament i, the variant '<extruder_type[map[i]-1]> <nozzle_volume_type[map[i]-1]>' in
-        # filament_extruder_variant. Without it slicing logs 'could not found extruder_type Bowden'
-        # and crashes. The per-filament values stay those of the old variant: re-resolve the
-        # filament preset for that variant if they differ (on the X2D they are equal for PLA/PETG).
-        et, nvt = ps.get("extruder_type", []), ps.get("nozzle_volume_type", [])
-        if et and nvt and "filament_extruder_variant" in ps:
-            ps["filament_extruder_variant"] = [f"{et[v - 1]} {nvt[v - 1]}" for v in nozzle_of_filament]
-            self._touch_ps()
+        if plate is None:
+            ps["filament_map"] = [str(v) for v in nozzle_of_filament]
+        # PrintConfig.cpp update_values_to_printer_extruders_for_multiple_filaments looks up, for filament i, the
+        # variant '<extruder_type[map[i]-1]> <nozzle_volume_type[map[i]-1]>' among the filament_extruder_variant
+        # entries whose filament_self_index is i (index by index, PrintConfig.cpp:8022-8052). The two lists stay in
+        # block form (one block of variants per filament); collapsing the variants to one entry per filament made
+        # filament 2 unfindable ('could not found extruder_type ... filament_index 2', PrintConfig.cpp:8935).
+        if "filament_extruder_variant" in ps:
+            self.repair_extruder_variants()
         if plate is None:
             ps["filament_map"] = [str(v) for v in nozzle_of_filament]
             ps["filament_map_mode"] = mode
@@ -606,6 +618,95 @@ class Project:
             _set_meta(p, "filament_map_mode", mode, after="locked")
             _set_meta(p, "filament_maps", " ".join(str(v) for v in nozzle_of_filament), after="filament_map_mode")
             self._touch_ms()
+
+    # -- the per-extruder keys a CLI re-slice needs (reference 03 section "Re-slicing a CLI export") ------------------
+    def _variant_block(self, slot: int, given: Sequence[Sequence[str]] | None) -> list[str]:
+        """The extruder variants of filament `slot` (1-based): the filament preset's own list when given, else the
+        printer's variant list (the X2D filament presets list the same six variants in the same order)."""
+        ps = self.project_settings
+        if given and slot <= len(given) and given[slot - 1]:
+            return [str(v) for v in given[slot - 1]]
+        pev = ps.get("printer_extruder_variant")
+        if isinstance(pev, list) and pev:
+            return [str(v) for v in pev]
+        evl = ps.get("extruder_variant_list")
+        if isinstance(evl, list) and evl:
+            return [v.strip() for e in evl for v in str(e).split(",") if v.strip()]
+        et, nvt = ps.get("extruder_type") or [], ps.get("nozzle_volume_type") or []
+        return [f"{t} {v}" for t, v in zip(et, nvt, strict=False)]
+
+    def repair_extruder_variants(self, filament_variants: Sequence[Sequence[str]] | None = None) -> bool:
+        """Rewrite `filament_extruder_variant` and `filament_self_index` in block form: per filament, its variant list,
+        with its slot number once per variant. A block that already matches stays as it is. When the file already holds
+        `filament_self_index` blocks, a rebuilt block must keep its length (the 6N value keys follow it). Returns
+        True when something changed. Raises ProjectError when the blocks cannot be rebuilt consistently."""
+        ps = self.project_settings
+        n = self.n_filaments()
+        if n == 0:
+            return False
+        var = [str(v) for v in ps.get("filament_extruder_variant") or []]
+        idx = [str(v) for v in ps.get("filament_self_index") or []]
+        counts = {i: idx.count(str(i)) for i in range(1, n + 1)}
+        if idx and len(var) == len(idx) and all(counts[i] for i in counts) and len(idx) == sum(counts.values()):
+            return False  # already one consistent block per filament
+        new_var: list[str] = []
+        new_idx: list[str] = []
+        for i in range(1, n + 1):
+            block = self._variant_block(i, filament_variants)
+            if idx and counts.get(i) and counts[i] != len(block):
+                raise ProjectError(
+                    f"filament {i} has {counts[i]} entries in filament_self_index but {len(block)} extruder variants: "
+                    "cannot rebuild filament_extruder_variant; re-export the project"
+                )
+            new_var += block
+            new_idx += [str(i)] * len(block)
+        if new_var == var and new_idx == idx:
+            return False
+        ps["filament_extruder_variant"] = new_var
+        ps["filament_self_index"] = new_idx
+        self._touch_ps()
+        return True
+
+    def repair_nozzle_stats(self) -> bool:
+        """`extruder_nozzle_stats` `[]` (what a CLI export without --slice writes) or a `#0` count makes every later CLI
+        slice of the file exit -100 "No valid nozzle found" (BambuStudio.cpp:4101-4156, ToolOrdering.cpp:1477-1481).
+        Write `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` per extruder (the value a sliced export holds),
+        and resize filament_volume_map / filament_nozzle_map to the filament count as Studio does
+        (PresetBundle.cpp:2384-2387). Returns True when something changed."""
+        ps = self.project_settings
+        changed = False
+        nvt = [str(v) for v in ps.get("nozzle_volume_type") or []]
+        if "extruder_nozzle_stats" in ps and nvt and _stats_bad(ps.get("extruder_nozzle_stats")):
+            cnt = [str(v) for v in ps.get("extruder_max_nozzle_count") or []]
+            want = [f"{t}#{cnt[i] if i < len(cnt) and str(cnt[i]) not in ('', '0') else '1'}" for i, t in enumerate(nvt)]
+            ps["extruder_nozzle_stats"] = want
+            new = ps.get("extruder_nozzle_stats_new")
+            if isinstance(new, list) and new and _stats_bad(new):  # a non-empty _new wins over the plain key (BS.cpp:4151)
+                ps["extruder_nozzle_stats_new"] = list(want)
+            changed = True
+        n = self.n_filaments()
+        for key, fill in (("filament_volume_map", "0"), ("filament_nozzle_map", "0")):
+            v = ps.get(key)
+            if isinstance(v, list) and n and len(v) != n:
+                ps[key] = (list(v) + [fill] * n)[:n]
+                changed = True
+        if changed:
+            self._touch_ps()
+        return changed
+
+    def reslice_problems(self) -> list[str]:
+        """Why a later CLI run on this file (`--slice`) would fail or use the wrong per-filament values; [] when none."""
+        ps = self.project_settings
+        out = []
+        if "extruder_nozzle_stats" in ps and _stats_bad(ps.get("extruder_nozzle_stats")):
+            out.append(f'extruder_nozzle_stats {ps.get("extruder_nozzle_stats")} (Studio exits -100 "No valid nozzle found")')
+        var, idx = ps.get("filament_extruder_variant"), ps.get("filament_self_index")
+        if isinstance(var, list) and isinstance(idx, list) and len(var) != len(idx):
+            out.append(
+                f"filament_extruder_variant has {len(var)} entries but filament_self_index {len(idx)} "
+                "(Studio logs 'could not found extruder_type' and slices with the wrong filament values)"
+            )
+        return out
 
     def set_object_setting(self, object_name: str, key: str, value) -> None:
         """Per-object process override, e.g. enable_support, sparse_infill_density ('25%'),

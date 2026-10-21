@@ -126,7 +126,9 @@ def test_override_filament_makes_the_plate_multi_and_reserves_the_tower(tmp_path
         resolver,
         [{"name": "p", "parts": [{"path": str(stls["body"]), "set": {"support_filament": "2"}, "at": [210, 210], "brim_margin": 0}]}],
     )
-    assert any("prime-tower reserve" in t for t in fails(plan))
+    tower = plan.plates[0].tower  # the plate is multi: an "auto" tower lands clear of the part (tower.py)
+    assert tower is not None and tower.footprint is not None
+    assert not L.overlaps(tower.footprint.rect, plan.plates[0].parts[0].placed.rect())
 
 
 # ---------------------------------------------------------------------------- 2. multipart geometry

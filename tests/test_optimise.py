@@ -467,7 +467,8 @@ def test_single_two_filament_object_keeps_the_tower_reserve(tmp_path, stls, reso
         {"name": "label", "parts": [{"path": str(stls["base"])}, {"path": str(stls["text"]), "filament": 2}], "at": [220, 220]}
     ]
     plan = Pipeline(FakeStudio(), resolver).plan(Spec.from_json(d))
-    assert any("prime-tower reserve" in c.text for c in plan.plates[0].checks if not c.ok)
+    tower = plan.plates[0].tower  # one two-filament object by object: Studio still builds the tower (tower.py)
+    assert tower is not None and tower.footprint is not None
     assert not any("no prime tower" in w for w in plan.warnings)
     assert not any(c.text.startswith("print-by-object") for c in plan.plates[0].checks)  # one object: no sequential rules
 

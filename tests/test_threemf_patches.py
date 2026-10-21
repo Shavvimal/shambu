@@ -98,11 +98,96 @@ def test_bad_colours_raise(project_file, colours):
         apply(project_file, X.SetFilamentColours(colours))
 
 
-def test_set_filament_map_project_updates_variant(project_file):
+def test_set_filament_map_project_writes_variant_blocks(project_file):
+    """The conftest fixture holds the short form (one variant per filament, no filament_self_index). The map patch
+    writes one block of extruder variants per filament with a matching filament_self_index, never one entry each."""
     s = apply(project_file, X.SetFilamentMap((1, 2)))
     assert (s["filament_map"], s["filament_map_mode"]) == (["1", "2"], "Manual")
     ps = Project(str(project_file)).project_settings
-    assert ps["filament_extruder_variant"] == ["Direct Drive Standard", "Bowden Standard"]
+    block = ["Direct Drive Standard", "Bowden Standard"]
+    assert ps["filament_extruder_variant"] == block + block
+    assert ps["filament_self_index"] == ["1", "1", "2", "2"]
+
+
+X2D_VARIANTS = [
+    "Direct Drive Standard",
+    "Direct Drive High Flow",
+    "Direct Drive E3D High Flow",
+    "Bowden Standard",
+    "Bowden High Flow",
+    "Bowden E3D High Flow",
+]
+# What an unsliced X2D export held after the old map patch (plate 14): 12 self-index entries, 2 variants, empty stats
+UNSLICED_X2D = {
+    "extruder_nozzle_stats": [],
+    "extruder_max_nozzle_count": ["1", "1"],
+    "printer_extruder_variant": X2D_VARIANTS,
+    "filament_extruder_variant": ["Direct Drive Standard", "Bowden Standard"],
+    "filament_self_index": ["1"] * 6 + ["2"] * 6,
+    "filament_volume_map": ["0"],
+    "filament_nozzle_map": ["1"],
+    "filament_map": ["1", "2"],
+}
+
+
+def test_set_filament_map_keeps_the_x2d_blocks(tmp_path):
+    """Studio pairs filament_extruder_variant with filament_self_index index by index (PrintConfig.cpp:8022-8052):
+    a collapsed list left filament 2 unfindable ('could not found extruder_type ... filament_index 2')."""
+    f = make_3mf(tmp_path / "x2d.3mf", **{**UNSLICED_X2D, "filament_extruder_variant": X2D_VARIANTS * 2})
+    apply(f, X.SetFilamentMap((1, 2)))
+    ps = Project(str(f)).project_settings
+    assert ps["filament_extruder_variant"] == X2D_VARIANTS * 2
+    assert ps["filament_self_index"] == ["1"] * 6 + ["2"] * 6
+    f2 = make_3mf(tmp_path / "x2d-short.3mf", **UNSLICED_X2D)
+    apply(f2, X.SetFilamentMap((1, 2)))  # a collapsed file is rebuilt from the printer's variant list
+    assert Project(str(f2)).project_settings["filament_extruder_variant"] == X2D_VARIANTS * 2
+
+
+def test_repair_nozzle_stats_makes_an_unsliced_export_resliceable(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **UNSLICED_X2D)
+    pr = Project(str(f))
+    assert pr.reslice_problems() and pr.summary()["reslice_problems"][0].startswith("extruder_nozzle_stats []")
+    done = X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+    assert done == [X.RepairNozzleStats().describe()]
+    ps = Project(str(f)).project_settings
+    assert ps["extruder_nozzle_stats"] == ["Standard#1", "Standard#1"]
+    assert ps["filament_extruder_variant"] == X2D_VARIANTS * 2 and len(ps["filament_self_index"]) == 12
+    assert ps["filament_volume_map"] == ["0", "0"] and ps["filament_nozzle_map"] == ["1", "0"]
+    assert Project(str(f)).reslice_problems() == []
+
+
+def test_repair_nozzle_stats_takes_the_filament_preset_variants(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **UNSLICED_X2D)
+    own = tuple(reversed(X2D_VARIANTS))
+    X.PatchSet().add(X.RepairNozzleStats((tuple(X2D_VARIANTS), own))).apply(str(f))
+    assert Project(str(f)).project_settings["filament_extruder_variant"] == X2D_VARIANTS + list(own)
+
+
+def test_repair_nozzle_stats_is_idempotent_and_keeps_the_zip(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#0", "Standard#0"]})
+    ps_set = X.PatchSet().add(X.RepairNozzleStats())
+    first = ps_set.apply(str(f))
+    once = Project(str(f)).read(PROJECT_SETTINGS)
+    with zipfile.ZipFile(f) as z:
+        order = [(i.filename, i.compress_type) for i in z.infolist()]
+    assert ps_set.apply(str(f)) == first
+    assert Project(str(f)).read(PROJECT_SETTINGS) == once
+    with zipfile.ZipFile(f) as z:
+        assert z.testzip() is None
+        assert [(i.filename, i.compress_type) for i in z.infolist()] == order
+    assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["Standard#1", "Standard#1"]
+
+
+def test_repair_refuses_a_block_it_cannot_rebuild(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **{**UNSLICED_X2D, "filament_self_index": ["1"] * 6 + ["2"] * 4})
+    with pytest.raises(ProjectError, match="filament 2 has 4 entries"):
+        X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
+
+
+def test_reslice_problems_flags_mismatched_variant_lengths(tmp_path):
+    f = make_3mf(tmp_path / "u.3mf", **{**UNSLICED_X2D, "extruder_nozzle_stats": ["Standard#1", "Standard#1"]})
+    (msg,) = Project(str(f)).reslice_problems()
+    assert msg.startswith("filament_extruder_variant has 2 entries but filament_self_index 12")
 
 
 def test_set_filament_map_plate(project_file):
