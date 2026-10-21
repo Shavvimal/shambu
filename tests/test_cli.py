@@ -149,9 +149,10 @@ def test_patch_nothing_exit_2(capsys, project_file):
     assert run(capsys, "patch", str(project_file))[0] == 2
 
 
-def test_patch_bad_value_exit_3(capsys, project_file):
+def test_patch_refused_value_exit_1(capsys, project_file):
+    """A refused patch is exit 1 whichever module refused it (usage 2, environment 3)."""
     code, out, _ = run(capsys, "--json", "patch", str(project_file), "--bed-type", "Glass")
-    assert code == 3
+    assert code == 1
     assert "ProjectError" in one_json(out)["error"]
 
 
@@ -1072,3 +1073,40 @@ def test_filesystem_errors_are_exit_3_with_one_json_document(capsys, tmp_path, m
     monkeypatch.setattr(Path, "write_text", no_log)
     code, out, _ = run(capsys, "--json", "studio", "--out", str(tmp_path / "runs"), "--", "--help")
     assert code == 3 and "No space left on device" in one_json(out)["error"]
+
+
+def test_build_open_failure_is_exit_3_with_one_json_document(capsys, tmp_path, monkeypatch):
+    import subprocess as sp
+    from types import SimpleNamespace
+
+    from shambu import facade
+
+    fake = SimpleNamespace(to_json=lambda: {"ok": True}, report="# r\n", run=SimpleNamespace(ok=True), ok=True, project=tmp_path / "p.3mf")
+    monkeypatch.setattr(Bambu, "build", lambda self, spec, **kw: fake)
+
+    def boom(*a, **kw):
+        raise sp.CalledProcessError(1, a[0], stderr=b"Unable to find application named 'BambuStudio'")
+
+    monkeypatch.setattr(facade.subprocess, "run", boom)
+    code, out, _ = run(capsys, "--json", "build", str(write_spec(tmp_path)), "--open")
+    doc = one_json(out)  # exactly one document, no traceback after it
+    assert code == 3 and doc["ok"] is True and doc["open_error"].startswith("StudioError: `open -a BambuStudio` exited 1")
+
+
+def test_missing_studio_version_is_logged(caplog):
+    from types import SimpleNamespace
+
+    def no_studio():
+        raise StudioError("Bambu Studio binary not found")
+
+    with caplog.at_level("WARNING"):
+        assert cli._studio_version(SimpleNamespace(studio_cli=no_studio)) is None
+    assert "version is unknown" in caplog.text
+
+
+def test_move_parse_errors_quote_what_was_typed(capsys, tmp_path):
+    f = _geo(tmp_path)
+    code, out, _ = run(capsys, "patch", str(f), "--move", "body=12")
+    assert code == 2 and "--move 'body=12'" in out and "','" not in out
+    code, out, _ = run(capsys, "patch", str(f), "--move", "body=1x,2")
+    assert code == 2 and "--move 'body=1x,2'" in out

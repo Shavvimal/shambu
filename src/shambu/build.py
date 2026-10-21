@@ -458,18 +458,19 @@ _SLICING_WARNINGS = re.compile(r"found slicing warnings: (.+?)(?:, no_check=\d)?
 _ERROR_LINE = re.compile(r"\[error\]\s+(.+?)\s*$", re.M)
 
 
-def _log_text(rr: RunResult) -> str:
+def _log_text(rr: RunResult) -> tuple[str, str | None]:
+    """Studio's log of a pass and, when it cannot be read, why (never a silent empty log: the record says so)."""
     try:
-        return Path(rr.log).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+        return Path(rr.log).read_text(encoding="utf-8", errors="replace"), None
+    except OSError as e:
+        return "", f"Studio's log {rr.log} could not be read ({e.strerror or e}): the pass is classified by its exit code"
 
 
 def checked_outcome(rr: RunResult, plate: int, known: Collection[str] = ()) -> dict:
     """One checked pass: `ok`, `skippable` (-101, or -100 with Studio's slicing-warning line) or `fail`, with what the log
     says. A -101 pair comes from `studio.conflicts_in_log` (`known`: the CLI object names) and reads as `export_fails`
     does (`studio.conflict_phrase`). The record keeps the pass's own log and result.json paths."""
-    text = _log_text(rr)
+    text, unreadable = _log_text(rr)
     rec: dict = {
         "plate": plate,
         "exit": rr.code,
@@ -493,6 +494,9 @@ def checked_outcome(rr: RunResult, plate: int, known: Collection[str] = ()) -> d
     else:
         errs = _ERROR_LINE.findall(text)
         rec.update(kind="fail", reason=errs[-1] if errs else rr.meaning())
+    if unreadable:
+        rec["warning"] = unreadable
+        rec["reason"] += f" (WARN: {unreadable})"
     return rec
 
 
@@ -833,9 +837,7 @@ class Pipeline:
             free = [p.placed for p in parts if not p.placed.fixed]
             # The tower footprint (fixed spot, or a provisional back-right corner for "auto") keeps packed parts out;
             # TowerClear checks the final footprint after every plate is planned.
-            reserve, tower_base = self._tower_reserve(
-                pspec, pi, multi, parts, bool(free), process, filaments, facts, spec, problems, warnings
-            )
+            reserve, tower_base = self._tower_reserve(pspec, pi, multi, parts, bool(free), process, filaments, facts, spec, warnings)
             pctx = replace(ctx, by_object=sequential)
             obstacles = [reserve] if reserve else []
             placement_checks: list[L.Check] = []
@@ -859,7 +861,8 @@ class Pipeline:
                 overflow = len(packed) > 1
                 if overflow:
                     problems.append(
-                        f"plate {pi} '{pspec.name}': the parts need {len(packed)} plates; move some to another plate in the spec"
+                        f"plate {pi} '{pspec.name}': the packer put the parts on {len(packed)} plates (a heuristic, no rotation; "
+                        "a hand layout can differ); move some to another plate in the spec or give them an `at`"
                     )
             for p in parts:
                 p.place_members()
@@ -943,7 +946,7 @@ class Pipeline:
     @staticmethod
     def _tower_reserve(
         pspec, pi: int, multi: bool, parts: list[PlannedPart], has_free: bool, process: dict, filaments: list[dict], facts: dict,
-        spec: Spec, problems: list[str], warnings: list[str],
+        spec: Spec, warnings: list[str],
     ) -> tuple[L.Rect | None, T.TowerSettings | None]:  # fmt: skip
         """The rect packed parts must avoid on a two-filament plate, and the plate's tower settings (None: no tower)."""
         if not multi:
@@ -1190,13 +1193,8 @@ class Pipeline:
                 facets += M.read_stl(fp)
             except BambuError as e:
                 return None, f"{fp.name} cannot be read ({e})"
-        if not facets:  # an STL without facets (a test stand-in): Studio's --info box is all there is, no warning
-            return None, ""
-        sil = M.silhouette(facets)
-        off = max(abs(a - b) for a, b in zip((sil.x0, sil.y0, sil.x1, sil.y1), (*body.min[:2], *body.max[:2]), strict=True))
-        if off > 0.5:
-            return None, f"the STL's box differs from Studio's by {off:.1f} mm (a unit conversion or a 3MF input?)"
-        return L.RasterFootprint.from_silhouette(sil), ""
+        # an STL without facets (a test stand-in): Studio's --info box is all there is, no warning
+        return L.outline_of(facets, (*body.min[:2], *body.max[:2]))
 
     @staticmethod
     def _placement_checks(packed: L.Placement, free: list[L.Placed], placer: L.Placer) -> list[L.Check]:
@@ -1208,7 +1206,8 @@ class Pipeline:
             out.append(
                 L.Check(
                     False,
-                    f"{why}. No position was computed for {key}, so no overlap, bed-edge or reach check ran for it. "
+                    f"{why}. This is the packer's answer (a heuristic, no rotation): Studio's arrange or a hand layout can "
+                    f"differ. No position was computed for {key}, so no overlap, bed-edge or reach check ran for it. "
                     f"Give {key} an `at` [x, y] (min corner), a `support_spread` or its own plate.",
                     "placement",
                 )
@@ -1224,8 +1223,9 @@ class Pipeline:
             out.append(
                 L.Check(
                     False,
-                    f"the parts need {len(packed)} plates with their support spreads ({split}). This is the {kind}, not "
-                    f"Studio's arrange. Move the parts of plate 2 and later to another plate in the spec.",
+                    f"the {kind} put the parts on {len(packed)} plates with their support spreads ({split}). That is the "
+                    f"packer's answer (a heuristic), not a proof: Studio's arrange or a hand layout (`at`) can fit more. "
+                    f"Move the parts of plate 2 and later to another plate in the spec, or place them by hand.",
                     "placement",
                 )
             )

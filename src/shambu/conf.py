@@ -9,16 +9,19 @@ shambu's own data file lives beside it: `~/Library/Application Support/shambu/ca
 (`CALIBRATION`), the measured prints `shambu calibrate --add` stores. `load_calibration()` and
 `save_calibration()` read and write it (atomic: a temp file, then `os.replace`), and
 `update_calibration()` does load-change-save under a file lock. It holds a list of prints with the
-fixed fields of `calibrate.validate_print` (date, printer model, material, Studio total, rate,
-startup offset, flags, the log's file name) and never an IP, a serial, an access code or a path.
+fixed fields of `calibrate.validate_print` (a session fingerprint, date, printer model, material, Studio total,
+rate, startup offset, poll times, speed levels, flags) and never a file name, an IP, a serial, an access code or a
+path.
 """
 
 from __future__ import annotations
 
 import fcntl
+import ipaddress
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -133,6 +136,51 @@ def load_calibration(path: Path | None = None) -> list[dict]:
     """The stored prints; [] when the file does not exist. Raises ConfError for a file that is not version-1
     calibration JSON or holds a print that does not match the schema, DataFileError when it cannot be read."""
     return _read_calibration(path or CALIBRATION)
+
+
+# One identifier detector for every outward text (the facade's printer errors, the calibration names)
+_MASKED = re.compile("\\w{2,}\u2026\\w{2,}|\\w{3}\\.\\.\\.\\w{3}")
+_HOST = re.compile(r"(?i)\b[a-z0-9-]+\.(?:local|lan|home|internal|com|net|org|io)\b")
+_TOKEN_SPLIT = re.compile(r"[\s,;()\[\]{}<>\"'=/\\]+")
+_IP_CAND = re.compile(r"\[?[0-9A-Fa-f:.%]*[.:][0-9A-Fa-f:.%]*\]?(?::\d+)?")
+
+
+def _is_ip(tok: str) -> bool:
+    """`tok` is an IPv4 or IPv6 address, with or without brackets, a port or a zone (`ipaddress`; a version string such
+    as 02.08.02.61 is not one: leading zeros are refused)."""
+    t = tok.strip("[]")
+    for cand in (t, t.rsplit(":", 1)[0] if t.count(":") == 1 else t, t.split("%", 1)[0], tok.split("]", maxsplit=1)[0].lstrip("[")):
+        try:
+            ipaddress.ip_address(cand)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def identifying(s: str) -> bool:
+    """True when the text holds an IP address (v4 or v6, with or without a port), a masked serial or a LAN host name.
+    Known secrets (the serial, the access code) are `sensitive_values`, scrubbed by `scrub_text`."""
+    if _MASKED.search(s) or _HOST.search(s):
+        return True
+    return any(_is_ip(tok) for tok in _TOKEN_SPLIT.split(s) if tok)
+
+
+def redact_ip(text: str) -> str:
+    """`text` with every IP address (v4, v6, with a port) as '<ip>' and every LAN host name as '<host>': a printer
+    error names the host it tried, and no output or file may (CONTRIBUTING: never commit an IP address)."""
+
+    def one(m: re.Match) -> str:
+        tok = m.group(0)
+        core = tok.rstrip(":.")  # "10.1.2.3:8883:" in "connect to 10.1.2.3:8883: timed out"
+        if not _is_ip(core):
+            return tok
+        _host, sep, port = core.rpartition(":")
+        keep = sep + port if port.isdigit() and (core.startswith("[") or core.count(":") == 1) else ""
+        return "<ip>" + keep + tok[len(core) :]  # the port stays: it is not an identifier
+
+    text = _IP_CAND.sub(one, text)
+    return _HOST.sub("<host>", text)
 
 
 def sensitive_values(conf: dict | None = None) -> list[str]:

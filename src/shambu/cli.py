@@ -1,8 +1,8 @@
 """Command line: `shambu <command> ...`. Each subcommand is a small class registered with @command.
 
 Output is human text by default and JSON with `--json` (before or after the command name), so an agent can parse
-it. Exit codes: 0 ok, 1 a check or verification failed or the spec is invalid, 2 bad usage, 3 an environment error
-(binary, config).
+it. Exit codes: 0 ok, 1 a check or verification failed, the spec is invalid or a patch was refused, 2 bad usage, 3 an
+environment error (binary, config, a file that cannot be written), 130 interrupted.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from .edits import (
     ReplaceMesh,
     SetTower,
 )
-from .errors import BambuError, BuildError, StudioError
+from .errors import BambuError, BuildError, ProjectError, StudioError
 from .facade import Bambu
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
@@ -580,10 +580,15 @@ class Split(Command):
 
 
 def _studio_version(app: Bambu) -> str | None:
+    """Studio's version for the sweep provenance, or None with a WARN on stderr naming why (never silent)."""
     try:
-        return app.studio_cli().version()
-    except BambuError:
+        v = app.studio_cli().version()
+    except BambuError as e:
+        log.warning("Bambu Studio's version is unknown (%s): the written spec's provenance records none", e)
         return None
+    if v is None:
+        log.warning("Bambu Studio did not report its version: the written spec's provenance records none")
+    return v
 
 
 def _sweep_command(a: argparse.Namespace) -> list[str]:
@@ -702,8 +707,13 @@ class Sweep(Command):
                 studio_version=_studio_version(app),
                 command=_sweep_command(a),
             )
-            spec_out = S.relocate_meshes(spec_out, a.write_spec)
-            path = S.write_spec(a.write_spec, spec_out)
+            try:
+                spec_out = S.relocate_meshes(spec_out, a.write_spec)
+                path = S.write_spec(a.write_spec, spec_out)
+            except BambuError as e:  # the measured table is the sweep's result: print it, then the error (exit 3)
+                msg = f"{type(e).__name__}: {e}"
+                out.emit({"results": [r.to_json() for r in results], "written": None, "error": msg}, S.table(results) + [msg])
+                return 3
             written = {"path": str(path), **{k: v for k, v in spec_out["_sweep"].items() if k != "from"}}
             last = S.written_line(a.write_spec, spec_out["_sweep"], failed)
         out.emit({"results": [r.to_json() for r in results], "written": written}, S.table(results) + [last])
@@ -768,9 +778,15 @@ class Build(Command):
             probe_supports=a.probe_supports,
             **kw,
         )
-        out.emit(r.to_json(), r.report.splitlines())
+        doc, lines = r.to_json(), r.report.splitlines()
         if a.open and r.run and r.run.ok:
-            app.open_in_studio(r.project)
+            try:  # before the output, so a failed open lands in the one JSON document
+                app.open_in_studio(r.project)
+            except StudioError as e:
+                doc["open_error"] = f"StudioError: {e}"
+                out.emit(doc, [*lines, f"StudioError: {e}"])
+                return 3
+        out.emit(doc, lines)
         return 0 if r.ok else 1
 
 
@@ -896,8 +912,8 @@ class PatchCmd(Command):
         except ValueError as e:
             out.emit({"error": f"bad patch option: {e}"}, [f"bad patch option: {e}; see --help for the formats"])
             return 2
-        except EditError as e:
-            out.emit({"error": f"EditError: {e}"}, [f"EditError: {e}"])
+        except ProjectError as e:  # EditError is one: a refused patch is exit 1 whichever module refused it
+            out.emit({"error": f"{type(e).__name__}: {e}"}, [f"{type(e).__name__}: {e}"])
             return 1
         if not ps.patches:
             out.emit({"patched": []}, ["nothing to do: give at least one patch option"])
@@ -911,8 +927,8 @@ class PatchCmd(Command):
                 )
                 return 0
             done = app.edit(a.file, ps, a.out, verify=not a.no_verify)
-        except EditError as e:
-            out.emit({"error": f"EditError: {e}"}, [f"EditError: {e} (the input file is unchanged)"])
+        except ProjectError as e:  # an edits.py or patches.py refusal, or an undeclared entry change at save
+            out.emit({"error": f"{type(e).__name__}: {e}"}, [f"{type(e).__name__}: {e} (the input file is unchanged)"])
             return 1
         dest = a.out or a.file
         out.emit(
@@ -985,11 +1001,16 @@ class PatchCmd(Command):
             if not eq or not obj:
                 raise ValueError(f"--move {x!r}: use OBJECT=X,Y[@PLATE] or OBJECT=+DX,+DY")
             pos, _, plate = rest.partition("@")
-            xs, ys = (v.strip() for v in pos.split(",")) if pos.count(",") == 1 else ("", "")
+            if pos.count(",") != 1:
+                raise ValueError(f"--move {x!r}: needs two comma-separated numbers after '=' (X,Y or +DX,+DY)")
+            xs, ys = (v.strip() for v in pos.split(","))
             signed = [v[:1] in ("+", "-") for v in (xs, ys)]
             if any(signed) and not all(signed):
                 raise ValueError(f"--move {x!r}: a relative move needs a sign on both values (+5,-5); absolute values are the min corner")
-            mx, my = _floats(f"{xs},{ys}", 2, "--move")
+            try:
+                mx, my = _floats(pos, 2, "--move")
+            except ValueError as e:  # quote what the user typed, not a rebuilt "X,Y"
+                raise ValueError(f"--move {x!r}: {str(e).split(': ', 1)[-1]}") from e
             ps.add(MoveObject(obj, mx, my, all(signed), _plate_arg(plate, "--move"), a.strict))
         for x in a.tower:
             ps.add(SetTower(*_tower_arg(x)))

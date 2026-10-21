@@ -730,3 +730,16 @@ def test_group_mask_is_the_union_of_the_members_masks():
     assert m is not None and m.bbox()[0] == pytest.approx(-1.0) and m.bbox()[2] == pytest.approx(61.5)
     b.support_mask = None
     assert L.group_mask([a, b], (0.0, 0.0)) is None  # one supported member without a mask: the spread decides
+
+
+def test_one_outline_rule_with_the_box_guard_and_its_own_warn_kind():
+    from conftest import box_facets
+    from shambu.report import check_line
+
+    facets = box_facets((0, 0, 0), (10, 10, 5))
+    fp, why = L.outline_of(facets, (0.0, 0.0, 10.0, 10.0))
+    assert fp is not None and why == ""
+    fp, why = L.outline_of(facets, (0.0, 0.0, 25.0, 10.0))
+    assert fp is None and "differs from Studio's by 15.0 mm" in why
+    c = L.Check(True, "label: the clearance uses the bounding box, not the outline: x", "outline")
+    assert c.warn and check_line(c).startswith("WARN outline: ")

@@ -9,16 +9,37 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from .threemf import Project
+from .threemf import DEFAULT_TOUCHES, Project
 
 
 class Patch(Protocol):
-    def apply(self, project: Project) -> None: ...
+    """A change to a project. `touches` are the entry patterns it may change (`Project.save` refuses any other);
+    `resolve_touches(project)` narrows them for that project; `verify(after, before)` re-opens the written archive.
+    `PatchBase` gives the three optional members their defaults (Metadata/*, the declared set, no check)."""
+
+    @property
+    def touches(self) -> frozenset[str]: ...
+
+    def apply(self, project: Project, /) -> None: ...
     def describe(self) -> str: ...
+    def resolve_touches(self, project: Project, /) -> frozenset[str]: ...
+    def verify(self, after: Project, before: Project | None = None, /) -> None: ...
+
+
+class PatchBase:
+    """The defaults of the optional `Patch` members, for every patch here and in edits.py."""
+
+    touches: frozenset[str] = DEFAULT_TOUCHES
+
+    def resolve_touches(self, project: Project) -> frozenset[str]:
+        return self.touches
+
+    def verify(self, after: Project, before: Project | None = None) -> None:
+        return None
 
 
 @dataclass(frozen=True)
-class SetBedType:
+class SetBedType(PatchBase):
     bed_type: str
     plate: int | None = None  # None = project default; plates with an override are updated too
 
@@ -30,7 +51,7 @@ class SetBedType:
 
 
 @dataclass(frozen=True)
-class SetBedTypeEverywhere:
+class SetBedTypeEverywhere(PatchBase):
     bed_type: str
 
     def apply(self, p: Project) -> None:
@@ -43,7 +64,7 @@ class SetBedTypeEverywhere:
 
 
 @dataclass(frozen=True)
-class SetPrintSequence:
+class SetPrintSequence(PatchBase):
     sequence: str  # "by layer" | "by object"
     plate: int | None = None
 
@@ -55,7 +76,7 @@ class SetPrintSequence:
 
 
 @dataclass(frozen=True)
-class SetFilamentColours:
+class SetFilamentColours(PatchBase):
     colours: tuple[str, ...]
 
     def apply(self, p: Project) -> None:
@@ -66,7 +87,7 @@ class SetFilamentColours:
 
 
 @dataclass(frozen=True)
-class SetFilamentMap:
+class SetFilamentMap(PatchBase):
     extruders: tuple[int, ...]
     plate: int | None = None
     mode: str = "Manual"
@@ -81,7 +102,7 @@ class SetFilamentMap:
 
 
 @dataclass(frozen=True)
-class RepairNozzleStats:
+class RepairNozzleStats(PatchBase):
     """Make a CLI export re-sliceable by the CLI (reference 03 section "Re-slicing a CLI export"):
     - `extruder_nozzle_stats` `[]` or a `#0` count becomes `<nozzle_volume_type>#<extruder_max_nozzle_count>` per
       extruder (an empty stat exits -100 "No valid nozzle found");
@@ -104,7 +125,7 @@ class RepairNozzleStats:
 
 
 @dataclass(frozen=True)
-class SetObjectSetting:
+class SetObjectSetting(PatchBase):
     object_name: str
     key: str
     value: str
@@ -117,7 +138,7 @@ class SetObjectSetting:
 
 
 @dataclass(frozen=True)
-class ClearObjectSetting:
+class ClearObjectSetting(PatchBase):
     object_name: str
     key: str
 
@@ -129,7 +150,7 @@ class ClearObjectSetting:
 
 
 @dataclass(frozen=True)
-class SetExtruder:
+class SetExtruder(PatchBase):
     object_name: str
     extruder: int
     part_name: str | None = None
@@ -142,7 +163,7 @@ class SetExtruder:
 
 
 @dataclass(frozen=True)
-class SetHeightRange:
+class SetHeightRange(PatchBase):
     object_name: str
     min_z: float
     max_z: float
@@ -156,7 +177,7 @@ class SetHeightRange:
 
 
 @dataclass(frozen=True)
-class AddCustomGcode:
+class AddCustomGcode(PatchBase):
     plate: int
     top_z: float
     kind: str = "pause"  # pause | color_change | tool_change | custom | template
@@ -177,7 +198,7 @@ class AddCustomGcode:
 
 
 @dataclass(frozen=True)
-class RenamePlate:
+class RenamePlate(PatchBase):
     plate: int
     name: str
 
@@ -189,7 +210,7 @@ class RenamePlate:
 
 
 @dataclass(frozen=True)
-class RenameObject:
+class RenameObject(PatchBase):
     old: str
     new: str
 

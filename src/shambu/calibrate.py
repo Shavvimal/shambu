@@ -30,7 +30,6 @@ with the printer agreeing with Studio and no pause, whose rates span less than 0
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import math
 import re
@@ -38,6 +37,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from . import conf
 from .errors import BambuError
 
 STANDARD_SPEED = 2  # spd_lvl 2 = standard (printer.SPEED_LEVELS)
@@ -582,10 +582,6 @@ def fit(polls: list[Poll], session: Session, track: M73Track) -> PrintFit:
 
 
 # ------------------------------------------------------------------------------------------------ the stored print
-_MASKED = re.compile("\\w{2,}\u2026\\w{2,}|\\w{3}\\.\\.\\.\\w{3}")
-_HOST = re.compile(r"(?i)\b[a-z0-9-]+\.(?:local|lan|home|internal|com|net|org|io)\b")
-_TOKEN_SPLIT = re.compile(r"[\s,;()\[\]{}<>\"'=/\\]+")
-_NAME_FIELDS = ("printer_model", "material")
 _SCHEMA: dict[str, tuple] = {
     "session": ("session",),
     "date": ("date",),
@@ -618,19 +614,7 @@ def session_fingerprint(header: dict | None, first_poll: dict, last_poll: dict) 
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
-def identifying(s: str) -> bool:
-    """True when the text holds an IP address (v4 or v6, by `ipaddress`, with or without a port), a masked serial or
-    a LAN host name. Known secrets (the serial, the access code) are the caller's to scrub: `conf.sensitive_values`."""
-    if _MASKED.search(s) or _HOST.search(s):
-        return True
-    for tok in _TOKEN_SPLIT.split(s):
-        for cand in (tok, tok.rsplit(":", 1)[0] if tok.count(":") == 1 else tok, tok.split("%", 1)[0]):
-            try:
-                ipaddress.ip_address(cand)
-                return True
-            except ValueError:
-                continue
-    return False
+identifying = conf.identifying  # one detector (conf.py) for the calibration names and the facade's errors
 
 
 def storable_name(v) -> bool:

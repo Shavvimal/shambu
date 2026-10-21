@@ -492,7 +492,6 @@ class MeshInfo:
 
 
 _INFO_KEYS = ("size_x", "size_y", "size_z", "min_x", "max_x", "min_y", "max_y", "min_z", "max_z", "manifold")
-_PCT = re.compile(r"percent=(\d+)")
 
 ProgressListener = Callable[[str, dict], None]
 
@@ -938,22 +937,6 @@ def parse_orient(text: str) -> list[OrientTable]:
     if cur:
         tables.append(OrientTable(rank_candidates(cur, None), None))
     return tables
-
-
-def progress_from_log(log_path: Path) -> dict:
-    """Last progress hints from a CLI log: percent lines (debug 4) and the last plate/thumbnail line."""
-    pct, last = None, ""
-    try:
-        for line in open(log_path, errors="replace"):
-            m = _PCT.search(line)
-            if m:
-                pct = int(m.group(1))
-            low = line.lower()
-            if "finished" in low or "thumbnail" in low or "plate" in low:
-                last = line.strip()[-160:]
-    except OSError:
-        pass
-    return {"percent": pct, "last": last}
 
 
 # Convenience singletons are avoided on purpose; callers construct StudioCLI() once and pass it on.

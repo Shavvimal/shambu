@@ -28,12 +28,9 @@ TESTED_STUDIO = "02.08.02.61"  # the Studio build every rule in this package was
 REPO = "https://github.com/Shavvimal/shambu"
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+")  # used with fullmatch: "0.4.0\n" is not a version
 _TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
-_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 
-def redact_ip(text: str) -> str:
-    """A printer error names the host it tried; the report file must not (CONTRIBUTING: never commit an IP address)."""
-    return _IPV4.sub("<ip>", text)
+redact_ip = conf.redact_ip  # one detector: conf.py
 
 
 def install_kind(direct_url: dict | None, installer: str | None = None) -> tuple[str, str | None]:
@@ -293,8 +290,15 @@ class Bambu:
         return runs.studio_raw(self.studio_cli(), raw, Path.cwd(), Path(out_dir), timeout)
 
     def open_in_studio(self, path: str | Path) -> None:
-        """Opens the project for the user. With single_instance off this starts a second Studio process."""
-        subprocess.run(["open", "-a", "BambuStudio", str(Path(path).resolve())], check=True)
+        """Opens the project for the user. With single_instance off this starts a second Studio process. StudioError
+        when `open` fails or is missing (exit 3 at the CLI, not a traceback)."""
+        try:
+            subprocess.run(["open", "-a", "BambuStudio", str(Path(path).resolve())], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or b"").decode("utf-8", "replace").strip()[:200]
+            raise StudioError(f"`open -a BambuStudio` exited {e.returncode}" + (f": {err}" if err else "")) from e
+        except OSError as e:
+            raise StudioError(f"`open -a BambuStudio` could not run ({e.strerror or e})") from e
 
     # ---- printer (read-only)
     def printer(

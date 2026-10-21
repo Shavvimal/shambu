@@ -4,8 +4,7 @@ import pytest
 
 from shambu import recipes as R
 from shambu.errors import BuildError
-from shambu.spec import HeightRangeSpec, PartSpec, Spec, SpecBuilder, WipeTowerSpec
-from shambu.tower import TowerSettings
+from shambu.spec import HeightRangeSpec, PartSpec, Spec, SpecBuilder
 
 
 def spec_json(tmp_path, **over) -> dict:
@@ -252,15 +251,6 @@ def test_wipe_tower_rejects_bad_values(tmp_path, value, match):
         Spec.from_json(d)
 
 
-def test_wipe_tower_spot_outside_the_shared_reach_or_bed_raises_naming_the_plate():
-    base = TowerSettings()
-    WipeTowerSpec("fixed", 172, 150, 22, False, 2).check_spot(2, X2D_FACTS, base, 218)  # inside: no error
-    with pytest.raises(BuildError, match=r"plate 2 wipe_tower at \(10, 150\).*share only x 20.5..256"):
-        WipeTowerSpec("fixed", 10, 150, 22, False, 2).check_spot(2, X2D_FACTS, base, 218)
-    with pytest.raises(BuildError, match=r"plate 3 wipe_tower at \(208, 208\).*leaves the bed 256 x 256"):
-        WipeTowerSpec("fixed", 208, 208).check_spot(3, X2D_FACTS, base, 218)  # 41.4 rib wall + 8 mm brim
-
-
 def test_unknown_keys_are_warnings_not_errors(tmp_path):
     d = spec_json(tmp_path)
     d["plates"][0]["parts"][0]["brim_margn"] = 3
@@ -279,3 +269,9 @@ def test_support_spread_is_a_known_part_key(tmp_path):
     d["plates"][0]["parts"][0]["support_spread"] = [21, 0.5, 0.5, 3]
     s = Spec.from_json(d)
     assert s.warnings == () and s.plates[0].parts[0].support_spread == (21.0, 0.5, 0.5, 3.0)
+
+
+def test_a_written_specs_sweep_provenance_is_not_an_unknown_key(tmp_path):
+    d = spec_json(tmp_path)
+    d["_sweep"] = {"variant": "fast", "studio_estimate_s": 100}
+    assert Spec.from_json(d).warnings == ()

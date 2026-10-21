@@ -18,7 +18,7 @@ from shambu import edits as E
 from shambu import layout as L
 from shambu.build import Pipeline, two_pass_slice
 from shambu.errors import BambuError, ProjectError, StudioError
-from shambu.patches import PatchSet, SetFilamentMap
+from shambu.patches import PatchBase, PatchSet, SetFilamentMap
 from shambu.studio import CliCommand, RunResult, conflicts_in_log
 from shambu.threemf import MODEL, Project
 
@@ -210,7 +210,7 @@ def test_replace_mesh_component_layout_keeps_world_box(tmp_path):
 
 # ---------------------------------------------------------------------------- 10 the save() guard
 @dataclass(frozen=True)
-class _Sneaky:
+class _Sneaky(PatchBase):
     """Declares project_settings only, but rewrites the root model."""
 
     touches: frozenset[str] = frozenset({"Metadata/project_settings.config"})
@@ -223,7 +223,7 @@ class _Sneaky:
 
 
 @dataclass(frozen=True)
-class _Undeclared:
+class _Undeclared(PatchBase):
     def apply(self, p: Project) -> None:
         p.write_entry("3D/Objects/object_1.model", b"<model/>")
 
@@ -236,7 +236,7 @@ def test_save_rejects_undeclared_entry_change(geo_file):
     with pytest.raises(ProjectError, match="did not declare"):
         E.EditSet([_Sneaky()]).apply(str(geo_file))
     with pytest.raises(ProjectError, match="did not declare"):
-        PatchSet([_Undeclared()]).apply(str(geo_file))  # a patch without `touches` declares Metadata/*
+        PatchSet([_Undeclared()]).apply(str(geo_file))  # PatchBase's default `touches`: Metadata/*
     assert geo_file.read_bytes() == raw
 
 
@@ -887,7 +887,7 @@ def test_settings_patch_on_a_sliced_archive_declares_the_invalidation(tmp_path):
 
 
 @dataclass(frozen=True)
-class _DropsSlices:
+class _DropsSlices(PatchBase):
     """Declares project_settings only, but its change drops the slice (an undeclared deletion)."""
 
     touches: frozenset[str] = frozenset({"Metadata/project_settings.config"})
@@ -1205,7 +1205,7 @@ def test_replace_with_a_size_change_then_move(tmp_path, geo_file):
 
 
 @dataclass(frozen=True)
-class _CachedSneak:
+class _CachedSneak(PatchBase):
     """Declares project_settings only, but changes the parsed model settings (no slice to drop)."""
 
     touches: frozenset[str] = frozenset({"Metadata/project_settings.config"})
@@ -1257,7 +1257,7 @@ def test_move_into_a_notch_passes_on_silhouettes_and_fails_on_boxes(tmp_path):
     out = tmp_path / "moved.3mf"
     es = E.EditSet([E.MoveObject("label", *notch, strict=True)])  # strict: any FAIL line raises
     es.apply(str(path), str(out))
-    assert any(n.startswith("  OK: label: clearance on silhouettes to 1 other object(s)") and "no FAIL" in n for n in es.notes)
+    assert any(n.startswith("  OK: label: clearance on outlines to 1 other object(s)") and "no FAIL" in n for n in es.notes)
     p = Project(str(out))
     obj = E.find_object(p, "label")
     lo, hi = E._Geometry(p).world_box(obj)
@@ -1357,3 +1357,11 @@ def test_add_filament_repairs_an_unsliced_cli_export_first(tmp_path):
     assert p.reslice_problems() == [] and p.n_filaments() == 2
     ps = p.project_settings
     assert len(ps["filament_extruder_variant"]) == len(ps["filament_self_index"]) and "2" in ps["filament_self_index"]
+
+
+def test_an_unreadable_pass_log_is_a_warning_not_silence(tmp_path):
+    from shambu.build import checked_outcome
+
+    rr = RunResult(["BambuStudio"], 101 % 256, -101, 0.1, tmp_path / "gone" / "x.log", {"return_code": -101}, None)
+    rec = checked_outcome(rr, 1)
+    assert rec["kind"] == "skippable" and "could not be read" in rec["warning"] and str(tmp_path / "gone" / "x.log") in rec["reason"]

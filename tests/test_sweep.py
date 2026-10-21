@@ -346,3 +346,17 @@ def test_relocate_meshes_keeps_two_different_meshes_of_one_name_apart(tmp_path):
     pa, pb = (p["path"] for p in got["plates"][0]["parts"])
     assert pa != pb
     assert Path(pa).read_bytes() == b"solid a\n" and Path(pb).read_bytes() == b"solid b\n"
+
+
+def test_write_spec_failure_still_prints_the_table(capsys, sweep_files, monkeypatch):
+    from shambu.errors import BuildError
+
+    tmp, sp, vp, _ = sweep_files
+
+    def fail(path, spec):
+        raise BuildError(f"cannot write {path}")
+
+    monkeypatch.setattr(S, "write_spec", fail)
+    code = cli.main(["sweep", str(sp), "--variants", str(vp), "--write-spec", str(tmp / "best.json"), "--pick", "slow"])
+    out = capsys.readouterr().out
+    assert code == 3 and "baseline" in out and "slow" in out and out.rstrip().endswith(f"BuildError: cannot write {tmp / 'best.json'}")

@@ -423,7 +423,8 @@ def test_overflow_line_names_the_split(tmp_path, stls, resolver):
     plan = Pipeline(studio, resolver).plan(boxes_spec(tmp_path, [{"path": str(stls["body"]), "name": "big", "count": 3}]))
     bad = [c for c in plan.plates[0].checks if not c.ok]
     assert len(bad) == 1 and bad[0].kind == "placement"
-    assert "the parts need 3 plates with their support spreads (plate 1: big; plate 2: big #2; plate 3: big #3)" in bad[0].text
+    assert "put the parts on 3 plates with their support spreads (plate 1: big; plate 2: big #2; plate 3: big #3)" in bad[0].text
+    assert "the packer's answer (a heuristic), not a proof" in bad[0].text
     lines = L.describe([x.placed for x in plan.plates[0].parts])
     assert "not placed (would need plate 2)" in lines[1] and "not placed (would need plate 3)" in lines[2]
 
@@ -660,7 +661,7 @@ def test_footprint_comes_from_the_oriented_stl(tmp_path, resolver):
     plan = Pipeline(FakeStudio(sizes={"u.stl": (55.0, 100.0, 10.0)}), resolver).plan(boxes_spec(tmp_path, [{"path": str(path)}]))
     assert plan.plates[0].parts[0].placed.footprint is None  # Studio's box differs from the STL's: keep the box
     assert any(
-        "the layout uses the bounding box, not the outline: the STL's box differs from Studio's by 15.0 mm" in w for w in plan.warnings
+        "the layout uses the bounding box, not the outline: the mesh's box differs from Studio's by 15.0 mm" in w for w in plan.warnings
     )
 
 

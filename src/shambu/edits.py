@@ -50,10 +50,10 @@ from . import layout as L
 from . import mesh as M
 from . import tower as T
 from .errors import BambuError, ProjectError
-from .patches import Patch, PatchSet
+from .patches import Patch, PatchBase, PatchSet
 from .presets import machine_facts
 from .studio import MeshInfo
-from .threemf import DEFAULT_TOUCHES, LAYER_RANGES, MODEL, MODEL_SETTINGS, NS_CORE, NS_PROD, PROJECT_SETTINGS, Project
+from .threemf import LAYER_RANGES, MODEL, MODEL_SETTINGS, NS_CORE, NS_PROD, PROJECT_SETTINGS, Project
 
 Vec = tuple[float, float, float]
 # invalidate_slices() drops these: an edit that changes geometry or settings declares them
@@ -548,8 +548,8 @@ def _params(project: Project, obj: _Obj) -> dict:
 
 
 def _outline(geo: _Geometry, obj: _Obj, item: Sequence[float] | None = None) -> tuple[L.Footprint | None, str]:
-    """The object's XY silhouette (`layout.RasterFootprint`, every printing part through component then item), and ""
-    or, when it does not rasterise, None and the reason: the checks then use the bounding box (as `build` does)."""
+    """The object's XY outline (every part through component then item) by `layout.outline_of`, the rule `check`
+    uses, against the object's world box; None and the reason when it does not rasterise (the box stands in)."""
     t_item = obj.item if item is None else list(item)
     facets: list[M.Facet] = []
     try:
@@ -558,9 +558,12 @@ def _outline(geo: _Geometry, obj: _Obj, item: Sequence[float] | None = None) -> 
             full = _compose(t_item, c.transform)
             w = [_apply(full, v) for v in m.vertices]
             facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
-        return L.RasterFootprint.from_silhouette(M.silhouette(facets)), ""
     except BambuError as e:
         return None, str(e)
+    if not facets:
+        return None, "the object has no triangles"
+    lo, hi = geo.world_box(obj, t_item)
+    return L.outline_of(facets, (lo[0], lo[1], hi[0], hi[1]))
 
 
 def _placed(
@@ -647,12 +650,12 @@ def layout_checks(
     others, boxed = plate_objects(project, plate, skip=obj.oid)
     if why:
         boxed.insert(0, f"{obj.name}: the clearance uses the bounding box, not the outline: {why}")
-    checks += [L.Check(True, b, "margin") for b in boxed]
+    checks += [L.Check(True, b, "outline") for b in boxed]  # no spread involved: not a margin rule
     for them in others:
         c = clear(me, them)
         if c is not None:
             checks.append(c)
-    kind = "silhouettes" if not boxed else "silhouettes (boxes where noted)"
+    kind = "outlines" if not boxed else "outlines (boxes where noted)"
     hard = sum(1 for c in checks if not c.ok)
     checks.append(
         L.Check(
@@ -726,7 +729,7 @@ def canonical_triangles(verts: Sequence[Vec], tris: Iterable[tuple[int, int, int
 
 # ---------------------------------------------------------------------------- the edits
 @dataclass(frozen=True)
-class ReplaceMesh:
+class ReplaceMesh(PatchBase):
     """Swap one part's mesh for an STL and keep the object: its name, settings, transform and plate.
 
     anchor: `frame` (default) keeps the STL frames coincident, as the GUI does; `centre` keeps the old world bbox
@@ -951,7 +954,7 @@ class ReplaceMesh:
 
 
 @dataclass(frozen=True)
-class MoveObject:
+class MoveObject(PatchBase):
     """Move an object so its world bbox MIN corner is at (x, y) on its plate (plate-local mm, the convention of spec
     `at`), or by (+dx, +dy) with `relative`. `plate` moves it to another plate. Only the build item's translation
     changes; layout rules run as FAIL lines and raise only with `strict`."""
@@ -1056,7 +1059,7 @@ class MoveObject:
 
 
 @dataclass(frozen=True)
-class SetTower:
+class SetTower(PatchBase):
     """The prime tower's min corner (plate-local mm) on one plate, or on every plate when `plate` is None."""
 
     x: float
@@ -1468,7 +1471,7 @@ def variant_lookup(ps: dict) -> dict[int, int | None]:
 
 
 @dataclass(frozen=True)
-class AddFilament:
+class AddFilament(PatchBase):
     """Append filament slot N+1 (preset, colour, extruder). Slots 1..N stay byte-identical. A no-op when the last
     slot already is this preset, colour and extruder, so the same PatchSet applied twice adds one slot."""
 
@@ -1686,11 +1689,10 @@ class AddFilament:
 
 # ---------------------------------------------------------------------------- the composite
 def touches_of(patches: Iterable[Patch], project: Project) -> frozenset[str]:
-    """Union of what the patches declare; a patch without `touches` (every patch in patches.py) declares Metadata/*."""
+    """Union of what the patches declare (`Patch.resolve_touches`; `PatchBase` defaults to Metadata/*)."""
     out: set[str] = set()
     for p in patches:
-        resolve = getattr(p, "resolve_touches", None)
-        out |= resolve(project) if callable(resolve) else getattr(p, "touches", DEFAULT_TOUCHES)
+        out |= p.resolve_touches(project)
     return frozenset(out)
 
 
@@ -1764,9 +1766,8 @@ class EditSet(PatchSet):
         def verify(tmp: str) -> None:
             after = Project(tmp)
             for patch in self.patches:
-                v = getattr(patch, "verify", None)
-                if callable(v) and not isinstance(patch, MoveObject):
-                    v(after, before)
+                if not isinstance(patch, MoveObject):  # moves are checked together (_verify_moves)
+                    patch.verify(after, before)
             self._verify_moves(after)
             if check is not None:
                 check(tmp)

@@ -163,7 +163,7 @@ def test_auto_placement_on_plate_14_drops_the_rib_wall():
     assert fp is not None and not fp.settings.rib_wall and fp.settings.brim == 2.0
     r = fp.rect
     assert T.inside(r, REACH)
-    assert all(T._gap(r, o) >= T.PART_CLEARANCE - 1e-9 and not T._overlaps(r, o) for _, o in PLATE14)
+    assert all(T._gap(r, o) >= T.PART_CLEARANCE - 1e-9 and not L.overlaps(r, o) for _, o in PLATE14)
 
 
 def _shape(key, rects, z=10.0, filament=1, spread=None):
@@ -275,8 +275,8 @@ def test_footprint_clearance_keeps_the_box_test_for_a_part_without_an_outline():
 
 
 def test_auto_placement_failure_names_the_blocking_part():
-    wall = [("wall", (20.5, 0.0, 256.0, 256.0))]
-    plan = T.plan_auto(3, DEFAULT, H14, wall, REACH)
+    wall = (("wall", (20.5, 0.0, 256.0, 256.0)),)
+    (plan,) = T.plan_project([T.TowerRequest(3, "auto", DEFAULT, H14, wall, REACH, BED)])
     assert plan.footprint is None and plan.problem is not None
     assert plan.problem.startswith(f"plate 3: no free prime tower spot {T.BOTH} reach")
     assert "is blocked by wall" in plan.problem and '"wipe_tower": false' in plan.problem

@@ -93,7 +93,8 @@ def check_line(c: L.Check) -> str:
     """One check as a report line, its kind first so a reader (and the skill) can sort them: `PLACEMENT NOT DONE:`
     (the packer gave up, no position exists), `FAIL body overlap:` (the parts themselves meet), `FAIL margin rule:`
     (a measured or spec margin, the bodies are apart), `WARN margin rule:` (an estimate; the slice decides),
-    `WARN brim:` (a brim Studio will clip at the bed edge or a nozzle's reach),
+    `WARN brim:` (a brim Studio will clip at the bed edge or a nozzle's reach), `WARN outline:` (the box stands in for
+    a mesh that did not rasterise),
     `FAIL:` and `OK:` for the rest."""
     if c.kind == "placement" and not c.ok:
         return "PLACEMENT NOT DONE: " + c.text
@@ -101,6 +102,8 @@ def check_line(c: L.Check) -> str:
         return ("WARN margin rule: " if c.ok else "FAIL margin rule: ") + c.text
     if c.kind == "brim" and c.ok:
         return "WARN brim: " + c.text
+    if c.kind == "outline" and c.ok:
+        return "WARN outline: " + c.text
     if c.kind == "body" and not c.ok:
         return "FAIL body overlap: " + c.text
     return ("OK: " if c.ok else "FAIL: ") + c.text

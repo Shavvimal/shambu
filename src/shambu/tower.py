@@ -19,7 +19,7 @@ needed with ONE filament when the process uses Smooth timelapse (`need_wipe_towe
 then plans an "auto" tower on a one-filament plate too.
 
 Design: pure functions for the estimate (`min_depth`, `auto_brim`, `TowerSettings.size`, `footprint`), a grid search
-for a free spot (`find_spot`, `auto_place`) whose obstacle test is a parameter (the `Clearance` protocol:
+for a free spot (`find_spot`, `auto_place`) whose obstacle test is a parameter (the `TowerClearance` protocol:
 `FootprintClearance` over the layout's part silhouettes and support spreads, strict first and then relaxed, or
 `BoxClearance` over part rects), `plan_project` for ONE tower size per project over every plate, and one `Rule` for the
 limit checker (`TowerClear`). It handles the tower's size and spot. It does not handle the post-slice tower, purge
@@ -167,7 +167,7 @@ class TowerSettings:
 
 
 @dataclass(frozen=True)
-class Footprint:
+class TowerFootprint:
     """A tower at (x, y): its body w x d and its brim. `rect` includes the brim (the area nothing else may use)."""
 
     x: float
@@ -197,9 +197,9 @@ class Footprint:
         )
 
 
-def footprint(settings: TowerSettings, height: float, x: float, y: float) -> Footprint:
+def footprint(settings: TowerSettings, height: float, x: float, y: float) -> TowerFootprint:
     w, d = settings.size(height)
-    return Footprint(x, y, w, d, settings.brim_at(height), height, settings)
+    return TowerFootprint(x, y, w, d, settings.brim_at(height), height, settings)
 
 
 def shared_reach(extruders: Iterable[Mapping], bed: Mapping, aux_x_limit: float | None = None) -> Rect:
@@ -217,15 +217,9 @@ def inside(r: Rect, area: Rect, eps: float = 1e-6) -> bool:
     return r[0] >= area[0] - eps and r[1] >= area[1] - eps and r[2] <= area[2] + eps and r[3] <= area[3] + eps
 
 
-def _overlaps(a: Rect, b: Rect) -> bool:
-    return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
-
-
 def _gap(a: Rect, b: Rect) -> float:
-    """Shortest distance between two rectangles; 0 when they touch or overlap."""
-    dx = max(b[0] - a[2], a[0] - b[2], 0.0)
-    dy = max(b[1] - a[3], a[1] - b[3], 0.0)
-    return math.hypot(dx, dy)
+    """Shortest distance between two rectangles; 0 when they touch or overlap (`layout.rect_gap`)."""
+    return L.rect_gap(a, b)[0]
 
 
 def _area(a: Rect, b: Rect) -> float:
@@ -234,7 +228,7 @@ def _area(a: Rect, b: Rect) -> float:
     return w * h if w > 0 and h > 0 else 0.0
 
 
-class Clearance(Protocol):
+class TowerClearance(Protocol):
     """The obstacle test of the placement, as a parameter: `FootprintClearance` tests the parts' silhouettes and
     support spreads (build.py binds it when the parts have outlines), `BoxClearance` tests part rects."""
 
@@ -279,7 +273,7 @@ class BoxClearance:
 
     def clear(self, rect: Rect) -> bool:
         # The grown rect is a quick reject; a corner needs the exact (Euclidean) gap
-        return all(not _overlaps(rect, g) or (not _overlaps(rect, o) and _gap(rect, o) >= self.margin - 1e-9) for _, o, g in self.grown)
+        return all(not L.overlaps(rect, g) or (not L.overlaps(rect, o) and _gap(rect, o) >= self.margin - 1e-9) for _, o, g in self.grown)
 
     def gap(self, rect: Rect) -> float:
         return min((_gap(rect, o) for _, o in self.obstacles), default=CLEARANCE_CAP)
@@ -290,7 +284,7 @@ class BoxClearance:
         return (sum(a for a, _ in hits), max(hits)[1]) if hits else (0.0, None)
 
     def blocking(self, rect: Rect) -> list[tuple[str, Rect]]:
-        return [(n, o) for n, o, g in self.grown if _overlaps(rect, g) and (_overlaps(rect, o) or _gap(rect, o) < self.margin - 1e-9)]
+        return [(n, o) for n, o, g in self.grown if L.overlaps(rect, g) and (L.overlaps(rect, o) or _gap(rect, o) < self.margin - 1e-9)]
 
     def describe(self) -> str:
         return f"{self.margin:g} mm clearance to every part's box (with brim and support spread)"
@@ -391,19 +385,19 @@ def _wh(r: Rect) -> tuple[float, float]:
     return (r[2] - r[0], r[3] - r[1])
 
 
-def as_clearance(obstacles: Sequence[tuple[str, Rect]] | Clearance, margin: float = PART_CLEARANCE) -> Clearance:
+def as_clearance(obstacles: Sequence[tuple[str, Rect]] | TowerClearance, margin: float = PART_CLEARANCE) -> TowerClearance:
     if isinstance(obstacles, (list, tuple)):
         return BoxClearance(tuple(obstacles), margin)
     return obstacles  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
-class Placement:
+class TowerPlacement:
     """The result of `auto_place`: a footprint, or None with the best blocked spot and the part that blocks it."""
 
-    footprint: Footprint | None
+    footprint: TowerFootprint | None
     tried: tuple[str, ...]  # one entry per settings tried, e.g. "41.4 mm (rib wall)"
-    best: Footprint | None = None
+    best: TowerFootprint | None = None
     blocker: str | None = None
 
 
@@ -423,21 +417,21 @@ def _origins(fw: float, fd: float, brim: float, area: Rect, step: float) -> Iter
 def find_spot(
     settings: TowerSettings,
     height: float,
-    obstacles: Sequence[tuple[str, Rect]] | Clearance,
+    obstacles: Sequence[tuple[str, Rect]] | TowerClearance,
     area: Rect,
     clearance: float = PART_CLEARANCE,
     step: float = 1.0,
-) -> tuple[Footprint | None, Footprint | None, str | None]:
+) -> tuple[TowerFootprint | None, TowerFootprint | None, str | None]:
     """(free footprint, best blocked footprint, its blocker). The footprint is recomputed from `settings` (a narrower
     tower is deeper, PartPlate.cpp:2255-2259). A spot is free when the footprint lies in `area` and `obstacles`
-    (part rects, or any `Clearance`) clears it. Score: the clearance (capped at CLEARANCE_CAP, floored to 0.5 mm),
+    (part rects, or any `TowerClearance`) clears it. Score: the clearance (capped at CLEARANCE_CAP, floored to 0.5 mm),
     then high y (Studio's own default sits at the back, y 250, PartPlate.cpp:69-70), then high x."""
     test = as_clearance(obstacles, clearance)
     fp0 = footprint(settings, height, 0.0, 0.0)
     fw, fd = fp0.outer
-    best_free: tuple[tuple[float, float, float], Footprint] | None = None
-    best_blocked: tuple[tuple[float, float, float], Footprint, str | None] | None = None
-    column: tuple[float, Clearance] | None = None
+    best_free: tuple[tuple[float, float, float], TowerFootprint] | None = None
+    best_blocked: tuple[tuple[float, float, float], TowerFootprint, str | None] | None = None
+    column: tuple[float, TowerClearance] | None = None
     for x, y in _origins(fw, fd, fp0.brim, area, step):
         fp = replace(fp0, x=x, y=y)
         r = fp.rect
@@ -481,25 +475,25 @@ def _tried(s: TowerSettings, height: float) -> str:
 def auto_place(
     settings: TowerSettings,
     height: float,
-    obstacles: Sequence[tuple[str, Rect]] | Clearance,
+    obstacles: Sequence[tuple[str, Rect]] | TowerClearance,
     area: Rect,
     clearance: float = PART_CLEARANCE,
     step: float = 1.0,
     fallback: bool = True,
-) -> Placement:
+) -> TowerPlacement:
     """One plate on its own: the first settings in `candidates()` (or only `settings` without `fallback`) with a free
     spot. `plan_project` makes the choice for every plate together."""
     tried: list[str] = []
-    best: Footprint | None = None
+    best: TowerFootprint | None = None
     blocker: str | None = None
     for s in candidates(settings) if fallback else [settings]:
         fp, b, who = find_spot(s, height, obstacles, area, clearance, step)
         tried.append(_tried(s, height))
         if fp is not None:
-            return Placement(fp, tuple(tried))
+            return TowerPlacement(fp, tuple(tried))
         if b is not None:
             best, blocker = b, who
-    return Placement(None, tuple(tried), best, blocker)
+    return TowerPlacement(None, tuple(tried), best, blocker)
 
 
 # ---------------------------------------------------------------------------- the plan of one plate
@@ -510,7 +504,7 @@ class TowerPlan:
 
     plate: int
     mode: str
-    footprint: Footprint | None = None
+    footprint: TowerFootprint | None = None
     problem: str | None = None
     warning: str | None = None
 
@@ -523,7 +517,7 @@ def _fmt_rect(r: Rect) -> str:
     return f"x {r[0]:.1f}..{r[2]:.1f} y {r[1]:.1f}..{r[3]:.1f}"
 
 
-def _alternative(settings: TowerSettings, height: float, test: Clearance, area: Rect, first_w: float) -> str:
+def _alternative(settings: TowerSettings, height: float, test: TowerClearance, area: Rect, first_w: float) -> str:
     p = auto_place(settings, height, test, area)
     if p.footprint is None:
         return f'Free spots {BOTH} reach: none down to width {FALLBACK_WIDTHS[-1]:g}; set "wipe_tower": false or move parts'
@@ -532,7 +526,9 @@ def _alternative(settings: TowerSettings, height: float, test: Clearance, area: 
     return f"Free spots {BOTH} reach: {lead}x {fp.x:.0f} y {fp.y:.0f} with {fp.settings.describe()}"
 
 
-def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]] | Clearance, area: Rect, bed: Rect) -> str | None:
+def check_fixed(
+    plate: int, fp: TowerFootprint, obstacles: Sequence[tuple[str, Rect]] | TowerClearance, area: Rect, bed: Rect
+) -> str | None:
     """The FAIL line for a tower at a fixed spot, or None when it is clear (the obstacle test clears it, inside the
     bed and inside the shared reach)."""
     test = as_clearance(obstacles)
@@ -561,7 +557,9 @@ def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]]
     return f"plate {plate} {fp.describe()}: {' and '.join(why)} ({test.describe()}). {alt}. Set plates[{plate - 1}].wipe_tower."
 
 
-def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | None, blocker: str | None, how: str, why: str = "") -> str:
+def _fail_auto(
+    plate: int, area: Rect, tried: Sequence[str], best: TowerFootprint | None, blocker: str | None, how: str, why: str = ""
+) -> str:
     where = ""
     if best is not None:
         where = f"; the best spot ({best.x:.0f}, {best.y:.0f}) at {best.settings.describe()}" + (
@@ -573,18 +571,6 @@ def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | N
         + f" with {how}{where}{why}. Move parts, set plates[{plate - 1}].wipe_tower "
         '{"x", "y", "width", "rib_wall", "brim"}, or set "wipe_tower": false'
     )
-
-
-def plan_auto(
-    plate: int, settings: TowerSettings, height: float, obstacles: Sequence[tuple[str, Rect]] | Clearance, area: Rect, fallback: bool = True
-) -> TowerPlan:
-    """The "auto" tower of one plate on its own: the first free spot (`auto_place`), or a FAIL line naming the best
-    blocked spot."""
-    p = auto_place(settings, height, obstacles, area, fallback=fallback)
-    if p.footprint is not None:
-        return TowerPlan(plate, "auto", p.footprint)
-    how = as_clearance(obstacles).describe()
-    return TowerPlan(plate, "auto", None, problem=_fail_auto(plate, area, p.tried, p.best, p.blocker, how))
 
 
 # ---------------------------------------------------------------------------- every plate together
@@ -603,12 +589,12 @@ class TowerRequest:
     bed: Rect
     x: float | None = None
     y: float | None = None
-    clearance: Clearance | None = None
+    clearance: TowerClearance | None = None
 
-    def test(self) -> Clearance:
+    def test(self) -> TowerClearance:
         return self.clearance if self.clearance is not None else as_clearance(self.obstacles)
 
-    def relaxed(self) -> Clearance | None:
+    def relaxed(self) -> TowerClearance | None:
         """The test without estimated spreads (None: the test has no relaxed form)."""
         rel = getattr(self.test(), "relaxed", None)
         return rel() if rel is not None else None
@@ -622,11 +608,11 @@ def _with_size(s: TowerSettings, key: tuple[float, bool, float]) -> TowerSetting
     return replace(s, width=key[0], rib_wall=key[1], brim=key[2])
 
 
-Found = dict[int, tuple[Footprint | None, Footprint | None, str | None]]
+Found = dict[int, tuple[TowerFootprint | None, TowerFootprint | None, str | None]]
 
 
 def _search(
-    autos: Sequence[TowerRequest], keys: Sequence[tuple[float, bool, float]], tests: Mapping[int, Clearance]
+    autos: Sequence[TowerRequest], keys: Sequence[tuple[float, bool, float]], tests: Mapping[int, TowerClearance]
 ) -> tuple[Found, list[str]]:
     """The first size key every plate finds a spot for, with each plate's own test; else the last key's results."""
     tried: list[str] = []
@@ -688,7 +674,7 @@ def plan_project(requests: Sequence[TowerRequest], fallback: bool = True) -> lis
     return [out[r.plate] for r in requests]
 
 
-def _estimate_warning(r: TowerRequest, fp: Footprint) -> str | None:
+def _estimate_warning(r: TowerRequest, fp: TowerFootprint) -> str | None:
     """The WARN line for a tower inside an estimated support spread (the strict test blocks it, the relaxed one not)."""
     within = getattr(r.test(), "estimates_within", None)
     names = within(fp.rect) if within is not None else []

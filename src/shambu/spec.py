@@ -52,7 +52,7 @@ from typing import Any
 
 from .errors import BuildError
 from .mesh import Orientation
-from .tower import WIDTH_RANGE, TowerSettings, footprint, inside, shared_reach
+from .tower import WIDTH_RANGE, TowerSettings
 
 BED_TYPES = ("Default Plate", "Cool Plate", "Engineering Plate", "High Temp Plate", "Textured PEI Plate", "Supertack Plate")
 SUBTYPES = ("normal_part", "negative_part", "modifier_part", "support_enforcer", "support_blocker")
@@ -60,7 +60,8 @@ PRINT_SEQUENCES = ("by layer", "by object")
 COLOUR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 # The keys each JSON object may hold. Anything else is dropped with a warning (Spec.warnings), never silently.
 KNOWN_KEYS = {
-    "spec": {"name", "outdir", "printer", "process", "filaments", "plates", "bed_type", "filament_map", "aux_x_limit", "layout"},
+    "spec": {"name", "outdir", "printer", "process", "filaments", "plates", "bed_type", "filament_map", "aux_x_limit", "layout",
+             "_sweep"},  # _sweep: the provenance `sweep --write-spec` writes
     "process": {"base", "name", "recipes", "set"},
     "filament": {"preset", "colour", "name", "set", "colour_note"},
     "layout": {"gap", "edge"},
@@ -300,29 +301,6 @@ class WipeTowerSpec:
             rib_wall=self.rib_wall if self.rib_wall is not None else base.rib_wall,
             brim=self.brim if self.brim is not None else base.brim,
         )
-
-    def size_key(self) -> tuple:
-        return (self.width, self.rib_wall, self.brim)
-
-    def check_spot(self, plate_no: int, facts: dict, base: TowerSettings, height: float, aux_x_limit: float | None = None) -> None:
-        """Raise BuildError when a fixed tower's footprint (brim included, at the plate's tallest part `height`) leaves
-        the bed or the area every extruder reaches (`facts["extruders"]`)."""
-        if self.mode != "fixed" or self.x is None or self.y is None:
-            return
-        fp = footprint(self.settings(base), height, self.x, self.y)
-        r = fp.rect
-        bed = facts["bed"]
-        bed_r = (bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1])
-        reach = shared_reach(facts["extruders"], bed, aux_x_limit)
-        where = f"plate {plate_no} wipe_tower at ({self.x:g}, {self.y:g})"
-        span = f"x {r[0]:.1f}..{r[2]:.1f} y {r[1]:.1f}..{r[3]:.1f} with its {fp.brim:g} mm brim"
-        if not inside(r, bed_r):
-            raise BuildError(f"{where} spans {span}: it leaves the bed {bed_r[2]:g} x {bed_r[3]:g}")
-        if not inside(r, reach):
-            raise BuildError(
-                f"{where} spans {span}: extruders 1 and 2 (left and right nozzle) print the tower, and they share only x {reach[0]:g}..{reach[2]:g} "
-                f"y {reach[1]:g}..{reach[3]:g}"
-            )
 
 
 @dataclass(frozen=True)

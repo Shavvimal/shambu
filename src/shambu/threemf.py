@@ -110,11 +110,11 @@ def _slot_stats(ps: dict, i: int) -> dict:
     CLI derives it) or the list is shorter than the extruder index."""
     fmap = ps.get("filament_map") or []
     try:
-        ext = int(fmap[i]) if i < len(fmap) else 1
+        ext: int | None = int(fmap[i]) if i < len(fmap) else 1  # no map entry: Studio's default, extruder 1
     except (TypeError, ValueError):
-        ext = 1
+        ext = None  # a malformed map is shown as unknown, never guessed
     eff = effective_stats(ps)
-    stat = eff[1][ext - 1] if eff and 0 < ext <= len(eff[1]) else None
+    stat = eff[1][ext - 1] if eff and ext is not None and 0 < ext <= len(eff[1]) else None
     return {"extruder": ext, "nozzle_stats": stat}
 
 

@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
-from .errors import LayoutError
+from .errors import BambuError, LayoutError
 from .studio import MeshInfo
 
 BED = 256.0
@@ -131,6 +131,8 @@ NO_SPREAD = Spread()
 
 
 def _int(v) -> int:
+    """An optional integer setting (enforce_support_layers, raft_layers): a missing or malformed value is 0, Studio's
+    default (a documented silent fallback, rubric 13)."""
     try:
         return int(float(str(v).strip()))
     except (TypeError, ValueError):
@@ -468,6 +470,28 @@ class RasterFootprint(_Bands):
         return cls(tuple(rows), hx - lx, rows[-1][1] - rows[0][0], lx=lx, ly=rows[0][0])
 
 
+OUTLINE_BOX_TOL = 0.5  # mm: an outline whose box differs more from the expected box is not trusted (the box stands in)
+
+
+def outline_of(facets: Sequence, box: tuple[float, float, float, float]) -> tuple[Footprint | None, str]:
+    """The XY outline of `facets` (mesh.silhouette, after the orientation) as a RasterFootprint, and "". None (the
+    bounding box) plus the reason when there are no facets, the mesh does not rasterise, or the outline's box differs
+    from `box` (x0, y0, x1, y1: Studio's box for a spec part, the world box for a project object) by more than
+    OUTLINE_BOX_TOL (a unit conversion, a 3MF input). The one outline rule for `check` and `patch`."""
+    from . import mesh as M  # mesh is a sibling planning module; imported here to keep layout's import light
+
+    if not facets:
+        return None, ""
+    try:
+        sil = M.silhouette(facets)
+    except BambuError as e:  # mesh raises BuildError for an empty mesh: the box stands in, with the reason
+        return None, str(e)
+    off = max(abs(a - b) for a, b in zip((sil.x0, sil.y0, sil.x1, sil.y1), box, strict=True))
+    if off > OUTLINE_BOX_TOL:
+        return None, f"the mesh's box differs from Studio's by {off:.1f} mm (a unit conversion or a 3MF input?)"
+    return RasterFootprint.from_silhouette(sil), ""
+
+
 SUPPORT_MASK_CELL = 0.5  # the same cell as mesh.SILHOUETTE_CELL
 
 
@@ -501,7 +525,7 @@ def union_footprint(shapes: Iterable[Footprint], origin: tuple[float, float], ce
 class Placed:
     """A part with its mesh info and where its bounding box sits on the bed.
 
-    `margin` is the brim (or nothing when the spec's brim_margin is the spread): it counts at the bed edge and in the
+    `brim` is the brim margin (0 when the spec's brim_margin is the spread): it counts at the bed edge and in the
     extruder reach, never between two parts (Studio clips brims against neighbours, Brim.cpp:258-365). `spread` is the
     support reach past the box per side. `footprint` is the outline in the part's own frame (bbox minimum at 0, 0);
     None means the box. `placed` is False when the placer found no position: no geometric rule runs on the part, and
@@ -656,7 +680,8 @@ def overlaps(a: Rect, b: Rect) -> bool:
 class Check:
     """One line of the plate's check. `kind` sorts it: body (the parts themselves meet), margin (the margin rule: a
     support spread reaches another part or the bed edge, the bodies are apart), placement (the packer could not place a part), bed, reach, height, spool, tower,
-    sequence, mesh, summary, brim (a brim Studio will clip). An ok Check of kind margin or brim is a WARN."""
+    sequence, mesh, summary, brim (a brim Studio will clip), outline (the bounding box stands in for a mesh that did not
+    rasterise). An ok Check of kind margin, brim or outline is a WARN."""
 
     ok: bool
     text: str
@@ -664,7 +689,7 @@ class Check:
 
     @property
     def warn(self) -> bool:
-        return self.ok and self.kind in ("margin", "brim")
+        return self.ok and self.kind in ("margin", "brim", "outline")
 
 
 def _side_reaches(src: Placed, dst: Footprint) -> list[tuple[float, str]]:
@@ -715,7 +740,7 @@ def pair_check(a: Placed, b: Placed) -> Check | None:
             text = f"{where_a} and {where_b} intersect by {iw:.1f} x {ih:.1f} mm. The parts themselves overlap: move one."
         else:
             text = (
-                f"{where_a} and {where_b}: the footprints touch ({g:.1f} mm apart; the line allowance is {LINE:.1f} mm). "
+                f"{where_a} and {where_b}: the outlines touch ({g:.1f} mm apart; the line allowance is {LINE:.1f} mm). "
                 "Studio refuses crossing paths (exit -101): move one."
             )
         return Check(False, text, "body")
