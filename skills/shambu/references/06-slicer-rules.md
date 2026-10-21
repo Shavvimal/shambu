@@ -173,6 +173,17 @@ What shambu does:
   feeler box (x >= 195.1) is too narrow for the T8 tower with 3 mm clearance, yet T8 sliced: the feeler is narrower
   than its box there (the G-code tower reached x 195.8). Towers at (161, 226), (167, 216) and (167, 205) conflicted
   with the feeler or the mount although they were clear of the boxes: tree supports and brims spread past the box.
+- One size for the project: the fallback runs over every plate together, and the first size every "auto" plate
+  accepts wins (a narrower tower is deeper, so each step recomputes the footprint per plate). A fixed `wipe_tower`
+  pins the size. If one plate blocks every size, that plate FAILs and the message names it.
+- The estimate is the GUI's. Studio recomputes the real tower at slice time from the actual tool changes
+  (WipeTower.cpp:4520-4585), so the sliced tower can be a little different.
+- Smooth timelapse (`timelapse_type 1`) needs a tower with one filament too (PartPlate.cpp:2222-2223): shambu plans an
+  "auto" tower on such a plate.
+- "Has support" is Studio's own predicate: `enable_support`, `enforce_support_layers > 0` or `raft_layers > 0`
+  (Print.hpp:492-494). A raft-only part prints its raft interface with the process interface filament too.
+- The obstacle test of the placement is a parameter (`tower.Clearance`): the box test is the default, and a
+  silhouette test can replace it.
 - Studio's own "Prime Tower is too close to others" is a warning, not a headless exit (Print.cpp:1003-1045). The
   binding check is the post-slice conflict test (-101).
 

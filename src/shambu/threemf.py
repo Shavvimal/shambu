@@ -57,11 +57,40 @@ GCODE_TYPES = {"color_change": 0, "pause": 1, "tool_change": 2, "template": 3, "
 GCODE_TYPE_NAMES = {v: k for k, v in GCODE_TYPES.items()}
 
 
-def _stats_bad(v) -> bool:
-    """An `extruder_nozzle_stats` value the CLI cannot slice with: empty, or a `Type#0` count."""
-    if not isinstance(v, list) or not v:
+STATS_NEW, STATS_OLD = "extruder_nozzle_stats_new", "extruder_nozzle_stats"
+
+
+def _entry_count(entry) -> int:
+    """Nozzles in one extruder's stat, `Type#n` or `Type#n|Type#m` (PrintConfig.cpp:751-783 sums them)."""
+    total = 0
+    for part in str(entry).split("|"):
+        _, sep, n = part.partition("#")
+        if sep:
+            try:
+                total += int(n.strip() or 0)
+            except ValueError:
+                continue
+    return total
+
+
+def _stats_bad(v, n_ext: int = 0) -> bool:
+    """A stat list the CLI cannot slice with: empty, shorter than the extruder count, or an extruder with 0 nozzles."""
+    if not isinstance(v, list) or not v or len(v) < n_ext:
         return True
-    return any(str(e).rpartition("#")[2].strip() in ("", "0") for e in v)
+    return any(_entry_count(e) <= 0 for e in v)
+
+
+def effective_stats(ps: dict) -> tuple[str, list] | None:
+    """The stat list a CLI run uses, and its key: a non-empty `extruder_nozzle_stats_new` wins, else the plain key
+    (BambuStudio.cpp:4151-4155). None when neither key is in the file: the CLI then derives the stat from
+    `extruder_max_nozzle_count` (4101, 4135-4146)."""
+    if STATS_NEW not in ps and STATS_OLD not in ps:
+        return None
+    new = ps.get(STATS_NEW)
+    if isinstance(new, list) and new:
+        return STATS_NEW, new
+    old = ps.get(STATS_OLD)
+    return STATS_OLD, old if isinstance(old, list) else []
 
 
 def _float_or(text: str, default: float) -> float:
@@ -670,19 +699,27 @@ class Project:
     def repair_nozzle_stats(self) -> bool:
         """`extruder_nozzle_stats` `[]` (what a CLI export without --slice writes) or a `#0` count makes every later CLI
         slice of the file exit -100 "No valid nozzle found" (BambuStudio.cpp:4101-4156, ToolOrdering.cpp:1477-1481).
-        Write `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` per extruder (the value a sliced export holds),
-        and resize filament_volume_map / filament_nozzle_map to the filament count as Studio does
+        The key the CLI reads (`effective_stats`: a non-empty `_new` wins) gets
+        `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` for each empty or zero-count extruder entry only; a
+        valid entry (High Flow included) stays as it is. A repaired `_new` is copied to the plain key so the two agree.
+        Also resize filament_volume_map / filament_nozzle_map to the filament count as Studio does
         (PresetBundle.cpp:2384-2387). Returns True when something changed."""
         ps = self.project_settings
         changed = False
         nvt = [str(v) for v in ps.get("nozzle_volume_type") or []]
-        if "extruder_nozzle_stats" in ps and nvt and _stats_bad(ps.get("extruder_nozzle_stats")):
+        eff = effective_stats(ps)
+        if eff is not None and nvt and _stats_bad(eff[1], len(nvt)):
+            key, cur = eff
             cnt = [str(v) for v in ps.get("extruder_max_nozzle_count") or []]
-            want = [f"{t}#{cnt[i] if i < len(cnt) and str(cnt[i]) not in ('', '0') else '1'}" for i, t in enumerate(nvt)]
-            ps["extruder_nozzle_stats"] = want
-            new = ps.get("extruder_nozzle_stats_new")
-            if isinstance(new, list) and new and _stats_bad(new):  # a non-empty _new wins over the plain key (BS.cpp:4151)
-                ps["extruder_nozzle_stats_new"] = list(want)
+
+            def default(i: int) -> str:
+                return f"{nvt[i]}#{cnt[i] if i < len(cnt) and str(cnt[i]) not in ('', '0') else '1'}"
+
+            n_ext = max(len(nvt), len(cur))
+            want = [str(cur[i]) if i < len(cur) and _entry_count(cur[i]) > 0 else default(min(i, len(nvt) - 1)) for i in range(n_ext)]
+            ps[key] = want
+            if key == STATS_NEW and STATS_OLD in ps:
+                ps[STATS_OLD] = list(want)
             changed = True
         n = self.n_filaments()
         for key, fill in (("filament_volume_map", "0"), ("filament_nozzle_map", "0")):
@@ -698,8 +735,9 @@ class Project:
         """Why a later CLI run on this file (`--slice`) would fail or use the wrong per-filament values; [] when none."""
         ps = self.project_settings
         out = []
-        if "extruder_nozzle_stats" in ps and _stats_bad(ps.get("extruder_nozzle_stats")):
-            out.append(f'extruder_nozzle_stats {ps.get("extruder_nozzle_stats")} (Studio exits -100 "No valid nozzle found")')
+        eff = effective_stats(ps)
+        if eff is not None and _stats_bad(eff[1], len(ps.get("nozzle_volume_type") or [])):
+            out.append(f'{eff[0]} {eff[1]} (Studio exits -100 "No valid nozzle found")')
         var, idx = ps.get("filament_extruder_variant"), ps.get("filament_self_index")
         if isinstance(var, list) and isinstance(idx, list) and len(var) != len(idx):
             out.append(

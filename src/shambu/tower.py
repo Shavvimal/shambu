@@ -12,6 +12,11 @@ Sources (Bambu Studio v02.08.02.61, `skills/shambu/references/06-slicer-rules.md
   WipeTower.cpp:1587-1630;
 - the footprint `x - brim .. x + w + brim`, `y - brim .. y + d + brim`: PartPlate.cpp:2290-2296 and
   BambuStudio.cpp:4462-4488 (CLI log `wipe bbox: min {200, 200} - max {257.39, 257.39}` at (208, 208), H 218).
+
+Limits: the GUI formula is an estimate. Studio recomputes the real tower at slice time from the actual tool changes
+(`WipeTower::plan_tower` and the depth pass, WipeTower.cpp:4520-4585), so the sliced tower can differ. A tower is also
+needed with ONE filament when the process uses Smooth timelapse (`need_wipe_tower`, PartPlate.cpp:2222-2223): build.py
+then plans an "auto" tower on a one-filament plate too.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
+from typing import Protocol
 
 from .layout import Check
 
@@ -204,12 +210,55 @@ def _area(a: Rect, b: Rect) -> float:
     return w * h if w > 0 and h > 0 else 0.0
 
 
+class Clearance(Protocol):
+    """The obstacle test of the placement, as a parameter: `BoxClearance` tests part rects here; a silhouette test
+    (the layout checker's raster footprints) binds in its place without a change to the search."""
+
+    def clear(self, rect: Rect) -> bool:
+        """True when a tower footprint `rect` may stand there."""
+        ...
+
+    def gap(self, rect: Rect) -> float:
+        """The clearance of a free `rect` to the nearest obstacle (scoring only)."""
+        ...
+
+    def blocker(self, rect: Rect) -> tuple[float, str | None]:
+        """For a blocked `rect`: (how much it is blocked, the name of the worst obstacle)."""
+        ...
+
+
+@dataclass(frozen=True)
+class BoxClearance:
+    """Part rects (margin-grown, `Placed.rect()`) plus `margin` mm on every side."""
+
+    obstacles: tuple[tuple[str, Rect], ...]
+    margin: float = PART_CLEARANCE
+
+    def clear(self, rect: Rect) -> bool:
+        return all(not _overlaps(rect, o) and _gap(rect, o) >= self.margin - 1e-9 for _, o in self.obstacles)
+
+    def gap(self, rect: Rect) -> float:
+        return min((_gap(rect, o) for _, o in self.obstacles), default=CLEARANCE_CAP)
+
+    def blocker(self, rect: Rect) -> tuple[float, str | None]:
+        m = self.margin
+        hits = [(_area(rect, (o[0] - m, o[1] - m, o[2] + m, o[3] + m)), n) for n, o in self.obstacles]
+        hits = [h for h in hits if h[0] > 0]
+        return (sum(a for a, _ in hits), max(hits)[1]) if hits else (0.0, None)
+
+
+def as_clearance(obstacles: Sequence[tuple[str, Rect]] | Clearance, margin: float = PART_CLEARANCE) -> Clearance:
+    if isinstance(obstacles, (list, tuple)):
+        return BoxClearance(tuple(obstacles), margin)
+    return obstacles  # type: ignore[return-value]
+
+
 @dataclass(frozen=True)
 class Placement:
     """The result of `auto_place`: a footprint, or None with the best blocked spot and the part that blocks it."""
 
     footprint: Footprint | None
-    tried: tuple[str, ...]  # one entry per settings tried, e.g. "width 41.4 (rib wall)"
+    tried: tuple[str, ...]  # one entry per settings tried, e.g. "41.4 mm (rib wall)"
     best: Footprint | None = None
     blocker: str | None = None
 
@@ -227,38 +276,36 @@ def _origins(fw: float, fd: float, brim: float, area: Rect, step: float) -> Iter
 def find_spot(
     settings: TowerSettings,
     height: float,
-    obstacles: Sequence[tuple[str, Rect]],
+    obstacles: Sequence[tuple[str, Rect]] | Clearance,
     area: Rect,
     clearance: float = PART_CLEARANCE,
     step: float = 1.0,
 ) -> tuple[Footprint | None, Footprint | None, str | None]:
-    """(free footprint, best blocked footprint, its blocker). A spot is free when the footprint lies in `area` and
-    keeps `clearance` from every obstacle rect. Score: the clearance (capped at CLEARANCE_CAP and floored to 0.5 mm),
+    """(free footprint, best blocked footprint, its blocker). The footprint is recomputed from `settings` (a narrower
+    tower is deeper, PartPlate.cpp:2255-2259). A spot is free when the footprint lies in `area` and `obstacles`
+    (part rects, or any `Clearance`) clears it. Score: the clearance (capped at CLEARANCE_CAP, floored to 0.5 mm),
     then high y (Studio's own default sits at the back, y 250, PartPlate.cpp:69-70), then high x."""
+    test = as_clearance(obstacles, clearance)
     fp0 = footprint(settings, height, 0.0, 0.0)
     fw, fd = fp0.outer
     best_free: tuple[tuple[float, float, float], Footprint] | None = None
-    best_blocked: tuple[tuple[float, float, float], Footprint, str] | None = None
+    best_blocked: tuple[tuple[float, float, float], Footprint, str | None] | None = None
     for x, y in _origins(fw, fd, fp0.brim, area, step):
         fp = replace(fp0, x=x, y=y)
         r = fp.rect
-        gaps = [(_gap(r, o), name, o) for name, o in obstacles]
-        g = min((v for v, _, _ in gaps), default=CLEARANCE_CAP)
-        if g >= clearance - 1e-9 and not any(_overlaps(r, o) for _, _, o in gaps):
-            key = (math.floor(min(g, CLEARANCE_CAP) * 2) / 2, y, x)
+        if test.clear(r):
+            key = (math.floor(min(test.gap(r), CLEARANCE_CAP) * 2) / 2, y, x)
             if best_free is None or key > best_free[0]:
                 best_free = (key, fp)
         elif best_free is None:
-            grown = [(name, (o[0] - clearance, o[1] - clearance, o[2] + clearance, o[3] + clearance)) for _, name, o in gaps]
-            hits = [(_area(r, o), name) for name, o in grown if _overlaps(r, o)]
-            total = sum(a for a, _ in hits)
+            total, name = test.blocker(r)
             key_b = (-total, y, x)
             if best_blocked is None or key_b > best_blocked[0]:
-                best_blocked = (key_b, fp, max(hits)[1] if hits else "")
+                best_blocked = (key_b, fp, name)
     if best_free is not None:
         return best_free[1], None, None
     if best_blocked is not None:
-        return None, best_blocked[1], best_blocked[2] or None
+        return None, best_blocked[1], best_blocked[2]
     return None, None, None
 
 
@@ -272,23 +319,28 @@ def candidates(settings: TowerSettings) -> list[TowerSettings]:
     return out
 
 
+def _tried(s: TowerSettings, height: float) -> str:
+    w, _ = s.size(height)
+    return f"{w:.1f} mm" + (" (rib wall)" if s.rib_wall else " (no rib wall)")
+
+
 def auto_place(
     settings: TowerSettings,
     height: float,
-    obstacles: Sequence[tuple[str, Rect]],
+    obstacles: Sequence[tuple[str, Rect]] | Clearance,
     area: Rect,
     clearance: float = PART_CLEARANCE,
     step: float = 1.0,
     fallback: bool = True,
 ) -> Placement:
-    """The first settings in `candidates()` (or only `settings` without `fallback`) with a free spot."""
+    """One plate on its own: the first settings in `candidates()` (or only `settings` without `fallback`) with a free
+    spot. `plan_project` makes the choice for every plate together."""
     tried: list[str] = []
     best: Footprint | None = None
     blocker: str | None = None
     for s in candidates(settings) if fallback else [settings]:
         fp, b, who = find_spot(s, height, obstacles, area, clearance, step)
-        w, _ = s.size(height)
-        tried.append(f"{w:.1f} mm" + (" (rib wall)" if s.rib_wall else " (no rib wall)"))
+        tried.append(_tried(s, height))
         if fp is not None:
             return Placement(fp, tuple(tried))
         if b is not None:
@@ -299,8 +351,8 @@ def auto_place(
 # ---------------------------------------------------------------------------- the plan of one plate
 @dataclass(frozen=True)
 class TowerPlan:
-    """What a plate's tower is: `mode` "auto" | "fixed" | "off" | "none" (one filament, or print-by-object).
-    `footprint` is set for auto and fixed; `problem` is a FAIL line for the plate's checks."""
+    """What a plate's tower is: `mode` "auto" | "fixed" | "off". `footprint` is set for a placed tower; `problem`
+    is a FAIL line for the plate's checks."""
 
     plate: int
     mode: str
@@ -354,25 +406,101 @@ def check_fixed(plate: int, fp: Footprint, obstacles: Sequence[tuple[str, Rect]]
     return f"plate {plate} {fp.describe()}: {' and '.join(why)}. {alt}. Set plates[{plate - 1}].wipe_tower."
 
 
+def _fail_auto(plate: int, area: Rect, tried: Sequence[str], best: Footprint | None, blocker: str | None, why: str = "") -> str:
+    where = ""
+    if best is not None:
+        where = f"; the best spot ({best.x:.0f}, {best.y:.0f}) at {best.settings.describe()}" + (
+            f" is blocked by {blocker}" if blocker else ""
+        )
+    return (
+        f"plate {plate}: no free prime tower spot both nozzles reach ({_fmt_rect(area)}), tried "
+        + ", ".join(tried)
+        + f" with {PART_CLEARANCE:g} mm clearance to every part{where}{why}. Move parts, set plates[{plate - 1}].wipe_tower "
+        '{"x", "y", "width", "rib_wall", "brim"}, or set "wipe_tower": false'
+    )
+
+
 def plan_auto(
     plate: int, settings: TowerSettings, height: float, obstacles: Sequence[tuple[str, Rect]], area: Rect, fallback: bool = True
 ) -> TowerPlan:
-    """The "auto" tower of a plate: the first free spot (`auto_place`), or a FAIL line naming the best blocked spot."""
+    """The "auto" tower of one plate on its own: the first free spot (`auto_place`), or a FAIL line naming the best
+    blocked spot."""
     p = auto_place(settings, height, obstacles, area, fallback=fallback)
     if p.footprint is not None:
         return TowerPlan(plate, "auto", p.footprint)
-    where = ""
-    if p.best is not None:
-        where = f"; the best spot ({p.best.x:.0f}, {p.best.y:.0f}) at {p.best.settings.describe()}" + (
-            f" is blocked by {p.blocker}" if p.blocker else ""
-        )
-    msg = (
-        f"plate {plate}: no free prime tower spot both nozzles reach ({_fmt_rect(area)}), tried "
-        + ", ".join(p.tried)
-        + f" with {PART_CLEARANCE:g} mm clearance to every part{where}. Move parts, set plates[{plate - 1}].wipe_tower "
-        '{"x", "y", "width", "rib_wall", "brim"}, or set "wipe_tower": false'
-    )
-    return TowerPlan(plate, "auto", None, problem=msg)
+    return TowerPlan(plate, "auto", None, problem=_fail_auto(plate, area, p.tried, p.best, p.blocker))
+
+
+# ---------------------------------------------------------------------------- every plate together
+@dataclass(frozen=True)
+class TowerRequest:
+    """One plate's tower question. `settings` is the process tower with the plate's own filament count (the volume
+    term); `obstacles` the plate's part rects; `clearance` overrides the box test (a silhouette binding)."""
+
+    plate: int
+    mode: str  # auto | fixed | off
+    settings: TowerSettings
+    height: float
+    obstacles: tuple[tuple[str, Rect], ...]
+    area: Rect
+    bed: Rect
+    x: float | None = None
+    y: float | None = None
+    clearance: Clearance | None = None
+
+    def test(self) -> Sequence[tuple[str, Rect]] | Clearance:
+        return self.clearance if self.clearance is not None else self.obstacles
+
+
+def _size_key(s: TowerSettings) -> tuple[float, bool, float]:
+    return (s.width, s.rib_wall, s.brim)
+
+
+def _with_size(s: TowerSettings, key: tuple[float, bool, float]) -> TowerSettings:
+    return replace(s, width=key[0], rib_wall=key[1], brim=key[2])
+
+
+def plan_project(requests: Sequence[TowerRequest], fallback: bool = True) -> list[TowerPlan]:
+    """The towers of every plate with ONE size configuration (width, rib wall and brim are process-global in Studio).
+    A fixed tower pins the size. Otherwise the configurations of `candidates()` are tried in order, and the first one
+    every "auto" plate finds a spot for wins; each step recomputes the footprint per plate (its height and filament
+    count). When none fits every plate, the plates that block the last configuration FAIL and say so."""
+    out: dict[int, TowerPlan] = {}
+    for r in requests:
+        if r.mode == "off":
+            out[r.plate] = TowerPlan(r.plate, "off")
+        elif r.mode == "fixed" and r.x is not None and r.y is not None:
+            fp = footprint(r.settings, r.height, r.x, r.y)
+            out[r.plate] = TowerPlan(r.plate, "fixed", fp, check_fixed(r.plate, fp, r.obstacles, r.area, r.bed))
+    autos = [r for r in requests if r.plate not in out]
+    if autos:
+        fixed = [r for r in requests if r.mode == "fixed"]
+        if fixed:
+            keys = [_size_key(fixed[0].settings)]
+        elif fallback:
+            keys = [_size_key(s) for s in candidates(autos[0].settings)]
+        else:
+            keys = [_size_key(autos[0].settings)]
+        tried: list[str] = []
+        found: dict[int, tuple[Footprint | None, Footprint | None, str | None]] = {}
+        for key in keys:
+            found = {r.plate: find_spot(_with_size(r.settings, key), r.height, r.test(), r.area) for r in autos}
+            tried.append(_tried(_with_size(autos[0].settings, key), max(r.height for r in autos)))
+            if all(f[0] is not None for f in found.values()):
+                break
+        ok = [n for n, f in found.items() if f[0] is not None]
+        for r in autos:
+            spot, best, who = found[r.plate]
+            if spot is not None:
+                out[r.plate] = TowerPlan(r.plate, "auto", spot)
+                continue
+            why = ""
+            if fixed:
+                why = f" (the size is pinned by plate {fixed[0].plate}'s wipe_tower: one size per project)"
+            elif ok:
+                why = f" (one tower size per project: plates {ok} fit, plate {r.plate} blocks every size)"
+            out[r.plate] = TowerPlan(r.plate, "auto", None, problem=_fail_auto(r.plate, r.area, tried, best, who, why))
+    return [out[r.plate] for r in requests]
 
 
 def off_warning(plate: int) -> str:
@@ -396,6 +524,25 @@ class TowerClear:
         elif self.plan.footprint is not None:
             fp = self.plan.footprint
             yield Check(True, f"plate {self.plan.plate} {fp.describe()}, clear of every part ({self.plan.mode})")
+
+
+def _num(v) -> float:
+    try:
+        return float(v[0] if isinstance(v, list) else v)
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+
+
+def needs_support(params: Mapping) -> bool:
+    """Studio's "has support material": `enable_support`, or `enforce_support_layers > 0`, or `raft_layers > 0`
+    (`PrintObject::has_support_material`, Print.hpp:492-494). A raft-only part prints its raft and raft interface
+    with the support filaments too. (The layout checker carries the same predicate; one copy at merge.)"""
+    return _on(params.get("enable_support"), False) or _num(params.get("enforce_support_layers")) > 0 or _num(params.get("raft_layers")) > 0
+
+
+def smooth_timelapse(process: Mapping) -> bool:
+    """`timelapse_type` 1 (Smooth) needs a prime tower even on a one-filament plate (PartPlate.cpp:2222-2223)."""
+    return str(process.get("timelapse_type", "0")).strip().lower() in ("1", "smooth")
 
 
 @dataclass(frozen=True)

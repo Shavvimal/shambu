@@ -649,8 +649,9 @@ slices with its first variant's values: PLA Matte got the Direct Drive flow rati
 | `filament_volume_map`, `filament_nozzle_map` | one entry per filament (Studio resizes with 0, PresetBundle.cpp:2384-2387) | tolerated (Print.cpp:2840-2862) |
 | `wipe_tower_x`, `wipe_tower_y` | one value per plate, at a free spot both nozzles reach | -101 / -104 |
 
-What shambu does: the `RepairNozzleStats` patch writes `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>`
-per extruder when the stat is empty or holds `#0`, rebuilds the variant blocks from each filament preset (or the
+What shambu does: the `RepairNozzleStats` patch repairs the key the CLI reads (a non-empty `_new` wins, else the
+plain key). It writes `<nozzle_volume_type[i]>#<extruder_max_nozzle_count[i]>` for each empty or `#0` extruder entry
+only, so a valid High Flow stat stays byte-identical, and it copies a repaired `_new` to the plain key. It also rebuilds the variant blocks from each filament preset (or the
 printer's `printer_extruder_variant` when no preset is at hand), and resizes the two maps. `shambu build` applies it
 to every unsliced export, `shambu patch --repair-nozzle-stats` to an older file. `Pipeline.verify()` FAILs a file
 with an empty stat, a `#0` count, or variant and self-index lists of different lengths, and `shambu inspect` prints

@@ -68,7 +68,8 @@ WALL_INFILL_KEYS = ("wall_filament", "sparse_infill_filament", "solid_infill_fil
 
 
 def _support_on(settings: Mapping) -> bool:
-    return str(settings.get("enable_support", "0")).strip().lower() in ("1", "true")
+    """Studio's "has support material" (support, enforced support layers or a raft): `tower.needs_support`."""
+    return T.needs_support(settings)
 
 
 def effective_filaments(part_spec: PartSpec, files: FileRefs | None = None, process: Mapping | None = None) -> set[int]:
@@ -508,6 +509,7 @@ class Pipeline:
 
         alist = A.AssembleList()
         plates: list[PlannedPlate] = []
+        requests: list[T.TowerRequest | None] = []  # one per plate; planned together after the loop (one size per project)
         used_keys: set[str] = set()
         k = 0  # assemble_index: unique across the project, as object names are global
         # Native orientation (pass 1) loads the same machine and process JSON as the export (pass 2), so Studio's
@@ -539,6 +541,8 @@ class Pipeline:
                         f"plate {pi} '{pspec.name}': print-by-object, so Studio builds no prime tower; the idle nozzle is not wiped between objects"
                     )
             multi = len({f for p in parts for f in p.placed.filaments}) > 1 and not sequential
+            # Smooth timelapse needs a tower on a one-filament plate too (PartPlate.cpp:2222-2223)
+            multi = multi or (T.smooth_timelapse(process) and not sequential)
             fixed = [p for p in parts if p.placed.fixed]
             free = [p.placed for p in parts if not p.placed.fixed]
             # The tower footprint (fixed spot, or a provisional back-right corner for "auto") keeps packed parts out;
@@ -579,11 +583,11 @@ class Pipeline:
                 overflow = False
             for p in parts:
                 p.place_members()
-            tower = self._tower_plan(pspec, pi, multi, parts, tower_base, facts, spec) if not overflow else None
+            requests.append(self._tower_request(pspec, pi, multi, parts, tower_base, facts, spec) if not overflow else None)
             if overflow:  # the overflow parts sit on a second virtual plate: overlap and reach checks would only repeat the problem
                 checks = [L.Check(False, f"the parts need {len(packed)} plates (see Problems); no further placement checks")]
             else:
-                extra: tuple = ((T.TowerClear(tower),) if tower else ()) + ((T.InterfaceReach(uses),) if uses else ())
+                extra: tuple = (T.InterfaceReach(uses),) if uses else ()  # TowerClear runs after every plate is planned
                 checker = (
                     replace(self.checker, rules=self.checker.rules + extra) if isinstance(self.checker, L.LimitChecker) else self.checker
                 )
@@ -655,7 +659,8 @@ class Pipeline:
                     + " (Studio's default 0 prints support with whichever filament is loaded; the right nozzle cannot reach x < 20.5)"
                 )
             alist.plates.append(plate)
-            plates.append(PlannedPlate(plate.name, parts, checks, seq, tower))
+            plates.append(PlannedPlate(plate.name, parts, checks, seq))
+        self._plan_towers(plates, requests, spec)
         problems += self._tower_globals(plates, process)
         warnings += self._name_objects([x for p in plates for x in p.parts])
         problems += A.validate(alist.to_json(), known_keys=known, filament_count=len(filaments))
@@ -691,26 +696,36 @@ class Pipeline:
         return (area[2] - w - 2 * b, area[3] - d - 2 * b, area[2], area[3]), base
 
     @staticmethod
-    def _tower_plan(
+    def _tower_request(
         pspec, pi: int, multi: bool, parts: list[PlannedPart], base: T.TowerSettings | None, facts: dict, spec: Spec
-    ) -> T.TowerPlan | None:
-        """The plate's tower after packing: the fixed spot checked, or the "auto" spot chosen around the packed parts."""
+    ) -> T.TowerRequest | None:
+        """The plate's tower question after packing (None: the plate needs no tower)."""
         if not multi:
             return None
-        if base is None:
-            return T.TowerPlan(pi, "off")
         bed = facts["bed"]
         bed_r = (bed["x"][0], bed["y"][0], bed["x"][1], bed["y"][1])
         area = T.shared_reach(facts["extruders"], bed, spec.aux_x_limit)
         height = max((p.placed.info.size[2] for p in parts), default=0.0)
-        obstacles = [(p.key, p.placed.rect()) for p in parts]
+        obstacles = tuple((p.key, p.placed.rect()) for p in parts)
         wt = pspec.wipe_tower
-        if wt.mode == "fixed" and wt.x is not None and wt.y is not None:
-            fp = T.footprint(base, height, wt.x, wt.y)
-            return T.TowerPlan(pi, "fixed", fp, T.check_fixed(pi, fp, obstacles, area, bed_r))
+        if base is None:
+            return T.TowerRequest(pi, "off", T.TowerSettings(), height, obstacles, area, bed_r)
+        mode = "fixed" if wt.mode == "fixed" and wt.x is not None and wt.y is not None else "auto"
+        return T.TowerRequest(pi, mode, base, height, obstacles, area, bed_r, wt.x, wt.y)
+
+    @staticmethod
+    def _plan_towers(plates: list[PlannedPlate], requests: list[T.TowerRequest | None], spec: Spec) -> None:
+        """Every plate's tower with one project-wide size (tower.plan_project); each plate gets its TowerClear check."""
+        asked = [r for r in requests if r is not None]
+        if not asked:
+            return
         # A tower size the user set in process.set stays as it is: no fallback to smaller widths
         fallback = not any(k in spec.process.set for k in ("prime_tower_width", "prime_tower_rib_wall", "prime_tower_brim_width"))
-        return T.plan_auto(pi, base, height, obstacles, area, fallback=fallback)
+        by_plate = {t.plate: t for t in T.plan_project(asked, fallback=fallback)}
+        for pi, plate in enumerate(plates, 1):
+            plate.tower = by_plate.get(pi)
+            if plate.tower is not None and plate.tower.mode != "off":
+                plate.checks += list(T.TowerClear(plate.tower).check([], None))
 
     @staticmethod
     def _tower_globals(plates: list[PlannedPlate], process: dict) -> list[str]:

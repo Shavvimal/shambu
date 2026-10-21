@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -168,7 +169,10 @@ def test_auto_placement_on_plate_14_drops_the_rib_wall():
 def test_plate_14_t8_strip_is_narrower_than_a_22_mm_tower_with_3_mm_clearance():
     """T8 sliced a 22 mm tower without rib wall at (172, 150) in the strip between the housing (x <= 168.5) and the
     feeler (x >= 195.1). By bounding boxes the strip is 26.6 mm wide and the footprint 26 mm, so the box model with
-    3 mm clearance rejects it: the real feeler is narrower than its box there (the T8 G-code tower reached x 195.8)."""
+    3 mm clearance rejects it: the real feeler is narrower than its box there (the T8 G-code tower reached x 195.8).
+
+    KNOWN MISMATCH: the fix is the silhouette binding. At merge, bind `TowerRequest.clearance` to the layout
+    checker's raster `Footprint.gap` instead of `BoxClearance`; then auto placement should accept this strip."""
     t8 = T.TowerSettings.from_config(
         {"prime_tower_width": "22", "prime_tower_rib_wall": "0", "prime_tower_brim_width": "2"}, PLATE14_PRESETS
     )
@@ -375,3 +379,112 @@ def test_live_reslice_of_patched_unsliced_export(tmp_path):
     bad.save(str(tmp_path / "unpatched.3mf"))
     fail = reslice(tmp_path / "unpatched.3mf", "unpatched")
     assert fail.code == -100 and "No valid nozzle found" in fail.summary()
+
+
+# ---------------------------------------------------------------------------- one size per project, depth per width
+def test_every_fallback_width_recomputes_the_depth():
+    depths = [s.size(H14)[1] for s in T.candidates(DEFAULT)[1:]]  # widths 35, 30, 25, 22, 20, no rib wall
+    assert depths == sorted(depths)  # narrower is deeper: volume / (layer_height x width) x spacing
+    assert depths[-1] > depths[-2] > T.min_depth(H14)
+
+
+def _req(plate, obstacles, height=H14):
+    return T.TowerRequest(plate, "auto", DEFAULT, height, tuple(obstacles), REACH, BED)
+
+
+def test_plan_project_picks_one_size_every_plate_accepts():
+    roomy = _req(1, [("a", (20.5, 0.0, 120.0, 120.0))])  # plate 1 takes the 41.4 mm rib-wall tower
+    tight = _req(2, PLATE14)  # plate 2 needs the rib wall off
+    p1, p2 = T.plan_project([roomy, tight])
+    assert p1.footprint is not None and p2.footprint is not None
+    assert p1.footprint.settings == p2.footprint.settings  # one configuration for the project
+    assert not p1.footprint.settings.rib_wall
+    assert T.find_spot(DEFAULT, H14, roomy.obstacles, REACH)[0] is not None  # alone, plate 1 would keep the rib wall
+
+
+def test_plan_project_fails_the_plate_that_blocks_every_size():
+    roomy = _req(1, [("a", (20.5, 0.0, 120.0, 120.0))])
+    full = _req(2, [("wall", (20.5, 0.0, 256.0, 256.0))])
+    _, p2 = T.plan_project([roomy, full])
+    assert p2.footprint is None and p2.problem is not None
+    assert p2.problem.startswith("plate 2: no free prime tower spot") and "plate 2 blocks every size" in p2.problem
+    assert "is blocked by wall" in p2.problem
+
+
+def test_build_writes_one_tower_size_for_two_plates(tmp_path, stls, resolver):
+    plates = [
+        {
+            "name": "p",
+            "parts": [
+                {"path": str(stls["body"]), "name": "body_1", "at": [30, 30]},
+                {"path": str(stls["text"]), "filament": 2, "at": [80, 30]},
+            ],
+        },
+        {
+            "name": "q",
+            "parts": [
+                {"path": str(stls["base"]), "name": "base_1", "at": [21, 0]},  # fills most of the bed: only a narrow strip stays free
+                {"path": str(stls["text"]), "name": "text_1", "filament": 2, "at": [30, 230]},
+            ],
+        },
+    ]
+    studio = FakeStudio(sizes={"body.stl": (20, 20, 150), "base.stl": (200, 210, 150), "text.stl": (10, 10, 5)})
+    plan = Pipeline(studio, resolver).plan(spec_of(tmp_path, plates, brim_type="no_brim"))
+    t1, t2 = (p.tower for p in plan.plates)
+    assert t1 is not None and t2 is not None and t1.footprint is not None and t2.footprint is not None, [
+        c.text for p in plan.plates for c in p.checks if not c.ok
+    ]
+    assert t1.footprint.settings == t2.footprint.settings and not t1.footprint.settings.rib_wall
+    assert plan.process["prime_tower_rib_wall"] == "0" and plan.process["prime_tower_width"] == f"{t1.footprint.settings.width:g}"
+    assert not any("prime tower size is per project" in p for p in plan.problems)
+
+
+def test_smooth_timelapse_plans_a_tower_on_a_one_filament_plate(tmp_path, stls, resolver):
+    plates = [{"name": "p", "parts": [{"path": str(stls["body"]), "name": "body_1"}]}]
+    plan = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, plates, timelapse_type="1"))
+    tower = plan.plates[0].tower
+    assert tower is not None and tower.footprint is not None and tower.mode == "auto"
+    plain = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, plates))
+    assert plain.plates[0].tower is None
+
+
+# ---------------------------------------------------------------------------- one support predicate
+def test_needs_support_counts_enforced_layers_and_rafts():
+    assert T.needs_support({"enable_support": "1"})
+    assert T.needs_support({"enable_support": "0", "raft_layers": "2"})
+    assert T.needs_support({"enforce_support_layers": "3"})
+    assert not T.needs_support({"enable_support": "0", "raft_layers": "0", "enforce_support_layers": "0"})
+
+
+def test_raft_only_part_counts_the_process_interface_filament(tmp_path, stls, resolver):
+    process = {"support_interface_filament": "2", "enable_support": "0"}
+    raft = PartSpec.from_json({"path": str(tmp_path / "a.stl"), "set": {"raft_layers": "3"}})
+    assert effective_filaments(raft, process=process) == {1, 2}
+    plates = [{"name": "p", "parts": [{"path": str(stls["body"]), "name": "body_1", "at": [5, 40], "set": {"raft_layers": "3"}}]}]
+    plan = Pipeline(FakeStudio(), resolver).plan(spec_of(tmp_path, plates, support_interface_filament="2", enable_support="0"))
+    fails = [c.text for c in plan.plates[0].checks if not c.ok]
+    assert any(t.startswith("body_1 has support with the process support_interface_filament 2 (extruder 2") for t in fails), fails
+
+
+# ---------------------------------------------------------------------------- the obstacle test is a parameter
+@dataclass(frozen=True)
+class OpenStrip:
+    """A stand-in for the silhouette binding: only the T8 strip between housing and feeler is free."""
+
+    def clear(self, rect):
+        return rect[0] >= 168.5 and rect[2] <= 196.0 and rect[1] >= 145.6
+
+    def gap(self, rect):
+        return 0.0
+
+    def blocker(self, rect):
+        return (1.0, "feeler_module_print")
+
+
+def test_placement_takes_a_clearance_binding():
+    t8 = replace(DEFAULT, rib_wall=False, width=22.0, brim=2.0)
+    fp, _, _ = T.find_spot(t8, H14, OpenStrip(), REACH)
+    assert fp is not None and fp.rect[0] >= 168.5 and fp.rect[2] <= 196.0
+    req = T.TowerRequest(1, "auto", DEFAULT, H14, tuple(PLATE14), REACH, BED, clearance=OpenStrip())
+    (plan,) = T.plan_project([req])
+    assert plan.footprint is not None and plan.footprint.settings.width == 22.0  # 35, 30, 25 do not fit the strip
