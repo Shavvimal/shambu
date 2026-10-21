@@ -281,7 +281,9 @@ Machine and files
 - Check footprints, not part counts: two medium parts can be wider than the bed together.
 
 Time and logging
-- The slicer estimate wins over any planning rate. Weigh every part and log it.
+- The slicer estimate beats any planning rate, but it is Studio's prediction, not a measured time: say "Studio
+  estimate". Weigh every part, and log real prints with `shambu printer watch --log` so `shambu calibrate` can
+  compare them (reference 06 section 11).
 - Colour on top costs one swap; colour on a side swaps every layer and costs far more.
 
 Troubleshooting

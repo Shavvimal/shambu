@@ -190,7 +190,14 @@ What shambu does:
   x 95 starts at y 63.4. Auto then takes a 35 mm tower without rib wall at (132, 2) (estimates) or (128, 2) (probe),
   clear of every spread. Sliced with the probe (2026-10-21, n=1 per spot): (128, 2) exit 0, 24 h 13 min, 635.1 g;
   T8 at (172, 150) exit 0, 22 h 30 min, 603.1 g. The wider tower costs 1 h 43 min and 32 g here. One of four slices
-  at (128, 2) crashed (-139, in tree support) and the three re-runs passed.
+  at (128, 2) crashed (-139, in tree support) and the three re-runs passed: a -139 is "rerun once, then report"
+  (reference 02 section 2.7).
+- The size decision: `auto` keeps Studio's own order, the process size with the rib wall first, then the rib wall
+  off at 35 mm, and narrower widths only when nothing wider fits. The 22 mm saving above (1 h 43 min, 32 g, n=1) is
+  an option the user can take, not the default, because a 218 mm tower 22 mm wide without a rib wall is a
+  stability risk. To take it: a fixed spot `"wipe_tower": {"x": .., "y": .., "width": 22, "rib_wall": false}` (x and
+  y are required), or `prime_tower_width` "22" and `prime_tower_rib_wall` "0" in `process.set` with `"auto"`
+  placing it (a size in `process.set` is kept, no fallback).
 - One size for the project: the fallback runs over every plate together, and the first size every "auto" plate
   accepts wins (a narrower tower is deeper, so each step recomputes the footprint per plate). A fixed `wipe_tower`
   pins the size. If one plate blocks every size, that plate FAILs and the message names it.
@@ -210,7 +217,7 @@ What shambu does:
 ## 11. Studio's time estimate versus the printer
 
 Source: research C (2026-10-21), from two watched X2D prints, Studio's `GCodeProcessor.cpp` (v02.08.02.61) and five
-outside reports. This section replaces the "slicer estimate wins" line in section 8. Show the Studio estimate. Show a
+outside reports. Show the Studio estimate. Show a
 measured rate or a calibrated time only from `shambu calibrate` data, with n.
 
 **The two measured prints disagree.** Both prints used Generic PETG, a 0.4 HS01 nozzle and the X2D 0.4 profile.

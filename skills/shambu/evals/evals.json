@@ -4,19 +4,19 @@
     {
       "id": 1,
       "prompt": "I have two STLs, parts/jaw.stl (I need 2 of them, PETG black) and parts/label.stl (1 copy, white PLA). Make me one Bambu Studio plate for my X2D: jaws in PETG on the left nozzle, the label in PLA on the right nozzle, print by object so there is no prime tower, Textured PEI. Slice it and tell me the time and grams. Put the output in /abs/out/jaws.",
-      "expected_output": "A spec file with two filaments, print_sequence 'by object' and group_by_filament, built with `shambu build plate.json --slice` after `shambu check` reads OK. The reply uses the hand-back template: project path, sliced status, per-plate time and grams with the filament-change count, one line per object with its filament, and both standing warnings.",
+      "expected_output": "A spec file with two filaments, print_sequence 'by object' and group_by_filament, built with `shambu build plate.json --slice` after `shambu check` passes its fact checks. The reply uses the hand-back template: project path, sliced status, per-plate 'Studio estimate' time and grams with the filament-change count, the Pre-flight and Slice lines, one line per object with its filament, and both standing warnings.",
       "files": [],
       "expectations": [
-        "Runs `shambu doctor --json` before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
+        "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
         "Writes a plate.json spec with two entries in `filaments`, each `{\"preset\": \"loaded\"}` (the PETG spool on the left nozzle is filament 1, the PLA spool on the right is filament 2), or pins the presets the printer reports and no others",
         "Assigns jaw.stl to filament 1 with count 2, and label.stl to filament 2",
         "Sets `print_sequence` to \"by object\" on the plate, and sets `group_by_filament`",
         "Sets `bed_type` to \"Textured PEI Plate\"",
-        "Runs `shambu check plate.json` and gets every line to OK before it builds",
+        "Runs `shambu check plate.json` before it builds, fixes every FAIL that states a fact, and does not treat a margin-rule line (`WARN margin rule` or `FAIL margin rule`) as a reason to split the plate",
         "Runs `shambu build plate.json --slice` (not `BambuStudio` directly)",
         "Does not hand-assemble BambuStudio command-line flags",
         "Hands back a `Filaments:` line that says the presets came from the printer at HH:MM (or that the printer was not read and the owner must confirm the spools by eye)",
-        "Hands back using the template: a Project line with sliced status, a Plate line with time, grams and filament changes, and one line per object",
+        "Hands back using the template: a Project line with sliced status, a Plate line that says 'Studio estimate' with time and grams and the filament-change count, a Pre-flight line, a Slice line with the Studio exit, and one line per object",
         "Includes both standing warnings: the first print of a new fit is a coupon in the same orientation, and holes print undersize (about 0.1 mm vertical, 0.2 to 0.3 mm horizontal)",
         "Quotes time and gram numbers from the report or the build output, and does not invent them"
       ]
@@ -46,6 +46,116 @@
         "Does not unzip and edit the 3MF XML by hand",
         "Optionally runs `shambu inspect` before or after the patch to confirm the bed type",
         "If the project is sliced, says that patching drops the G-code and the user must re-slice (or rebuild with --slice)"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Put parts/housing.stl (124 x 135 x 218 mm, standing, tree supports), parts/shell.stl (59 x 61 x 48, tree supports) and parts/mount.stl (41 x 59 x 32, tree supports) on one X2D plate. I've laid them out in Studio before with about 10 mm between them and it sliced fine. PETG, Textured PEI, out to /abs/out/cam.",
+      "expected_output": "One plate. `shambu check` places the three parts with the bottom-left packer, or gives `WARN margin rule` lines (the housing's estimated tree spread) that it says the slice decides. The reply names any margin line as shambu's estimate, not a Studio limit, offers `--probe-supports` or `brim_margin` if a line blocks, and lets `shambu build --slice` decide. It does not tell the user the parts need more than one plate.",
+      "files": [],
+      "expectations": [
+        "Writes one plate with all three parts",
+        "If it gives `at`, the values are min corners: every part's bbox lies inside 0..256 on both axes",
+        "Does not say the parts need two or three plates, or that the housing must print alone, on the strength of `shambu check` alone",
+        "If `check` prints a margin-rule line, quotes it and names it as shambu's estimate of the support spread (the slice decides), not a Studio limit",
+        "Runs `shambu build plate.json --slice` and treats Studio's exit code as the answer; a -101 is reported with the two objects it names",
+        "Hands back with the template: a Pre-flight line, a Slice line with the Studio exit, and a Plate line with 'Studio estimate'"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Same housing plate as yesterday (spec at /abs/out/cam/plate.json) but use the PLA on the right nozzle as support interface only, PETG parts. Build and slice it.",
+      "expected_output": "Adds `dual-material-interface` with two `loaded` filaments and map 1,2, leaves `wipe_tower` on \"auto\" (or a fixed spot both nozzles reach), runs `shambu check`, fixes a reach or tower FAIL it names, and builds with --slice. If Studio fails, the hand-back quotes the exit code and the log line; when no line names the reason it says the cause is not established, offers the one-material build, and names one test that would separate the causes. A -139 is rerun once before it is reported.",
+      "files": [],
+      "expectations": [
+        "Uses the `dual-material-interface` recipe and two filaments written as `{\"preset\": \"loaded\"}`",
+        "Leaves `wipe_tower` as \"auto\" or gives a spot inside both nozzles' reach; if `check` FAILs on the tower, quotes the blocker it names and does not move the tower by hand in the 3MF",
+        "Keeps every supported part at x >= 20.5 plus its interface spread, or quotes the reach FAIL that says otherwise",
+        "Does not default to a 22 mm tower without the rib wall; if it mentions the narrower tower, it offers it as an option",
+        "Runs `shambu build plate.json --slice`, not `BambuStudio` directly",
+        "If the slice fails, the reply quotes the Studio exit code and its log line",
+        "If Studio exits -139, reruns the same command once before reporting it",
+        "If the slice fails and no output names the reason, the reply contains 'The cause is not established' (or the same meaning) and does not say the failure is because of space, the tower, or the filament",
+        "Offers the one-material build as the fallback when the two-filament slice fails"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "make me a plate from parts/bracket.stl, PETG, slice it",
+      "expected_output": "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` first. Where the installed CLI is another version (doctor exit 3, match false, or a usage error on --expect-version), the reply stops, names both versions and gives the fix (`/shambu:setup update`). It does not switch to `uv run --project` or another copy, and it does not build.",
+      "files": [],
+      "expectations": [
+        "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` before writing a spec",
+        "When doctor reports a version mismatch, the reply states the installed version and the expected version",
+        "Gives the fix: `/shambu:setup update` or the pinned `uv tool install --reinstall \"shambu @ git+https://github.com/Shavvimal/shambu@v...\"` line that doctor prints",
+        "Does not run `uv run --project`, a checkout, or any other shambu copy to work round the mismatch",
+        "Does not wrap shambu in `timeout` or discard its stderr with `2>/dev/null`",
+        "Does not build or slice until the versions match"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Put parts/housing.stl (124 x 135 x 218 mm) in the middle of the bed and parts/mount.stl (41 x 59 x 32) in the front right corner, 5 mm in from the edges. PLA, Textured PEI, out to /abs/out/mid.",
+      "expected_output": "`at` is the min corner: housing at [66, 60.5] ((256-124)/2, (256-135)/2), mount at [210, 5] (256-5-41, 5). The hand-back shows each object's min corner and size.",
+      "files": [],
+      "expectations": [
+        "Gives the housing `at` [66, 60.5] (within 0.5 mm), not [128, 128]",
+        "Gives the mount `at` with x = 256 - 5 - 41 = 210 and y = 5 (front is low y), within 0.5 mm",
+        "Says in the reply or the spec that `at` is the bounding-box min corner",
+        "Runs `shambu check` and every bbox on the plate lines lies inside 0..256"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Which face should parts/coupon.stl print on to be fastest? Compare the options, then build the fastest one with 4 walls and slice it. Spec is /abs/out/coupon/plate.json.",
+      "expected_output": "Runs `shambu sweep plate.json --orientations coupon --write-spec <file>`, builds the written spec with a 4-wall change put in a variant or in its process.set, and hands back the sweep rows that decided with 'Studio estimate' times.",
+      "files": [],
+      "expectations": [
+        "Runs `shambu sweep` with `--orientations coupon`",
+        "Uses `--write-spec` (optionally `--pick`) to get the winning spec, and does not copy the variant's lay_on_face into a spec by hand",
+        "Sets 4 walls (`wall_loops` 4) through a `--variants` entry or the written spec's `process.set`, and says so",
+        "Builds the written spec with `shambu build ... --slice`",
+        "The hand-back includes the sweep rows that decided, and calls the times 'Studio estimate'"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "In /abs/projects/all-on-one.3mf, swap the housing for the new version parts/housing_E7a.stl. Keep my layout and settings exactly as they are.",
+      "expected_output": "Runs `shambu inspect` to name the object, then `shambu patch /abs/projects/all-on-one.3mf --replace-mesh <object>=parts/housing_E7a.stl` (with `--dry-run` or `-o` first if it wants to keep the original). If the patch refuses (a 90-degree turn, a different STL frame, a size change, a shared or painted mesh), it quotes the refusal and follows its hint (`--rotate-mesh`, `--anchor centre`) or asks the user before `--allow-size-change` / `--drop-paint`. It re-slices with `shambu slice`. It never unzips the 3MF.",
+      "files": [],
+      "expectations": [
+        "Uses `shambu patch ... --replace-mesh OBJECT=parts/housing_E7a.stl` with the object name from `shambu inspect` or the project",
+        "Does not unzip the 3MF, edit `3D/Objects/*.model` or `model_settings.config`, or rezip it",
+        "Does not run `BambuStudio` directly with hand-made flags",
+        "If the patch refuses, quotes the refusal and uses the flag it names, or asks the user before `--allow-size-change` or `--drop-paint`",
+        "Reports the pair-rule lines the patch prints for the new mesh, and re-slices with `shambu slice` (not a raw Studio call)",
+        "Hands back with the template, including the Patches line"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "How long will plate.json take to print? Just slice it and tell me when it'll be done if I start now.",
+      "expected_output": "Builds with --slice and reports 'Studio estimate <h> h <m> min' from the report. It says this is Studio's prediction, not a measured time, and gives no finish time adjusted by any factor unless shambu prints a measured range or a calibrated figure. It may offer `shambu printer watch --log ... --gcode3mf ...` and `shambu calibrate --add` to measure this print.",
+      "files": [],
+      "expectations": [
+        "Runs `shambu build plate.json --slice`",
+        "Quotes the time from the report with the words 'Studio estimate'",
+        "Says the estimate is Studio's prediction and is not calibrated against this printer, unless the report itself prints a measured range or a calibrated figure, which it quotes with its n",
+        "Does not state a real duration or apply a ratio of its own (such as 0.75) as if it were measured",
+        "If it gives a clock time, it labels it as estimate-based"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "Add parts/feeler.stl (50 x 226 x 64 mm, needs tree supports) and parts/cradle.stl (22 x 99 x 29, tree supports) to one plate and build it. PETG.",
+      "expected_output": "Runs `shambu check`. If the report says PLACEMENT NOT DONE, the reply quotes that line, says no position was computed, and offers `at` for the feeler (straight along the bed edge) or a `brim_margin`. Otherwise it builds with --slice. It never reports parts at the origin as overlaps and does not say the feeler needs the bed diagonal or its own plate.",
+      "files": [],
+      "expectations": [
+        "If the check fails to place a part, quotes the `PLACEMENT NOT DONE` line as the reason and says no position exists",
+        "Does not report 'feeler and cradle overlap' or bed-edge FAILs at negative x/y as real clashes",
+        "Does not say the feeler needs the bed diagonal or its own plate",
+        "Offers an `at` placement for the feeler with its bbox inside the bed (y from about 15 to 241), or `brim_margin`, then slices to confirm",
+        "Does not pass `--keep-going` to export a plate with an unplaced part"
       ]
     }
   ]

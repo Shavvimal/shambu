@@ -1,6 +1,6 @@
 ---
 name: shambu
-description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It reads which spools the printer holds and uses them as the project's filaments, places parts, sets the process, brims, supports and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It also compares orientation and print-sequence variants, inspects and patches existing .3mf or .gcode.3mf files, and reads a Bambu Lab printer's progress over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a print time or filament estimate, wants to change settings in a 3MF, or asks how far the print is, even if Bambu Studio is not named. Not for designing parts (use a CAD skill), mesh repair, or starting, pausing or sending prints.
+description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It reads which spools the printer holds and uses them as the project's filaments, places parts on their outlines (never rotated) or at the corner the spec gives, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It also compares orientation and print-sequence variants, inspects, patches and edits existing .3mf or .gcode.3mf files (settings, mesh, filaments, object and tower positions), and reads a Bambu Lab printer's progress over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a print time or filament estimate, wants to change a 3MF, or asks how far the print is, even if Bambu Studio is not named. Not for designing or editing CAD parts (use a CAD skill), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
 argument-hint: "[stl files or project.3mf] [print notes]"
 allowed-tools: Bash(shambu *), Read
 ---
@@ -10,53 +10,85 @@ allowed-tools: Bash(shambu *), Read
 Produce a `.3mf` (or a sliced `.gcode.3mf`) that the user opens, checks and prints. Never design parts, never
 send a job. Request: $ARGUMENTS
 
-## Before you start
+## Before you start (standing rules)
 
-1. Before EVERY build, not once per session: `shambu --version` (it must print: shambu 0.4.0; another number or a usage error means a stale CLI: stop and give `/shambu:setup update`), then `shambu doctor --json --expect-version 0.4.0`. It gives the printer preset, both nozzles'
-   reach and height, the bed, the GUI's current presets and bed type, the recipe list, and under `printer` the
-   spools loaded on the printer right now: per nozzle the material, colour, preset id and the resolved preset
-   name. Use those values, not assumptions, and not a spec from an earlier day. If `shambu` is missing, tell the
-   user to run `/shambu:setup` and stop.
-2. Filaments come from the printer. Write every filament as `{"preset": "loaded"}` unless the owner names a
-   spool; `check` and `build` read the printer again and fill in the preset and colour of the spool in that nozzle.
-   A pinned preset that is not the spool in its nozzle, or that cannot be compared with it (nothing loaded, no
-   installed preset for the spool), is a FAIL (exit 1): write `"loaded"`, or ask the owner to load or change the
-   spool. `--allow-filament-mismatch` only when the owner says the spool will change before the print,
-   and the hand-back says so. A pinned colour is replaced by the spool colour unless the spec gives a
-   `colour_note`. `shambu printer filaments` reads the spools alone (one `pushall`, read-only).
-3. If the doctor or the check says the printer was not read (`loaded on the printer: not read`, or a line starting
-   `Filaments: WARNING printer not read`), the filaments come from the GUI's last-used presets in
-   `BambuStudio.conf`, which can be days old. Then the project's filaments are UNVERIFIED: the hand-back's
-   `Filaments:` line says so, the `Next:` line starts with "confirm the spools by eye (Studio's filament dropdown
-   lists Left filaments and Right filaments) before Print", and the reply never calls the project ready to print.
-   Never pass `--no-printer` unless the owner says the printer is off.
-4. One name per nozzle: left nozzle = filament 1 (main, direct drive); right nozzle = filament 2 (auxiliary,
-   Bowden; on the X2D it reaches x 20.5 to 256 only, up to 256 mm, and prints no TPU). `filament_map` moves a
-   filament to the other nozzle, and the spool comparison follows it.
-5. Everything goes through the CLI. Never hand-assemble `BambuStudio` flags: the CLI encodes every rule found by
-   reverse engineering Studio 02.08.02.61 (`references/00-findings.md`).
+1. Before EVERY build: `shambu --version` (it must print: shambu 0.4.0), then
+   `shambu doctor --json --expect-version 0.4.0`. Exit 3 with `"shambu": {"match": false}` (`MISMATCH` and a
+   `Fix:` line) means another version is on PATH; a usage error on `--expect-version` means one older than 0.4.0.
+   Either way: stop, give both versions and the fix (`/shambu:setup update`); never use `uv run --project`, a
+   checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`. Missing: `/shambu:setup`.
+2. doctor gives the printer preset, both nozzles' reach and height, the bed, the GUI presets, the recipes and,
+   under `printer`, the spools loaded now. Use those values, not a spec from an earlier day.
+3. Write every filament as `{"preset": "loaded"}` unless the user names a spool; a pinned preset that is not the
+   spool in its nozzle is a FAIL. `--allow-filament-mismatch` only when the user says the spool will change. If
+   the printer was not read (`Filaments: WARNING printer not read`), the filaments are UNVERIFIED: the hand-back
+   says so and `Next:` starts "confirm the spools by eye". `--no-printer` only when the user says it is off.
+4. Left nozzle = filament 1 (main, direct drive); right nozzle = filament 2 (Bowden; on the X2D x 20.5 to 256
+   only, no TPU). `filament_map` moves a filament to the other nozzle.
+5. Everything goes through the shambu CLI. Never run `BambuStudio` yourself and never unzip a 3MF to edit its XML
+   (the rules: `references/00-findings.md`). The two sanctioned exits: `shambu slice FILE.3mf`, and, only after
+   the user says yes, the logged `shambu studio -- ARGS`. When no verb does the work, say "shambu has no verb for
+   <work>" and offer the Studio GUI steps or that one `shambu studio` call.
+6. State a cause only when a check line or the Studio log states it (Hand-back, Cause). Never say "needs N
+   plates" or "must print alone" from `check`: a plate count comes from a slice.
 
 ## Workflow (copy this checklist into the reply)
 
-- [ ] 1. Spec: write `plate.json` (example below; the full shape: `shambu spec`; the settings bundles: `shambu recipes`).
-- [ ] 2. Orient: for a single-file part that does not already lie on an obvious flat face, `"orientation": "auto"`
-      lets Studio's auto-orient turn it at build time (it also converts a mesh in metres). To choose by hand,
-      `shambu orient part.stl` (add `--native` for Studio's table) and put the chosen `lay_on_face` in the spec. A
-      mesh under 1 mm is in metres: `shambu rotate part.stl -o DIR --convert-unit`.
-- [ ] 3. Check: `shambu check plate.json` until every line reads OK (the spools on the printer against the
-      filaments, presets, measurements, placement, reach, by-object rules). The `Filaments:` line near the top
-      names each filament's source: the printer at HH:MM, the spec (override), or the GUI with a WARNING.
-- [ ] 4. Compare when the answer is not obvious: `shambu sweep plate.json --orientations PART --by-object`
-      (and `--variants v.json` for settings). The slicer's table decides: time, grams, support, waste, swaps.
-- [ ] 5. Build: `shambu build plate.json --slice`. Exit 1 means a check, the export or a verification failed:
-      read the report, fix the spec, rebuild. Exit 3 means the environment (binary, config, a missing file).
-- [ ] 6. Hand back with the template below, including both standing warnings.
+- [ ] 1. Spec: write `plate.json` (example below; `shambu spec` shows the full shape, `shambu recipes` the
+      bundles). `shambu spec plate.json` warns about each unknown key (a typo is dropped).
+- [ ] 2. Orient: `"orientation": "auto"` (Studio's auto-orient), or `shambu orient part.stl [--native]` and the
+      chosen `lay_on_face`. A mesh under 1 mm is in metres: `shambu rotate part.stl -o DIR --convert-unit`.
+- [ ] 3. Pre-flight: `shambu check plate.json`. Fix every FAIL that states a fact: spool, preset, file, mesh,
+      `body overlap`, reach, height, `tower`. `WARN margin rule` is shambu's spread estimate: the slice decides.
+      `FAIL margin rule` uses a measured or spec spread. `WARN brim`: Studio will clip that brim.
+      `PLACEMENT NOT DONE`: the packer gave up, no position exists; quote it and give `at` or `brim_margin`.
+      `--probe-supports` measures each supported part's spread with a cached solo slice.
+- [ ] 4. Compare when the answer is not obvious: `shambu sweep plate.json --orientations PART [--by-object]
+      [--variants v.json] --write-spec plate-best.json [--pick NAME]`, then build the written spec; never copy a
+      variant by hand. A further change (4 walls) goes in a `--variants` entry or the written spec's
+      `process.set`, named in the hand-back. Strength and finish stay the user's call.
+- [ ] 5. Build and slice: `shambu build plate.json --slice`: the final test. Exit 1: a check, the export or a
+      verification failed; fix the spec, rebuild. Exit 3: the environment. On `export FAILED`, quote the exit
+      and the log line (Decision rules). An unplaced part never exports, even with `--keep-going`; ask the user
+      before `--keep-going` and list every FAIL it overrode.
+- [ ] 6. Hand back with the template below. It is a gate.
 
-Change an existing project with `shambu patch` instead of rebuilding when only settings move (bed type,
-colours, nozzle map, per-object settings, filament per object or part, height ranges, pauses, colour changes,
-plate print sequence, names). Patching a sliced file drops its G-code: rebuild with `--slice` or let the user
-re-slice. `patch` changes settings only; it does not re-check spacing, so a by-object plate patched from a
-by-layer layout still needs 60 mm between objects.
+Change an existing project with `shambu patch` (settings, bed, colours, map, pauses, names, print sequence, the
+edits under Commands; `--dry-run` first). Patching a sliced file drops its G-code: `shambu slice` again. `patch`
+does not re-check by-object spacing (60 mm between objects).
+
+## Hand-back (a gate: no reply about a check, build, sweep, patch or slice goes out without it)
+
+Use it for every result: a failure, a "does not fit" answer, a sweep, a project the user made and you patched.
+The template comes first; an explanation follows it, never replaces it.
+
+```
+Project: <path>  (sliced | unsliced | export FAILED: <Studio exit and reason>)   Printer: <preset>   Process: <name> (<base>, recipes ...)
+Filaments: from the printer at HH:MM: 1 = <preset> <colour> (<left/right external spool | AMS n slot m>), 2 = ...
+           | WARNING printer not read (<reason>): from the GUI presets, UNVERIFIED; confirm the spools by eye before Print
+Plate <n>: Studio estimate <h> h <m> min, <g> g (model <g>, support <g>, tower <g>, flush <g>, <k> filament changes)  print sequence: by layer | by object
+  <object>  filament <n> (<material>)  <w> x <d> x <h> mm, min corner at x.., y..  face <normal> | as exported  recipes ...
+  Prime tower: <x, y, width, rib wall> | none
+Pre-flight (shambu check): all OK | <kind> <quoted line> ...        Patches: ...
+Slice: Studio exit 0 | Studio exit <code>: "<quoted log line>" | not sliced (<why>)   Checks skipped: <quoted line> | none   Slicer warnings: ...
+Cause (only when something failed): the check line or Studio log line that states it, quoted | "not established"
+Sweep (when run): the table rows that decided the choice, and why.
+Still by hand in Studio: painted supports, brim ear points, variable layer height, <anything the spec cannot say>.
+Next: open the project, confirm the plate type and colours, check Preview (Line Type: Overhang wall, Bridge, Support rows; the first layer), then Print.
+Standing warnings:
+- The first print of any new fit is a coupon or one part, in the same orientation as the feature. A flat coupon cannot qualify a sideways bore.
+- Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores. Every bore that prints horizontal is flagged above.
+```
+
+Quote the report `<outdir>/<name>.report.md`; never paraphrase its numbers.
+
+- Time: always "Studio estimate" with the number. A measured range ("measured prints ran at A to B x Studio
+  (n=N)") or "calibrated about H h M min (n=N)" appears only when `shambu` prints it; never apply a ratio
+  yourself, never say "it will take".
+- Cause: when the check and the slice disagree, or a slice fails and no line names why, write exactly: "The
+  check said <quoted line>. The slicer said <exit code and quoted line>. The cause is not established." Then
+  name the one test that would tell the candidates apart, and run it if it is cheap. A guess given as the reason
+  is a fault, even when it sounds right.
 
 ## Minimal spec
 
@@ -68,90 +100,71 @@ by-layer layout still needs 60 mm between objects.
   "bed_type": "Textured PEI Plate",
   "plates": [{"name": "p", "print_sequence": "by object", "group_by_filament": true,
               "parts": [{"path": "/abs/jaw.stl", "count": 2, "lay_on_face": [0, 1, 0], "recipes": ["tree-supports"]},
-                        {"path": "/abs/label.stl", "filament": 2, "recipes": ["flat-no-brim"]}]}]
+                        {"path": "/abs/label.stl", "filament": 2, "recipes": ["flat-no-brim"], "at": [150, 20]}]}]
 }
 ```
 
-A part is a `path` with `filament`, `count`, `recipes`, `set` (keys as strings), `height_ranges`, `at` [x, y],
-`lay_on_face` [nx, ny, nz] and `rotate` [x, y, z] degrees, or `"orientation": "auto"` (not with either); or
-`parts` (several files merged into one object, turned together). Per plate: `pause_at_z`, `colour_changes`, `print_sequence`, `group_by_filament` (by object:
-same-filament parts with the same settings merge into one object, packed close inside, 60 mm between groups).
-`aux_x_limit: 235.5` applies the user's stricter reading of the right nozzle. A filament is `{"preset": "loaded"}`
-(the spool in that nozzle, with its colour), or a pinned `preset` with an optional `colour` and `colour_note`.
-
-## Hand-back (use this shape every time)
-
-```
-Project: <path>  (sliced | unsliced | export FAILED: <Studio exit and reason>)   Printer: <preset>   Process: <name> (<base>, recipes ...)
-Filaments: from the printer at HH:MM: 1 = <preset> <colour> (<left/right external spool | AMS n slot m>), 2 = ...
-           | WARNING printer not read (<reason>): from the GUI presets, UNVERIFIED; confirm the spools by eye before Print
-Plate <n>: <time> h, <g> g (model <g>, support <g>, tower <g>, flush <g>, <k> filament changes)  print sequence: by layer | by object
-  <object>  filament <n> (<material>)  <w> x <d> x <h> mm at x.., y..  face <normal> | as exported  recipes ...
-Checks: all OK | FAIL: ...        Patches: ...        Slicer warnings: ...
-Sweep (when run): the table rows that decided the choice, and why.
-Still by hand in Studio: painted supports, brim ear points, variable layer height, <anything the spec cannot say>.
-Next: open the project, confirm the plate type and colours, check Preview (Line Type: Overhang wall, Bridge, Support rows; the first layer), then Print.
-Standing warnings:
-- The first print of any new fit is a coupon or one part, in the same orientation as the feature. A flat coupon cannot qualify a sideways bore.
-- Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores. Every bore that prints horizontal is flagged above.
-```
-
-Write it as plain statements with numbers, in the order above. The report file `<outdir>/<name>.report.md`
-holds the same facts; quote it, do not paraphrase numbers.
+A part takes `path`, `filament`, `count`, `recipes`, `set` (string values), `height_ranges`, `lay_on_face`
+[nx, ny, nz] or `rotate` [x, y, z], or `"orientation": "auto"` (not with either); or `parts` (several files as
+one object). `at` [x, y] is the bed position of the turned part's bounding-box MIN corner (front-left), not its
+centre: to centre a part w x d, write [(256 - w) / 2, (256 - d) / 2]. `brim_margin` (mm) replaces the brim and
+support margins; `support_spread` [-x, +x, -y, +y] (mm) the support part per side. Per plate: `print_sequence`,
+`group_by_filament`, `pause_at_z`, `colour_changes`, `wipe_tower` (`"auto"`, the default with two filaments;
+`{"x", "y", "width", "rib_wall", "brim"}` with x, y the min corner; or `false`). A pinned filament `colour` gives
+way to the spool's unless it has a `colour_note`. `aux_x_limit: 235.5`: the user's stricter right-nozzle reach.
 
 ## Commands
 
 ```
-shambu doctor [--no-printer] [--ip IP] | info FILE... | presets list filament --contains PETG | recipes | spec
-shambu orient PART.stl [--threshold 60] [--top 12] [--write DIR]      # score orientations: contact, support shadow, height
-shambu orient PART.stl --native [--write DIR]                         # Studio's auto-orient table, lay_on_face = -vector
-shambu rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] [--rotate x,y,z] [--scale 1000 | --convert-unit]
-shambu split PART.stl -o DIR                                           # one STL per body
-shambu check plate.json | build plate.json [--slice] [--open]          # both read the printer's spools first
-       [--allow-filament-mismatch] [--no-printer] [--ip IP]
-shambu sweep plate.json [--orientations PART]... [--source own|studio] [--by-object] [--variants v.json] [--no-slice]
-shambu inspect project.3mf
+shambu --version | doctor [--expect-version X.Y.Z] [--no-printer] [--ip IP] [--printer-timeout S]
+shambu info FILE... | inspect project.3mf | presets list filament --contains PETG | recipes | spec [plate.json]
+shambu orient PART.stl [--native] [--write DIR] | rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] | split PART.stl -o DIR
+shambu check plate.json | build plate.json [--slice] [--no-check] [--open] [--probe-supports]   # both read the spools first
+       [--allow-filament-mismatch] [--no-printer] [--ip IP] [--keep-going: only with the user's yes]
+shambu sweep plate.json [--orientations PART]... [--source own|studio] [--by-object] [--variants v.json] [--write-spec OUT.json [--pick NAME]]
 shambu patch project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 --print-sequence "1:by object"
-shambu printer filaments [--ip IP] | printer status | printer watch --every 300     # read-only
+shambu patch project.3mf --replace-mesh OBJECT[/PART]=new.stl [--rotate-mesh X,Y,Z | --lay-on-face NX,NY,NZ] [--anchor frame|centre|min]
+       --add-filament "PRESET[:#RRGGBB][@EXTRUDER]" | --move OBJECT=X,Y[@PLATE] (or +DX,+DY) [--strict] | --tower X,Y[@PLATE]
+       --repair-nozzle-stats | --dry-run | -o OUT.3mf
+shambu slice FILE.3mf [--plate N] [--no-check] [--tower X,Y[@PLATE]] [--settings-from plate.json]
+shambu studio [--out DIR] -- ARGS...                                   # logged raw Studio call: only with the user's yes
+shambu printer filaments | printer status | printer watch [--every 300] [--log FILE --gcode3mf F.gcode.3mf [--wait-for-start]]
+shambu calibrate --log FILE --add | calibrate --show                    # store a watched print; show the fit
 ```
 
-`--json` gives one JSON document (`printer watch --json`: one per poll). Exit codes: 0 ok, 1 a check, export
-or verification failed, 2 usage, 3 environment.
+`--json` gives one JSON document (`printer watch --json`: one per poll). Exit codes: 0 ok, 1 a check, export or
+verification failed, 2 usage, 3 environment.
+
+Edits: `--replace-mesh` keeps the name, settings and plate, and refuses a size change, a shared mesh or paint
+(`--allow-size-change`, `--drop-paint`). `--add-filament` appends slot N+1 with the preset's colour, or the next
+unused default colour and a WARN naming it, then a verify slice. `--move` and `--tower` take the min corner and
+report `check`'s pair rule. `slice --no-check` adds an unchecked pass per plate only after a -101 or a warning
+-100, and lists what it skipped. `shambu studio` logs under `studio-runs/<UTC stamp>/`: quote the command, exit
+and log path; its output is unverified until `shambu inspect` reads it.
 
 ## Decision rules
 
 | Situation | Do |
 |---|---|
 | Functional PETG part | process `petg-functional` + `no-hole-compensation`; `solid-part` only on parts sized as solid |
-| Everyday PLA, decorative PLA | `pla-light`; `pla-decorative` |
 | Part needs strength | more walls, lie the load in the layer plane, stronger filament, fillets in CAD; never more infill first |
-| Tall, or long and narrow | `tall-outer-brim`; flat coupons and small parts `flat-no-brim`; a corner lifts on a big flat plate: `dog-ears` (user places the points) |
-| Overhangs | `tree-supports` per object, never for the whole plate; `snug-normal-supports` for a flat area straight above the plate; `bridge-short-spans` frees spans to 10 mm; `minimal-supports`, `counterbore-bridging`, `petg-supports`, `more-support` as named. Trees spread up to 25 mm past the footprint: the layout reserves that |
-| PETG part with PLA loaded too (or the reverse) | `dual-material-interface`: the other material as interface only, map 1,2, supported features at x >= 20.5 |
-| Two filaments, several single-colour objects | `print_sequence` by object with `group_by_filament`; sweep `--by-object` to confirm (measured 1 h 24 to 40 min; merged groups 21 min against 29 min as separate objects and 42 min by layer on four cubes); it loses on many tiny parts; biggest-volume filament on the left nozzle |
-| Colour on a face | horizontal colour bands (Z) beat vertical ones (12 min vs 68 min for the same text); text face down as gaps in the first layers (`two-colour-first-layers`); no second filament loaded: `pause_at_z` |
-| Orientation unclear | `"orientation": "auto"` for a quick answer (Studio's auto-orient, single-file parts); to compare, `sweep --orientations PART --source studio` (Studio's candidates) or the default `--source own`; priority: load direction, then supports and finish, then time; largest flat face down otherwise; show faces up or on a side; bed-facing fillets are a CAD fix (chamfer). Both scores misread bridges, and shambu's favours standing a thin part: the sweep decides |
-| Time matters | `coarse-fast` (0.28), `fast-infill`, Standard not High Quality (1666 s vs 1062 s for the same 0.16 layers on a cube), fewer top shells on hidden tops, colour changes near the bottom; a `height_ranges` entry with a coarser `layer_height` above the detail |
-| Top surface rough or a show face | `fine-0.16` only on the part that needs it (flat solid tops look worse and print slower); `top-concentric` on round tops; `iron-top` on one flat face; keep the X2D defaults (monotonic-line top, one wall on all top surfaces, 0.42 top line width) elsewhere |
-| Finish matters | `scarf-seam` on cylinders, `seam-back` on cornered parts, `show-walls`, `precise-fit` for fits, `fuzzy-skin` to hide lines; matte filament, polish or resin after (`references/09-user-notes.md`) |
-| Shims and rings | `shim-0.1mm`, alone on the plate |
-| Thin walls | `wide-line-two-loop-walls` |
-| TPU | filament 1 only (the checker enforces it); dry everything except PLA |
-| Several bodies in one STL | `shambu split`, then one part each (inward shells are cavities, not bodies) |
-| Part bigger than the bed, or no good face | the user cuts it in Studio (C, with dowels) or in CAD; the tool has no mesh boolean |
+| Tall, or long and narrow | `tall-outer-brim`; flat coupons, small parts `flat-no-brim`; a lifting corner: `dog-ears` (the user places the points) |
+| Overhangs | `tree-supports` per object; `snug-normal-supports` for a flat area straight above the plate; `bridge-short-spans` (spans to 10 mm); `minimal-supports`, `counterbore-bridging`, `petg-supports`, `more-support` |
+| Parts close together | `check` keeps the larger of two facing support spreads plus 1 mm, not their sum; short of an estimate is a WARN. The slice decides: exit -101 is a real clash |
+| PETG part with PLA loaded too (or the reverse) | `dual-material-interface`: the other material as interface only, map 1,2. The process interface makes the plate two-filament: every supported part sits at x >= 20.5 plus its interface spread |
+| Two filaments by layer (prime tower) | `wipe_tower` "auto" finds a spot both nozzles reach or FAILs naming the blocker. Size: the tallest part's (41 mm plus an 8 mm brim at 218 mm) with the rib wall, then 35 mm without it, narrower only if nothing fits. 22 mm without the rib wall is faster: offer it (a spot with `width` 22, or `prime_tower_width` in `process.set`), never default to it: a tall narrow tower can topple |
+| Two filaments, several single-colour objects | by object with `group_by_filament` (no tower); sweep `--by-object` to confirm; loses on many tiny parts; most volume on the left nozzle |
+| Orientation unclear | `"orientation": "auto"`, or `sweep --orientations PART [--source studio]`; load direction first, then supports and finish, then time |
+| Other needs (PLA, time, finish, colour, shims, thin walls) | the recipe whose "When" matches in `shambu recipes`; finish and fine layers per part only; colour in horizontal bands; one filament loaded: `pause_at_z`; TPU on filament 1 |
+| Several bodies in one STL; bigger than the bed | `shambu split`; the user cuts it in Studio or CAD |
+| Studio exit -101 | quote the two objects it names. Under a 1 mm gap neither a pass nor a -101 is proof (not repeatable). If the user accepts the GUI's warning: `--no-check`; the hand-back quotes `Checks skipped` |
+| Exit -100, -102, -104, -21 | -100: quote the stderr line ("No valid nozzle found": `patch --repair-nozzle-stats`); -102: right-nozzle work at x < 20.5; -104: off the bed; -21: Studio's arrange could not fit the parts (24 mm apart with trees): give `at` |
+| Exit -139 (crash) | run the same command once more; a second -139: report it with the log path, do not work round it |
 
-The reasons and numbers behind every row: `references/06-slicer-rules.md` and `references/08-optimisation.md`.
+Reasons and numbers: `references/06-slicer-rules.md`, `references/08-optimisation.md`.
 
-## Print by object, in one paragraph
-
-Each object prints start to finish before the next. With one filament per nozzle that removes the prime tower
-and the nozzle change on every layer. It loses on many tiny parts, where each object waits out the minimum
-layer time alone; `group_by_filament` merges same-filament parts into one object so the group prints together.
-The tool orders objects by filament then height, packs them 60 mm apart (4 mm when all are under 4 mm tall),
-closes the row after any object over 32.8 mm (a later object in its Y band would hit the gantry rods), refuses
-Smooth timelapse and clumping detection, and lets Studio drop the tower. Studio's own rules and the live tests:
-`references/08-optimisation.md` section 2. GUI equivalent for the user: right-click the plate, Plate Settings,
-Print sequence, By object; Arrange.
+By object, shambu keeps 60 mm between objects and closes the row after one over 32.8 mm (reference 08 section 2).
+It never runs Studio's arrange and never rotates a part to pack it.
 
 ## Never
 
@@ -159,28 +172,25 @@ Print sequence, By object; Arrange.
 - Set supports, brims or infill for the whole plate when one part needs them: per object.
 - Guess an orientation for a part exported in an assembly frame: `shambu orient`, then `lay_on_face`.
 - Send keystrokes to Studio, press Print, or publish anything but one `pushall` to the printer.
-- Trust the orientation score over the slicer: bridges count as overhang in the score; the sweep decides.
-- Reuse a spec's filaments from an earlier day, or pin a preset the printer does not hold. A project whose
-  filament is not loaded makes Studio offer a swap on open, and the swap resets the process to the stock preset
-  (2 walls, 15 % infill) without a word: `"loaded"`, and `check` compares.
+- Reuse a spec's filaments from an earlier day: Studio's swap on open resets the process to the stock preset.
 
 ## Reading the printer
 
-`shambu printer filaments` and `shambu printer status` read the selected printer's serial and LAN access code
-from Bambu Studio's own configuration, find the printer on the LAN, subscribe and send one `pushall`.
-`filaments` prints, per nozzle (1 = left, 2 = right) and per slot, the loaded state, material, colour, Bambu
-preset id and the installed preset name that id resolves to; `status` prints state, progress, layer, remaining
-time, nozzle, bed and chamber temperatures and HMS codes. `watch` polls until the print leaves RUNNING/PAUSE.
-Nothing else is ever sent; the access code never leaves memory. Details and pitfalls: `references/00-findings.md`
-section 8.
+`printer filaments` and `status` send one `pushall`. `status`, `watch` and the log never show the IP; the masked
+serial appears on stdout only. To measure a print: `printer watch --wait-for-start --log print.jsonl --gcode3mf
+plate.gcode.3mf` until FINISH, then `calibrate --log print.jsonl --add`. A calibrated time needs three qualifying
+prints of one printer model and material (`references/06-slicer-rules.md` section 11).
 
 ## References (read when the row says so)
 
 | File | What | Read when |
 |---|---|---|
-| [00-findings.md](references/00-findings.md) | Every rule the CLI encodes, one paragraph each; the printer reader | something fails, or before changing the library |
-| [06-slicer-rules.md](references/06-slicer-rules.md) | The reasons and numbers behind the recipes; X2D limits | choosing between recipes, explaining a setting |
-| [08-optimisation.md](references/08-optimisation.md) | Orientation, print-by-object source rules, supports, time, finish, headless metrics, the Studio GUI workflow | optimising a plate, explaining the Studio steps |
+| [00-findings.md](references/00-findings.md) | Every rule the CLI encodes, one paragraph each, with the Studio source line | something fails, or before changing the library |
+| [02-binary-crash.md](references/02-binary-crash.md) | Studio's exit codes and crashes | Studio exits non-zero |
+| [03-3mf-format.md](references/03-3mf-format.md) | The 3MF entries, re-slicing a CLI export, the edit verbs | patching or editing a project |
+| [04-app-printer-control.md](references/04-app-printer-control.md) | The printer report, the watch log | reading or logging a print |
+| [06-slicer-rules.md](references/06-slicer-rules.md) | Reasons behind the recipes; X2D limits; the prime tower; Studio's estimate against the printer | choosing a recipe, a tower, explaining a time |
+| [08-optimisation.md](references/08-optimisation.md) | Orientation, print by object, supports, the layout checker, headless metrics, the GUI workflow | optimising a plate, explaining a check line |
 | [07-print-recipes.md](references/07-print-recipes.md) | Key scopes, defaults, the tip table | adding a recipe or a per-object key |
 | [09-user-notes.md](references/09-user-notes.md) | The user's own finish and fit notes | the hand-back for this user |
-| 01 to 05 | CLI source, binary, 3MF format, printer protocol, other tools | changing the code |
+| 01, 05 | CLI source, other tools | changing the code |

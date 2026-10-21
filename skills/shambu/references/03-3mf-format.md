@@ -32,6 +32,7 @@ Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate fr
 | [7. Gaps and next steps](#7-gaps-and-next-steps) | Open questions and the tests that would close them |
 | [8. Re-slicing a CLI export](#8-re-slicing-a-cli-export) | The per-extruder keys a later `--slice` needs, and the exit -100 chain |
 | [Appendix: `project_settings.config` keys by source](#appendix-project_settingsconfig-keys-by-source) | Each `project_settings.config` key, grouped by preset source |
+| [Project edits](#project-edits-replace-a-mesh-add-a-filament-move-an-object-or-the-tower-shambu-04-editspy) | How `patch --replace-mesh`, `--add-filament`, `--move`, `--tower` and `shambu slice --no-check` change a project, with the Studio rules they follow |
 
 ## 0. Headline findings
 
@@ -677,7 +678,7 @@ Classified against `<project>/plates/config/{process-gridfinity,filament-pla,mac
 
 
 
-## Project edits: replace a mesh, add a filament, move an object or the tower (shambu 0.3.x, `edits.py`)
+## Project edits: replace a mesh, add a filament, move an object or the tower (shambu 0.4, `edits.py`)
 
 Verified against Studio 02.08.02.61 (source at tag v02.08.02.61) and live CLI runs on copies of real projects.
 
@@ -709,7 +710,10 @@ colour, and appends slot N+1 itself. The per-variant keys are Studio's `filament
 (PrintConfig.cpp:7464); a block's length comes from its preset's `filament_extruder_variant`. A one-entry vector means
 "every slot uses entry 0" (Config.hpp:681-685) and is written out before the append. The verify step slices plate 1:
 the variant lookup (`could not found extruder_type`, PrintConfig.cpp:8935) runs when a slice applies the config, not on
-a plain export.
+a plain export. The colour: `PRESET:#RRGGBB` sets it; without one the slot takes the preset's own colour, and
+when the preset has none, the next default colour no slot uses, with a WARN line that names it. `@EXTRUDER` maps
+the slot to a nozzle (default extruder 1). A preset and colour that a slot already has is refused unless
+`--allow-duplicate`; `--no-verify` skips the verify slice (about 20 s on a full plate).
 
 **Prime tower.** `wipe_tower_x/y` are per-plate vectors of the tower's MIN corner, plate-local (BambuStudio.cpp:4481-4486,
 Print.cpp:2423). The CLI estimates the footprint as `x - brim .. x + width + brim`; `--tower` checks

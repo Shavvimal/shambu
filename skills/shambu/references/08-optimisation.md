@@ -11,8 +11,19 @@ fetches get HTTP 402) and the Studio source. Everything measured is a slicer est
 Target throughout: Bambu Lab X2D, 0.4 mm nozzle, filament 1 on the left direct-drive nozzle, filament 2 on the
 right Bowden nozzle (x >= 20.5 mm, 256 mm tall), no AMS, Bambu Studio 02.08.02.61.
 
-Section map: 1 orientation, 2 print-by-object (source rules), 3 supports and overhangs, 4 time, 5 surface and fit,
-6 headless metrics, 7 Studio GUI workflow for the user, 8 ClassCAD, 9 corrections to older references, 10 sources.
+## Contents
+
+1. Orientation
+2. Print-by-object: the exact rules (source)
+3. Supports, overhangs and bridging (3.6: the first spread measurement and the old margin rule)
+4. Time
+5. Surface and fit
+6. Headless metrics
+7. Studio GUI workflow for the user
+8. ClassCAD as a mesh engine: evaluated, not adopted
+9. Corrections to older references
+10. Sources
+11. Layout checker: support spread, the pair rule, footprints, the packer and the support probe (the rules now)
 
 ---
 
@@ -247,9 +258,11 @@ The planner used to measure only the model footprint. A gripper bracket (95 x 17
 path conflicts). In the bracket-alone G-code, Support extrusions below z 10 reach x 110.1 and y 107.4 against an outer
 wall at x 96.8, y 91.8: 13 to 15.6 mm past the box. With `layout.gap` 15 it still conflicted; with gap 20 it sliced
 (8 h 25 min, 231.7 g). On a two-filament SO-101 plate the jaw on filament 2 (bbox from x 25.7) put T1 support at x 15.0,
-inside the right nozzle's dead strip, and Studio refused it with -102. The rule then (section 11 replaced it): a part with supports got a margin of
-0.25 x its height, clamped to 5..25 mm (the bracket, 170 mm tall on its cheek face, got the 25 mm cap), and the
-extruder-reach check used the rect with the margin.
+inside the right nozzle's dead strip, and Studio refused it with -102. The rule then (0.2.0 to 0.3.0; section 11
+replaced it): a part with supports got a margin of 0.25 x its height, clamped to 5..25 mm (the bracket, 170 mm tall
+on its cheek face, got the 25 mm cap), and the extruder-reach check used the rect with the margin. The measurement
+covers one part, tree supports, one side, below z 10; the rule put the margin on all four sides at every height and
+summed two neighbours' margins.
 
 ---
 
@@ -439,8 +452,9 @@ Not verified: whether a native `classcad-cli` worker build imports STL as a soli
   (STL at z -38): copy 2 floated at z 38 and sat off the bed. Fixed in `build.py`.
 - Real-part findings in one place: the copy bug, the support-filament pin (3.3b), zero-contact orientation
   candidates (1.2), meshes in metres (`shambu rotate --scale`). The manual loop lives in `data/README.md`.
-- Support spread: tree support reached 15.6 mm past a gripper bracket's box (Studio -101 at gap 15, sliced at 20).
-  The layout now keeps 0.25 x height, 5..25 mm, round a supported part (3.6).
+- Support spread: tree support reached 15.6 mm past a gripper bracket's box, on one side, below z 10 (Studio -101
+  at gap 15, sliced at 20). The layout then kept 0.25 x height, 5..25 mm, on every side of a supported part (3.6);
+  that over-reserved and refused the 2026-10-20 housing plate. Section 11 holds the rule now.
 - Metres: `check` passed an OpenArm J7_joint_B scaled to metres (0.0 x 0.0 x 0.0 mm, OK) and Studio failed with -100.
   A mesh under 1 mm now fails `check`; the SO-101 URDF meshes are the real case.
 - Export failure: on the gripper p5-bracket plate (-101), OpenArm G3 (-63) and SO-101 plate-arms the report said

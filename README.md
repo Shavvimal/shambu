@@ -26,8 +26,9 @@ spec.json  ->  check  ->  build  ->  patch  ->  verify  ->  report.md (+ project
 
 - **Presets** are resolved from Bambu Studio's own profile files, including the `include` templates the CLI
   itself ignores (otherwise a project gets the generic start G-code instead of the printer's).
-- **Placement** is computed, never left to the slicer's arrange: every part gets a stated bed rectangle, brim
-  margins, and a check against the bed, both nozzles' reach and height, TPU on the main nozzle, and the prime tower.
+- **Placement** is computed, never left to the slicer's arrange: parts are packed on their mesh outlines (never
+  rotated) or put at the min corner the spec gives, then checked against the bed, both nozzles' reach and height,
+  TPU on the main nozzle, each neighbour's support spread and the prime tower. The slice is the final clash test.
 - **Export** runs the Studio binary headless with the flags that are known to work, in a private data and AppKit
   home so it can never hang on a hidden "reopen windows?" alert.
 - **Patch** fixes what the CLI leaves wrong in the 3MF (bed type per plate, all filament colours, the nozzle map
@@ -79,10 +80,14 @@ shambu build  plate.json         # + export with Studio's CLI, patch, verify, wr
 shambu build  plate.json --slice # also slice headless: <name>.gcode.3mf with time and filament estimates
 ```
 
-A spec names the printer preset, a process preset with recipes and overrides, the filaments (`"loaded"` takes the spool in that nozzle) and the
-plates with their parts (a file with filament, count, recipes, settings, height ranges, optional fixed position; or
-several files merged into one object). `build` writes `<outdir>/<name>.3mf`, `<name>.report.md`, `<name>.log` and
-the CLI inputs under `<outdir>/shambu/`.
+A spec names the printer preset, a process preset with recipes and overrides, the filaments (`"loaded"` takes the
+spool in that nozzle) and the plates with their parts (a file with filament, count, recipes, settings, height
+ranges, and an optional `at`: the min corner of its box on the bed; or several files merged into one object). Each
+`check` line names its kind: `FAIL body overlap`, `FAIL margin rule`, `WARN margin rule` (an estimated support
+spread: the slice decides), `WARN brim` or `PLACEMENT NOT DONE`. `--probe-supports` measures each supported part's
+spread with a cached solo slice. A two-filament plate gets a prime tower that `"wipe_tower": "auto"` sizes and
+places. `build --slice` is the final test: Studio's exit -101 names the two objects that clash. `build` writes
+`<outdir>/<name>.3mf`, `<name>.report.md`, `<name>.log` and the CLI inputs under `<outdir>/shambu/`.
 
 **2. Find the best orientation and print sequence.** Score orientations without slicing, then let the slicer judge.
 
@@ -99,21 +104,39 @@ A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate ta
 `--write-spec OUT.json` writes the fastest variant that passed (or `--pick NAME`) as a full spec with the original
 `outdir` and a `_sweep` key that records the variant and its Studio estimate; build that file.
 
-**3. Inspect or patch an existing project.**
+**3. Inspect, patch, edit or re-slice an existing project.**
 
 ```
 shambu inspect project.3mf
 shambu patch project.3mf --bed-type "Textured PEI Plate" --colours "#1A1A1A,#F0F0F0" --map 1,2 \
     --set "carrier_1:enable_support=1" --pause 1:10.2 --rename-plate "1:carrier D.6" --print-sequence "1:by object"
+shambu patch project.3mf --replace-mesh housing=housing-v2.stl --dry-run   # swap a mesh, keep name, settings, place
+shambu patch project.3mf --add-filament "Bambu PLA Matte @BBL X2D 0.4 nozzle:#FCECD6@2"
+shambu patch project.3mf --move housing=40,30        # the object's min corner, plate-local mm
+shambu patch project.3mf --tower 172,150@1          # the prime tower's min corner on plate 1
+shambu slice project.3mf [--no-check]                                    # headless slice of a saved project
 ```
 
-**4. Read the printer (read-only).**
+`patch` changes the project in place (or to `-o`) and declares every entry it touches. The edit verbs check what
+they change: `--replace-mesh` refuses a size change, a shared or painted mesh; `--add-filament` appends a slot and
+verifies it with a slice (a preset with no colour takes the next unused default colour, with a warning); `--move`
+and `--tower` report the same pair rule as `check`. `shambu slice --no-check` adds an unchecked pass only after a
+-101 or a warning -100, as the GUI would, and the report lists what it skipped. `shambu studio -- ARGS` is the
+logged last resort for anything else.
+
+**4. Read the printer (read-only) and measure prints.**
 
 ```
 shambu printer filaments [--ip <printer-ip>]   # the spool in each nozzle and slot, with the preset it resolves to
 shambu printer status [--ip <printer-ip>]
 shambu printer watch --every 300          # until the printer leaves RUNNING/PAUSE
+shambu printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf   # log one print
+shambu calibrate --log print.jsonl --add  # store it; `calibrate --show` prints the fit per printer and material
 ```
+
+Every time in a report is "Studio estimate", Studio's own prediction. The watch log stamps each poll and never
+holds the IP or the serial. A report adds the measured range of stored prints, and a calibrated time only when
+three qualifying prints of that printer model and material agree.
 
 `check` and `build` read the same report before resolving a spec: a filament written as `{"preset": "loaded"}` takes
 the spool in that nozzle with its colour, and a pinned preset that is not loaded fails the check (exit 1) unless
@@ -159,8 +182,12 @@ Exit codes: 0 ok, 1 a check or verification failed, 2 usage, 3 environment (bina
 - `support_filament` 0 ("default") lets Studio print a part's support with whichever filament is loaded. On a
   two-filament plate that put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102). The
   planner pins `support_filament` and `support_interface_filament` to the part's own filament when they are unset.
-- Tree support spreads past a part's box: 15.6 mm on a 170 mm bracket, which conflicted at a 15 mm gap. The layout
-  keeps 0.25 x height, clamped to 5..25 mm, round a supported part, and checks extruder reach on that rect.
+- Tree support spreads past a part's box and does not avoid a neighbour: 20.9 mm on one side of a 218 mm housing,
+  15.6 mm under a 170 mm bracket. The checker estimates `min(22, max(8, 0.10 x height))` per side (normal support
+  5 mm), keeps the larger of two facing spreads plus 1 mm between parts, and leaves the verdict to the slice
+  (exit -101); `--probe-supports` measures it.
+- An unsliced CLI export writes `extruder_nozzle_stats: []`, and a later CLI slice of it exits -100 "No valid
+  nozzle found". Every export gets the repaired key, and verify refuses a file without it.
 - A mesh whose whole bbox is under 1 mm is in metres (URDF exports); Studio fails it with -100. `check` refuses it,
   and `shambu rotate --scale 1000` writes a mm copy.
 

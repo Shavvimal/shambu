@@ -26,6 +26,7 @@ Source references below use a sparse clone of `bambulab/BambuStudio` master at `
 | [Recommended command set for the wrapper](#recommended-command-set-for-the-wrapper) | The proposed read-only subcommands |
 | [Citations](#citations) | Source links for the claims above |
 | [Artefacts in $S](#artefacts-in-s) | Files the investigation left in the scratch workspace |
+| [Track 7 - Time and job fields, and the watch log](#track-7---time-and-job-fields-and-the-watch-log-2026-10-21) | The report's time, speed and stage keys, and `printer watch --log` with `--gcode3mf` for `shambu calibrate` |
 
 ## TL;DR
 
