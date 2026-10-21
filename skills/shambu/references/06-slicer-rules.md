@@ -148,9 +148,9 @@ stored only to describe the print. The report shows the range of rates ("measure
 (n=N)"). It shows "calibrated about H h M min (n=N)" only when at least 3 prints of that printer model and material
 qualify, and their rates span less than 0.15. A print qualifies when all of these hold:
 
-- it finished (FINISH), and the log shows its start;
+- it finished (FINISH), and the log shows its start (a PREPARE poll, or a first RUNNING poll at layer 0);
 - every poll was at Standard speed and 100 %;
-- the printer's remaining time stayed within 5 % of Studio's M73 R;
+- every layer poll has the printer's remaining time, and it stayed within 5 % of Studio's M73 R;
 - it was never paused.
 
 A paused print has its paused time removed and is flagged. A log whose clock goes back, whose `task_id` changes or
@@ -206,5 +206,6 @@ slow-downs. D.7's 0.75 is an outlier, and a non-Standard speed level explains it
 1. Export the plate as a `.gcode.3mf`.
 2. Run `shambu printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf` before or right after
    sending the print, and leave it until it logs FINISH.
-3. Run `shambu calibrate --log print.jsonl --add`. The calibration file stores the log's file name, not its path.
+3. Run `shambu calibrate --log print.jsonl --add`. The calibration file stores a fingerprint of the session (its
+   header and first and last poll), not the file's name, so one session imported twice is one print.
 4. Run `shambu calibrate --show` to print the stored prints and the fit per printer model and material.

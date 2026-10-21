@@ -994,7 +994,7 @@ def _watch(a, svc, out: Output) -> int:
     try:
         if a.log:
             try:
-                log_f = open(a.log, "a", encoding="utf-8")  # closed in the finally below
+                log_f = open(a.log, "a", encoding="utf-8")  # closed below, on both paths
             except OSError as e:
                 raise DataFileError(f"--log {a.log}: cannot open it for appending ({e.strerror})") from e
             if header is not None:
@@ -1014,9 +1014,18 @@ def _watch(a, svc, out: Output) -> int:
                 out.emit(item.to_json(), item.lines() + [""])
                 write(rec)
             sys.stdout.flush()
-    finally:
-        if log_f is not None:
+    except BaseException:
+        if log_f is not None:  # keep the error in flight: a second failure on close must not replace it
+            try:
+                log_f.close()
+            except OSError as e:
+                log.warning("closing --log after an error failed too: %s", e.strerror)
+        raise
+    if log_f is not None:
+        try:
             log_f.close()
+        except OSError as e:
+            raise DataFileError(f"--log {a.log}: cannot write it ({e.strerror})") from e
     return code
 
 
@@ -1033,33 +1042,44 @@ class Calibrate(Command):
         from . import calibrate as C
         from . import conf
 
-        fits, prints, errors = [], [], []
+        fits, prints, errors, notes = [], [], [], []
         for path in a.log:
             name = Path(path).name
             try:
                 with open(path, encoding="utf-8") as f:
                     sessions = C.read_log(f)
-                if not sessions:
-                    raise C.CalibrationError("the log is empty")
-                for s in sessions:
+            except OSError as e:
+                errors.append(f"{name}: cannot read it ({e.strerror})")
+                continue
+            except C.CalibrationError as e:
+                errors.append(f"{name}: {e}")
+                continue
+            found = 0
+            for s in sessions:  # each session on its own: one bad or empty session does not hide the others
+                try:
+                    if not any(r["state"] == "RUNNING" for _, r in s.polls):
+                        notes.append(f"{name}: the session at line {s.line} has no RUNNING poll (no print): skipped")
+                        continue
                     if not s.header or not s.header.get("track"):
                         raise C.CalibrationError(
                             f"the session at line {s.line} is not tied to a G-code file: watch with --log and --gcode3mf"
                         )
                     track = C.M73Track.from_json(s.header["track"])
                     fit = C.fit(C.polls_from_session(s, track), s, track)
-                    fits.append(fit)
-                    prints.append(fit.to_print(name))
-            except OSError as e:
-                errors.append(f"{name}: cannot read it ({e.strerror})")
-            except C.CalibrationError as e:
-                errors.append(f"{name}: {e}")
+                except C.CalibrationError as e:
+                    errors.append(f"{name}: {e}")
+                    continue
+                found += 1
+                fits.append(fit)
+                prints.append(fit.to_print(C.session_fingerprint(s.header, s.polls[0][1], s.polls[-1][1])))
+            if not found and not any(e.startswith(f"{name}: ") for e in errors):
+                errors.append(f"{name}: no session with a RUNNING poll: the log holds no print")
         added = 0
         if a.add and prints and not errors:
 
             def add(stored: list[dict]) -> list[dict]:
-                for p in prints:
-                    stored = [s for s in stored if (s.get("log"), s.get("first_read_at")) != (p["log"], p["first_read_at"])]
+                for p in prints:  # one session is one print, whatever the log file is called
+                    stored = [s for s in stored if s.get("session") != p["session"]]
                     stored.append(p)
                 return stored
 
@@ -1072,7 +1092,7 @@ class Calibrate(Command):
             if show
             else []
         )
-        lines = [f"ERROR: {e}" for e in errors]
+        lines = [f"ERROR: {e}" for e in errors] + [f"note: {n}" for n in notes]
         for fit in fits:
             lines += fit.lines()
         if a.add:
@@ -1091,10 +1111,16 @@ class Calibrate(Command):
             ]
             for c in combined:
                 lines += c.lines()
-        out.emit(
-            {"prints": prints, "errors": errors, "added": added, "stored": stored if show else None, "fits": combined if show else None},
-            lines,
-        )
+        doc = {
+            "prints": prints,
+            "errors": errors,
+            "notes": notes,
+            "added": added,
+            "stored": stored if show else None,
+            "fits": combined if show else None,
+        }
+        secrets = conf.sensitive_values()  # file names and G-code labels are free text: scrub the serial and code
+        out.emit(json.loads(conf.scrub_text(json.dumps(_jsonable(doc)), secrets)), [conf.scrub_text(x, secrets) for x in lines])
         return 1 if errors else 0
 
 

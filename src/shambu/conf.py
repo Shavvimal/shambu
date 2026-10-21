@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
 from .errors import BambuError, ConfError
+
+log = logging.getLogger(__name__)
 
 APPSUPPORT = Path.home() / "Library/Application Support/BambuStudio"
 CONF = APPSUPPORT / "BambuStudio.conf"
@@ -132,9 +135,50 @@ def load_calibration(path: Path | None = None) -> list[dict]:
     return _read_calibration(path or CALIBRATION)
 
 
+def sensitive_values(conf: dict | None = None) -> list[str]:
+    """The serials, their masks and the access codes in Studio's config: text no shambu output may carry. [] when
+    the config cannot be read (nothing to compare with)."""
+    try:
+        c = conf or load()
+    except (ConfError, OSError, ValueError):
+        return []
+    serials = {str(k) for k in (c.get("access_code") or {})} | {str(selected_serial(c) or "")}
+    codes = {str(v) for v in (c.get("access_code") or {}).values() if v}
+    vals = {s for s in serials if s} | {mask(s) for s in serials if len(s) > 6} | codes
+    return sorted((v for v in vals if len(v) >= 4), key=len, reverse=True)
+
+
+def scrub_text(text: str, values: list[str] | None = None) -> str:
+    """`text` with every known sensitive value (`sensitive_values`) replaced by '<redacted>'."""
+    for v in sensitive_values() if values is None else values:
+        text = text.replace(v, "<redacted>")
+    return text
+
+
+def scrub_prints(prints: list[dict], values: list[str] | None = None) -> list[dict]:
+    """Calibration prints with any name that holds a known sensitive value set to None."""
+    vals = sensitive_values() if values is None else values
+    out = []
+    for r in prints:
+        r = dict(r)
+        for k in ("printer_model", "material"):
+            if isinstance(r.get(k), str) and any(v in r[k] for v in vals):
+                r[k] = None
+        out.append(r)
+    return out
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as e:  # cleanup is best effort: the caller's error is the one to report
+        log.warning("could not remove the temp file %s: %s", path, e.strerror)
+
+
 def _write_calibration(p: Path, prints: list[dict]) -> None:
     from .calibrate import CalibrationError, validate_print
 
+    prints = scrub_prints(prints)
     for r in prints:
         try:
             validate_print(r)
@@ -145,17 +189,20 @@ def _write_calibration(p: Path, prints: list[dict]) -> None:
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".calibration-", suffix=".json")
     except OSError as e:
         raise DataFileError(f"{p.parent}: cannot write there ({e.strerror})") from e
+    failure: OSError | None = None
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"version": CALIBRATION_VERSION, "prints": prints}, f, indent=1, allow_nan=False)
             f.write("\n")
         os.replace(tmp, p)
     except OSError as e:
-        Path(tmp).unlink(missing_ok=True)
-        raise DataFileError(f"{p}: cannot write it ({e.strerror})") from e
+        failure = e
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        _unlink_quietly(tmp)
         raise
+    if failure is not None:
+        _unlink_quietly(tmp)
+        raise DataFileError(f"{p}: cannot write it ({failure.strerror})") from failure
 
 
 def save_calibration(prints: list[dict], path: Path | None = None) -> Path:
