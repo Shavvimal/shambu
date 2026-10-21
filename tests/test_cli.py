@@ -1,7 +1,9 @@
 """cli.main: subcommands, --json output, exit codes. Bambu() is replaced by a facade over fakes."""
 
 import json
+import subprocess
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -467,3 +469,68 @@ def test_doctor_without_the_binary_still_prints_and_exits_3(capsys, monkeypatch,
     code, out, _ = run(capsys, "--json", "doctor", "--no-printer")
     j = one_json(out)
     assert code == 3 and "binary not found" in j["studio"]["error"] and j["shambu"]["version"]
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "-1", "1e300"])
+def test_doctor_printer_timeout_must_be_finite_and_positive(capsys, bad):
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer", f"--printer-timeout={bad}")
+    assert code == 2 and "finite number of seconds" in one_json(out)["error"]
+
+
+def test_doctor_expect_version_with_a_trailing_newline_is_exit_2(capsys):
+    import shambu
+
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer", "--expect-version", shambu.__version__ + "\n")
+    assert code == 2 and "X.Y.Z" in one_json(out)["error"]
+
+
+def test_install_kind_names_a_branch_as_a_revision():
+    from shambu.facade import install_kind
+
+    assert install_kind({"vcs_info": {"vcs": "git", "requested_revision": "main"}})[0] == "uv tool, git revision main"
+
+
+def test_malformed_info_plist_is_a_studio_error(tmp_path, capsys, monkeypatch, resolver):
+    app = tmp_path / "BambuStudio.app" / "Contents"
+    (app / "MacOS").mkdir(parents=True)
+    binary = app / "MacOS" / "BambuStudio"
+    binary.write_text("")
+    st = studio_mod.StudioCLI.__new__(studio_mod.StudioCLI)
+    st.binary = binary
+    (app / "Info.plist").write_bytes(b"not a plist at all")
+    with pytest.raises(StudioError, match="cannot read the Studio version"):
+        st.version()
+    (app / "Info.plist").write_bytes(b'<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>')
+    with pytest.raises(StudioError, match="KeyError"):
+        st.version()
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=st, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer")
+    j = one_json(out)
+    assert code == 3 and "cannot read the Studio version" in j["studio"]["error"] and "recipes" in j
+
+
+@pytest.mark.parametrize(
+    "result, pids",
+    [
+        (lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "12 34\n", ""), [12, 34]),
+        (lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", ""), []),  # no process: an ordinary negative
+        (lambda argv, **kw: subprocess.CompletedProcess(argv, 3, "", "pgrep: bad"), None),
+        (lambda argv, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 2)), None),
+        (lambda argv, **kw: (_ for _ in ()).throw(FileNotFoundError("pgrep")), None),
+    ],
+)
+def test_running_pids_unknown_is_none(monkeypatch, caplog, result, pids):
+    st = studio_mod.StudioCLI.__new__(studio_mod.StudioCLI)
+    st.binary = Path("/Applications/BambuStudio.app/Contents/MacOS/BambuStudio")
+    monkeypatch.setattr(studio_mod.subprocess, "run", result)
+    with caplog.at_level("WARNING", logger="shambu.studio"):
+        assert st.running_pids() == pids
+    assert bool(caplog.records) == (pids is None)
+
+
+def test_doctor_shows_unknown_pids(capsys, monkeypatch):
+    from conftest import FakeStudio
+
+    monkeypatch.setattr(FakeStudio, "running_pids", lambda self: None)
+    code, out, _ = run(capsys, "doctor", "--no-printer")
+    assert code == 0 and "(running pids: unknown (pgrep failed))" in out.splitlines()[1]

@@ -43,7 +43,6 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,7 +141,8 @@ class ArpProbe:
 
     Bounds (a slow resolver or a large LAN must not stall a check): `arp -an` (numeric, so no reverse DNS per entry)
     with a 2 s timeout, then the 8883 probe in a pool of `workers` threads, `timeout` s per host and `sweep_s` for the
-    whole probe. A host that has not answered when the sweep ends counts as closed."""
+    whole probe. A host that has not answered when the sweep ends counts as closed. The probe threads are daemons: a
+    probe still blocked when the sweep ends never holds up the process exit."""
 
     timeout: float = 0.5
     sweep_s: float = 2.0
@@ -160,19 +160,44 @@ class ArpProbe:
         except OSError as e:
             log.warning("arp -an failed (%s); no ARP discovery", e)
             return []
+        if r.returncode != 0:
+            log.warning("arp -an exited with status %s (%s); reading what it printed", r.returncode, (r.stderr or "").strip()[:200])
         return arp_hosts(r.stdout or "")
 
     def probe_hosts(self, hosts: list[str]) -> list[dict]:
         if not hosts:
             return []
-        pool = ThreadPoolExecutor(max_workers=max(1, min(self.workers, len(hosts))), thread_name_prefix="shambu-probe")
-        try:
-            futs = {pool.submit(self.probe, h, 8883, self.timeout): h for h in hosts}
-            done, _ = wait(futs, timeout=self.sweep_s)
-            open_ = {futs[f] for f in done if not f.exception() and f.result()}
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-        return [{"ip": h, "method": "arp+8883"} for h in hosts if h in open_]  # ARP order, not finish order
+        todo = list(hosts)
+        open_: set[str] = set()
+        lock = threading.Lock()
+        left = [len(hosts)]
+        finished = threading.Event()
+        deadline = time.monotonic() + self.sweep_s
+
+        def worker() -> None:
+            while True:
+                with lock:
+                    if not todo or time.monotonic() >= deadline:
+                        return
+                    h = todo.pop(0)
+                try:
+                    ok = bool(self.probe(h, 8883, self.timeout))
+                except Exception as e:  # noqa: BLE001 - a closed port is False; anything else is worth a warning
+                    log.warning("port probe of %s raised %s: %s; counted as closed", h, type(e).__name__, e)
+                    ok = False
+                with lock:
+                    if ok:
+                        open_.add(h)
+                    left[0] -= 1
+                    if left[0] == 0:
+                        finished.set()
+
+        for i in range(max(1, min(self.workers, len(hosts)))):
+            threading.Thread(target=worker, name=f"shambu-probe-{i}", daemon=True).start()
+        finished.wait(self.sweep_s)
+        with lock:
+            found = set(open_)
+        return [{"ip": h, "method": "arp+8883"} for h in hosts if h in found]  # ARP order, not finish order
 
     def find(self) -> list[dict]:
         return self.probe_hosts(self.hosts())
@@ -907,6 +932,16 @@ class FilamentDecoder:
 
 # ---------------------------------------------------------------------------------- service
 @dataclass
+class _Attempt:
+    """One read's state: the step it is in, its step times, and whether the caller gave up on it."""
+
+    step: str = "start"
+    timings: dict[str, float] = field(default_factory=dict)
+    abandoned: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass
 class PrinterService:
     """Facade: serial and access code from Studio's config, IP from discovery or the caller.
 
@@ -914,8 +949,11 @@ class PrinterService:
     proves the host at the IP is the selected printer before the access code leaves this machine.
 
     `budget_s` bounds one whole read (config, discovery, MQTT): the read runs in a worker thread, and when the budget
-    runs out the caller gets `PrinterError("timed out after 15 s in <step>")` and the thread is left to die with the
-    process (daemon). `on_step(name, seconds)` hears each step as it ends (`arp`, `probe`, `mqtt`); `timings` keeps them."""
+    runs out the caller gets `PrinterError("timed out after 15 s in <step>")`. The expired attempt's thread is not
+    stopped: it is a daemon, it finishes or dies with the process, and it never calls `on_step` or writes `timings`
+    again. That is fine for the CLI; a long-lived caller keeps such a thread until its socket times out.
+    `on_step(name, seconds)` hears each step of the current read as it ends (`config`, `arp`, `probe`, `mqtt`);
+    `timings` holds the steps of the last read."""
 
     ip: str | None = None
     serial: str | None = None
@@ -926,43 +964,60 @@ class PrinterService:
     budget_s: float | None = BUDGET_S
     on_step: Callable[[str, float], None] | None = field(default=None, repr=False)
     timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
-    step: str = field(default="start", init=False, repr=False)
-    _abandoned: bool = field(default=False, init=False, repr=False)
+    _local: threading.local = field(default_factory=threading.local, init=False, repr=False)
+
+    def _attempt(self) -> _Attempt:
+        a = getattr(self._local, "attempt", None)
+        if a is None:  # resolve() or _read() called directly, outside _bounded
+            a = self._local.attempt = _Attempt()
+            self.timings = a.timings
+        return a
 
     @contextmanager
     def _timed(self, name: str) -> Iterator[None]:
-        self.step = name
+        a = self._attempt()
+        a.step = name
         t0 = time.monotonic()
         try:
             yield
         finally:
             dt = round(time.monotonic() - t0, 2)
-            self.timings[name] = dt
-            if self.on_step is not None and not self._abandoned:  # no progress line after the caller gave up
-                try:
-                    self.on_step(name, dt)
-                except Exception:  # noqa: BLE001 - a progress printer must never fail the read
-                    pass
+            with a.lock:
+                if not a.abandoned:  # an expired attempt reports nothing: the caller gave up on it
+                    a.timings[name] = dt
+                    if self.on_step is not None:
+                        try:
+                            self.on_step(name, dt)
+                        except Exception:  # noqa: BLE001 - a progress printer must never fail the read
+                            pass
 
     def _bounded(self, fn: Callable[[], T]) -> T:
-        """`fn()` within `budget_s`, or PrinterError naming the step it was in. No budget: a plain call."""
-        if not self.budget_s or self.budget_s <= 0:
-            return fn()
-        self._abandoned = False
+        """`fn()` within `budget_s` in a worker thread with its own attempt state, or PrinterError naming the step it was
+        in. No budget: the same attempt state, in the caller's thread."""
+        attempt = _Attempt()
+        self.timings = attempt.timings
         box: dict = {}
 
         def work() -> None:
+            self._local.attempt = attempt
             try:
                 box["value"] = fn()
             except BaseException as e:  # noqa: BLE001 - re-raised in the caller's thread
                 box["error"] = e
+            finally:
+                self._local.attempt = None
 
-        t = threading.Thread(target=work, name="shambu-printer-read", daemon=True)
-        t.start()
-        t.join(self.budget_s)
-        if t.is_alive():
-            self._abandoned = True
-            raise PrinterError(f"timed out after {self.budget_s:g} s in {self.step}")
+        if not self.budget_s or self.budget_s <= 0:
+            work()
+        else:
+            t = threading.Thread(target=work, name="shambu-printer-read", daemon=True)
+            t.start()
+            t.join(self.budget_s)
+            if t.is_alive():
+                with attempt.lock:
+                    attempt.abandoned = True
+                    self.timings = dict(attempt.timings)  # the steps that ended in time, frozen
+                raise PrinterError(f"timed out after {self.budget_s:g} s in {attempt.step}")
         if "error" in box:
             raise box["error"]
         return box["value"]

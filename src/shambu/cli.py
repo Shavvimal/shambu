@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -174,7 +176,9 @@ def shambu_lines(d: dict) -> list[str]:
 def studio_lines(st: dict) -> list[str]:
     if "error" in st:
         return [f"Bambu Studio: {st['error']} (tested {st['tested']})"]
-    lines = [f"Bambu Studio {st['version']} (tested {st['tested']}) at {st['binary']} (running pids: {st['running_pids'] or 'none'})"]
+    pids = st["running_pids"]
+    shown = "unknown (pgrep failed)" if pids is None else (pids or "none")
+    lines = [f"Bambu Studio {st['version']} (tested {st['tested']}) at {st['binary']} (running pids: {shown})"]
     if not st["match"]:
         lines.append(f"WARN: Bambu Studio {st['version']} is not the tested {st['tested']}; other 02.08.x builds work but are untested")
     return lines
@@ -202,10 +206,10 @@ class Doctor(Command):
     def run(self, a, app, out):
         from .facade import VERSION_RE
 
-        if a.expect_version is not None and not VERSION_RE.match(a.expect_version):
+        if a.expect_version is not None and not VERSION_RE.fullmatch(a.expect_version):
             return usage(out, f"--expect-version {a.expect_version!r}: give X.Y.Z, for example 0.4.0")
-        if a.printer_timeout <= 0:
-            return usage(out, f"--printer-timeout {a.printer_timeout:g}: give a number of seconds above 0")
+        if not (math.isfinite(a.printer_timeout) and 0 < a.printer_timeout < threading.TIMEOUT_MAX):
+            return usage(out, f"--printer-timeout {a.printer_timeout:g}: give a finite number of seconds above 0")
         app.printer_ip = a.printer_ip
         app.printer_timeout = a.printer_timeout
         d = app.doctor(
@@ -859,8 +863,8 @@ class Printer(Command):
     def run(self, a, app, out):
         from .printer import BUDGET_S, ArpProbe, SsdpListen
 
-        # one read's budget: 15 s, or the report wait plus the connect and handshake bounds when --wait asks for more
-        app.printer_timeout = max(BUDGET_S, a.wait + 8)
+        # one read's budget: 15 s at the default --wait 8, and --wait plus 7 s (connect and grace) above that
+        app.printer_timeout = max(BUDGET_S, a.wait + 7)
         svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "discover":
             hits = ArpProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])

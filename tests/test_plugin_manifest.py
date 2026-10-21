@@ -40,7 +40,10 @@ def test_skill_version_literals_match_package():
     `__version__` (a 0.2.0 skill once drove a 0.2.1 CLI and a 0.3.0 checkout in one session)."""
     skill = (ROOT / "skills" / "shambu" / "SKILL.md").read_text()
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
+    readme = (ROOT / "README.md").read_text()
     assert VERSION_LITERALS[0].findall(skill), "the shambu skill must run doctor with --expect-version"
     assert VERSION_LITERALS[1].findall(setup), "the setup skill must install a tagged version"
-    found = {v for text in (skill, setup) for rx in VERSION_LITERALS for v in rx.findall(text)}
+    assert VERSION_LITERALS[1].findall(readme), "the README must install a tagged version"
+    assert 'shambu"' not in readme and 'shambu" shambu' not in readme, "an untagged git install line in the README"
+    found = {v for text in (skill, setup, readme) for rx in VERSION_LITERALS for v in rx.findall(text)}
     assert found == {shambu.__version__}

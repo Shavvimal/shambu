@@ -544,10 +544,19 @@ def written_line(path: str, prov: dict, failed: Sequence[str] = ()) -> str:
 
 
 def write_spec(path: str | Path, spec: dict) -> Path:
-    """Writes through a temporary file in the same folder, so a crash never leaves half a spec."""
+    """Writes through a new, uniquely named temporary file in the same folder (created exclusively, so it can never be
+    an existing file such as the input spec), then renames it over `path`. A crash never leaves half a spec. A failed
+    write or rename removes the temporary file and raises BuildError naming the destination and the reason."""
     p = Path(path).expanduser()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(p)
+    tmp: Path | None = None
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=p.parent, prefix=f".{p.name}.", suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            f.write(json.dumps(spec, indent=2) + "\n")
+        tmp.replace(p)
+    except OSError as e:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise BuildError(f"cannot write the spec to {p}: {e.strerror or e}") from e
     return p

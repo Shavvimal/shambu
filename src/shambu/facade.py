@@ -24,7 +24,8 @@ from .threemf import Project
 DEFAULT_MACHINE = "Bambu Lab X2D 0.4 nozzle"
 TESTED_STUDIO = "02.08.02.61"  # the Studio build every rule in this package was reverse engineered and tested on
 REPO = "https://github.com/Shavvimal/shambu"
-VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+")  # used with fullmatch: "0.4.0\n" is not a version
+_TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
 _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 
@@ -43,7 +44,9 @@ def install_kind(direct_url: dict | None) -> tuple[str, str | None]:
     if isinstance(vcs, dict):
         commit = str(vcs["commit_id"])[:7] if vcs.get("commit_id") else None
         rev = vcs.get("requested_revision")
-        return (f"uv tool, git tag {rev}" if rev else "uv tool, git (no tag)"), commit
+        if not rev:
+            return "uv tool, git (no tag)", commit
+        return (f"uv tool, git tag {rev}" if _TAG_RE.fullmatch(str(rev)) else f"uv tool, git revision {rev}"), commit
     d = direct_url.get("dir_info")
     if isinstance(d, dict):
         return ("editable checkout" if d.get("editable") else "uv tool, local folder (snapshot)"), None

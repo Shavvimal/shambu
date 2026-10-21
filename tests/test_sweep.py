@@ -162,3 +162,32 @@ def test_written_spec_lists_a_changed_path(tmp_path):
     w = S.written_spec(spec, v, r, "/in.json")
     assert w["_sweep"]["paths_changed"] == ["/o/sweep/_units/p/p.stl"] and w["_sweep"]["orientation"] == {"label": "studio 1"}
     assert "orientation" not in w["plates"][0]["parts"][0]
+
+
+def test_a_temp_name_can_never_clobber_the_input(capsys, sweep_files):
+    """The old temp file was <OUT>.tmp: with the input named x.json.tmp the write truncated it and the rename removed it."""
+    tmp, sp, vp, _ = sweep_files
+    src = tmp / "x.json.tmp"
+    src.write_bytes(sp.read_bytes())
+    before = src.read_bytes()
+    code, _, _ = sweep(capsys, str(src), "--variants", str(vp), "--write-spec", str(tmp / "x.json"))
+    assert code == 0
+    assert src.read_bytes() == before
+    assert json.loads((tmp / "x.json").read_text())["_sweep"]["variant"] == "fast"
+    assert sorted(p.name for p in tmp.iterdir() if p.name.endswith(".tmp")) == ["x.json.tmp"]  # no temp file left
+
+
+def test_a_failed_write_is_one_error_document_and_exit_3(capsys, sweep_files, monkeypatch):
+    from pathlib import Path
+
+    tmp, sp, vp, _ = sweep_files
+
+    def denied(self, target):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "replace", denied)
+    code = cli.main(["--json", "sweep", str(sp), "--variants", str(vp), "--write-spec", str(tmp / "o.json")])
+    j = json.loads(capsys.readouterr().out)  # exactly one document
+    assert code == 3
+    assert j["error"] == f"BuildError: cannot write the spec to {tmp / 'o.json'}: Permission denied"
+    assert not (tmp / "o.json").exists() and not [p for p in tmp.iterdir() if p.name.endswith(".tmp")]

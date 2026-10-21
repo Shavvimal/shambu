@@ -4,6 +4,7 @@ import json
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 
@@ -439,3 +440,69 @@ def test_read_times_each_discovery_step(monkeypatch, tmp_path):
     svc = printer.PrinterService(discovery=(arp,), reader_factory=Ok)
     assert svc.status().ip == "10.0.0.9"
     assert list(svc.timings) == ["config", "arp", "probe", "mqtt"]
+
+
+# ---------------------------------------------------------------------------- review follow-ups (Codex, 2026-10-21)
+def test_a_blocked_probe_never_holds_up_the_process_exit():
+    """The sweep ends at 0.05 s; a probe still sleeping 3 s must not keep the interpreter alive at exit."""
+    code = (
+        "import time\n"
+        "from shambu import printer\n"
+        "t0 = time.monotonic()\n"
+        "hits = printer.ArpProbe(probe=lambda ip, port, t: time.sleep(3) or True, sweep_s=0.05).probe_hosts(['10.0.0.1'])\n"
+        "assert hits == [] and time.monotonic() - t0 < 0.5\n"
+    )
+    t0 = time.monotonic()
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, r.stderr
+    assert time.monotonic() - t0 < 2.5  # interpreter start and import included; a joined probe would take 3 s or more
+
+
+def test_a_probe_that_raises_is_logged_and_counted_closed(caplog):
+    def boom(ip, port, timeout):
+        if ip.endswith(".1"):
+            raise RuntimeError("socket layer broke")
+        return ip.endswith(".2")
+
+    with caplog.at_level("WARNING", logger="shambu.printer"):
+        hits = printer.ArpProbe(probe=boom).probe_hosts(["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+    assert [h["ip"] for h in hits] == ["10.0.0.2"]
+    assert any("RuntimeError: socket layer broke" in r.getMessage() for r in caplog.records)
+    assert len(caplog.records) == 1  # a closed port (False) is an ordinary negative, not a warning
+
+
+def test_a_nonzero_arp_exit_is_logged(caplog):
+    def runner(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, ARP_AN, "arp: something odd")
+
+    with caplog.at_level("WARNING", logger="shambu.printer"):
+        assert printer.ArpProbe(runner=runner).hosts() == ["10.0.0.1", "10.0.0.9"]
+    assert any("exited with status 1" in r.getMessage() for r in caplog.records)
+
+
+def test_an_expired_read_does_not_touch_the_next_one(monkeypatch, tmp_path):
+    _service_conf(monkeypatch, tmp_path)
+    n = [0]
+
+    class SlowThenFast:
+        def __init__(self, *a):
+            n[0] += 1
+            self.slow = n[0] == 1
+
+        def read(self):
+            if self.slow:
+                time.sleep(0.6)
+            return full()
+
+    events = []
+    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=SlowThenFast, budget_s=0.2, on_step=lambda s, dt: events.append(s))
+    with pytest.raises(PrinterError, match="in mqtt"):
+        svc.status()
+    assert events == ["config"]
+    events.clear()
+    svc.budget_s = 2.0
+    svc.status()  # the second read starts while the first attempt's thread is still asleep
+    second = dict(svc.timings)
+    time.sleep(0.7)  # the first attempt wakes and finishes its mqtt step now
+    assert events == ["config", "mqtt"]  # only the second read's own steps
+    assert svc.timings == second and second["mqtt"] < 0.5
