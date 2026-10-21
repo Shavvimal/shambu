@@ -465,7 +465,7 @@ def test_patch_add_filament_with_studio(capsys, tmp_path, monkeypatch, resolver)
     ps = Project(str(out_path)).project_settings
     assert ps["filament_settings_id"] == ["Test PLA", "Test PETG Basic"] and ps["filament_map"] == ["1", "2"]
     assert ps["filament_self_index"] == ["1"] * 6 + ["2"] * 6
-    assert any(n.startswith("verify: Studio sliced plate 1") for n in doc["notes"])
+    assert any(n.startswith("verify slice: Studio sliced plate 1") for n in doc["notes"])
     runs = [c[1] for c in studio.calls if c[0] == "run"]
     assert len(runs) == 3 and all("--load-filaments" in r for r in runs[:2]) and "--slice=1" in runs[2]
     assert runs[0][runs[0].index("--load-filaments") + 1].endswith("filament-new.json")  # the new preset alone
@@ -489,9 +489,9 @@ def test_patch_add_filament_one_per_call(capsys, tmp_path):
     assert code == 2 and "one --add-filament per call" in out
 
 
-def test_patch_add_filament_unknown_preset_is_exit_3(capsys, tmp_path):
-    code, _, err = run(capsys, "patch", str(_geo(tmp_path)), "--add-filament", "No Such Filament:#FFFFFF")
-    assert code == 3 and "not found" in err
+def test_patch_add_filament_unknown_preset_is_exit_1(capsys, tmp_path):
+    code, out, _ = run(capsys, "patch", str(_geo(tmp_path)), "--add-filament", "No Such Filament:#FFFFFF")
+    assert code == 1 and "not found" in out
 
 
 def test_build_no_check_without_slice_is_exit_2(capsys, tmp_path):
@@ -511,7 +511,7 @@ def test_slice_verb_two_pass(capsys, tmp_path, monkeypatch, resolver):
     assert code == 0 and doc["ok"]
     assert doc["output"] == str(tmp_path / "in.gcode.3mf")
     assert doc["checks_skipped"]["pair"] == ["a", "b"]
-    assert "G-code path conflict check (exit -101)" in doc["checks_skipped"]["skipped"]
+    assert "G-code path conflict check (exit -101)" in doc["checks_skipped"]["checks"]
     runs = [c[1] for c in studio.calls if c[0] == "run"]
     assert "--no-check" not in runs[0] and runs[1].index("--no-check") < runs[1].index("--slice=0")
 
@@ -565,3 +565,97 @@ def test_patch_add_filament_with_an_absent_old_preset(capsys, tmp_path, monkeypa
     argv = studio.calls[1][1]
     loads = argv[argv.index("--load-filaments") + 1]
     assert loads.endswith("filament-1.json;" + loads.split(";")[1]) and loads.split(";")[1].endswith("filament-new.json")
+
+
+def test_slice_refuses_the_input_as_output(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    raw = src.read_bytes()
+    (tmp_path / "alias.3mf").symlink_to(src)
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    for out_arg in (str(src), str(tmp_path / "alias.3mf")):
+        code, out, _ = run(capsys, "--json", "slice", str(src), "-o", out_arg)
+        assert code == 2 and "is the input file" in one_json(out)["error"]
+    assert src.read_bytes() == raw and studio.calls == []
+
+
+def test_slice_replaces_the_output_only_after_success(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    old = tmp_path / "out.gcode.3mf"
+    old.write_bytes(b"previous output")
+    studio = SequenceStudio(None, codes=[-102])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, _, _ = run(capsys, "slice", str(src), "-o", str(old))
+    assert code == 1 and old.read_bytes() == b"previous output"
+
+
+def _verify_studio(tmp_path, code: int, log: str | None):
+    """FixturesStudio whose third call (the verify slice) exits `code` and leaves `log` (None: no log file)."""
+    _, fixtures = _scratch_3mf(tmp_path)
+
+    @dataclass
+    class VerifyStudio(FixturesStudio):
+        def run(self, cmd, **kw):
+            rr = super().run(cmd, **kw)
+            if len(self.calls) == 3:
+                if log is None:
+                    rr.log.unlink()
+                else:
+                    rr.log.write_text(log)
+                rr = type(rr)(rr.cmd, code % 256, code, rr.seconds, rr.log, {"return_code": code}, rr.output)
+            return rr
+
+    return VerifyStudio(fixtures=fixtures)
+
+
+@pytest.mark.parametrize("code, log", [(124, "$ fake\n[timeout after 1200 s]\n"), (0, None)], ids=["timeout", "no-log"])
+def test_verify_slice_failure_leaves_the_destination(capsys, tmp_path, monkeypatch, resolver, code, log):
+    src = _geo(tmp_path, filaments=1)
+    raw = src.read_bytes()
+    studio = _verify_studio(tmp_path, code, log)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    rc, out, _ = run(capsys, "--json", "patch", str(src), "--add-filament", "Test PETG Basic:#FCECD6@2")
+    assert rc == 1 and "verify slice" in one_json(out)["error"]
+    assert src.read_bytes() == raw
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--move", "nope=1,1"],
+        ["--move", "body=1,1@5"],
+        ["--replace-mesh", "nope=x.stl"],
+        ["--add-filament", "No Such Filament"],
+        ["--add-filament", "Test PETG Basic:#FCECD6@5"],
+        ["--tower", "120,30@9"],
+    ],
+    ids=["unknown-object", "plate-range", "replace-unknown", "unknown-preset", "bad-extruder", "tower-plate"],
+)
+def test_refused_edits_exit_1(capsys, tmp_path, argv):
+    code, out, _ = run(capsys, "--json", "patch", str(_geo(tmp_path)), *argv)
+    assert code == 1, out
+    assert one_json(out)["error"].startswith("EditError")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["patch", "{f}", "--tower", "nan,30"],
+        ["patch", "{f}", "--tower", "120,30@oops"],
+        ["patch", "{f}", "--move", "body=inf,3"],
+        ["slice", "{f}", "--tower", "1,2@x"],
+        ["studio", "--", "--slice", "oops", "x.3mf"],
+    ],
+    ids=["tower-nan", "tower-plate", "move-inf", "slice-tower", "studio-slice"],
+)
+def test_malformed_numbers_are_usage_errors(capsys, tmp_path, monkeypatch, argv):
+    monkeypatch.chdir(tmp_path)
+    f = str(_geo(tmp_path))
+    code, out, _ = run(capsys, "--json", *[a.replace("{f}", f) for a in argv])
+    assert code == 2
+    assert "error" in one_json(out)

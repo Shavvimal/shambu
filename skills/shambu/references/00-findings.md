@@ -158,7 +158,7 @@ status pushes are exempt from Bambu's Authorization Control, so no Developer Mod
 - `--move camera_housing_v2_print=+5,+5` and back: only `3D/3dmodel.model` changed, and the round trip is byte-identical
   apart from the dropped `plate_1.json`. At the original position the move check prints the FAIL line
   "camera_housing_v2_print and housing_print overlap", the pair of the -101 below.
-- `shambu slice FILE --no-check` slices checked first (per plate) and adds a `--no-check` pass only after an overridable
+- `shambu slice FILE --no-check` slices checked first (per plate) and adds a `--no-check` pass only after a skippable
   -101 or -100. On the plate-14 project with the E7a housing the checked pass exited -101 ("conflicts between
   camera_housing_v2_print and housing_print"), the second pass exported 16 h 58 min, 457.8 g, and the report says what
   the check found. The same file and argv also exited 0 in 2 of 4 checked slices: at a 0.25 mm gap Studio's conflict

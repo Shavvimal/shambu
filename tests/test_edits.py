@@ -239,10 +239,20 @@ def test_save_rejects_undeclared_entry_change(geo_file):
 
 
 def test_save_rejects_rels_and_3d_entry_changes(geo_file):
+    raw = geo_file.read_bytes()
     p = Project(str(geo_file))
     p.write_entry("3D/_rels/3dmodel.model.rels", b"<Relationships/>")
     with pytest.raises(ProjectError, match="relationship"):
         p.save(str(geo_file), {"3D/*"})
+    p = Project(str(geo_file))
+    p._put("3D/Objects/object_9.model", b"<model/>")  # a new 3D entry, even when 3D/* is declared
+    with pytest.raises(ProjectError, match="added, removed or reordered a 3D"):
+        p.save(str(geo_file), {"3D/*"})
+    p = Project(str(geo_file))
+    p.write_entry("3D/Objects/object_1.model", b"<model/>")  # a real 3D change under the default declaration
+    with pytest.raises(ProjectError, match="did not declare"):
+        p.save(str(geo_file))
+    assert geo_file.read_bytes() == raw
 
 
 # ---------------------------------------------------------------------------- 11-16 add filament
@@ -421,7 +431,10 @@ def test_add_filament_from_preset_warns(tmp_path):
     assert len(Project(str(tmp_path / "two.3mf")).project_settings["flush_volumes_matrix"]) == 8
 
 
-@pytest.mark.xfail(reason="set_filament_map collapses filament_extruder_variant; the tower agent's threemf fix closes it", strict=False)
+MAP_XFAIL = "set_filament_map collapses the variant blocks; fixed in the tower worktree, marker removed at merge"
+
+
+@pytest.mark.xfail(reason=MAP_XFAIL, strict=False)
 def test_set_filament_map_keeps_variant_blocks(tmp_path):
     path = make_geo_3mf(tmp_path / "two.3mf", filaments=2)
     PatchSet([SetFilamentMap((1, 2))]).apply(str(path))
@@ -607,7 +620,7 @@ def test_slice_no_check_two_pass(tmp_path, stls, resolver):
     assert r.checks_skipped is not None and r.checks_skipped["pair"] == ["a", "b"]
     assert r.project.is_file()
     doc = r.to_json()
-    assert "G-code path conflict check (exit -101)" in doc["checks_skipped"]["skipped"]
+    assert "G-code path conflict check (exit -101)" in doc["checks_skipped"]["checks"]
     assert "found G-code path conflicts between a and b (exit -101); exported with --no-check" in doc["checks_skipped"]["report_line"]
     assert any(w.startswith("sliced with --no-check: Studio's checks found G-code path conflicts between a and b") for w in doc["warnings"])
     assert "exported with --no-check as the GUI would" in r.report
@@ -616,7 +629,7 @@ def test_slice_no_check_two_pass(tmp_path, stls, resolver):
 def test_no_check_does_not_mask_unprintable(tmp_path):
     studio = SequenceStudio(None, codes=[-102, 0], logs=["[error]   plate 1: path in the unprintable area\n"])
     rr, skipped = _two_pass(studio, tmp_path)
-    assert rr.code == -102 and not rr.ok and skipped and skipped["overridden"] is False
+    assert rr.code == -102 and not rr.ok and skipped and skipped["skipped"] is False
     assert "unprintable area" in skipped["report_line"] and "no unchecked pass ran" in skipped["report_line"]
     assert len(studio.calls) == 1
 
@@ -637,7 +650,7 @@ def test_no_check_pair_not_in_log_still_continues(tmp_path):
 def test_no_check_keeps_both_passes_logs_and_results(tmp_path):
     studio = SequenceStudio(make_3mf(tmp_path / "f.3mf", sliced=True), codes=[-101, 0], logs=[CONFLICT_LOG, ""])
     rr, skipped = _two_pass(studio, tmp_path)
-    assert rr.ok and skipped and skipped["overridden"]
+    assert rr.ok and skipped and skipped["skipped"]
     first, second = Path(skipped["first_log"]), Path(skipped["second_log"])
     assert first.parent != second.parent and first.is_file() and second.is_file()
     assert "gcode path conflicts" in first.read_text()
@@ -654,7 +667,7 @@ def test_no_check_checks_every_plate(tmp_path):
     assert [r for r in runs[0] if r.startswith("--slice")] == ["--slice=1"] and "--slice=3" in runs[2]
     assert "--no-check" in runs[3] and "--slice=0" in runs[3]
     assert rr.ok and skipped
-    assert [(p["plate"], p["kind"]) for p in skipped["plates"]] == [(1, "override"), (2, "ok"), (3, "override")]
+    assert [(p["plate"], p["kind"]) for p in skipped["plates"]] == [(1, "skippable"), (2, "ok"), (3, "skippable")]
     assert "plate 1: G-code path conflicts between a and b" in skipped["report_line"]
     assert "plate 3: G-code path conflicts between c and d" in skipped["report_line"]
 
@@ -664,7 +677,7 @@ def test_no_check_exception_exit_100_is_not_retried(tmp_path):
     studio = SequenceStudio(None, codes=[-100, 0], logs=[log])
     rr, skipped = _two_pass(studio, tmp_path)
     assert rr.code == -100 and len(studio.calls) == 1
-    assert skipped and skipped["overridden"] is False and "extruder_nozzle_stats size mismatch" in skipped["report_line"]
+    assert skipped and skipped["skipped"] is False and "extruder_nozzle_stats size mismatch" in skipped["report_line"]
 
 
 def test_no_check_slicing_warning_exit_100_is_retried(tmp_path):
@@ -750,12 +763,16 @@ def test_replace_mesh_same_bounds_other_topology_is_not_a_noop(tmp_path, geo_fil
     q = [a[0], a[1], a[2], b[1]]
     facets[0], facets[1] = (q[0], q[1], q[3]), (q[1], q[2], q[3])
     stl = M.write_stl(tmp_path / "flipped.stl", facets)
-    es = replace(geo_file, stl, tmp_path / "out.3mf")
-    assert any("triangles 12 -> 12" in n for n in es.notes)
+    replace(geo_file, stl, tmp_path / "out.3mf")
+    got = E.read_mesh(entries(tmp_path / "out.3mf")["3D/Objects/object_1.model"].decode(), "1")
+    new = E.load_stl(stl)
+    old = E.read_mesh(entries(geo_file)["3D/Objects/object_1.model"].decode(), "1")
+    assert E.canonical_triangles(got.vertices, got.triangles) == E.canonical_triangles(new.local, new.triangles)
+    assert E.canonical_triangles(got.vertices, got.triangles) != E.canonical_triangles(old.vertices, old.triangles)
 
 
 def test_failed_verification_leaves_the_original(tmp_path, geo_file, monkeypatch):
-    def broken(self, p):
+    def broken(self, p, before=None):
         raise E.EditError("re-open check: forced")
 
     monkeypatch.setattr(E.ReplaceMesh, "verify", broken)
@@ -834,6 +851,9 @@ def test_settings_patch_on_a_sliced_archive_declares_the_invalidation(tmp_path):
     PatchSet([SetBedType("Textured PEI Plate")]).apply(str(path), str(tmp_path / "a.3mf"))
     assert "Metadata/plate_1.gcode" not in entries(tmp_path / "a.3mf")
     E.EditSet([E.SetTower(120, 30)]).apply(str(path), str(tmp_path / "b.3mf"))  # declares SLICE_TOUCHES + model settings
+    b = entries(tmp_path / "b.3mf")
+    assert "Metadata/plate_1.gcode" not in b and "Metadata/plate_1.gcode.md5" not in b and "Metadata/plate_1.json" not in b
+    assert b"<plate" not in b["Metadata/slice_info.config"]
 
 
 @dataclass(frozen=True)
@@ -856,3 +876,250 @@ def test_undeclared_deletion_raises(tmp_path):
     with pytest.raises(ProjectError, match=r"Metadata/plate_1\.gcode"):
         E.EditSet([_DropsSlices()]).apply(str(path))
     assert path.read_bytes() == raw
+
+
+# ---------------------------------------------------------------------------- review round 2
+def _two_parts_sharing(path: Path) -> Path:
+    """Body with a second part (sub-object 1 again): two components of one object name the same mesh."""
+    rewrite(
+        path,
+        MODEL,
+        lambda t: t.replace(
+            '<component p:path="/3D/Objects/object_1.model" objectid="1" p:UUID="00010000-b206-40ff-9872-83e8017abed1" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>',
+            '<component p:path="/3D/Objects/object_1.model" objectid="1" p:UUID="00010000-b206-40ff-9872-83e8017abed1" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>\n'
+            '    <component p:path="/3D/Objects/object_1.model" objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 20"/>',
+        ),
+    )
+    return path
+
+
+def test_replace_mesh_refuses_a_mesh_shared_inside_one_object(tmp_path):
+    path = _two_parts_sharing(make_geo_3mf(tmp_path / "s.3mf"))
+    raw = path.read_bytes()
+    with pytest.raises(E.EditError, match="shares its mesh"):
+        replace(path, write_box_stl(tmp_path / "fine.stl", (0, 0, 0), (30, 20, 10), fine=True))
+    assert path.read_bytes() == raw
+
+
+def test_replace_mesh_refuses_mesh_shared_metadata(tmp_path):
+    path = make_geo_3mf(tmp_path / "m.3mf")
+    rewrite(
+        path,
+        "Metadata/model_settings.config",
+        lambda t: t.replace(
+            '<metadata key="name" value="label_1"/>',
+            '<metadata key="name" value="label_1"/>\n      <metadata key="mesh_shared" value="1"/>',
+        ),
+    )
+    with pytest.raises(E.EditError, match=r"shares its mesh with \['label'\]"):
+        replace(path, write_box_stl(tmp_path / "fine.stl", (0, 0, 0), (30, 20, 10), fine=True))
+    with pytest.raises(E.EditError, match="mesh_shared"):
+        E.EditSet([E.ReplaceMesh("label", str(write_box_stl(tmp_path / "l.stl", (-5, -5, 0), (5, 5, 2), fine=True)))]).apply(str(path))
+
+
+def test_add_filament_expands_one_entry_vectors(tmp_path):
+    path = make_geo_3mf(
+        tmp_path / "short.3mf",
+        filaments=2,
+        filament_colour=["#00AE42"],
+        filament_multi_colour=["#00AE42"],
+        filament_map=["1"],
+        pressure_advance=["0.02"],
+    )
+    ps = Project(str(path)).project_settings
+    slot = E.slot_from_preset(ps, NEW_PRESET)
+    es = E.EditSet([E.AddFilament(slot, "#FCECD6", 2)])
+    a, b = tmp_path / "a.3mf", tmp_path / "b.3mf"
+    es.apply(str(path), str(a))
+    new = Project(str(a)).project_settings
+    assert new["filament_colour"] == ["#00AE42", "#00AE42", "#FCECD6"]
+    assert new["filament_multi_colour"] == ["#00AE42", "#00AE42", "#FCECD6"]
+    assert new["filament_map"] == ["1", "1", "2"]
+    assert new["pressure_advance"] == ["0.02"] * 3
+    assert any("slot 1's value copied" in n and "pressure_advance" in n for n in es.notes) or any(
+        "copied from slot 1" in n and "pressure_advance" in n for n in es.notes
+    )
+    es.apply(str(a), str(b))  # the same request again: no fourth slot
+    assert len(Project(str(b)).project_settings["filament_settings_id"]) == 3
+    assert a.read_bytes() == b.read_bytes()
+
+
+def test_add_filament_variant_key_missing_from_the_preset_is_reported(tmp_path):
+    path = one_filament(tmp_path)
+    ps = Project(str(path)).project_settings
+    preset = {k: v for k, v in NEW_PRESET.items() if k != "nozzle_temperature"}
+    es = E.EditSet([E.AddFilament(E.slot_from_preset(ps, preset), "#FCECD6", 2)])
+    es.apply(str(path), str(tmp_path / "two.3mf"))
+    new = Project(str(tmp_path / "two.3mf")).project_settings
+    assert new["nozzle_temperature"] == ps["nozzle_temperature"] + [ps["nozzle_temperature"][0]] * 6
+    assert any("slot 1's value copied" in n and "nozzle_temperature" in n for n in es.notes)
+
+
+def test_move_uses_the_destination_plate_map(tmp_path):
+    path = make_geo_3mf(tmp_path / "p2.3mf", plates=2)
+
+    def plate2_reversed(t: str) -> str:
+        head, sep, tail = t.partition('<metadata key="plater_id" value="2"/>')
+        return head + sep + tail.replace('<metadata key="filament_maps" value="1 2"/>', '<metadata key="filament_maps" value="2 1"/>', 1)
+
+    rewrite(path, "Metadata/model_settings.config", plate2_reversed)
+    with pytest.raises(E.EditError, match="extruder 2"):  # body is filament 1, which plate 2 prints on extruder 2
+        E.EditSet([E.MoveObject("body", 10, 120, plate=2, strict=True)]).apply(str(path))
+    E.EditSet([E.MoveObject("body", 10, 120, strict=True)]).apply(str(path), str(tmp_path / "ok.3mf"))  # plate 1: extruder 1
+
+
+def test_move_checks_every_instance_of_a_neighbour(tmp_path):
+    path = make_geo_3mf(tmp_path / "inst.3mf")
+    rewrite(
+        path,
+        MODEL,
+        lambda t: t.replace(" </build>", '  <item objectid="4" transform="1 0 0 0 1 0 0 0 1 105 105 1" printable="1"/>\n </build>'),
+    )
+    rewrite(
+        path,
+        "Metadata/model_settings.config",
+        lambda t: t.replace(
+            "  </plate>",
+            '    <model_instance>\n      <metadata key="object_id" value="4"/>\n      <metadata key="instance_id" value="1"/>\n    </model_instance>\n  </plate>',
+        ),
+    )
+    es = E.EditSet([E.MoveObject("body", 90, 95)])
+    es.apply(str(path), str(tmp_path / "out.3mf"))
+    assert any("label (instance 1)" in n and "bounding boxes" in n for n in es.notes)
+    assert not any("label (instance 0)" in n for n in es.notes)
+
+
+def test_replace_mesh_anchor_min_keeps_a_sink(tmp_path):
+    path = make_geo_3mf(tmp_path / "sunk.3mf")
+    rewrite(path, MODEL, lambda t: t.replace('transform="1 0 0 0 1 0 0 0 1 55 60 5"', 'transform="1 0 0 0 1 0 0 0 1 55 60 3"'))
+    out = tmp_path / "out.3mf"
+    replace(path, write_box_stl(tmp_path / "fine.stl", (0, 0, 0), (30, 20, 10), fine=True), out, anchor="min")
+    lo, hi = box(out, "body")
+    assert (lo[0], lo[1], lo[2], hi[2]) == pytest.approx((GEO_BODY_AT[0], GEO_BODY_AT[1], -2.0, 8.0))
+
+
+def test_tower_footprint_must_fit_extruder_two(tmp_path, geo_file):
+    with pytest.raises(E.EditError, match=r"x 13\.\.64.*extruder 2"):  # x 21 passes the corner, not the 8 mm brim
+        E.EditSet([E.SetTower(21, 30)]).apply(str(geo_file))
+    E.EditSet([E.SetTower(29, 30)]).apply(str(geo_file), str(tmp_path / "ok.3mf"))
+
+
+def test_tower_refuses_non_finite_values(geo_file):
+    with pytest.raises(E.EditError, match="finite"):
+        E.EditSet([E.SetTower(float("nan"), 30)]).apply(str(geo_file))
+
+
+def test_final_combined_pass_is_classified(tmp_path):
+    studio = SequenceStudio(make_3mf(tmp_path / "f.3mf", sliced=True), codes=[0, 0, -101, 0], logs=["", "", CONFLICT_LOG, ""])
+    rr, skipped = _two_pass(studio, tmp_path, plates=(1, 2))
+    runs = [c[1] for c in studio.calls]
+    assert len(runs) == 4 and "--no-check" in runs[3]
+    assert rr.ok and skipped and skipped["skipped"]
+    assert [(p["plate"], p["kind"]) for p in skipped["plates"]] == [(1, "ok"), (2, "ok"), (0, "skippable")]
+    assert "all plates together: G-code path conflicts between a and b" in skipped["report_line"]
+
+
+def test_variant_lookup_maps_hybrid_to_standard():
+    ps = {
+        "filament_settings_id": ["a"],
+        "filament_map": ["1"],
+        "extruder_type": ["Direct Drive"],
+        "nozzle_volume_type": ["Hybrid"],
+        "filament_extruder_variant": list(VARIANTS),
+        "filament_self_index": ["1"] * 6,
+    }
+    assert E.variant_lookup(ps) == {1: 0}
+
+
+def test_relative_move_applied_twice_is_a_no_op(tmp_path, geo_file):
+    es = E.EditSet([E.MoveObject("body", 5, 5, relative=True)])
+    a, b = tmp_path / "a.3mf", tmp_path / "b.3mf"
+    d1 = es.apply(str(geo_file), str(a))
+    d2 = es.apply(str(a), str(b))
+    assert d1 == d2 == ["object 'body': moved to min corner (45, 55) on plate 1"]
+    assert a.read_bytes() == b.read_bytes()
+    assert box(b, "body")[0][:2] == pytest.approx((45, 55))
+
+
+def test_malformed_project_data_is_an_edit_error(tmp_path):
+    path = make_geo_3mf(tmp_path / "bad.3mf")
+    rewrite(path, MODEL, lambda t: t.replace('transform="1 0 0 0 1 0 0 0 1 55 60 5"', 'transform="1 0 0 0 1 0 0 0 1 55 sixty 5"'))
+    with pytest.raises(E.EditError, match="sixty"):
+        E.EditSet([E.MoveObject("body", 1, 1)]).apply(str(path))
+    path = make_geo_3mf(tmp_path / "bad2.3mf")
+    rewrite(path, "3D/Objects/object_1.model", lambda t: t.replace(' z="-5"/>', "/>", 1))
+    with pytest.raises(E.EditError, match="sub-object 1: a <vertex> or <triangle> lacks"):
+        E.EditSet([E.MoveObject("body", 1, 1)]).apply(str(path))
+
+
+def test_dry_run_checks_the_touches(geo_file):
+    with pytest.raises(ProjectError, match="did not declare"):
+        E.EditSet([_Sneaky()]).preview(str(geo_file))
+
+
+def test_frame_anchor_with_component_and_item_rotation(tmp_path):
+    path = make_geo_3mf(tmp_path / "rot.3mf")
+    rewrite(
+        path,
+        MODEL,
+        lambda t: t.replace('transform="1 0 0 0 1 0 0 0 1 55 60 5"', f'transform="{ROT90} 55 60 5"').replace(
+            'objectid="1" p:UUID="00010000-b206-40ff-9872-83e8017abed1" transform="1 0 0 0 1 0 0 0 1 0 0 0"',
+            f'objectid="1" p:UUID="00010000-b206-40ff-9872-83e8017abed1" transform="{ROT90} 0 0 0"',
+        ),
+    )
+    tf = item_tf(path, "2")
+    out = tmp_path / "out.3mf"
+    replace(path, write_box_stl(tmp_path / "longer.stl", (0, 0, 0), (36, 20, 10)), out, allow_size_change=True)
+    new = item_tf(out, "2")
+    assert [new[9 + i] - tf[9 + i] for i in range(3)] == pytest.approx([-3.0, 0.0, 0.0], abs=1e-6)  # 180 degrees: +3 in x -> -3
+
+
+def test_move_verify_checks_size_and_z(tmp_path, geo_file):
+    out = tmp_path / "out.3mf"
+    E.EditSet([E.MoveObject("body", 50, 60)]).apply(str(geo_file), str(out))
+    E.MoveObject("body", 50, 60).verify(Project(str(out)), Project(str(geo_file)))
+    rewrite(out, MODEL, lambda t: t.replace("1 0 0 0 1 0 0 0 1 65 70 5", "1 0 0 0 1 0 0 0 1 65 70 7"))
+    with pytest.raises(E.EditError, match="re-open check"):
+        E.MoveObject("body", 50, 60).verify(Project(str(out)), Project(str(geo_file)))
+
+
+def test_replace_mesh_verify_checks_the_written_triangles(tmp_path, geo_file):
+    stl = write_box_stl(tmp_path / "fine.stl", (0, 0, 0), (30, 20, 10), fine=True)
+    out = tmp_path / "out.3mf"
+    replace(geo_file, stl, out)
+    rm = E.ReplaceMesh("body", str(stl))
+    rm.verify(Project(str(out)), Project(str(geo_file)))
+    rewrite(
+        out, "3D/Objects/object_1.model", lambda t: t.replace('<triangle v1="0" v2="1" v3="2"/>', '<triangle v1="0" v2="2" v3="1"/>', 1)
+    )
+    with pytest.raises(E.EditError, match="re-open check"):
+        rm.verify(Project(str(out)), Project(str(geo_file)))
+
+
+@pytest.mark.xfail(reason=MAP_XFAIL, strict=False)
+def test_add_filament_then_map_keeps_the_blocks(tmp_path):
+    path = one_filament(tmp_path)
+    E.EditSet([add_patch(path), SetFilamentMap((1, 2))]).apply(str(path), str(tmp_path / "two.3mf"))
+    ps = Project(str(tmp_path / "two.3mf")).project_settings
+    assert ps["filament_self_index"] == ["1"] * 6 + ["2"] * 6 and len(ps["filament_extruder_variant"]) == 12
+    assert E.variant_lookup(ps) == {1: 0, 2: 9}
+
+
+def test_studio_hatch_contains_every_path(tmp_path):
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "x.3mf").write_bytes(b"")
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    (root / "link.json").symlink_to(outside)
+    (root / "a.json").write_text(json.dumps({"plates": [{"objects": [{"path": str(tmp_path / "far.stl")}]}]}))
+    for bad, msg in [
+        (["--load-settings", str(outside), "--slice", "1", "x.3mf"], "outside the working tree"),
+        (["--load-settings", "../outside.json", "--slice", "1", "x.3mf"], "outside the working tree"),
+        (["--load-settings", "link.json", "--slice", "1", "x.3mf"], "outside the working tree"),
+        (["--load-filaments", "x.json;../outside.json", "--slice", "1", "x.3mf"], "outside the working tree"),
+        (["--load-assemble-list", "a.json", "--slice", "1"], "assemble-list model path"),
+        (["--slice", "oops", "x.3mf"], "whole number"),
+    ]:
+        with pytest.raises(StudioError, match=msg):
+            CliCommand.parse(bad, root)

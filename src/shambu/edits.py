@@ -18,8 +18,15 @@ Format facts (reference 03 section 2, and `03-3mf-format.md` "Project edits"):
   `filament_extruder_variant[i]` (PrintConfig.cpp:8022-8052); a short vector silently gives filament N+1 the values
   of filament 1, so every per-filament vector is extended and checked.
 
-This module is planning core: no zipfile, no subprocess. It computes the new bytes and `threemf.Project` writes
-them. The Studio run that normalises a new filament slot happens in the CLI layer, which hands `FilamentSlot` in.
+Design: each edit is a frozen dataclass Command (`apply`, `describe`, `touches`, `verify`) that the `EditSet`
+Composite runs, like `patches.py`. Reading is ElementTree; writing is targeted text substitution of the one `<mesh>`
+or `transform` attribute, so every other byte of an entry stays. The STL and the preset are read through `mesh.py`
+and the caller; the clearance test is one injectable function (`CLEARANCE`).
+
+This module is planning core: no zipfile, no subprocess, and it writes no file itself. It computes the new bytes;
+`threemf.Project.save()` writes the temporary archive, runs the verify hook on it and renames it (its atomic writer
+owns every os.replace, chmod and unlink). The Studio runs that normalise a new filament slot happen in `runs.py`,
+which hands a `FilamentSlot` in.
 
 Not here: multi-instance objects (a GUI clone), painting, mesh repair, adding or removing objects.
 """
@@ -28,7 +35,6 @@ from __future__ import annotations
 
 import copy
 import math
-import os
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Sequence
@@ -49,7 +55,7 @@ SLICE_TOUCHES = frozenset({"Metadata/plate_*.gcode", "Metadata/plate_*.gcode.md5
 SIZE_TOL = 0.05  # mm per axis before a replacement counts as a size change
 FRAME_TOL = 1.0  # mm the world centre may move under --anchor frame with an unchanged size
 PLATE_GAP = 1.2  # 1 + LOGICAL_PART_PLATE_GAP (PartPlate.cpp:56)
-TOWER_BRIM = 8.0  # the CLI's tower footprint margin estimate (BambuStudio.cpp:4481-4486)
+TOWER_BRIM = 8.0  # the brim around the tower in the CLI's footprint estimate (BambuStudio.cpp:4481-4486)
 TOWER_MIN_WIDTH = 35.0
 PLACEHOLDER_FLUSH = "600"  # mm3 per change when Studio did not compute the matrix (only without Studio)
 # Per-filament project keys that the CLI does not grow on --load-filaments (D report, Q2 table)
@@ -85,7 +91,8 @@ _SPECIAL_KEYS = {
 
 
 class EditError(ProjectError):
-    """An edit's self-check failed (size change, no-op, paint, off the bed). The input file is unchanged."""
+    """An edit was refused or its self-check failed (unknown object, a plate out of range, a size change, a no-op,
+    paint, off the bed, malformed project data). The input file is unchanged. The CLI maps it to exit 1."""
 
 
 # ---------------------------------------------------------------------------- transforms
@@ -93,9 +100,12 @@ def parse_transform(text: str | None) -> list[float]:
     """The 12 numbers of a 3MF transform; identity when absent."""
     if not text:
         return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-    vals = [float(x) for x in text.split()]
-    if len(vals) != 12:
-        raise ProjectError(f"transform {text!r} does not hold 12 numbers")
+    try:
+        vals = [float(x) for x in text.split()]
+    except ValueError as e:
+        raise EditError(f"transform {text!r} holds a value that is not a number ({e})") from e
+    if len(vals) != 12 or not all(math.isfinite(v) for v in vals):
+        raise EditError(f"transform {text!r} does not hold 12 finite numbers")
     return vals
 
 
@@ -130,7 +140,7 @@ def _inverse3(m: list[list[float]]) -> list[list[float]]:
     g, h, i = m[2]
     det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
     if abs(det) < 1e-12:
-        raise ProjectError("a transform is singular")
+        raise EditError("a transform is singular")
     return [
         [(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
         [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
@@ -155,7 +165,7 @@ def _bbox(points: Iterable[Vec]) -> tuple[Vec, Vec]:
         ys.append(p[1])
         zs.append(p[2])
     if not xs:
-        raise ProjectError("a mesh has no vertices")
+        raise EditError("a mesh has no vertices")
     return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
 
 
@@ -205,9 +215,10 @@ class _Obj:
     oid: str
     name: str
     ms: ET.Element  # <object> in model_settings.config
-    item_text: str | None  # the build item's transform attribute
+    item_text: str | None  # the first build item's transform attribute
     n_items: int
     comps: list[_Comp]
+    item_texts: list[str | None] = field(default_factory=list)  # every build item, in build order (instance ids)
 
     @property
     def item(self) -> list[float]:
@@ -229,16 +240,16 @@ def _root(project: Project) -> ET.Element:
     try:
         return ET.fromstring(project.read(MODEL))
     except ET.ParseError as e:
-        raise ProjectError(f"{project.path}: {MODEL} is not valid XML ({e})") from e
+        raise EditError(f"{project.path}: {MODEL} is not valid XML ({e})") from e
 
 
 def find_object(project: Project, name: str) -> _Obj:
     hits = [o for o in project.model_settings.findall("object") if _meta(o, "name") == name]
     if not hits:
         names = [_meta(o, "name") for o in project.model_settings.findall("object")]
-        raise ProjectError(f"no object named {name!r}; objects: {names}")
+        raise EditError(f"no object named {name!r}; objects: {names}")
     if len(hits) > 1:
-        raise ProjectError(f"{len(hits)} objects named {name!r}; rename them first (shambu patch --rename-object)")
+        raise EditError(f"{len(hits)} objects named {name!r}; rename them first (shambu patch --rename-object)")
     return _object(project, hits[0], _root(project))
 
 
@@ -246,15 +257,16 @@ def _object(project: Project, ms: ET.Element, root: ET.Element) -> _Obj:
     oid = ms.get("id") or ""
     res = next((o for o in root.iter(f"{{{NS_CORE}}}object") if o.get("id") == oid), None)
     if res is None:
-        raise ProjectError(f"object id {oid} is in model_settings.config but not in {MODEL}")
+        raise EditError(f"object id {oid} is in model_settings.config but not in {MODEL}")
     comps = [
         _Comp((c.get(f"{{{NS_PROD}}}path") or "").lstrip("/"), c.get("objectid") or "", c.get("transform"))
         for c in res.iter(f"{{{NS_CORE}}}component")
     ]
     if not comps or any(not c.path for c in comps):
-        raise ProjectError(f"object {_meta(ms, 'name')!r} holds its mesh in {MODEL}, not in a sub-model: not a Bambu Studio layout")
+        raise EditError(f"object {_meta(ms, 'name')!r} holds its mesh in {MODEL}, not in a sub-model: not a Bambu Studio layout")
     items = [i for i in root.iter(f"{{{NS_CORE}}}item") if i.get("objectid") == oid]
-    return _Obj(oid, _meta(ms, "name") or "", ms, items[0].get("transform") if items else None, len(items), comps)
+    texts = [i.get("transform") for i in items]
+    return _Obj(oid, _meta(ms, "name") or "", ms, texts[0] if texts else None, len(items), comps, texts)
 
 
 def read_mesh(text: str, sub_id: str) -> _Mesh:
@@ -262,24 +274,29 @@ def read_mesh(text: str, sub_id: str) -> _Mesh:
     byte-identical outside the span)."""
     m = re.search(rf'<object\b[^>]*\bid="{re.escape(sub_id)}"[^>]*>', text)
     if m is None:
-        raise ProjectError(f"sub-object {sub_id} not found in its sub-model")
+        raise EditError(f"sub-object {sub_id} not found in its sub-model")
     start = text.find("<mesh>", m.end())
     end = text.find("</mesh>", start)
     nxt = text.find("<object", m.end())
     if start < 0 or end < 0 or (0 <= nxt < start):
-        raise ProjectError(f"sub-object {sub_id} has no <mesh>")
+        raise EditError(f"sub-object {sub_id} has no <mesh>")
     end += len("</mesh>")
     body = text[start:end]
     verts: list[Vec] = []
-    for vm in re.finditer(r"<vertex\b([^>]*)/>", body):
-        a = dict(_ATTR.findall(vm.group(1)))
-        verts.append((float(a["x"]), float(a["y"]), float(a["z"])))
     tris: list[tuple[int, int, int]] = []
     paint = False
-    for tm in re.finditer(r"<triangle\b([^>]*)/>", body):
-        a = dict(_ATTR.findall(tm.group(1)))
-        tris.append((int(a["v1"]), int(a["v2"]), int(a["v3"])))
-        paint = paint or any(k.startswith("paint_") or k == "face_property" for k in a)
+    try:
+        for vm in re.finditer(r"<vertex\b([^>]*)/>", body):
+            a = dict(_ATTR.findall(vm.group(1)))
+            verts.append((float(a["x"]), float(a["y"]), float(a["z"])))
+        for tm in re.finditer(r"<triangle\b([^>]*)/>", body):
+            a = dict(_ATTR.findall(tm.group(1)))
+            tris.append((int(a["v1"]), int(a["v2"]), int(a["v3"])))
+            paint = paint or any(k.startswith("paint_") or k == "face_property" for k in a)
+    except (KeyError, ValueError) as e:
+        raise EditError(f"sub-object {sub_id}: a <vertex> or <triangle> lacks a coordinate or index, or holds a non-number ({e!r})") from e
+    if any(not 0 <= i < len(verts) for t in tris for i in t):
+        raise EditError(f"sub-object {sub_id}: a triangle names a vertex index out of range (Studio: 'invalid vertex id')")
     return _Mesh(verts, tris, paint, (start, end))
 
 
@@ -297,7 +314,7 @@ def _text(project: Project, name: str) -> str:
     try:
         return project.read(name).decode("utf-8")
     except UnicodeDecodeError as e:
-        raise ProjectError(f"{project.path}: {name} is not UTF-8 ({e})") from e
+        raise EditError(f"{project.path}: {name} is not UTF-8 ({e})") from e
 
 
 def _sub_item_transform(text: str, oid: str, new_text: str) -> str:
@@ -305,7 +322,7 @@ def _sub_item_transform(text: str, oid: str, new_text: str) -> str:
     pat = re.compile(rf'<item\b[^>]*\bobjectid="{re.escape(oid)}"[^>]*?/?>')
     hits = pat.findall(text)
     if len(hits) != 1:
-        raise ProjectError(f"{len(hits)} build items for object id {oid}: a moved or replaced object needs exactly one")
+        raise EditError(f"{len(hits)} build items for object id {oid}: a moved or replaced object needs exactly one")
 
     def fix(m: re.Match) -> str:
         tag = m.group(0)
@@ -319,7 +336,7 @@ def _sub_item_transform(text: str, oid: str, new_text: str) -> str:
 def _sub_component_transform(text: str, oid: str, sub_id: str, new_text: str) -> str:
     om = re.search(rf'<object\b[^>]*\bid="{re.escape(oid)}"[^>]*>.*?</object>', text, re.S)
     if om is None:
-        raise ProjectError(f"object id {oid} not found in {MODEL}")
+        raise EditError(f"object id {oid} not found in {MODEL}")
     block = om.group(0)
     pat = re.compile(rf'<component\b[^>]*\bobjectid="{re.escape(sub_id)}"[^>]*?/>')
 
@@ -331,7 +348,7 @@ def _sub_component_transform(text: str, oid: str, sub_id: str, new_text: str) ->
 
     new_block, n = pat.subn(fix, block, count=1)
     if n != 1:
-        raise ProjectError(f"component {sub_id} of object {oid} not found")
+        raise EditError(f"component {sub_id} of object {oid} not found")
     return text[: om.start()] + new_block + text[om.end() :]
 
 
@@ -351,13 +368,15 @@ class _Geometry:
             self._meshes[key] = read_mesh(self._texts[comp.path], comp.sub_id)
         return self._meshes[key]
 
-    def world_box(self, obj: _Obj, item: Sequence[float] | None = None, override: dict[str, list[Vec]] | None = None) -> tuple[Vec, Vec]:
-        """World bbox of an object: every component's vertices through component then item. `override` replaces the
+    def world_box(
+        self, obj: _Obj, item: Sequence[float] | None = None, replace_verts: dict[str, list[Vec]] | None = None
+    ) -> tuple[Vec, Vec]:
+        """World bbox of an object: every component's vertices through component then item. `replace_verts` replaces the
         vertices of a sub-object id, `item` the item transform."""
         t_item = obj.item if item is None else list(item)
         pts: list[Vec] = []
         for c in obj.comps:
-            verts = (override or {}).get(c.sub_id) or self.mesh(c).vertices
+            verts = (replace_verts or {}).get(c.sub_id) or self.mesh(c).vertices
             full = _compose(t_item, c.transform)
             pts += [_apply(full, v) for v in verts]
         return _bbox(pts)
@@ -382,6 +401,19 @@ def _plates(project: Project) -> list[ET.Element]:
     return project.model_settings.findall("plate")
 
 
+def _instance_plates(project: Project, oid: str) -> dict[int, int]:
+    """instance_id -> 1-based plate position, from the plates' <model_instance> elements."""
+    out: dict[int, int] = {}
+    for i, p in enumerate(_plates(project), 1):
+        for mi in p.findall("model_instance"):
+            if _meta(mi, "object_id") == oid:
+                try:
+                    out[int(_meta(mi, "instance_id") or 0)] = i
+                except ValueError as e:
+                    raise EditError(f"plate {i}: model_instance of object {oid} has instance_id {_meta(mi, 'instance_id')!r}") from e
+    return out
+
+
 def _plate_of(project: Project, oid: str) -> int:
     """1-based position of the plate holding object `oid` (plate order in model_settings.config)."""
     for i, p in enumerate(_plates(project), 1):
@@ -404,22 +436,29 @@ def _origin(project: Project, plate: int) -> tuple[float, float]:
 
 def _object_filaments(project: Project, obj: _Obj) -> tuple[int, set[int]]:
     """The object's filament and the others it uses: part extruders, support filaments, height-range extruders."""
-    main = int(_meta(obj.ms, "extruder") or 1)
+
+    def slot(v: str | None, where: str) -> int:
+        try:
+            return int(float(v or 0))
+        except ValueError as e:
+            raise EditError(f"object {obj.name!r}: {where} is {v!r}, not a filament slot number") from e
+
+    main = slot(_meta(obj.ms, "extruder"), "extruder") or 1
     also: set[int] = set()
     for part in obj.ms.findall("part"):
         if part.get("subtype") in (None, "normal_part", "modifier_part"):
-            e = _meta(part, "extruder")
-            if e and e != "0":
-                also.add(int(e))
+            e = slot(_meta(part, "extruder"), f"part {_meta(part, 'name')!r} extruder")
+            if e:
+                also.add(e)
     for k in ("support_filament", "support_interface_filament", "wall_filament", "sparse_infill_filament", "solid_infill_filament"):
-        v = _meta(obj.ms, k) or str(project.project_settings.get(k, "0"))
-        if v not in ("", "0"):
-            also.add(int(float(v)))
+        e = slot(_meta(obj.ms, k) or str(project.project_settings.get(k, "0")), k)
+        if e:
+            also.add(e)
     idx = _build_index(project, obj.oid)
     for r in _ranges(project, idx):
-        e = r.get("extruder")
-        if e and e != "0":
-            also.add(int(float(e)))
+        e = slot(r.get("extruder"), f"height range {r['min_z']}..{r['max_z']} extruder")
+        if e:
+            also.add(e)
     return main, also - {main}
 
 
@@ -431,7 +470,10 @@ def _build_index(project: Project, oid: str) -> int:
 def _ranges(project: Project, build_index: int) -> list[dict]:
     if not project.has(LAYER_RANGES) or not build_index:
         return []
-    root = ET.fromstring(project.read(LAYER_RANGES))
+    try:
+        root = ET.fromstring(project.read(LAYER_RANGES))
+    except ET.ParseError as e:
+        raise EditError(f"{project.path}: {LAYER_RANGES} is not valid XML ({e})") from e
     out = []
     for o in root.findall("object"):
         if o.get("id") == str(build_index):
@@ -442,9 +484,22 @@ def _ranges(project: Project, build_index: int) -> list[dict]:
     return out
 
 
-def _context(project: Project) -> L.Context:
+def plate_filament_map(project: Project, plate: int | None) -> list[int]:
+    """The filament -> extruder map that slices plate `plate`: the plate's own `filament_maps` when it has one, else the
+    project's `filament_map` (PartPlate.cpp:288 get_real_filament_maps)."""
     ps = project.project_settings
-    fmap = [int(v) for v in ps.get("filament_map") or []]
+    raw = None
+    if plate is not None and 1 <= plate <= len(_plates(project)):
+        raw = (_meta(_plates(project)[plate - 1], "filament_maps") or "").split() or None
+    try:
+        return [int(v) for v in (raw or ps.get("filament_map") or [])]
+    except ValueError as e:
+        raise EditError(f"plate {plate}: the filament map {raw or ps.get('filament_map')} holds a non-number") from e
+
+
+def _context(project: Project, plate: int | None = None) -> L.Context:
+    ps = project.project_settings
+    fmap = plate_filament_map(project, plate)
     tpu = {i for i, t in enumerate(ps.get("filament_type") or [], 1) if "TPU" in str(t)}
     return L.Context(_bed(project), {i + 1: e for i, e in enumerate(fmap)}, tpu)
 
@@ -478,27 +533,30 @@ CLEARANCE: Callable[[L.Placed, L.Placed], bool] = bbox_clear
 def layout_checks(
     project: Project, obj: _Obj, lo: Vec, hi: Vec, plate: int, geo: _Geometry, clear: Callable[[L.Placed, L.Placed], bool] | None = None
 ) -> list[L.Check]:
-    """Bed edges, extruder reach (every filament the object uses) and clearance to the other objects of the plate
-    (`clear`, default CLEARANCE: bounding boxes with brim margins). The slice is the real clash test; these lines say
-    what to look at."""
+    """Bed edges, extruder reach (every filament the object uses, through the plate's own filament map) and clearance
+    to every instance of every other object on the plate (`clear`, default CLEARANCE: bounding boxes with brim margins).
+    The slice is the real clash test; these lines say what to look at."""
     clear = clear or CLEARANCE
     origin = _origin(project, plate)
     main, also = _object_filaments(project, obj)
     me = _placed(obj.name, lo, hi, origin, main, also, _margin(project, obj))
-    ctx = _context(project)
+    ctx = _context(project, plate)
     checks = list(L.InsideBed().check([me], ctx)) + list(L.ExtruderReach().check([me], ctx))
     root = _root(project)
     for o in project.model_settings.findall("object"):
-        if o.get("id") == obj.oid or _plate_of(project, o.get("id") or "") != plate:
+        if o.get("id") == obj.oid:
             continue
         other = _object(project, o, root)
-        if other.n_items != 1:
-            continue
-        olo, ohi = geo.world_box(other)
+        where = _instance_plates(project, other.oid)
         om, oa = _object_filaments(project, other)
-        them = _placed(other.name, olo, ohi, origin, om, oa, _margin(project, other))
-        if not clear(me, them):
-            checks.append(L.Check(False, f"{me.key} and {them.key} overlap (footprints with brim margins)"))
+        for k, text in enumerate(other.item_texts or [other.item_text]):
+            if where.get(k, _plate_of(project, other.oid)) != plate:
+                continue
+            olo, ohi = geo.world_box(other, parse_transform(text))
+            label = other.name if other.n_items <= 1 else f"{other.name} (instance {k})"
+            them = _placed(label, olo, ohi, origin, om, oa, _margin(project, other))
+            if not clear(me, them):
+                checks.append(L.Check(False, f"{me.key} and {them.key} overlap (bounding boxes with brim margins)"))
     return checks
 
 
@@ -517,7 +575,7 @@ def load_stl(path: str | Path, rotate: Vec = (0.0, 0.0, 0.0), lay_on_face: Vec |
     try:
         facets = M.read_stl(path)
     except BambuError as e:
-        raise ProjectError(f"replacement mesh: {e}") from e
+        raise EditError(f"replacement mesh: {e}") from e
     o = M.Orientation(lay_on_face, rotate)
     if not o.is_identity:
         facets = M.transform(facets, o.matrix())
@@ -592,39 +650,45 @@ class ReplaceMesh:
 
     def _target(self, p: Project) -> tuple[_Obj, ET.Element, _Comp]:
         if self.anchor not in ("frame", "centre", "min"):
-            raise ProjectError(f"--anchor must be frame, centre or min, not {self.anchor!r}")
+            raise EditError(f"--anchor must be frame, centre or min, not {self.anchor!r}")
         obj = find_object(p, self.object_name)
         if obj.n_items != 1:
-            raise ProjectError(f"object {self.object_name!r} has {obj.n_items} build items: multi-instance objects are not supported")
+            raise EditError(f"object {self.object_name!r} has {obj.n_items} build items: multi-instance objects are not supported")
         parts = obj.ms.findall("part")
         if self.part_name is not None:
             parts = [x for x in parts if _meta(x, "name") == self.part_name]
             if len(parts) != 1:
-                raise ProjectError(f"{len(parts)} parts named {self.part_name!r} in {self.object_name!r}")
+                raise EditError(f"{len(parts)} parts named {self.part_name!r} in {self.object_name!r}")
         elif len(parts) != 1:
             names = [_meta(x, "name") for x in parts]
-            raise ProjectError(f"object {self.object_name!r} has {len(parts)} parts {names}: name one as OBJECT/PART")
+            raise EditError(f"object {self.object_name!r} has {len(parts)} parts {names}: name one as OBJECT/PART")
         part = parts[0]
         comp = next((c for c in obj.comps if c.sub_id == part.get("id")), None)
         if comp is None:
-            raise ProjectError(f"part id {part.get('id')} of {self.object_name!r} has no component in {MODEL}")
-        # Studio shares one mesh resource between identical volumes (bbs_3mf.cpp:7353-7367, loaded at 5271-5313):
-        # rewriting it would change every object that references it.
-        users = []
+            raise EditError(f"part id {part.get('id')} of {self.object_name!r} has no component in {MODEL}")
+        # Studio shares one mesh resource between identical volumes (bbs_3mf.cpp:7353-7367, loaded at 5271-5313): two
+        # components (of two objects, or two parts of one object) name the same sub-object, or a part carries the
+        # `mesh_shared` metadata the reader follows (bbs_3mf.cpp:5282-5313). Rewriting the mesh would change every
+        # volume that references it. (`source_object_id` is not the sharing mechanism, bbs_3mf.cpp:5450.)
+        if _meta(part, "mesh_shared") is not None:
+            raise EditError(
+                f"part of {self.object_name!r} carries mesh_shared {_meta(part, 'mesh_shared')!r}: its mesh is shared; replacing it is "
+                "not supported in this release"
+            )
+        refs: list[str] = []
         root = _root(p)
         for o in root.iter(f"{{{NS_CORE}}}object"):
             for c in o.iter(f"{{{NS_CORE}}}component"):
-                if (
-                    (c.get(f"{{{NS_PROD}}}path") or "").lstrip("/") == comp.path
-                    and c.get("objectid") == comp.sub_id
-                    and o.get("id") != obj.oid
-                ):
-                    users.append(o.get("id") or "")
-        if users:
-            names = [_meta(o, "name") for o in p.model_settings.findall("object") if o.get("id") in users]
-            raise EditError(
-                f"object {self.object_name!r} shares its mesh with {names or users}; replacing it is not supported in this release"
+                if (c.get(f"{{{NS_PROD}}}path") or "").lstrip("/") == comp.path and c.get("objectid") == comp.sub_id:
+                    refs.append(o.get("id") or "")
+        sharers = [m for m in p.model_settings.findall("object") for x in m.findall("part") if _meta(x, "mesh_shared") == comp.sub_id]
+        if len(refs) > 1 or sharers:
+            others = sorted(
+                {_meta(o, "name") or "" for o in p.model_settings.findall("object") if o.get("id") in refs and o.get("id") != obj.oid}
             )
+            others += sorted({_meta(m, "name") or "" for m in sharers})
+            who = others or [f"another part of {self.object_name!r}"]
+            raise EditError(f"object {self.object_name!r} shares its mesh with {who}; replacing it is not supported in this release")
         return obj, part, comp
 
     def resolve_touches(self, p: Project) -> frozenset[str]:
@@ -684,14 +748,17 @@ class ReplaceMesh:
                 raise EditError(
                     f"part of '{self.object_name}' has no source_offset_*: the STL frame is unknown; pass --anchor centre or min"
                 )
-            s_old = tuple(float(v) for v in offs if v is not None)
+            try:
+                s_old = tuple(float(v) for v in offs if v is not None)
+            except ValueError as e:
+                raise EditError(f"part of '{self.object_name}': source_offset_* {offs} is not numeric") from e
             d = (new.centre[0] - s_old[0], new.centre[1] - s_old[1], new.centre[2] - s_old[2])
             shift = _mv(lin, d)
         elif self.anchor == "centre":
             co, cn = _centre(*part_old), _centre(*part_new0)
             shift = (co[0] - cn[0], co[1] - cn[1], co[2] - cn[2])
         else:
-            shift = (part_old[0][0] - part_new0[0][0], part_old[0][1] - part_new0[0][1], 0.0)
+            shift = (part_old[0][0] - part_new0[0][0], part_old[0][1] - part_new0[0][1], part_old[0][2] - part_new0[0][2])
         new_item, new_ctf = list(item), list(ctf)
         single = len(obj.comps) == 1
         if single:
@@ -763,8 +830,8 @@ class ReplaceMesh:
             if not c.ok:
                 p.notes.append(f"  WARN: {c.text}")
 
-    def verify(self, p: Project) -> None:
-        """Re-open check: the object's sub-mesh has the STL's triangle count and its centred bbox."""
+    def verify(self, p: Project, before: Project | None = None) -> None:
+        """Re-open check: the object's sub-mesh has the STL's triangle count, its centred bbox and its triangles."""
         _, _, comp = self._target(p)
         new = load_stl(self.stl, self.rotate, self.lay_on_face)
         got = read_mesh(_text(p, comp.path), comp.sub_id)
@@ -795,13 +862,23 @@ class MoveObject:
         to = f"by ({self.x:+g}, {self.y:+g}) mm" if self.relative else f"to min corner ({self.x:g}, {self.y:g})"
         return f"object '{self.object_name}': moved {to}" + (f" on plate {self.plate}" if self.plate else "")
 
+    def absolute(self, p: Project) -> MoveObject:
+        """The same move as an absolute min-corner target on `p` (EditSet resolves a relative move against its input
+        once, so the PatchSet records the target and applying it again is a no-op)."""
+        if not self.relative:
+            return self
+        _, _, dst, _, _, (tx, ty) = self.target(p)
+        return MoveObject(self.object_name, round(tx, 6), round(ty, 6), False, self.plate or dst, self.strict)
+
     def target(self, p: Project) -> tuple[_Obj, int, int, Vec, Vec, tuple[float, float]]:
+        if not (math.isfinite(self.x) and math.isfinite(self.y)):
+            raise EditError(f"--move {self.object_name}: {self.x}, {self.y} are not finite numbers")
         obj = find_object(p, self.object_name)
         if obj.n_items != 1:
-            raise ProjectError(f"object {self.object_name!r} has {obj.n_items} build items: multi-instance objects are not supported")
+            raise EditError(f"object {self.object_name!r} has {obj.n_items} build items: multi-instance objects are not supported")
         n_plates = len(_plates(p))
         if self.plate is not None and not 1 <= self.plate <= max(n_plates, 1):
-            raise ProjectError(f"plate {self.plate} does not exist: the project has {n_plates} plate(s)")
+            raise EditError(f"plate {self.plate} does not exist: the project has {n_plates} plate(s)")
         geo = _Geometry(p)
         lo, hi = geo.world_box(obj)
         cur = _plate_of(p, obj.oid)
@@ -818,7 +895,7 @@ class MoveObject:
         o_dst = _origin(p, dst)
         dx, dy = tx + o_dst[0] - lo[0], ty + o_dst[1] - lo[1]
         size = _size(lo, hi)
-        if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+        if abs(dx) > 5e-6 or abs(dy) > 5e-6:  # below the 1e-6 rounding of a resolved relative target: no move
             t = obj.item
             t[9] += dx
             t[10] += dy
@@ -826,7 +903,9 @@ class MoveObject:
             p.invalidate_slices()
         if dst != cur:
             plates = _plates(p)
-            mi = next(m for m in plates[cur - 1].findall("model_instance") if _meta(m, "object_id") == obj.oid)
+            mi = next((m for m in plates[cur - 1].findall("model_instance") if _meta(m, "object_id") == obj.oid), None)
+            if mi is None:
+                raise EditError(f"plate {cur} holds no model_instance of '{self.object_name}': cannot move it to plate {dst}")
             plates[cur - 1].remove(mi)
             plates[dst - 1].append(mi)
             p.touch_model_settings()
@@ -848,16 +927,24 @@ class MoveObject:
         if fails and self.strict:
             raise EditError(f"--strict: the move of '{self.object_name}' breaks a layout rule: " + "; ".join(c.text for c in fails))
 
-    def verify(self, p: Project) -> None:
+    def verify(self, p: Project, before: Project | None = None) -> None:
+        """Re-open check: the min corner is the target, and the size and z range are those of `before`."""
         if self.relative:
-            return  # the target came from the old position; the dry run and the note show it
+            raise EditError("a relative move reached verify(): EditSet resolves it to an absolute target first")
         obj = find_object(p, self.object_name)
-        lo, _ = _Geometry(p).world_box(obj)
+        lo, hi = _Geometry(p).world_box(obj)
         o = _origin(p, _plate_of(p, obj.oid))
         if abs(lo[0] - o[0] - self.x) > 1e-3 or abs(lo[1] - o[1] - self.y) > 1e-3:
             raise EditError(
                 f"re-open check: '{self.object_name}' min corner is ({lo[0] - o[0]:.4f}, {lo[1] - o[1]:.4f}), not ({self.x}, {self.y})"
             )
+        if before is not None:
+            blo, bhi = world_box(before, self.object_name)
+            if any(abs(a - b) > 1e-3 for a, b in zip(_size(lo, hi), _size(blo, bhi), strict=True)) or abs(lo[2] - blo[2]) > 1e-3:
+                raise EditError(
+                    f"re-open check: '{self.object_name}' is {_v3(_size(lo, hi))} mm from z {lo[2]:.3f}, it was "
+                    f"{_v3(_size(blo, bhi))} mm from z {blo[2]:.3f}"
+                )
 
 
 @dataclass(frozen=True)
@@ -874,9 +961,11 @@ class SetTower:
 
     def apply(self, p: Project) -> None:
         ps = p.project_settings
+        if not (math.isfinite(self.x) and math.isfinite(self.y)):
+            raise EditError(f"--tower {self.x},{self.y}: not finite numbers")
         n_plates = max(len(_plates(p)), 1)
         if self.plate is not None and not 1 <= self.plate <= n_plates:
-            raise ProjectError(f"plate {self.plate} does not exist: the project has {n_plates} plate(s)")
+            raise EditError(f"plate {self.plate} does not exist: the project has {n_plates} plate(s)")
         if p.n_filaments() < 2 or str(ps.get("enable_prime_tower", "1")) in ("0", "false"):
             raise EditError(
                 f"the project uses {p.n_filaments()} filament(s) with enable_prime_tower {ps.get('enable_prime_tower', '1')!r}: "
@@ -889,19 +978,21 @@ class SetTower:
         except (TypeError, ValueError):
             w = TOWER_MIN_WIDTH
         x0, x1, y0, y1 = self.x - TOWER_BRIM, self.x + w + TOWER_BRIM, self.y - TOWER_BRIM, self.y + w + TOWER_BRIM
+        foot = (
+            f"the tower at ({self.x:g}, {self.y:g}) with width {w:g} and a {TOWER_BRIM:g} mm brim spans x {x0:g}..{x1:g} y {y0:g}..{y1:g}"
+        )
         if x0 < bed["x"][0] or x1 > bed["x"][1] or y0 < bed["y"][0] or y1 > bed["y"][1]:
-            raise EditError(
-                f"the tower at ({self.x:g}, {self.y:g}) with width {w:g} and an {TOWER_BRIM:g} mm margin spans x {x0:g}..{x1:g} "
-                f"y {y0:g}..{y1:g}, off the bed x {bed['x'][0]:g}..{bed['x'][1]:g} y {bed['y'][0]:g}..{bed['y'][1]:g}"
-            )
-        used = {str(v) for v in ps.get("filament_map") or []}
-        for pl in _plates(p):
-            used |= set((_meta(pl, "filament_maps") or "").split())
-        if "2" in used and len(facts["extruders"]) > 1:
-            reach = facts["extruders"][1]["x"][0]
-            if self.x < reach:
+            raise EditError(f"{foot}, off the bed x {bed['x'][0]:g}..{bed['x'][1]:g} y {bed['y'][0]:g}..{bed['y'][1]:g}")
+        plates = [self.plate] if self.plate else list(range(1, n_plates + 1))
+        used = {e for pl in plates for e in plate_filament_map(p, pl)}
+        for e in sorted(used):
+            if not 1 <= e <= len(facts["extruders"]):
+                continue
+            r = facts["extruders"][e - 1]
+            if x0 < r["x"][0] or x1 > r["x"][1] or y0 < r["y"][0] or y1 > r["y"][1]:
                 raise EditError(
-                    f"the tower x {self.x:g} is left of extruder 2's reach x >= {reach:g}, and the project maps a filament to extruder 2"
+                    f"{foot}, outside extruder {e}'s reach x {r['x'][0]:g}..{r['x'][1]:g} y {r['y'][0]:g}..{r['y'][1]:g}, and a "
+                    f"filament on {'plate ' + str(self.plate) if self.plate else 'the project'} maps to extruder {e}"
                 )
         for key, v in (("wipe_tower_x", self.x), ("wipe_tower_y", self.y)):
             old = ps.get(key)
@@ -920,7 +1011,7 @@ class SetTower:
             f"x {x0:g}..{x1:g} y {y0:g}..{y1:g}; Studio sizes the depth from the flush volumes at slice time)"
         )
 
-    def verify(self, p: Project) -> None:
+    def verify(self, p: Project, before: Project | None = None) -> None:
         ps = p.project_settings
         n = max(len(_plates(p)), 1)
         for key, v in (("wipe_tower_x", self.x), ("wipe_tower_y", self.y)):
@@ -953,17 +1044,17 @@ def check_preset(project_ps: dict, preset: dict, colour: str, extruder: int) -> 
     """Raise ProjectError for a bad colour, an extruder out of range, or a preset whose compatible_printers excludes the
     project's printer."""
     if not re.fullmatch(r"#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", colour):
-        raise ProjectError(f"bad colour {colour!r}: use #RRGGBB")
+        raise EditError(f"bad colour {colour!r}: use #RRGGBB")
     n_ext = len(project_ps.get("nozzle_diameter") or ["0.4"])
     if not 1 <= extruder <= n_ext:
-        raise ProjectError(f"extruder {extruder} is not in 1..{n_ext} (the printer has {n_ext} extruder(s))")
+        raise EditError(f"extruder {extruder} is not in 1..{n_ext} (the printer has {n_ext} extruder(s))")
     if preset.get("type") not in (None, "filament"):
-        raise ProjectError(f"preset {preset.get('name')!r} is a {preset.get('type')} preset, not a filament")
+        raise EditError(f"preset {preset.get('name')!r} is a {preset.get('type')} preset, not a filament")
     printer = str(project_ps.get("printer_settings_id") or "")
     parent = str(project_ps.get("inherits") or "")
     cp = preset.get("compatible_printers") or []
     if cp and printer not in cp and parent not in cp:
-        raise ProjectError(f"filament {preset.get('name')!r} compatible_printers {cp} does not list the project printer {printer!r}")
+        raise EditError(f"filament {preset.get('name')!r} compatible_printers {cp} does not list the project printer {printer!r}")
 
 
 # The shapes of the per-filament keys, explicit (never guessed from a length):
@@ -1186,8 +1277,11 @@ def variant_lookup(ps: dict) -> dict[int, int | None]:
     fmap = ps.get("filament_map") or []
     out: dict[int, int | None] = {}
     for i in range(1, len(ps.get("filament_settings_id") or []) + 1):
-        e = int(fmap[i - 1]) if i - 1 < len(fmap) else 1
-        want = f"{et[e - 1] if e - 1 < len(et) else '?'} {nvt[e - 1] if e - 1 < len(nvt) else '?'}"
+        e = int(fmap[i - 1]) if i - 1 < len(fmap) else (int(fmap[0]) if fmap else 1)
+        volume = nvt[e - 1] if e - 1 < len(nvt) else "?"
+        if volume == "Hybrid":  # not in presets: Studio matches Standard instead (PrintConfig.cpp:8031)
+            volume = "Standard"
+        want = f"{et[e - 1] if e - 1 < len(et) else '?'} {volume}"
         out[i] = next((k for k in range(min(len(fev), len(fsi))) if str(fsi[k]) == str(i) and fev[k] == want), None)
     return out
 
@@ -1230,49 +1324,62 @@ class AddFilament:
         if not isinstance(fev, list) or not isinstance(fsi, list):
             raise EditError("the project has no filament_extruder_variant / filament_self_index: not a Studio 2.x project")
         filament_shape(ps, {})  # raises for collapsed or unordered variant blocks
+        shape = filament_shape(ps, {})
         before = copy.deepcopy(ps)
         lookup_before = variant_lookup(ps)
-        v_old = len(fev)
+        v_old = shape.v
         changed: list[str] = []
         skipped: list[str] = []
-        for k, v in self.slot.single:
-            cur = ps.get(k)
-            if k in MAP_KEYS or not isinstance(cur, list):
-                if k in ps and k not in MAP_KEYS:
-                    skipped.append(k)
-                continue
-            if _short(k, cur, n, "per-filament"):
-                cur[:] = [cur[0]] * n  # the same meaning, written out: slot k used entry 0 before
-            cur.append(v)
-            changed.append(k)
-        for k, vals in self.slot.block:
+        fallbacks: list[str] = []
+        singles, blocks = dict(self.slot.single), dict(self.slot.block)
+        named = {"filament_colour": colour, "filament_multi_colour": colour}
+        named.update(
+            filament_map=str(self.extruder),
+            filament_nozzle_map=str(self.extruder),
+            filament_volume_map="0",
+            filament_map_2=str(self.extruder),
+        )
+        # every recognised per-filament key: the slot's own, the project-only ones, the colours and the maps. A
+        # one-entry vector ("every slot uses entry 0") is written out first; a key with no value for the new slot
+        # takes slot 1's value, and the report names it.
+        for k in sorted(set(singles) | set(PROJECT_ONLY_KEYS) | set(named)):
             cur = ps.get(k)
             if not isinstance(cur, list):
-                if k in ps:
+                if k in ps and k in singles:
+                    skipped.append(k)
+                continue
+            if not cur:
+                raise EditError(f"{k} is empty; a per-filament key needs {n} entries: an ambiguous shape, not extended")
+            if _short(k, cur, n, "per-filament"):
+                cur[:] = [cur[0]] * n
+            if k in named:
+                v = named[k]
+            elif k in singles:
+                v = singles[k]
+            else:
+                v = str(cur[0])
+                fallbacks.append(k)
+            cur.append(v)
+            changed.append(k)
+        # every recognised per-variant key (Studio's list): the slot's block, else slot 1's first entry per variant
+        b = len(self.slot.variants)
+        for k in sorted(set(blocks) | (FILAMENT_VARIANT_KEYS - {"filament_extruder_variant"})):
+            cur = ps.get(k)
+            if not isinstance(cur, list) or not cur:
+                if k in ps and k in blocks:
                     skipped.append(k)
                 continue
             if _short(k, cur, v_old, "per-variant"):
                 cur[:] = [cur[0]] * v_old
+            if k in blocks:
+                vals = blocks[k]
+            else:
+                vals = (str(cur[shape.blocks[0][0]]),) * b
+                fallbacks.append(k)
             cur.extend(vals)
             changed.append(k)
         fev.extend(self.slot.variants)
-        fsi.extend([str(n + 1)] * len(self.slot.variants))
-        for k in ("filament_colour", "filament_multi_colour"):
-            cur = ps.get(k)
-            if isinstance(cur, list):
-                if len(cur) == n + 1:
-                    cur[n] = colour
-                elif len(cur) == n:
-                    cur.append(colour)
-        for k, v in (
-            ("filament_map", str(self.extruder)),
-            ("filament_nozzle_map", str(self.extruder)),
-            ("filament_volume_map", "0"),
-            ("filament_map_2", str(self.extruder)),
-        ):
-            cur = ps.get(k)
-            if isinstance(cur, list) and len(cur) == n:
-                cur.append(v)
+        fsi.extend([str(n + 1)] * b)
         for k in ("different_settings_to_system", "inherits_group"):
             cur = ps.get(k)
             if isinstance(cur, list) and len(cur) == n + 2:
@@ -1304,7 +1411,7 @@ class AddFilament:
             if fv is not None and len(fv.split()) == n:
                 _set_meta(pl, "filament_volume_maps", f"{fv} 0".strip())
         p.touch_model_settings()
-        self._check(p, before, lookup_before, n, changed, e)
+        self._check(p, before, lookup_before, n, changed, e, set(blocks) | (FILAMENT_VARIANT_KEYS - {"filament_extruder_variant"}))
         p.notes.append(
             f"add-filament: slot {n + 1} = {self.slot.preset} {colour} on extruder {self.extruder}; {len(changed)} per-filament keys "
             f"extended, flush_volumes_matrix {e} x {n + 1} x {n + 1}, plate filament_maps extended; slots 1..{n} unchanged"
@@ -1312,6 +1419,8 @@ class AddFilament:
         p.notes += [f"  {x}" for x in self.slot.notes]
         if skipped:
             p.notes.append(f"  kept (not one entry per filament in this project): {', '.join(sorted(skipped))}")
+        if fallbacks:
+            p.notes.append(f"  WARN: no value for slot {n + 1}, slot 1's value copied: {', '.join(sorted(fallbacks))}")
         if self.slot.source != "studio":
             p.notes.append(
                 "  WARN: values not normalised by Studio (no Bambu Studio binary): the slot holds the resolved preset JSON as is"
@@ -1323,13 +1432,26 @@ class AddFilament:
             )
         p.notes.append(f"  slot {n + 1} is unused until --extruder, --set OBJ:support_interface_filament={n + 1} or --range uses it")
 
-    def _check(self, p: Project, before: dict, lookup_before: dict, n: int, changed: list[str], e: int) -> None:
+    def _check(self, p: Project, before: dict, lookup_before: dict, n: int, changed: list[str], e: int, variant_keys: set[str]) -> None:
+        """The whole recognised schema after the edit: lengths, the blocks, the variant lookup, the flush matrix, the
+        plate maps, that the requested colour and extruder landed, and that slots 1..N are unchanged."""
         ps = p.project_settings
         bad: list[str] = []
-        for k in changed:
-            want = len(ps["filament_extruder_variant"]) if k in dict(self.slot.block) else n + 1
-            if len(ps[k]) != want:
-                bad.append(f"{k} has {len(ps[k])} entries, not {want}")
+        v = len(ps["filament_extruder_variant"])
+        for k in (
+            set(PROJECT_ONLY_KEYS) | set(MAP_KEYS) | {"filament_colour", "filament_multi_colour", "filament_settings_id"} | set(changed)
+        ):
+            cur = ps.get(k)
+            if isinstance(cur, list) and k not in variant_keys and len(cur) != n + 1:
+                bad.append(f"{k} has {len(cur)} entries, not {n + 1}")
+        for k in variant_keys:
+            cur = ps.get(k)
+            if isinstance(cur, list) and cur and len(cur) != v:
+                bad.append(f"{k} has {len(cur)} entries, not {v} (one per variant)")
+        for k, want in (("filament_colour", self.colour.upper()), ("filament_map", str(self.extruder))):
+            cur = ps.get(k)
+            if isinstance(cur, list) and (len(cur) <= n or str(cur[n]).upper() != want):
+                bad.append(f"{k} slot {n + 1} is {cur[n] if len(cur) > n else 'missing'}, not the requested {want}")
         fsi = [int(x) for x in ps["filament_self_index"]]
         if fsi != sorted(fsi) or sorted(set(fsi)) != list(range(1, n + 2)):
             bad.append(f"filament_self_index {ps['filament_self_index']} does not cover 1..{n + 1} in order")
@@ -1356,7 +1478,7 @@ class AddFilament:
             elif k == "flush_volumes_matrix":
                 continue
             elif isinstance(old, list):
-                if new[: len(old)] != old:
+                if new[: len(old)] != old or (len(old) == 1 and k not in variant_keys and any(x != old[0] for x in new[:n])):
                     bad.append(f"{k}: an existing slot's entry changed")
             elif got != old:
                 bad.append(f"{k} changed")
@@ -1376,41 +1498,48 @@ def touches_of(patches: Iterable[Patch], project: Project) -> frozenset[str]:
 
 @dataclass
 class EditSet(PatchSet):
-    """A PatchSet that may hold edits: saves with the union of their `touches`, then re-opens the output and runs each
-    edit's `verify()`. `notes` holds the box reports, FAIL and WARN lines of the last apply or preview."""
+    """A PatchSet that may hold edits. `apply()` resolves a relative move to its absolute target (recorded in the set,
+    so applying the set again is a no-op), applies every patch, and saves with the union of their `touches`; the save
+    writes a temporary archive, runs each edit's `verify(after, before)` and the caller's `check(tmp)` on it, and only
+    then replaces the destination. `notes` holds the box reports, FAIL and WARN lines of the last apply or preview."""
 
     notes: list[str] = field(default_factory=list)
 
-    def preview(self, path: str) -> list[str]:
-        """Apply in memory without writing (for --dry-run): the notes, including the move targets."""
-        project = Project(path)
+    def _run(self, project: Project) -> list[str]:
+        self.patches = [x.absolute(project) if isinstance(x, MoveObject) else x for x in self.patches]
+        done = []
         for patch in self.patches:
-            patch.apply(project)
+            try:
+                patch.apply(project)
+            except (ValueError, KeyError, IndexError, StopIteration, ET.ParseError) as e:
+                raise EditError(f"{patch.describe()}: malformed project data ({type(e).__name__}: {e})") from e
+            done.append(patch.describe())
+        return done
+
+    def preview(self, path: str) -> list[str]:
+        """Apply in memory without writing (for --dry-run), with the same touches check as a save: the notes, including
+        the move targets."""
+        project = Project(path)
+        self._run(project)
+        project.check_touches(touches_of(self.patches, project))
         self.notes = list(project.notes)
         return self.notes
 
-    def apply(self, path: str, out: str | None = None) -> list[str]:
+    def apply(self, path: str, out: str | None = None, check: Callable[[str], None] | None = None) -> list[str]:
         if not self.patches:
             return []
-        project = Project(path)
-        done = []
-        for patch in self.patches:
-            patch.apply(project)
-            done.append(patch.describe())
-        dest = os.path.abspath(out or path)
-        tmp = os.path.join(os.path.dirname(dest), f".{os.path.basename(dest)}.{os.getpid()}.verify.3mf")
-        try:
-            project.save(tmp, touches_of(self.patches, project))
+        before, project = Project(path), Project(path)
+        done = self._run(project)
+
+        def verify(tmp: str) -> None:
             after = Project(tmp)
             for patch in self.patches:
-                check = getattr(patch, "verify", None)
-                if callable(check):
-                    check(after)
-            if os.path.exists(dest):
-                os.chmod(tmp, os.stat(dest).st_mode & 0o7777)
-            os.replace(tmp, dest)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+                v = getattr(patch, "verify", None)
+                if callable(v):
+                    v(after, before)
+            if check is not None:
+                check(tmp)
+
+        project.save(out or path, touches_of(self.patches, project), verify=verify)
         self.notes = list(project.notes)
         return done

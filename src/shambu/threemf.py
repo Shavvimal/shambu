@@ -34,7 +34,7 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -807,9 +807,11 @@ class Project:
         return removed
 
     # ------------------------------------------------------------------ (c) write
-    def save(self, out_path: str, touches: Iterable[str] | None = None) -> None:
+    def save(self, out_path: str, touches: Iterable[str] | None = None, verify: Callable[[str], None] | None = None) -> None:
         """Write the project atomically. `touches` are the entry patterns the applied patches declared (default
-        `Metadata/*`); check_touches() runs first, so an undeclared change raises before anything is written."""
+        `Metadata/*`); check_touches() runs first, so an undeclared change raises before anything is written.
+        `verify(tmp_path)` runs on the written temporary archive before it replaces `out_path`: when it raises, the
+        destination stays as it was."""
         if MODEL_SETTINGS in self._dirty:
             self._put(MODEL_SETTINGS, _xml_bytes(self.model_settings, "  "))
         if PROJECT_SETTINGS in self._dirty:
@@ -825,7 +827,9 @@ class Project:
         # Atomic: write a temporary file in the destination directory (same filesystem), check it,
         # then rename it over out_path. On any failure the original stays as it was.
         out_dir = os.path.dirname(os.path.abspath(out_path))
-        fd, tmp = tempfile.mkstemp(dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(
+            dir=out_dir, prefix="." + os.path.basename(out_path) + ".", suffix=".tmp.3mf"
+        )  # Studio reads it by extension (verify)
         try:
             with os.fdopen(fd, "wb") as f:
                 with zipfile.ZipFile(f, "w") as z:
@@ -840,6 +844,8 @@ class Project:
                 bad = z.testzip()
             if bad is not None:
                 raise ProjectError(f"{out_path}: the written zip fails its CRC check at {bad}; original kept")
+            if verify is not None:
+                verify(tmp)
             # mkstemp creates 0600: keep the original's mode, or give a new file the umask default.
             if os.path.exists(out_path):
                 os.chmod(tmp, os.stat(out_path).st_mode & 0o7777)

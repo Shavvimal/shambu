@@ -2,7 +2,7 @@
 
 Positions are computed here, never by Bambu's arrange, so the report can state where every part
 sits. The CLI's pos_x/pos_y/pos_z are a translation added to the STL's own coordinates, so a part
-whose bounding box should start at (x0, y0) on the bed gets pos = (x0 - min_x, y0 - min_y, -min_z).
+whose bounding-box min corner is (x0, y0) on the bed gets pos = (x0 - min_x, y0 - min_y, -min_z).
 
 Design: `Placer` is a Strategy (ShelfPacker today; an explicit or grid placer drops in). Limit checks
 are a list of `Rule` strategies run by `LimitChecker`, so a new printer fact is one more rule.

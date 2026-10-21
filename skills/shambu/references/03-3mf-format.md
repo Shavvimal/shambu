@@ -638,7 +638,8 @@ that centre in the STL's own frame. The GUI's "replace with STL" keeps the volum
 `R * (c_new - c_old)` so the two STL frames coincide (Plater.cpp:11302-11411), then calls `ensure_on_bed` only when the
 object is not sinking (Plater.cpp:11375, 11397). `face_count` and `mesh_stat face_count` are written, never read
 (bbs_3mf.cpp:8218, 8306). Studio shares one mesh resource between identical volumes (bbs_3mf.cpp:7353-7367; loaded at
-5271-5313): two objects' components then name the same `p:path` and `objectid`, and `--replace-mesh` refuses such an
+5271-5313): two components (of two objects, or of one object) name the same `p:path` and `objectid`, or a part carries the
+`mesh_shared` metadata the reader follows (bbs_3mf.cpp:5282-5313), and `--replace-mesh` refuses such an
 object. A raw STL and a shambu-oriented copy of it are in different frames (the oriented copy sits on its min corner):
 with `--anchor frame` the raw STL turned by `--rotate-mesh 0,0,90` moves the housing 91.74 mm, so the patch refuses
 it and names `--anchor centre`.
@@ -661,10 +662,11 @@ Print.cpp:2423). The CLI estimates the footprint as `x - brim .. x + width + bri
 **`--no-check`.** It skips the conflict check (-101), the support-necessity check and the -100 exit on empty-layer or
 overlap warnings; -102..-105 and validate errors still exit (BambuStudio.cpp:6192, 6418, 6974, 7185-7212). Studio exits
 on the first conflicting plate (BambuStudio.cpp:7105-7109), and -100 is also the generic exception exit
-(BambuStudio.cpp:7413-7418): only a -100 whose log has `found slicing warnings:` is overridable. A checked slice of a BBL
+(BambuStudio.cpp:7413-7418): only a -100 whose log has `found slicing warnings:` is skippable. A checked slice of a BBL
 3MF without `--load-filaments` resets `filament_prime_volume` to 45, a `--no-check` one does not
 (BambuStudio.cpp:6886-6894); `shambu slice` pins the project's values in every pass. Each pass writes its log and
-`result.json` into its own folder `<out>/<name>.passes/{checked[-plate-N],nocheck}/`.
+`result.json` into its own folder `<name>.slice/<name>.passes/{checked[-plate-N],checked-all,nocheck}/` next to the output; the
+export replaces the output only after the run succeeded, and an output that is the input is refused.
 
 **The touches contract.** Every patch declares the entries it changes, including what `invalidate_slices` removes
 (`Metadata/plate_N.gcode`, `.md5`, `plate_N.json`, the `slice_info.config` plates) and rewrites

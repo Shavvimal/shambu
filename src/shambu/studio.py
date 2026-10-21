@@ -118,6 +118,19 @@ _REFUSED = ("--pipe", "--datadir", "--uptodate", "--downward")
 _MODEL_EXT = (".3mf", ".stl", ".obj", ".step", ".stp", ".amf")
 
 
+def _assemble_paths_inside(path: Path, inside: Callable[[str, str], str]) -> None:
+    """Every model path of an assemble list must pass `inside` (the escape hatch's working-tree rule)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise StudioError(f"--load-assemble-list {path}: unreadable JSON ({e})") from e
+    plates = data.get("plates") if isinstance(data, dict) else None
+    for plate in plates if isinstance(plates, list) else []:
+        for o in (plate.get("objects") or []) if isinstance(plate, dict) else []:
+            if isinstance(o, dict) and isinstance(o.get("path"), str):
+                inside(o["path"], f"assemble-list model path in {path.name}:")
+
+
 def signed(status: int) -> int:
     """Shell exit status -> the CLI's negative return code."""
     return status - 256 if status > 127 else status
@@ -141,9 +154,17 @@ class CliCommand:
         """A raw Studio argument list as a checked command, for `shambu studio --`. The builder rules apply: `--flag 1`
         becomes `--flag=1`, pre-slice actions move before `--slice`, no action is refused (the GUI would open), and
         `--export-3mf` takes a bare name. Refused: `--pipe`, `--datadir` (shambu owns it), `--uptodate*`,
-        `--downward*`, short options, and an input outside the working tree `cwd`. Relative paths in `--load-*`
-        values resolve against `cwd`, because the binary runs in its private datadir."""
+        `--downward*`, short options, a malformed `--slice` plate, and any path outside the working tree `cwd`:
+        positional inputs, every `;`-separated path of a path-valued option (symlinks resolved), and the model paths
+        of an assemble list. Relative paths resolve against `cwd`, because the binary runs in its private datadir."""
         root = Path(cwd or os.getcwd()).resolve()
+
+        def inside(v: str, what: str) -> str:
+            full = (root / v).resolve() if not Path(v).is_absolute() else Path(v).resolve()
+            if not full.is_relative_to(root):
+                raise StudioError(f"{what} {v} is outside the working tree {root}")
+            return str(full)
+
         cmd = cls()
         i = 0
         while i < len(argv):
@@ -168,15 +189,19 @@ class CliCommand:
                 if name == "--export-3mf" and (not value or "/" in value):
                     raise StudioError("--export-3mf wants a bare file name; the CLI joins it to --outputdir (the run folder)")
                 if name in _PATH_VALUE and value:
-                    value = ";".join(str((root / v).resolve()) if v and not Path(v).is_absolute() else v for v in value.split(";"))
+                    value = ";".join(inside(v, name) if v else v for v in value.split(";"))
+                if name == "--load-assemble-list" and value:
+                    _assemble_paths_inside(Path(value), inside)
+                if name == "--slice":
+                    try:
+                        int(value or 0)
+                    except ValueError as e:
+                        raise StudioError(f"--slice {value!r}: the plate must be a whole number (0 = every plate)") from e
                 cmd.option(name, value)
             elif tok.startswith("-") and tok != "-":
                 raise StudioError(f"{tok}: short options are not passed through; use the --long form")
             else:
-                full = (root / tok).resolve()
-                if not full.is_relative_to(root):
-                    raise StudioError(f"input {tok} is outside the working tree {root}")
-                cmd.inputs.append(str(full))
+                cmd.inputs.append(inside(tok, "input"))
             i += 1
         if not cmd.has_action():
             raise StudioError("no action option: the CLI would open the GUI. Add --export-3mf NAME, --slice N, --info, ...")
