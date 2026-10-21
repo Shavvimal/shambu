@@ -42,15 +42,18 @@ import ssl
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from . import conf
 from .errors import PrinterError
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 CA_FILE = Path("/Applications/BambuStudio.app/Contents/Resources/cert/printer.cer")
 PUSHALL = {"pushing": {"sequence_id": "1", "command": "pushall", "version": 1, "push_target": 1}}
@@ -70,6 +73,12 @@ ACTIVE_STATES = ("printing", "paused", "preparing", "slicing")
 DONE_STATES = ("idle", "finished", "failed")  # watch() stops only on these; unknown or offline keeps it polling
 EXTRUDER_NAMES = {0: "auxiliary (right)", 1: "main (left)"}
 HMS_LEVELS = {1: "fatal", 2: "serious", 3: "common", 4: "info"}
+# Network bounds for one read (doctor timings, 2026-10-21): TCP connect, TLS handshake, MQTT keepalive, and the whole
+# read (discovery + connect + report) unless the caller gives another budget.
+CONNECT_S = 3.0
+HANDSHAKE_S = 5.0
+KEEPALIVE_S = 10
+BUDGET_S = 15.0
 TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
 # External spools on a dual-nozzle printer: virtual tray id -> the extruder id it feeds (live X2D, 2026-10-16; each
 # extruder's `snow` confirmed it). Single-nozzle printers report one external spool as `vt_tray` with tray_now 254.
@@ -98,7 +107,7 @@ class Discovery(Protocol):
     def find(self) -> list[dict]: ...
 
 
-def port_open(ip: str, port: int = 8883, timeout: float = 0.7) -> bool:
+def port_open(ip: str, port: int = 8883, timeout: float = 0.5) -> bool:
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
@@ -106,16 +115,67 @@ def port_open(ip: str, port: int = 8883, timeout: float = 0.7) -> bool:
         return False
 
 
+_ARP_IP = re.compile(r"\((\d+\.\d+\.\d+\.\d+)\)")
+
+
+def arp_hosts(text: str) -> list[str]:
+    """IPv4 hosts from `arp -an` output, in table order, once each. Skips multicast and broadcast addresses and
+    `(incomplete)` entries (no host answered ARP there, so nothing answers on 8883 either)."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = _ARP_IP.search(line)
+        if not m or "incomplete" in line:
+            continue
+        ip = m.group(1)
+        if ip.startswith(("224.", "239.", "255.")) or ip in out:
+            continue
+        out.append(ip)
+    return out
+
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
 @dataclass
 class ArpProbe:
-    """Hosts in the ARP table that answer on 8883. On a home LAN only Bambu printers do."""
+    """Hosts in the ARP table that answer on 8883. On a home LAN only Bambu printers do.
 
-    timeout: float = 0.7
+    Bounds (a slow resolver or a large LAN must not stall a check): `arp -an` (numeric, so no reverse DNS per entry)
+    with a 2 s timeout, then the 8883 probe in a pool of `workers` threads, `timeout` s per host and `sweep_s` for the
+    whole probe. A host that has not answered when the sweep ends counts as closed."""
+
+    timeout: float = 0.5
+    sweep_s: float = 2.0
+    workers: int = 16
+    arp_timeout: float = 2.0
+    runner: Runner = field(default=subprocess.run, repr=False)  # injectable: tests pass a fake
+    probe: Callable[[str, int, float], bool] = field(default=port_open, repr=False)
+
+    def hosts(self) -> list[str]:
+        try:
+            r = self.runner(["arp", "-an"], capture_output=True, text=True, timeout=self.arp_timeout)
+        except subprocess.TimeoutExpired:
+            log.warning("arp -an gave no answer within %g s; no ARP discovery", self.arp_timeout)
+            return []
+        except OSError as e:
+            log.warning("arp -an failed (%s); no ARP discovery", e)
+            return []
+        return arp_hosts(r.stdout or "")
+
+    def probe_hosts(self, hosts: list[str]) -> list[dict]:
+        if not hosts:
+            return []
+        pool = ThreadPoolExecutor(max_workers=max(1, min(self.workers, len(hosts))), thread_name_prefix="shambu-probe")
+        try:
+            futs = {pool.submit(self.probe, h, 8883, self.timeout): h for h in hosts}
+            done, _ = wait(futs, timeout=self.sweep_s)
+            open_ = {futs[f] for f in done if not f.exception() and f.result()}
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return [{"ip": h, "method": "arp+8883"} for h in hosts if h in open_]  # ARP order, not finish order
 
     def find(self) -> list[dict]:
-        out = subprocess.run(["arp", "-a"], capture_output=True, text=True).stdout
-        hosts = [m for m in re.findall(r"\((\d+\.\d+\.\d+\.\d+)\)", out) if not m.startswith(("224.", "239.", "255."))]
-        return [{"ip": h, "method": "arp+8883"} for h in hosts if port_open(h, 8883, self.timeout)]
+        return self.probe_hosts(self.hosts())
 
 
 @dataclass
@@ -192,7 +252,14 @@ class PinnedSSLSocket(ssl.SSLSocket):
     """Runs `check_identity` right after the handshake, so it runs before paho sends CONNECT with the access code."""
 
     def do_handshake(self, block: bool = False) -> None:
-        super().do_handshake(block)
+        # paho sets the socket timeout to its keepalive (10 s) before the handshake and cannot change keepalive on an
+        # open connection, so the handshake bound lives here: HANDSHAKE_S, then the keepalive timeout again.
+        prev = self.gettimeout()
+        self.settimeout(HANDSHAKE_S if prev is None else min(prev, HANDSHAKE_S))
+        try:
+            super().do_handshake(block)
+        finally:
+            self.settimeout(prev)
         serial = getattr(self.context, "expected_serial", "")
         if self.context.verify_mode != ssl.CERT_NONE:
             try:
@@ -355,8 +422,9 @@ class MqttReader:
             # insecure: tell paho not to call ssl.match_hostname (gone in 3.12). Verified: keeps check_hostname=True.
             c.tls_insecure_set(self.insecure)
             c.on_connect, c.on_message = on_connect, on_message
+            c.connect_timeout = CONNECT_S  # paho's default is 5 s; an unroutable --ip then fails in 3 s
             try:
-                c.connect(self.ip, 8883, keepalive=10)
+                c.connect(self.ip, 8883, keepalive=KEEPALIVE_S)
             except ssl.SSLError as e:
                 raise PrinterError(f"TLS verification failed for printer {conf.mask(self.serial)} at {self.ip}: {self._clean(e)}") from None
             except OSError as e:
@@ -843,7 +911,11 @@ class PrinterService:
     """Facade: serial and access code from Studio's config, IP from discovery or the caller.
 
     `insecure=True` turns off TLS verification for every read (the CLI's `--insecure`). Leave it off: a verified read
-    proves the host at the IP is the selected printer before the access code leaves this machine."""
+    proves the host at the IP is the selected printer before the access code leaves this machine.
+
+    `budget_s` bounds one whole read (config, discovery, MQTT): the read runs in a worker thread, and when the budget
+    runs out the caller gets `PrinterError("timed out after 15 s in <step>")` and the thread is left to die with the
+    process (daemon). `on_step(name, seconds)` hears each step as it ends (`arp`, `probe`, `mqtt`); `timings` keeps them."""
 
     ip: str | None = None
     serial: str | None = None
@@ -851,19 +923,70 @@ class PrinterService:
     discovery: tuple[Discovery, ...] = (ArpProbe(),)
     reader_factory: Callable[[str, str, str, float, bool], MqttReader] | None = None  # injectable transport; None = MqttReader at call time
     insecure: bool = False
+    budget_s: float | None = BUDGET_S
+    on_step: Callable[[str, float], None] | None = field(default=None, repr=False)
+    timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    step: str = field(default="start", init=False, repr=False)
+    _abandoned: bool = field(default=False, init=False, repr=False)
+
+    @contextmanager
+    def _timed(self, name: str) -> Iterator[None]:
+        self.step = name
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            dt = round(time.monotonic() - t0, 2)
+            self.timings[name] = dt
+            if self.on_step is not None and not self._abandoned:  # no progress line after the caller gave up
+                try:
+                    self.on_step(name, dt)
+                except Exception:  # noqa: BLE001 - a progress printer must never fail the read
+                    pass
+
+    def _bounded(self, fn: Callable[[], T]) -> T:
+        """`fn()` within `budget_s`, or PrinterError naming the step it was in. No budget: a plain call."""
+        if not self.budget_s or self.budget_s <= 0:
+            return fn()
+        self._abandoned = False
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                box["value"] = fn()
+            except BaseException as e:  # noqa: BLE001 - re-raised in the caller's thread
+                box["error"] = e
+
+        t = threading.Thread(target=work, name="shambu-printer-read", daemon=True)
+        t.start()
+        t.join(self.budget_s)
+        if t.is_alive():
+            self._abandoned = True
+            raise PrinterError(f"timed out after {self.budget_s:g} s in {self.step}")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
     def resolve(self) -> tuple[str, str, str]:
         """IP, serial, code. Discovery only proposes a host: the TLS name check (or, insecure, the report topic) in
         `MqttReader.read` confirms it is the selected printer. An SSDP hit that names the serial wins over other hits."""
-        c = conf.load()
-        serial = self.serial or conf.selected_serial(c)
-        if not serial:
-            raise PrinterError("no printer selected in Bambu Studio (Device tab)")
-        code = conf.access_code(serial, c)
+        with self._timed("config"):
+            c = conf.load()
+            serial = self.serial or conf.selected_serial(c)
+            if not serial:
+                raise PrinterError("no printer selected in Bambu Studio (Device tab)")
+            code = conf.access_code(serial, c)
         ip = self.ip
         if not ip:
             for d in self.discovery:
-                hits = d.find()
+                if isinstance(d, ArpProbe):
+                    with self._timed("arp"):
+                        hosts = d.hosts()
+                    with self._timed("probe"):
+                        hits = d.probe_hosts(hosts)
+                else:
+                    with self._timed(type(d).__name__.lower()):
+                        hits = d.find()
                 if hits:
                     named = [h for h in hits if h.get("serial") == serial]
                     ip = (named or hits)[0]["ip"]
@@ -875,23 +998,26 @@ class PrinterService:
     def _read(self, ip: str, serial: str, code: str) -> dict:
         if self.insecure:
             log.warning("TLS verification is off: the access code goes to whatever answers at %s", ip)
-        report = (self.reader_factory or MqttReader)(ip, serial, code, self.wait, self.insecure).read()
+        with self._timed("mqtt"):
+            report = (self.reader_factory or MqttReader)(ip, serial, code, self.wait, self.insecure).read()
         if self.insecure and report.get("_topic", f"device/{serial}/report") != f"device/{serial}/report":
             raise PrinterError(f"host {ip} answered for another device, not printer {conf.mask(serial)}")
         return report
 
+    def _resolve_and_read(self) -> tuple[str, str, dict]:
+        ip, serial, code = self.resolve()
+        return ip, serial, self._read(ip, serial, code)
+
     def raw_report(self) -> dict:
-        return self._read(*self.resolve())
+        return self._bounded(self._resolve_and_read)[2]
 
     def status(self) -> Status:
-        ip, serial, code = self.resolve()
-        report = self._read(ip, serial, code)
+        ip, serial, report = self._bounded(self._resolve_and_read)
         return StatusDecoder(conf.hms_table(serial[:3])).decode(report, serial, ip)
 
     def filaments(self, resolver=None, printer_preset: str | None = None) -> LoadedFilaments:
         """The spools in each nozzle and slot, from the same single `pushall` as `status()`. Read-only."""
-        ip, serial, code = self.resolve()
-        report = self._read(ip, serial, code)
+        ip, serial, report = self._bounded(self._resolve_and_read)
         return FilamentDecoder(resolver, printer_preset).decode(report, serial, ip)
 
     def watch(self, every_s: int = 300, until_idle: bool = True, max_polls: int = 200):

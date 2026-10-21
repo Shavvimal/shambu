@@ -364,7 +364,10 @@ class StudioCLI:
             return plistlib.load(f)["CFBundleShortVersionString"]
 
     def running_pids(self) -> list[int]:
-        r = subprocess.run(["pgrep", "-f", str(self.binary)], capture_output=True, text=True)
+        try:  # doctor calls this; a stuck process table must not stall it
+            r = subprocess.run(["pgrep", "-f", str(self.binary)], capture_output=True, text=True, timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            return []
         return [int(p) for p in r.stdout.split() if p.isdigit()]
 
     def datadir(self, name: str) -> Path:
