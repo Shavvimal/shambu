@@ -491,3 +491,102 @@ https://www.orcaslicer.com/wiki (precision, overhang, ironing, fuzzy skin pages,
 X posts by @thetechbff (overhang angles, bridge spans, PETG interface, support ironing, orientation and strength,
 Orca cone conversion; animations from real toolpaths, n=1 each), https://classcad.ch, https://buerli.io,
 https://www.npmjs.com/package/@classcad/mcp.
+
+---
+
+## 11. Layout checker: support spread, the pair rule, footprints and the packer (plate-14 post-mortem, 2026-10-21)
+
+Section 3.6's rule (`0.25 x height`, 5..25 mm, all four sides, summed between two parts, held off the bed edge) refused
+a five-part plate that printed (18 h 0 min, 480.7 g). The rule is replaced. Code: `layout.support_spread`,
+`layout.pair_check` / `Clearance`, `InsideBed`, `ExtruderReach`, `mesh.silhouette`, `layout.RasterFootprint`,
+`layout.BottomLeftPacker`, `probe.py`.
+
+### 11.1 What Studio enforces by layer (source, tag v02.08.02.61)
+
+| Fact | Where |
+|---|---|
+| No object-to-object clearance before slicing: `validate()` checks hulls against the exclude area only; the tower is a warning | `Print.cpp:944-1050`, `1036-1039`, `1353-1359` |
+| Exit -101: centrelines of two objects cross in one layer (1 mm buckets, > 0.01 mm); no clearance distance; support-on-support ignored | `GCode/ConflictChecker.cpp:16-17, 203-221, 289-314` |
+| Brims and skirts are not in the conflict test; brims of different objects are clipped against each other | `ConflictChecker.cpp:163-200`, `Brim.cpp:258-365` |
+| `--no-check` switches the conflict test off; the log names the two objects (CLI names), no z | `Print.cpp:2418-2435`, `BambuStudio.cpp:6971-6972` |
+| Tree support grows per object, against its own outlines and the bed border only: it does not avoid a neighbour and never leaves the bed | `Support/TreeSupport3D.cpp:5232-5246`, `TreeModelVolumes.cpp:128-133`, `TreeSupport.cpp:607-629, 2507-2522` |
+| Tree first-layer brim (auto) is 1..10 mm from the branch's second moment and height | `TreeSupport.cpp:2336, 2476-2484`, `ExPolygon.cpp:416-430` |
+| Studio's own arrange keeps 24 mm between objects when any part has tree supports (12 per item), and exits -21 when they do not fit | `ModelArrange.cpp:158-177`, `Arrange.cpp:84-136`, `BambuStudio.cpp:5477-5485` |
+
+### 11.2 Measured spread (G-code of the printed plate, centrelines past the part's own model extrusions)
+
+| Part | Height | -x | +x | -y | +y |
+|---|---|---|---|---|---|
+| housing (on its side) | 218 | **20.9** (z 0..5; 14.5 at z 20..25) | 0.3 | 0.3 | 2.9 |
+| camera mount | 32 | inside | inside | inside | inside |
+| camera shell | 48 | 2.5 | inside | inside | 2.9 |
+| feeler | 64 | 0.2 | 0.6 | 4.7 | 3.4 |
+| cradle | 29 | 7.1 | 7.1 | inside | inside |
+
+With section 3.6's bracket (170 mm tall, 15.6 mm) this gives the estimate: tree `min(22, max(8, 0.10 x height))`
+(20.9 / 218 = 0.096, 15.6 / 170 = 0.092; the cap is 20.9 plus one line), normal support 5 mm (11.4). The mesh does
+not tell the side: the housing's -y and +y overhangs had 0.3 and 2.9 mm, its -x overhang 20.9 mm. So the estimate
+goes on all four sides, and `--probe-supports` measures per side (11.6).
+
+Footprints on the printed plate: the feeler's wide part exists only in two end blocks, and the cradle sits between
+them. Box gap -3.7 mm (overlap), convex-hull gap 0.0, real gap 4.95 mm (brim to support), model to model about
+19.8 mm. Housing / shell: box gap 0.8 mm (the old "0.6 mm" refusal), hull gap 21.1 mm.
+
+### 11.3 The rules now
+
+- Pair (`Clearance`): footprint gap g (silhouette) and its direction. g < 1.0 mm (two lines) is a FAIL body ("footprints
+  touch" or "intersect by w x d mm"). Otherwise the need is max(a's spread toward b, b's spread toward a) + 1.0: the max,
+  not the sum, because support-on-support crossings do not fail Studio. Short against an estimate: WARN "the slice
+  decides". Short against a probe or a spec value: FAIL margin. Brims are not in the pair rule.
+- Bed (`InsideBed`): body, brim and normal-support spread inside the bed; tree spread is not counted (clipped).
+- Reach (`ExtruderReach`): only the sides where the extruder's reach is narrower than the bed (the right nozzle's
+  x < 20.5, `aux_x_limit`); there brim and the full spread count, trees too (section 3.3b, exit -102). No reach line
+  when the reach is the whole bed: it repeated the bed line on every spec of the post-mortem.
+- Spec: `brim_margin` replaces brim and support on every side (FAIL-level, counted at the bed edge); `support_spread`
+  `[mx, px, my, py]` replaces the support part per side.
+
+### 11.4 Live clash test (30 mm cube next to an L with a 15 mm cantilever at z 20..30, no brim)
+
+| Support on the L | gap 10 | gap 2 | gap 0 | gap -2 |
+|---|---|---|---|---|
+| none | 0 | 0 | 0 | -101 |
+| tree(auto) | 0 | 0 | -101 | -101 |
+| normal(auto) | 0 | -101 | -101 | -101 |
+
+Normal support spread 4.4 mm at z 0..5 and 2.5 mm above; tree 1.5 mm. The tree support box was identical at gap 10 and
+gap 2: it ignores the neighbour. Two unsupported models may touch (walls 0.42 mm apart sliced). `--no-check` on the
+tree gap-0 project exits 0 with crossing paths: a `--no-check` slice is not a clash test, so `build --slice` keeps the
+check, and on exit -101 the report names the two spec keys from the log line.
+
+### 11.5 Packer
+
+The five parts (124.2 x 135 x 218, 40.6 x 58.8 x 32.1, 58.6 x 60.7 x 47.8, 50 x 226.4 x 64, 22.1 x 99 x 28.9): the row
+packer needs 2 plates even at zero margin (the 226 mm feeler opens a row, the bed above the housing stays empty).
+`BottomLeftPacker` (candidate points at placed parts' edges plus spread + 1 + gap, lowest top edge then lowest right
+edge, first fit, 0 degrees only) fits them on 1 plate with the estimates and with the measured spreads (unit tests).
+Studio's arrange on the same five parts exits -21 with and without rotations. The row packer stays for print-by-object
+plates and filament groups. A part that fits nowhere is reported once ("PLACEMENT NOT DONE", with the arithmetic) and
+is never checked at a position nobody chose.
+
+### 11.6 Support probe (`check|build --probe-supports`)
+
+A solo `--slice` of each supported single-file part in its final orientation, `--no-check`, no prime tower, cached as
+`<outdir>/.probe/<mesh sha256>-<orientation>-<support keys hash>.json`. A one-object plate has no object labels in
+its G-code (live): the parser then reads every move after the first `; CHANGE_LAYER`, without `Custom` moves. Live on
+the plate-14 spec with the PLA-interface process (`raft_first_layer_expansion` 5, `tree_hybrid`; measured once, so not
+the printed file's settings): housing -x 13.8, +x 4.4, -y 0.9, +y 1.3; mount +x 4.6; shell -x 10.6, +y 8.1; feeler 7.0 /
+7.0 / 5.0 / 5.0; cradle -x 9.1, +x 7.7, -y 2.1. Five probes plus the check took 12.5 s; the cached rerun 0.4 s.
+
+### 11.7 Silhouette cost (Python 3.14, Apple silicon, 0.5 mm cell)
+
+Housing STL, 11,084 facets: 0.015 s. Feeler, 1,660 facets: 0.016 s. Cradle, 2,508 facets: 0.006 s. The 0.5 mm cell
+stays; a 1.0 mm cell saves nothing that matters. The raster is computed after the orientation is baked into the STL,
+never rotated, so a part turned 45 degrees keeps its real outline (a 50 x 226 bar is 11,300 mm2, not 195 x 195).
+
+### 11.8 Open
+
+- Normal support at the bed edge: no bed clip found in `SupportMaterial.cpp` / `SupportCommon.cpp`, not tested live;
+  the bed rule counts it.
+- Fade with z: every neighbour on plate 14 stands on the bed, so the z 0..5 band decides. An overhanging neighbour
+  (the feeler's end blocks at z 36..64 over the cradle) is where a z-aware check would matter.
+- Collinear support overlap still conflicts (`ConflictChecker.cpp:295-296`); not reproduced.
