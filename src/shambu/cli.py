@@ -135,6 +135,15 @@ def _mismatch_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _probe_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--probe-supports",
+        action="store_true",
+        help="slice each supported part alone (cached under <outdir>/.probe) and use its measured support spread per side "
+        "instead of the estimate (tree 0.10 x height, 8..22 mm; normal 5 mm)",
+    )
+
+
 def printer_lines(d: dict, config: dict) -> list[str]:
     """Doctor's 'loaded on the printer' section next to the GUI presets, with a MISMATCH line per differing slot."""
     if "error" in d:
@@ -693,13 +702,20 @@ class Check(Command):
         p.add_argument("spec")
         _printer_flags(p)
         _mismatch_flag(p)
+        _probe_flag(p)
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.spec, out)
         if isinstance(spec, int):
             return spec
         app.printer_ip = a.printer_ip
-        r = app.build(spec, export=False, printer=not a.no_printer, allow_filament_mismatch=a.allow_filament_mismatch)
+        r = app.build(
+            spec,
+            export=False,
+            printer=not a.no_printer,
+            allow_filament_mismatch=a.allow_filament_mismatch,
+            probe_supports=a.probe_supports,
+        )
         out.emit(r.to_json(), r.report.splitlines())
         return 0 if r.plan.ok else 1
 
@@ -716,6 +732,7 @@ class Build(Command):
         )
         _printer_flags(p)
         _mismatch_flag(p)
+        _probe_flag(p)
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.spec, out)
@@ -730,6 +747,7 @@ class Build(Command):
             do_slice=a.slice,
             printer=not a.no_printer,
             allow_filament_mismatch=a.allow_filament_mismatch,
+            probe_supports=a.probe_supports,
         )
         out.emit(r.to_json(), r.report.splitlines())
         if a.open and r.run and r.run.ok:

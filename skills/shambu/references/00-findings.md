@@ -140,3 +140,26 @@ status pushes are exempt from Bambu's Authorization Control, so no Developer Mod
 | `07-print-recipes.md` | Key scopes, defaults, the tip table | adding a recipe or a per-object key |
 | `08-optimisation.md` | Orientation, print-by-object source rules, supports, time, finish, headless metrics, the GUI workflow, ClassCAD | changing `mesh.py`, `layout.py`, `sweep.py`, or explaining a choice |
 | `09-user-notes.md` | The user's own finish and fit notes (personal tools, materials) | the hand-back for this user |
+
+## 10. The layout checker (plate-14 post-mortem, 2026-10-21)
+
+The old rule held a support margin of `0.25 x height` (5..25 mm) on all four sides, summed it between neighbours,
+held it off the bed edge, and compared bounding boxes. It refused a five-part plate that printed. Now
+(reference 08 section 11):
+
+- Studio has no clearance rule between objects before slicing. After slicing it refuses crossing centrelines
+  (exit -101, `ConflictChecker.cpp`). Tree supports do not avoid a neighbour and are clipped to the bed.
+- Measured spread: 20.9 mm on one side of a 218 mm housing (z 0..5), 0 to 7.1 mm everywhere else on that plate;
+  15.6 mm under a 170 mm bracket. Estimate: tree `min(22, max(8, 0.10 x height))`, normal 5, all four sides.
+  `--probe-supports` measures per side with a cached solo slice.
+- Pair rule: max of the two facing spreads + 1 mm, not the sum. Short against an estimate is a WARN ("the slice
+  decides"); against a probe or a spec value a FAIL. Brims leave the pair rule; tree spread leaves the bed rule.
+- Footprint: the mesh's XY silhouette after orientation (0.5 mm cells, 0.015 s on an 11k-facet part). A convex
+  hull would refuse the printed plate: the feeler's hull covers the cradle that sits between its end blocks.
+- Packer: bottom-left candidate points for by-layer plates (1 plate for the five parts; rows needed 2). A part that
+  fits nowhere gets one "PLACEMENT NOT DONE" line with the arithmetic, never bed-edge FAILs at the origin.
+- On exit -101 the report names the two spec keys from Studio's log line (it has no z). Exit -21 is Studio's own
+  arrange (24 mm between objects with tree supports).
+- Review corrections (reference 08 section 11.9): brims crossing the bed or a nozzle's reach are clipped (WARN), a
+  probe keeps a support mask for the pair rule, `count` copies are separate objects (each one clash-tested), and
+  `--keep-going` never exports an unplaced part.

@@ -20,6 +20,9 @@ the answer off a table instead of guessing. A variant is a small JSON patch over
 own auto-orient table) into variants for one part, and
 `by_object_variant()` flips every plate to print-by-object, so the two hacks the skill leans on most are one
 flag each on the command line.
+
+A plate's `checks` are `[ok, text]` pairs with a parallel `check_kinds` list; a WARN (kind margin or brim) is ok=True
+and never counts as a failed variant.
 """
 
 from __future__ import annotations

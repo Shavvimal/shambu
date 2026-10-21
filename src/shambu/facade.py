@@ -243,12 +243,15 @@ class Bambu:
         do_slice: bool = False,
         printer: bool = True,
         allow_filament_mismatch: bool = False,
+        probe_supports: bool = False,
     ) -> BuildResult:
         if not isinstance(spec, Spec):
             spec = load_spec(spec)
         pipeline = self.pipeline()  # a missing Studio binary is the environment error to report first
         res = self.resolve_filaments(spec, printer=printer, allow_mismatch=allow_filament_mismatch)
-        return pipeline.build(spec, export=export, timeout=timeout, keep_going=keep_going, do_slice=do_slice, filaments=res)
+        return pipeline.build(
+            spec, export=export, timeout=timeout, keep_going=keep_going, do_slice=do_slice, filaments=res, probe_supports=probe_supports
+        )
 
     def inspect(self, path: str | Path, features: bool = True) -> dict:
         """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature."""
