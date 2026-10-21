@@ -504,7 +504,10 @@ class PrintFit:
     def lines(self) -> list[str]:
         head = f"{self.printer_model or 'printer ?'}, {self.material or 'material ?'}, {self.first_read_at[:10]}: "
         if self.rate is None or self.rate_layers is None:
-            head += f"no rate (fewer than two polls at layer {RATE_MIN_LAYER} and up)"
+            head += (
+                f"no rate (the polls at layer {RATE_MIN_LAYER} and up span fewer than {RATE_MIN_SPAN_LAYERS} layers or "
+                f"{RATE_MIN_SPAN_MIN:g} minutes)"
+            )
         else:
             head += f"rate {self.rate:.3f} x Studio over layers {self.rate_layers[0]} to {self.rate_layers[1]}"
         out = [head]

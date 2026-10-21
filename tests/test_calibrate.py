@@ -684,6 +684,7 @@ def test_a_short_span_gives_no_rate_and_a_flag():
     """A 48 s, one-layer log once printed "rate 0.750": below 20 layers or 30 minutes there is no rate."""
     f = fit_log(print_log(layers=(11, 12), start=False, end=None))
     assert f.rate is None and C.FLAG_SPAN in f.flags
+    assert "span fewer than 20 layers or 30 minutes" in "\n".join(f.lines())
     f = fit_log(print_log(rate=0.2, layers=(11, 30), start=False, end=None))  # 20 layers but under 30 minutes
     assert f.rate is None and C.FLAG_SPAN in f.flags
 
