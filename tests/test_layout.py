@@ -16,8 +16,8 @@ FACTS = {
 }
 
 
-def part(key, w=20.0, h=20.0, z=10.0, filament=1, x0=0.0, y0=0.0, margin=0.0, also=(), manifold=True, lo=(0.0, 0.0, 0.0)):
-    return L.Placed(key, mesh(f"{key}.stl", (w, h, z), lo, manifold), filament, x0, y0, margin, also_filaments=frozenset(also))
+def part(key, w=20.0, h=20.0, z=10.0, filament=1, x0=0.0, y0=0.0, brim=0.0, also=(), manifold=True, lo=(0.0, 0.0, 0.0)):
+    return L.Placed(key, mesh(f"{key}.stl", (w, h, z), lo, manifold), filament, x0, y0, brim, also_filaments=frozenset(also))
 
 
 def failures(placed, **ctx):
@@ -40,7 +40,7 @@ def test_deepest_first_and_new_row_when_full():
 
 
 def test_margin_offsets_footprint():
-    p = L.ShelfPacker().place([part("a", margin=5.2)])[0][0]
+    p = L.ShelfPacker().place([part("a", brim=5.2)])[0][0]
     assert (p.x0, p.y0) == (7.2, 7.2)
     assert p.rect() == (2.0, 2.0, 32.4, 32.4)
 
@@ -148,12 +148,12 @@ def test_aux_x_limit():
 def test_aux_x_limit_clips_a_brim_and_fails_a_support():
     """The mesh ends at x 230 (under 235.5). Its 10 mm brim reaches x 240: Studio clips it (WARN). A 10 mm support
     spread reaching x 240 is a FAIL."""
-    p = part("a", filament=2, x0=210, y0=30, margin=10)
+    p = part("a", filament=2, x0=210, y0=30, brim=10)
     cs = L.LimitChecker().check([p], L.Context(FACTS, aux_x_limit=235.5))
     assert all(c.ok for c in cs) and any(
         c.kind == "brim" and "reaches x 240.0 on +x" in c.text and "clipped at x 235.5" in c.text for c in cs
     )
-    p.margin, p.spread = 0.0, L.Spread(0, 10, 0, 0, "probe", True)
+    p.brim, p.spread = 0.0, L.Spread(0, 10, 0, 0, "probe", True)
     t = failures([p], aux_x_limit=235.5)
     assert any("aux_x_limit" in x and "235.5" in x and "reaches x 240.0" in x for x in t)
 
@@ -224,7 +224,7 @@ def test_extruder_reach_counts_the_margin():
     """Support prints with the part's filament, so it must stay in that extruder's reach (FAIL). A brim past the reach
     is clipped by Studio to the nozzle's printable area (Brim.cpp:1079-1095, 1129-1138): a WARN."""
     assert failures([part("a", filament=2, x0=25, y0=30)]) == []
-    brim = part("a", filament=2, x0=25, y0=30, margin=5)  # 25 - 5 = 20 < 20.5
+    brim = part("a", filament=2, x0=25, y0=30, brim=5)  # 25 - 5 = 20 < 20.5
     cs = L.LimitChecker().check([brim], L.Context(FACTS))
     assert all(c.ok for c in cs)
     assert any(c.kind == "brim" and "brim on filament 2 reaches x 20.0 on -x and will be clipped at x 20.5" in c.text for c in cs)
@@ -240,8 +240,8 @@ def spread(mx, px=None, my=None, py=None, source="probe", tree=True):
     return L.Spread(mx, px, my, py, source, tree)
 
 
-def sup(key, w=20.0, h=20.0, x0=0.0, y0=0.0, s=L.NO_SPREAD, margin=0.0, filament=1, footprint=None, z=10.0):
-    p = part(key, w, h, z=z, x0=x0, y0=y0, margin=margin, filament=filament)
+def sup(key, w=20.0, h=20.0, x0=0.0, y0=0.0, s=L.NO_SPREAD, brim=0.0, filament=1, footprint=None, z=10.0):
+    p = part(key, w, h, z=z, x0=x0, y0=y0, brim=brim, filament=filament)
     p.spread, p.footprint = s, footprint
     return p
 
@@ -270,12 +270,6 @@ def test_normal_spread_estimate_is_five():
 def test_probe_spread_replaces_the_estimate():
     probe = L.Spread(21.0, 0.3, 0.3, 2.9, "probe")
     assert L.support_spread({"enable_support": "1"}, 218.0, probe) is probe
-
-
-def test_spread_turns_with_a_quarter_turn():
-    s = L.Spread(1.0, 2.0, 3.0, 4.0, "probe")
-    assert s.turned(1).sides() == (4.0, 3.0, 1.0, 2.0)  # (mx, px, my, py) -> (py, my, mx, px)
-    assert s.turned(4) == s
 
 
 def test_pair_clearance_takes_the_max_not_the_sum():
@@ -320,33 +314,33 @@ def test_body_overlap_names_both_boxes_and_the_intersection():
 
 
 def test_brims_do_not_count_between_parts():
-    a, b = sup("a", x0=10, y0=10, margin=5.2), sup("b", x0=32, y0=10, margin=5.2)
+    a, b = sup("a", x0=10, y0=10, brim=5.2), sup("b", x0=32, y0=10, brim=5.2)
     assert [x for x in checks([a, b]) if not x.ok or x.warn] == []
 
 
 def test_inside_bed_ignores_tree_spread_counts_normal_spread():
-    tree = sup("feeler", 50.0, 226.4, x0=100, y0=14.8, margin=5.2, s=spread(16.0, source="estimate", tree=True))
+    tree = sup("feeler", 50.0, 226.4, x0=100, y0=14.8, brim=5.2, s=spread(16.0, source="estimate", tree=True))
     assert failures([tree]) == []
-    normal = sup("feeler", 50.0, 226.4, x0=100, y0=14.8, margin=5.2, s=spread(16.0, source="estimate", tree=False))
+    normal = sup("feeler", 50.0, 226.4, x0=100, y0=14.8, brim=5.2, s=spread(16.0, source="estimate", tree=False))
     (t,) = failures([normal])
-    assert "is on the bed, but with its estimate support margin 16.0 mm each side" in t and "leaves the bed" in t
+    assert "is on the bed, but with its estimate support spread 16.0 mm each side" in t and "leaves the bed" in t
 
 
 def test_brim_only_off_the_bed_is_a_warn_support_off_the_bed_a_fail():
-    brim = sup("a", x0=2, y0=30, margin=5.2)
+    brim = sup("a", x0=2, y0=30, brim=5.2)
     cs = checks([brim])
     assert all(c.ok for c in cs) and [c.kind for c in cs if c.warn] == ["brim"]
     normal = sup("a", x0=2, y0=30, s=spread(5.0, source="estimate", tree=False))
-    assert any("support margin" in t for t in failures([normal]))
+    assert any("support spread" in t for t in failures([normal]))
 
 
 def test_packer_keeps_the_brim_on_the_bed_when_it_can_and_clips_it_when_it_must():
-    p = sup("wide", 250, 20, margin=5.2)  # 250 + 2 x 5.2 > 252: only a clipped brim fits
+    p = sup("wide", 250, 20, brim=5.2)  # 250 + 2 x 5.2 > 252: only a clipped brim fits
     got = L.BottomLeftPacker().place([p])
     assert got.unplaced == {} and any(c.kind == "brim" for c in checks([p]))
-    q = sup("small", 20, 20, margin=5.2)
+    q = sup("small", 20, 20, brim=5.2)
     L.BottomLeftPacker().place([q])
-    assert q.x0 - q.margin >= 2.0  # room for the whole brim: the brim stays on the bed
+    assert q.x0 - q.brim >= 2.0  # room for the whole brim: the brim stays on the bed
 
 
 def test_reach_counts_spread_only_toward_the_dead_strip():
@@ -385,14 +379,12 @@ def raster_part(key, rects, x0, y0, s=L.NO_SPREAD):
 
 
 def test_raster_gap_sees_into_a_notch():
-    from shambu import mesh as M
 
     u_rects = [(0, 0, 10, 100), (10, 0, 40, 10), (10, 90, 40, 100)]  # a U open to +x, like the feeler's end blocks
     u = raster_part("u", u_rects, 0, 0)
     inner = sup("inner", 20, 60, x0=15, y0=20)
     assert L.overlaps(u.rect(), inner.rect())  # the boxes overlap
-    hull = M.hull_2d((v[0], v[1]) for f in _boxes(*u_rects) for v in f)
-    assert {(0.0, 0.0), (40.0, 0.0), (40.0, 100.0), (0.0, 100.0)} == set(hull)  # the hull covers the inner box: gap 0
+    # its convex hull is the 40 x 100 rectangle, which covers the inner box: a hull gap would be 0
     g, _ = u.shape().gap(inner.shape())
     assert g == pytest.approx(5.0)
     assert L.pair_check(u, inner) is None
@@ -447,7 +439,7 @@ TREE = {"enable_support": "1", "support_type": "tree(auto)"}
 
 
 def plate14(spreads):
-    return [sup(k, w, d, z=h, margin=5.2, s=spreads(k, h)) for k, (w, d, h) in PLATE14.items()]
+    return [sup(k, w, d, z=h, brim=5.2, s=spreads(k, h)) for k, (w, d, h) in PLATE14.items()]
 
 
 def test_bottom_left_fits_plate14_on_one_plate_with_probe_spreads():
@@ -476,8 +468,8 @@ def test_packer_reports_unplaced_instead_of_raising():
     got = L.BottomLeftPacker().place([deep, ok])
     assert list(got.unplaced) == ["deep"] and not deep.placed and ok.placed
     assert got.unplaced["deep"] == (
-        "the packer could not place deep: 300.0 mm deep + 2 x 0.0 mm margin = 300.0 mm, the bed area is 252.0 mm deep "
-        "(2.0..254.0, inside the layout edges)"
+        "the packer could not place deep: 300.0 mm deep + 2 x 0.0 mm spread = 300.0 mm, the bed area is 252.0 mm deep "
+        "(2.0..254.0, inside the layout edges and the extruder reach)"
     )
 
 
@@ -496,9 +488,9 @@ def test_bottom_left_keeps_clear_of_fixed_parts_and_obstacles():
 
 
 def test_bottom_left_keeps_filament_2_in_reach():
-    p = sup("label", 30, 30, filament=2, margin=5.2)
+    p = sup("label", 30, 30, filament=2, brim=5.2)
     L.BottomLeftPacker().place([p], x_min_of={"label": 20.5})
-    assert p.x0 - p.margin >= 20.5
+    assert p.x0 - p.brim >= 20.5
 
 
 def test_shelf_packer_kept_for_by_object_order():
@@ -595,3 +587,50 @@ def test_a_concave_part_keeps_its_outline_when_fixed():
     got2 = L.BottomLeftPacker().place([small2], fixed=[fixed_u])
     assert len(got2) == 1 and got2.unplaced == {} and L.pair_check(small2, fixed_u) is None
     assert (small2.x0, small2.y0) == (small.x0, small.y0)
+
+
+# ---------------------------------------------------------------------------- second review (2026-10-21)
+def test_spread_is_tested_against_the_whole_neighbour_not_its_nearest_side():
+    """An L-shaped neighbour: one arm 2 mm above the part, the other 5 mm to its left. The nearest gap faces +y, where
+    the spread is 0; the 10 mm -x spread still crosses the left arm."""
+    a = sup("a", 20, 20, x0=50, y0=50, s=L.Spread(10, 0, 0, 0, "probe", True))
+    l_part = raster_part("l", [(25, 72, 80, 82), (25, 30, 45, 72)], 25, 30)  # top arm y 72..82, left arm x 25..45
+    g, _ = a.shape().gap(l_part.shape())
+    assert g == pytest.approx(2.0)
+    c = L.pair_check(a, l_part)
+    assert c is not None and not c.ok and "a's support reaches 10.0 mm on -x (measured by a solo slice)" in c.text
+    assert "are 2.0 mm apart" in c.text
+
+
+def test_reported_gap_is_exact_when_a_mask_collides():
+    u = raster_part("u", U_RECTS, 0, 0, s=L.Spread(0, 0, 0, 0, "probe", True))
+    u.support_mask = L.mask_from_points((x / 2, y / 2) for x in range(24, 78) for y in range(30, 170))
+    c = L.pair_check(u, sup("inner", 20, 60, x0=15, y0=20))
+    assert c is not None and "are 5.0 mm apart" in c.text  # the model gap, not the 1 mm cut-off of the mask test
+
+
+def test_bottom_left_finds_the_pocket_of_a_u():
+    """A fixed 252 x 252 U with 20 mm arms fills the bed; its pocket is the only place a 200 x 200 square fits.
+    Bounding-box candidates never offer it; the outline's internal corners do."""
+    u = raster_part("u", [(0, 0, 20, 252), (20, 0, 252, 20), (20, 232, 252, 252)], 2, 2)
+    u.fixed = True
+    sq = sup("square", 200, 200)
+    got = L.BottomLeftPacker().place([sq], fixed=[u])
+    assert len(got) == 1 and got.unplaced == {} and sq.placed
+    assert (sq.x0, sq.y0) == (27.0, 27.0)
+    assert L.pair_check(sq, u) is None
+
+
+def test_shelf_packer_keeps_the_right_reach_limit():
+    p = part("wide", 220, 20, filament=2)
+    got = L.ShelfPacker().place([p], x_min_of={"wide": 20.5}, x_max_of={"wide": 235.5})
+    assert got.plates == [] and "220.0 mm wide" in got.unplaced["wide"] and "extruder reach" in got.unplaced["wide"]
+    q = part("ok", 200, 20, filament=2)
+    L.ShelfPacker().place([q], x_min_of={"ok": 20.5}, x_max_of={"ok": 235.5})
+    assert q.placed and q.x0 >= 20.5 and q.x1 <= 235.5
+
+
+def test_shelf_packer_unplaces_a_part_pushed_past_its_reach_by_an_obstacle():
+    p = part("p", 100, 20)
+    got = L.ShelfPacker().place([p], [(2.0, 2.0, 120.0, 40.0)], x_max_of={"p": 200.0})
+    assert "no room" in got.unplaced["p"] and not p.placed

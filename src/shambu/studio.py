@@ -32,7 +32,7 @@ import plistlib
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -106,13 +106,31 @@ _ACTIONS = {
 
 # Log lines of a failed slice (Print.cpp:2434 and BambuStudio.cpp:5477-5485, v02.08.02.61). The names are the CLI's
 # object names (<stem>_<n>, assemble_<k>), before shambu renames them. The conflict line carries no z.
-_CONFLICT = re.compile(r"gcode path conflicts found between (\S+) and (\S+)")
+_CONFLICT = re.compile(r"gcode path conflicts found between (.+?)[ \t]*$", re.M)
 _ARRANGE_FAILED = re.compile(r"arrange failed:.*?plate index (\d+)")
 
 
-def conflicts_in_log(text: str) -> list[tuple[str, str]]:
-    """Every object pair of an exit -101 (`gcode path conflicts found between A and B`), in log order, once each."""
-    return list(dict.fromkeys(m.groups() for m in _CONFLICT.finditer(text)))  # type: ignore[misc]
+def conflicts_in_log(text: str, known: Collection[str] = ()) -> list[tuple[str, str | None]]:
+    """Every object pair of an exit -101 (`gcode path conflicts found between A and B`), in log order, once each.
+    Object names may hold spaces and even " and ", so the rest of the line is split at the " and " where both sides
+    are `known` CLI names; with no known split and exactly one " and ", at that one. A line no rule splits comes back
+    as (rest of the line, None)."""
+    out: list[tuple[str, str | None]] = []
+    for m in _CONFLICT.finditer(text):
+        rest = m.group(1)
+        cuts = [i for i in range(len(rest)) if rest.startswith(" and ", i)]
+        splits = [(rest[:i], rest[i + 5 :]) for i in cuts]
+        good = [s for s in splits if s[0] in known and s[1] in known]
+        pair: tuple[str, str | None]
+        if len(good) == 1:
+            pair = good[0]
+        elif not good and len(splits) == 1:
+            pair = splits[0]
+        else:
+            pair = (rest, None)
+        if pair not in out:
+            out.append(pair)
+    return out
 
 
 def arrange_failed_plate(text: str) -> int | None:

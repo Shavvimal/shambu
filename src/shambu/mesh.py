@@ -1,6 +1,6 @@
 """Triangle meshes without a dependency: read and write STL, rotate, lay a face on the bed, split bodies,
 score an orientation the way a printer cares about (bed contact, overhang, height), and project a mesh onto the
-bed (`silhouette`, the layout's footprint; `hull_2d`).
+bed (`silhouette`, the layout's footprint).
 
 Why here: Bambu Studio's CLI rotates every object at once (`--rotate*`) and the assemble list carries no
 transform (reference 01), so a per-part orientation has to be baked into the STL before the CLI sees it.
@@ -13,7 +13,7 @@ of the mesh, and `overhang` counts facets that face down more than `threshold` d
 vertical wall, 90 = a flat ceiling). The default 60 is what Studio supports by default (`support_threshold_angle`
 30 counts from horizontal: convert with 90 - angle); 45 is the conservative "45 degree rule" for a clean print.
 
-Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), 3D convex hulls, painted supports, and
+Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), convex hulls, painted supports, and
 anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those.
 """
 
@@ -733,26 +733,3 @@ def silhouette(facets: Sequence[Facet], cell: float = SILHOUETTE_CELL) -> Silhou
                 merged.append([c0, c1])
         rows.append(tuple((lx + c0 * cell, min(hx, lx + (c1 + 1) * cell)) for c0, c1 in merged))
     return Silhouette(cell, lx, ly, hx, hy, tuple(rows))
-
-
-def hull_2d(points: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Convex hull of XY points (Andrew's monotone chain), counter-clockwise, no repeated first point. For a report or
-    a quick area; the layout's gap uses `silhouette`, because a hull fills notches that other parts sit in."""
-    pts = sorted(set(points))
-    if len(pts) <= 2:
-        return pts
-
-    def turn(o, a, b) -> float:
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    lower: list[tuple[float, float]] = []
-    for p in pts:
-        while len(lower) >= 2 and turn(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-    upper: list[tuple[float, float]] = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and turn(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-    return lower[:-1] + upper[:-1]

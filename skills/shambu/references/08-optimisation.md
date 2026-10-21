@@ -534,16 +534,21 @@ them. Box gap -3.7 mm (overlap), convex-hull gap 0.0, real gap 4.95 mm (brim to 
 
 ### 11.3 The rules now
 
-- Pair (`Clearance`): footprint gap g (silhouette) and its direction. g < 1.0 mm (two lines) is a FAIL body ("footprints
-  touch" or "intersect by w x d mm"). Otherwise the need is max(a's spread toward b, b's spread toward a) + 1.0: the max,
-  not the sum, because support-on-support crossings do not fail Studio. Short against an estimate: WARN "the slice
-  decides". Short against a probe or a spec value: FAIL margin. Brims are not in the pair rule.
-- Bed (`InsideBed`): body, brim and normal-support spread inside the bed; tree spread is not counted (clipped).
+- Pair (`Clearance`): footprint gap g (silhouette). g under the 1.0 mm line allowance (`layout.LINE`, shambu's choice,
+  about two line widths) is a FAIL body ("footprints touch" or "intersect by w x d mm"). Otherwise each part's
+  outline is swept by one side's spread at a time and tested against the whole of the other part: the larger of the
+  two spreads counts, not their sum, because support-on-support crossings do not fail Studio. A probed part uses its
+  measured support mask instead. Short against an estimate: WARN "the slice decides". Short against a probe or a spec
+  value: FAIL margin. Brims are not in the pair rule.
+- Bed (`InsideBed`): body and normal-support spread inside the bed (FAIL); tree spread is not counted (clipped), and a
+  brim past the edge is a WARN brim (clipped too, 11.9).
 - Reach (`ExtruderReach`): only the sides where the extruder's reach is narrower than the bed (the right nozzle's
-  x < 20.5, `aux_x_limit`); there brim and the full spread count, trees too (section 3.3b, exit -102). No reach line
-  when the reach is the whole bed: it repeated the bed line on every spec of the post-mortem.
+  x < 20.5, `aux_x_limit`); there the full spread counts, trees too (section 3.3b, exit -102), and a brim past the
+  reach is a WARN brim. No reach line when the reach is the whole bed: it repeated the bed line on every spec of the
+  post-mortem.
 - Spec: `brim_margin` replaces brim and support on every side (FAIL-level, counted at the bed edge); `support_spread`
   `[mx, px, my, py]` replaces the support part per side.
+
 
 ### 11.4 Live clash test (30 mm cube next to an L with a 15 mm cantilever at z 20..30, no brim)
 
@@ -574,8 +579,8 @@ A solo `--slice` of each supported single-file part in its final orientation, `-
 `<outdir>/.probe/<mesh sha256>-<orientation>-<support keys hash>.json`. A one-object plate has no object labels in
 its G-code (live): the parser then reads every move after the first `; CHANGE_LAYER`, without `Custom` moves. Live on
 the plate-14 spec with the PLA-interface process (`raft_first_layer_expansion` 5, `tree_hybrid`; measured once, so not
-the printed file's settings): housing -x 13.8, +x 4.4, -y 0.9, +y 1.3; mount +x 4.6; shell -x 10.6, +y 8.1; feeler 7.0 /
-7.0 / 5.0 / 5.0; cradle -x 9.1, +x 7.7, -y 2.1. Five probes plus the check took 12.5 s; the cached rerun 0.4 s.
+the printed file's settings): housing -x 13.8, +x 4.4, -y 1.3, +y 1.3; mount +x 4.6; shell -x 10.6, +y 8.1; feeler 7.0 /
+7.0 / 5.0 / 5.0; cradle -x 14.9, +x 8.2, -y 2.1 (cache format 3, 11.10; format 1 read 9.1 / 7.7 for the cradle). Five probes plus the check took 12.5 s; the cached rerun 0.4 s.
 
 ### 11.7 Silhouette cost (Python 3.14, Apple silicon, 0.5 mm cell)
 
@@ -593,7 +598,7 @@ never rotated, so a part turned 45 degrees keeps its real outline (a 50 x 226 ba
 
 ### 11.9 Review corrections (Codex review against the source, 2026-10-21)
 
-- The 1.0 mm pair allowance (`layout.LINE`) is shambu's policy, not a Studio limit. Studio refuses lines of two objects
+- The 1.0 mm line allowance (`layout.LINE`) is shambu's policy, not a Studio limit. Studio refuses lines of two objects
   that overlap collinearly by more than 0.01 mm, whatever their roles, or cross more than 0.01 mm from an endpoint;
   only support-on-support crossings get a 100 mm threshold (`ConflictChecker.cpp:291-310`).
 - The conflict check reads the first instance of each PrintObject (`ConflictChecker.cpp:226, 244-245`), and Studio
@@ -613,3 +618,30 @@ never rotated, so a part turned 45 degrees keeps its real outline (a 50 x 226 ba
   no FAIL with the masks, 14.7 s for five fresh probes.
 - `--keep-going` never exports a plate with an unplaced part, as it never exports a placeholder filament.
 - Fixed parts (`at`) and filament groups keep their outlines (the group is the union of its members' outlines).
+
+### 11.10 Second review (Codex and rubric, 2026-10-21)
+
+- Probe parser: Studio unretracts with an E-only move (`G1 E.8 F1800`) at the travel destination, before the next
+  `; FEATURE:` comment. Counted as extrusion, that point joined the previous feature's box: on the solo cradle probe
+  the model box started at x 111.4 for 117.2, and the -x spread read 9.1 mm for 14.9. A move now needs an XY path
+  (a full-circle arc still counts); `probe.CACHE_FORMAT` 3 drops the old measurements.
+- Probe cache key: a hash of the complete resolved machine, every filament preset, the process with the part's own
+  settings, the filament slot and map, the bed type and the Studio version (shrinkage, nozzle diameter and contour
+  compensation all change the slice).
+- Pair rule: each part's outline is grown by its four spreads and tested against the whole neighbour, then side by
+  side to name the side. The old test looked only at the side facing the nearest gap, so an L-shaped neighbour 2 mm
+  away on one side passed while the spread on another side crossed its other arm. The report gives the exact model
+  gap.
+- Packer: candidates come from the internal corners of each placed outline too (a 200 mm square in the pocket of a
+  252 mm U). Plate 1 keeps its index when only fixed parts are on it, so a free part pushed to plate 2 is unplaced and
+  never exported. The row packer keeps the right-hand reach (`x_max_of`).
+- A raft keeps its bed margin on every source (estimate, spec, probe): raft paths are not clipped by the tree code
+  (`TreeSupport.cpp:1591-1617`). `layout.clipped_at_bed` is the one classification.
+- Report: no "N part(s) fit" line beside an unplaced part; a footprint that falls back to the box is a warning with
+  the reason; probe failures (no slice, no G-code, a bad archive, no model extrusion, a file error) are warnings and
+  the estimate applies; an unreadable slice log is reported as such. `check_kinds` holds the kind, `check_levels`
+  ok / warn / fail.
+- -101 names: object names with spaces are split at the " and " where both sides are known CLI names; two parts that
+  share a CLI name are named as "one of a, b".
+- Live on the plate-14 spec: without the probe, 3 WARN margin lines (the housing's 21.8 mm estimate), exit 0; with the
+  probe, no WARN and no FAIL, exit 0, 14.4 s for five fresh probes.

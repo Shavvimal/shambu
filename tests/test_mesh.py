@@ -280,9 +280,3 @@ def test_silhouette_rejects_an_empty_mesh_and_a_bad_cell():
         M.silhouette([])
     with pytest.raises(BuildError):
         M.silhouette(box((0, 0, 0), (1, 1, 1)), cell=0)
-
-
-def test_hull_2d_drops_inner_points():
-    pts = [(0, 0), (10, 0), (10, 10), (0, 10), (5, 5), (5, 0)]
-    assert set(M.hull_2d(pts)) == {(0, 0), (10, 0), (10, 10), (0, 10)}
-    assert M.hull_2d([(1, 1)]) == [(1, 1)]

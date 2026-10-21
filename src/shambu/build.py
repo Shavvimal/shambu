@@ -299,31 +299,52 @@ class BuildResult:
             return []
         try:
             text = self.run.log.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            text = ""
+        except OSError as e:
+            what = "the conflicting objects" if self.run.code == -101 else "the plate"
+            return [f"Studio failed with exit {self.run.code}, and its log {self.run.log} could not be read ({e}): {what} are unknown."]
         if self.run.code == -21:
             n = arrange_failed_plate(text)
             return [
                 f"Studio's arrange could not fit the parts on plate {n if n is not None else '(the log does not say which)'} "
                 "(it keeps 24 mm between objects when any part has tree supports)"
             ]
-        by_cli = {x.cli_name: x for x in self.plan.parts if x.cli_name}
-        pairs = conflicts_in_log(text)
+        by_cli: dict[str, list[PlannedPart]] = {}
+        for x in self.plan.parts:
+            if x.cli_name:
+                by_cli.setdefault(x.cli_name, []).append(x)
+        pairs = conflicts_in_log(text, by_cli)
         if not pairs:
             return ["Studio found crossing G-code paths (exit -101), and its log names no objects. Move the parts apart and build again."]
         out = []
         for a, b in pairs:
-            pa, pb = by_cli.get(a), by_cli.get(b)
-            ka, kb = (pa.key if pa else a), (pb.key if pb else b)
+            if b is None:
+                out.append(
+                    f"Studio found crossing G-code paths (exit -101) between '{a}', which shambu cannot split into two object names. "
+                    "Move the parts apart and build again."
+                )
+                continue
+
+            def name(cli: str) -> str:
+                got = by_cli.get(cli, [])
+                if len(got) == 1:
+                    return got[0].key
+                if got:
+                    return f"{cli} (one of {', '.join(x.key for x in got)}: they share that CLI name, so the log cannot tell which)"
+                return cli
+
+            pa, pb = by_cli.get(a, []), by_cli.get(b, [])
             reach = ""
-            if pa and pb:
-                _, (dx, dy) = L.rect_gap(pa.placed.rect(with_margin=False), pb.placed.rect(with_margin=False))
-                fa, sa = pa.placed.spread.facing(dx, dy)
-                fb, sb = pb.placed.spread.facing(-dx, -dy)
-                who, f, side, src = (pa, fa, sa, pa.placed.spread.source) if fa >= fb else (pb, fb, sb, pb.placed.spread.source)
+            if len(pa) == 1 and len(pb) == 1:
+                qa, qb = pa[0].placed, pb[0].placed
+                _, (dx, dy) = L.rect_gap(qa.rect(with_margin=False), qb.rect(with_margin=False))
+                fa, sa = qa.spread.facing(dx, dy)
+                fb, sb = qb.spread.facing(-dx, -dy)
+                who, f, side, src = (qa, fa, sa, qa.spread.source) if fa >= fb else (qb, fb, sb, qb.spread.source)
                 if f > 0:
                     reach = f" ({who.key}'s support reaches {f:.1f} mm on {side}" + (", estimated)" if src == "estimate" else ")")
-            out.append(f"Studio found crossing G-code paths between {ka} and {kb} (exit -101). Move them apart{reach} and build again.")
+            out.append(
+                f"Studio found crossing G-code paths between {name(a)} and {name(b)} (exit -101). Move them apart{reach} and build again."
+            )
         return out
 
     def slicer_warnings(self) -> list[str]:
@@ -377,7 +398,8 @@ class BuildResult:
                         if x.grouped
                     ],
                     "checks": [[c.ok, c.text] for c in p.checks],
-                    "check_kinds": [("warn" if c.warn else c.kind) for c in p.checks],
+                    "check_kinds": [c.kind for c in p.checks],
+                    "check_levels": [("warn" if c.warn else "ok") if c.ok else "fail" for c in p.checks],
                 }
                 for p in self.plan.plates
             ],
@@ -573,8 +595,6 @@ class Pipeline:
                         solo_row_above=clr["height_to_rod"],
                     )
                 packed = plate_placer.place(free, obstacles, x_min_of, fixed=fixed, x_max_of=x_max_of)
-                if not isinstance(packed, L.Placement):  # a placer written against the old protocol returns plates only
-                    packed = L.Placement(list(packed))
                 placement_checks = self._placement_checks(packed, free, plate_placer)
                 overflow = len(packed) > 1
                 if overflow:
@@ -742,14 +762,16 @@ class Pipeline:
             body = L.union_info(ok_infos)  # merged sub-parts share one translation: pack their union bbox
             eff_settings = {**process, **ps.set}
             margin, spread, mask = self._margins(ps, eff_settings, body, files, main, probe, warnings, where)
-            footprint = self._footprint(files, body)
+            footprint, why_box = self._footprint(files, body)
+            if why_box and warnings is not None:
+                warnings.append(f"{where} ({ps.key()}): the layout uses the bounding box, not the outline: {why_box}")
             for copy in range(ps.count):
                 key = _unique_key(ps.key(), used_keys)
                 placed = L.Placed(
                     key,
                     body,
                     main,
-                    margin=margin,
+                    brim=margin,
                     also_filaments=frozenset(eff - {main}),
                     spread=spread,
                     footprint=footprint,
@@ -780,7 +802,7 @@ class Pipeline:
         brim = L.brim_margin(eff_settings)
         if ps.support_spread is not None:
             mx, px, my, py = ps.support_spread
-            return brim, L.Spread(mx, px, my, py, "spec", L.is_tree(eff_settings), "spec support_spread"), None
+            return brim, L.Spread(mx, px, my, py, "spec", L.clipped_at_bed(eff_settings), "spec support_spread"), None
         measured: L.Spread | None = None
         mask: L.Footprint | None = None
         if probe is not None and L.needs_support(eff_settings) and len(files) == 1:
@@ -794,24 +816,25 @@ class Pipeline:
         return brim, L.support_spread(eff_settings, body.size[2], measured), mask
 
     @staticmethod
-    def _footprint(files: list[tuple[Path, int, str]], body: MeshInfo) -> L.Footprint | None:
+    def _footprint(files: list[tuple[Path, int, str]], body: MeshInfo) -> tuple[L.Footprint | None, str]:
         """The XY silhouette of the part's printing bodies in the frame the CLI loads (after the orientation), as a
-        RasterFootprint. None (the bounding box) when an STL cannot be read or its box differs from Studio's by more
-        than 0.5 mm (a unit conversion, a 3MF input): the box is then the safe outline."""
+        RasterFootprint, and "". None (the bounding box) plus the reason when an STL cannot be read or its box differs from Studio's by more than 0.5 mm (a unit conversion, a 3MF input): the box is then the
+        safe outline, and the caller warns."""
         facets: list[M.Facet] = []
         for fp, _, sub in files:
             if sub != "normal_part":
                 continue
             try:
                 facets += M.read_stl(fp)
-            except BambuError:
-                return None
-        if not facets:
-            return None
+            except BambuError as e:
+                return None, f"{fp.name} cannot be read ({e})"
+        if not facets:  # an STL without facets (a test stand-in): Studio's --info box is all there is, no warning
+            return None, ""
         sil = M.silhouette(facets)
-        if max(abs(a - b) for a, b in zip((sil.x0, sil.y0, sil.x1, sil.y1), (*body.min[:2], *body.max[:2]), strict=True)) > 0.5:
-            return None
-        return L.RasterFootprint.from_silhouette(sil)
+        off = max(abs(a - b) for a, b in zip((sil.x0, sil.y0, sil.x1, sil.y1), (*body.min[:2], *body.max[:2]), strict=True))
+        if off > 0.5:
+            return None, f"the STL's box differs from Studio's by {off:.1f} mm (a unit conversion or a 3MF input?)"
+        return L.RasterFootprint.from_silhouette(sil), ""
 
     @staticmethod
     def _x_max(p: L.Placed, ctx: L.Context) -> float:
@@ -840,7 +863,9 @@ class Pipeline:
             for n, plate in enumerate(packed.plates[1:], 2):
                 for p in plate:
                     p.placed, p.why_not = False, f"would need plate {n}"
-            split = "; ".join(f"plate {n}: " + ", ".join(p.key for p in plate) for n, plate in enumerate(packed.plates, 1))
+            split = "; ".join(
+                f"plate {n}: " + (", ".join(p.key for p in plate) or "the fixed parts only") for n, plate in enumerate(packed.plates, 1)
+            )
             kind = "row packer, no rotation" if isinstance(placer, L.ShelfPacker) else "bottom-left packer, no rotation"
             out.append(
                 L.Check(
@@ -909,7 +934,7 @@ class Pipeline:
             for m in members:  # a member the local packer left out is still a part to place on the plate
                 m.placed.placed, m.placed.why_not = True, ""
             if fits:  # the cluster's rect grows by the largest member margin on every side: it must still fit
-                gm = max(m.placed.reserve for m in members)
+                gm = max(m.placed.keep_out for m in members)
                 gw = max(m.placed.x1 for m in members) - min(m.placed.x0 for m in members) + 2 * gm
                 gh = max(m.placed.y1 for m in members) - min(m.placed.y0 for m in members) + 2 * gm
                 fits = gw <= x_hi - x_lo and gh <= y_hi - y_lo
@@ -948,7 +973,7 @@ class Pipeline:
                 key,
                 info,
                 fil,
-                margin=max(m.placed.margin for m in members),
+                brim=max(m.placed.brim for m in members),
                 also_filaments=first.placed.also_filaments,
                 spread=max((m.placed.spread for m in members), key=lambda sp: sp.most()),
                 # the members' own outlines, not the group's box: a part beside a concave member keeps its room

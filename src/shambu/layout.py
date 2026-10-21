@@ -46,11 +46,10 @@ from .studio import MeshInfo
 BED = 256.0
 EDGE = 2.0
 GAP = 5.0
-WIPE_TOWER = (15.0, 220.0, 35.0, 35.0)  # x, y, w, h reserved when a plate uses two filaments (CLI default position)
-# shambu's clearance policy, not a Studio limit: Studio has no clearance distance, it refuses lines that overlap or
-# cross by more than 0.01 mm (ConflictChecker.cpp:291-310). Two unsupported models 0 mm apart sliced with exit 0 (walls
-# 0.42 mm apart, reference 08 section 11.4), so 1.0 mm, about two line widths, is a margin for the slicer's own
-# rounding, not a measured threshold.
+# The line allowance: shambu's choice, not a Studio limit. Studio has no clearance distance, it refuses lines that
+# overlap or cross by more than 0.01 mm (ConflictChecker.cpp:291-310). Two unsupported models 0 mm apart sliced with
+# exit 0 (walls 0.42 mm apart, reference 08 section 11.4). 1.0 mm, about two line widths, covers the slicer's own
+# rounding; it is not a measured threshold.
 LINE = 1.0
 # Tree support spread past the model box, per side, as an estimate (reference 08 section 11.2, G-code of the printed
 # plate 14): the housing, 218 mm tall, 20.9 mm on -x at z 0..5 (20.9 / 218 = 0.096); the bracket, 170 mm tall,
@@ -115,16 +114,6 @@ class Spread:
             cands = list(zip(self.sides(), SIDES, strict=True))
         return max(cands, key=lambda c: c[0])
 
-    def toward(self, dx: float, dy: float) -> float:
-        return self.facing(dx, dy)[0]
-
-    def turned(self, quarter_turns: int) -> Spread:
-        """The spread after the part turns by quarter_turns x +90 degrees about z: (mx, px, my, py) -> (py, my, mx, px)."""
-        s = self
-        for _ in range(quarter_turns % 4):
-            s = replace(s, mx=s.py, px=s.my, my=s.mx, py=s.px)
-        return s
-
     def describe(self) -> str:
         v = self.sides()
         if max(v) == min(v):
@@ -159,6 +148,15 @@ def is_tree(p: Mapping) -> bool:
     return str(p.get("support_type", "tree(auto)")).startswith("tree")
 
 
+def clipped_at_bed(params: Mapping | None) -> bool:
+    """Studio clips this part's support to the bed border: tree support (TreeSupport.cpp:2507-2522) and no raft. Raft
+    paths are not clipped by the tree code (TreeSupport.cpp:1591-1617), so a raft keeps its bed margin. The one
+    classification for the estimate, the probe and the spec's support_spread."""
+    p = params or {}
+    supported = str(p.get("enable_support", "0")).strip().lower() in ("1", "true") or _int(p.get("enforce_support_layers", 0)) > 0
+    return supported and is_tree(p) and _int(p.get("raft_layers", 0)) <= 0
+
+
 def support_spread(params: Mapping | None, height: float, probe: Spread | None = None) -> Spread:
     """How far a part's support reaches past its bounding box, per side.
 
@@ -188,7 +186,7 @@ def support_spread(params: Mapping | None, height: float, probe: Spread | None =
             note = f"support {s:.1f} mm, the tree cap ({TREE_SPREAD_PER_MM:.2f} x {height:.1f} mm height is more), estimated"
         else:
             note = f"support {TREE_SPREAD_PER_MM:.2f} x {height:.1f} mm height, estimated"
-        return Spread(s, s, s, s, "estimate", True, note)
+        return Spread(s, s, s, s, "estimate", clipped_at_bed(p), note)
     return Spread(NORMAL_SPREAD, NORMAL_SPREAD, NORMAL_SPREAD, NORMAL_SPREAD, "estimate", False, "normal support, estimated")
 
 
@@ -275,6 +273,8 @@ class Footprint(Protocol):
 
     def translated(self, dx: float, dy: float) -> Footprint: ...
 
+    def grown(self, mx: float, px: float, my: float, py: float) -> Footprint: ...
+
     def area(self) -> float: ...
 
     def gap(self, other: Footprint, limit: float = math.inf) -> tuple[float, tuple[float, float]]:
@@ -311,6 +311,21 @@ class _Bands:
 
     def translated(self, dx: float, dy: float) -> Footprint:
         return replace(self, ox=self.ox + dx, oy=self.oy + dy)
+
+    def grown(self, mx: float, px: float, my: float, py: float) -> Footprint:
+        """The outline swept by mx/px/my/py mm toward -x/+x/-y/+y (each band widens and stretches), for the gap test
+        of a support spread. Grown bands may overlap in y; their y0 and y1 stay in the same order, which the gap walk
+        needs. Not for `area`."""
+        rows = []
+        for y0, y1, runs in self.rows:
+            merged: list[list[float]] = []
+            for a, b in runs:
+                if merged and a - mx <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b + px)
+                else:
+                    merged.append([a - mx, b + px])
+            rows.append((y0 - my, y1 + py, tuple((a, b) for a, b in merged)))
+        return replace(self, rows=tuple(rows), w=self.w + mx + px, h=self.h + my + py, lx=self.lx - mx, ly=self.ly - my)
 
     def area(self) -> float:
         return sum((y1 - y0) * sum(b - a for a, b in runs) for y0, y1, runs in self.rows)
@@ -425,7 +440,7 @@ class Placed:
     filament: int
     x0: float = 0.0
     y0: float = 0.0
-    margin: float = 0.0
+    brim: float = 0.0
     fixed: bool = False  # placed by the spec, not by the packer
     also_filaments: frozenset[int] = frozenset()  # filaments used by overrides, height ranges or sub-parts
     spread: Spread = NO_SPREAD
@@ -455,23 +470,23 @@ class Placed:
         return self.y0 + self.h
 
     @property
-    def reserve(self) -> float:
-        """One margin for every side, for the row packer: the larger of brim and support spread."""
-        return max(self.margin, self.spread.most())
+    def keep_out(self) -> float:
+        """The keep-out the row packer holds on every side: the larger of brim and support spread."""
+        return max(self.brim, self.spread.most())
 
     def bed_margin(self, with_brim: bool = True) -> tuple[float, float, float, float]:
         """Growth per side (-x, +x, -y, +y) that must stay on the bed: the support spread unless it is tree support
         (Studio clips trees to the bed border, TreeSupport.cpp:2507-2522), plus the brim when `with_brim` (Studio
         clips a brim too, Brim.cpp:1011-1138, so a brim off the bed is a WARN, not a FAIL)."""
         s = (0.0, 0.0, 0.0, 0.0) if self.spread.tree else self.spread.sides()
-        m = self.margin if with_brim else 0.0
+        m = self.brim if with_brim else 0.0
         return (m + s[0], m + s[1], m + s[2], m + s[3])
 
     def rect(self, with_margin: bool = True) -> Rect:
         """The bounding box, grown by brim plus support spread on each side when `with_margin`."""
         if not with_margin:
             return (self.x0, self.y0, self.x1, self.y1)
-        m, s = self.margin, self.spread
+        m, s = self.brim, self.spread
         return (self.x0 - m - s.mx, self.y0 - m - s.my, self.x1 + m + s.px, self.y1 + m + s.py)
 
     def shape(self) -> Footprint:
@@ -486,14 +501,15 @@ class Placed:
         return (self.x0 - self.info.min[0], self.y0 - self.info.min[1], -self.info.min[2])
 
     def margin_text(self) -> str:
-        """Where the margins come from, for a report line: `margin 8.0 mm = support 0.10 x 64.0 mm height, estimated`."""
+        """Where the brim and the spread come from, for a report line: `spread 8.0 mm = support 0.10 x 64.0 mm height,
+        estimated; brim 5.2 mm`."""
         parts = []
         if self.spread.most() > 0:
             v = self.spread.describe() if self.spread.source != "estimate" else f"{self.spread.most():.1f} mm"
-            parts.append(f"margin {v} = {self.spread.note or self.spread.source}")
-        if self.margin > 0:
-            parts.append(f"brim {self.margin:.1f} mm")
-        return "; ".join(parts) or "no margin"
+            parts.append(f"spread {v} = {self.spread.note or self.spread.source}")
+        if self.brim > 0:
+            parts.append(f"brim {self.brim:.1f} mm")
+        return "; ".join(parts) or "no brim or spread"
 
 
 def union_info(infos: Sequence[MeshInfo]) -> MeshInfo:
@@ -524,8 +540,8 @@ def overlaps(a: Rect, b: Rect) -> bool:
 # ---------------------------------------------------------------------------- checks
 @dataclass
 class Check:
-    """One line of the plate's check. `kind` sorts it: body (the parts themselves meet), margin (a support or brim
-    margin, not the bodies), placement (the packer could not place a part), bed, reach, height, spool, tower,
+    """One line of the plate's check. `kind` sorts it: body (the parts themselves meet), margin (the margin rule: a
+    support spread reaches another part or the bed edge, the bodies are apart), placement (the packer could not place a part), bed, reach, height, spool, tower,
     sequence, mesh, summary, brim (a brim Studio will clip). An ok Check of kind margin or brim is a WARN."""
 
     ok: bool
@@ -537,19 +553,45 @@ class Check:
         return self.ok and self.kind in ("margin", "brim")
 
 
+def _side_reaches(src: Placed, dst: Footprint) -> list[tuple[float, str]]:
+    """The sides of src's support spread that reach within the line allowance of dst's model. First src's outline
+    grown by all four spreads at once is tested against the whole of dst (an L-shaped neighbour can be nearest on one
+    side and still be crossed on another); then each side alone, to name the side. When only the corner of two sides
+    reaches, the facing side with the larger spread is named."""
+    base = src.shape()
+    if src.spread.most() <= 0:
+        return []
+    g_all, (dx, dy) = base.grown(*src.spread.sides()).gap(dst, limit=LINE + 0.01)
+    if g_all >= LINE:  # all four sides at once (the box model: a corner can hold two sides' spread)
+        return []
+    out = []
+    for i, (v, side) in enumerate(zip(src.spread.sides(), SIDES, strict=True)):
+        if v <= 0:
+            continue
+        grow = [0.0, 0.0, 0.0, 0.0]
+        grow[i] = v
+        g, _ = base.grown(*grow).gap(dst, limit=LINE + 0.01)
+        if g < LINE:
+            out.append((v, side))
+    if not out:  # only the corner region of two sides reaches: name the facing side with the larger spread
+        out.append(src.spread.facing(dx, dy))
+    return out
+
+
 def pair_check(a: Placed, b: Placed) -> Check | None:
     """The pair rule (fix 2 of the plate-14 post-mortem). None when the pair is clear.
 
-    - footprints closer than LINE (1 mm, shambu's policy): FAIL body, because their lines could cross (exit -101);
+    - footprints closer than the line allowance (LINE, 1 mm): FAIL body, because their lines could cross (exit -101);
     - a part with a measured support mask (probe): its support cells closer than LINE to the other's model is a FAIL.
       The mask, not the four spreads, because support inside a U-shaped notch stays inside the box (all spreads 0)
       and still meets a part nested in the notch;
-    - otherwise closer than its spread toward the other + LINE: its support could reach the other's model. Short
-      against a probe or spec spread is a FAIL. Short against an estimate is a WARN: the slice decides.
+    - otherwise each side's spread, swept from the part's outline, closer than LINE to the other's model: its support
+      could reach that model. Short against a probe or spec spread is a FAIL. Short against an estimate is a WARN: the
+      slice decides.
     Each part is tested against the other's model only: Studio counts a crossing of two supports only past 100 mm
-    (ConflictChecker.cpp:291-310), so the max of the two counts, not the sum."""
+    (ConflictChecker.cpp:291-310), so the larger of the two spreads counts, not their sum."""
     sa, sb = a.shape(), b.shape()
-    g, (dx, dy) = sa.gap(sb, limit=max(a.spread.most(), b.spread.most()) + LINE + 0.01)
+    g, _ = sa.gap(sb, limit=max(a.spread.most(), b.spread.most()) + LINE + 0.01)
     if g < LINE:
         ra, rb = sa.bbox(), sb.bbox()
         iw, ih = min(ra[2], rb[2]) - max(ra[0], rb[0]), min(ra[3], rb[3]) - max(ra[1], rb[1])
@@ -559,22 +601,23 @@ def pair_check(a: Placed, b: Placed) -> Check | None:
             text = f"{where_a} and {where_b} intersect by {iw:.1f} x {ih:.1f} mm. The parts themselves overlap: move one."
         else:
             text = (
-                f"{where_a} and {where_b}: the footprints touch ({g:.1f} mm apart; shambu keeps {LINE:.1f} mm). "
+                f"{where_a} and {where_b}: the footprints touch ({g:.1f} mm apart; the line allowance is {LINE:.1f} mm). "
                 "Studio refuses crossing paths (exit -101): move one."
             )
         return Check(False, text, "body")
     masked: list[tuple[Placed, Placed, float]] = []
-    spread_short: list[tuple[Placed, float, str]] = []
-    for src, dst, sgn in ((a, b, 1.0), (b, a, -1.0)):
+    reached: list[tuple[Placed, float, str]] = []
+    for src, dst in ((a, b), (b, a)):
         m = src.mask_shape()
         if m is not None:
             gm, _ = m.gap(dst.shape(), limit=LINE + 0.01)
             if gm < LINE:
                 masked.append((src, dst, gm))
             continue
-        f, side = src.spread.facing(sgn * dx, sgn * dy)
-        if g < f + LINE:
-            spread_short.append((src, f, side))
+        reached += [(src, v, side) for v, side in _side_reaches(src, dst.shape())]
+    if not masked and not reached:
+        return None
+    g, _ = sa.gap(sb)  # the exact gap for the message, not the cut-off value above
     if masked:
         src, dst, gm = masked[0]
         return Check(
@@ -583,19 +626,17 @@ def pair_check(a: Placed, b: Placed) -> Check | None:
             f"{max(gm, 0.0):.1f} mm of {dst.key}: move them apart",
             "margin",
         )
-    if not spread_short:
-        return None
-    hard = [s for s in spread_short if s[0].spread.hard]
+    hard = [s for s in reached if s[0].spread.hard]
     if hard:
         p, f, sd = max(hard, key=lambda h: h[1])
         how = "measured by a solo slice" if p.spread.source == "probe" else "set in the spec"
         return Check(
             False,
-            f"{a.key} and {b.key} are {g:.1f} mm apart; {p.key}'s support reaches {f:.1f} mm on {sd} ({how}); "
-            f"they need {f + LINE:.1f} mm: move them apart",
+            f"{a.key} and {b.key} are {g:.1f} mm apart; {p.key}'s support reaches {f:.1f} mm on {sd} ({how}), within the "
+            f"{LINE:.1f} mm line allowance of {b.key if p is a else a.key}: move them apart",
             "margin",
         )
-    reach = max(f for _, f, _ in spread_short)
+    reach = max(f for _, f, _ in reached)
     return Check(True, f"{a.key} and {b.key} are {g:.1f} mm apart; support reaches {reach:.1f} mm (estimated); the slice decides", "margin")
 
 
@@ -682,12 +723,12 @@ class InsideBed:
             if off(g):
                 yield Check(
                     False,
-                    f"{p.key} body {where} is on the bed, but with its {p.spread.source} support margin {p.spread.describe()} "
+                    f"{p.key} body {where} is on the bed, but with its {p.spread.source} support spread {p.spread.describe()} "
                     f"it reaches x {g[0]:.1f}..{g[2]:.1f} y {g[1]:.1f}..{g[3]:.1f}: that leaves the bed {size}",
                     "margin",
                 )
                 continue
-            m = p.margin
+            m = p.brim
             gb = (g[0] - m, g[1] - m, g[2] + m, g[3] + m)
             if m > 0 and off(gb):
                 clip = (max(gb[0], bed["x"][0]), max(gb[1], bed["y"][0]), min(gb[2], bed["x"][1]), min(gb[3], bed["y"][1]))
@@ -737,7 +778,7 @@ class ExtruderReach:
                     )
                 if not p.placed:
                     continue
-                s, m = p.spread, p.margin
+                s, m = p.spread, p.brim
                 sup = (p.x0 - s.mx, p.y0 - s.my, p.x1 + s.px, p.y1 + s.py)
                 lo_x, hi_x = e["x"]
                 if e["index"] == 2 and ctx.aux_x_limit is not None:
@@ -804,13 +845,6 @@ class MeshSane:
                 yield Check(True, f"{p.key}: STL min z is {p.info.min[2]:.2f}; the placement drops it onto the bed", "mesh")
 
 
-def gap_between(a: Rect, b: Rect) -> float:
-    """Shortest axis-aligned distance between two rectangles (0 when they touch or overlap)."""
-    dx = max(b[0] - a[2], a[0] - b[2], 0.0)
-    dy = max(b[1] - a[3], a[1] - b[3], 0.0)
-    return max(dx, dy) if (dx == 0 or dy == 0) else (dx * dx + dy * dy) ** 0.5
-
-
 class SequentialClearance:
     """Print-by-object (Studio 02.08, Print.cpp `sequential_print_clearance_valid`, reference 08):
     - the gap between two objects' convex hulls must be at least `radius - 0.2` mm (59.8 on the X2D); a bounding-box
@@ -829,7 +863,7 @@ class SequentialClearance:
         fails: list[Check] = []
         for i, a in enumerate(placed):
             for b in placed[i + 1 :]:
-                g = gap_between(a.rect(with_margin=False), b.rect(with_margin=False))
+                g, _ = rect_gap(a.rect(with_margin=False), b.rect(with_margin=False))
                 if g < need - 1e-6:
                     fails.append(
                         Check(
@@ -883,7 +917,7 @@ class LimitChecker:
         out: list[Check] = []
         for r in self.rules:
             out += list(r.check(placed, ctx))
-        if not any(not c.ok for c in out):
+        if not any(not c.ok for c in out) and all(p.placed for p in placed):  # no "fit" line beside a part with no position
             bed = ctx.facts["bed"]
             n = sum(1 for p in placed if p.placed)
             out.append(
@@ -934,15 +968,18 @@ def _unplace(p: Placed, reason: str, out: dict[str, str]) -> None:
     out[p.key] = reason
 
 
-def _too_big(p: Placed, x_range: tuple[float, float], y_range: tuple[float, float], m: tuple[float, float, float, float]) -> str | None:
-    """The arithmetic for a part that cannot fit an empty plate with margins m (-x, +x, -y, +y), else None."""
+def _too_big(
+    p: Placed, x_range: tuple[float, float], y_range: tuple[float, float], m: tuple[float, float, float, float], what: str
+) -> str | None:
+    """The arithmetic for a part that cannot fit an empty plate with `what` (spread or keep-out) m (-x, +x, -y, +y)
+    around it, else None."""
     for size, lo, hi, axis, word in ((p.h, m[2], m[3], y_range, "deep"), (p.w, m[0], m[1], x_range, "wide")):
         span = axis[1] - axis[0]
         if size + lo + hi > span + 1e-9:
-            marg = f"2 x {lo:.1f} mm margin" if abs(lo - hi) < 1e-9 else f"{lo:.1f} + {hi:.1f} mm margin"
+            grow = f"2 x {lo:.1f} mm {what}" if abs(lo - hi) < 1e-9 else f"{lo:.1f} + {hi:.1f} mm {what}"
             return (
-                f"{size:.1f} mm {word} + {marg} = {size + lo + hi:.1f} mm, the bed area is {span:.1f} mm {word} "
-                f"({axis[0]:.1f}..{axis[1]:.1f}, inside the layout edges)"
+                f"{size:.1f} mm {word} + {grow} = {size + lo + hi:.1f} mm, the bed area is {span:.1f} mm {word} "
+                f"({axis[0]:.1f}..{axis[1]:.1f}, inside the layout edges and the extruder reach)"
             )
     return None
 
@@ -950,7 +987,8 @@ def _too_big(p: Placed, x_range: tuple[float, float], y_range: tuple[float, floa
 @dataclass
 class ShelfPacker:
     """Rows along x from the bottom left, deepest parts first. Returns one or more plates. Kept for print-by-object
-    plates (`keep_order`, `solo_row_above`) and filament groups. It holds `Placed.reserve` on every side."""
+    plates (`keep_order`, `solo_row_above`) and filament groups. It holds `Placed.keep_out` on every side, and keeps
+    every part inside `x_min_of` / `x_max_of`."""
 
     x_range: tuple[float, float] = (EDGE, BED - EDGE)
     y_range: tuple[float, float] = (EDGE, BED - EDGE)
@@ -967,47 +1005,62 @@ class ShelfPacker:
         fixed: Sequence[Placed] = (),
         x_max_of: Mapping[str, float] | None = None,
     ) -> Placement:
-        x_min = dict(x_min_of or {})
+        x_min, x_max = dict(x_min_of or {}), dict(x_max_of or {})
+
+        def lo(p: Placed) -> float:
+            return max(self.x_range[0], x_min.get(p.key, self.x_range[0]))
+
+        def hi(p: Placed) -> float:
+            return min(self.x_range[1], x_max.get(p.key, self.x_range[1]))
+
         obstacles = list(obstacles) + [f.rect() for f in fixed]
         unplaced: dict[str, str] = {}
         fits = []
         for p in parts:
-            m = p.reserve
-            why = _too_big(p, (max(self.x_range[0], x_min.get(p.key, self.x_range[0])), self.x_range[1]), self.y_range, (m, m, m, m))
+            k = p.keep_out
+            why = _too_big(p, (lo(p), hi(p)), self.y_range, (k, k, k, k), "keep-out")
             if why:
                 _unplace(p, f"the row packer could not place {p.key}: {why}", unplaced)
             else:
                 fits.append(p)
-        left = list(fits) if self.keep_order else sorted(fits, key=lambda p: (-(p.h + 2 * p.reserve), -(p.w + 2 * p.reserve)))
+        left = list(fits) if self.keep_order else sorted(fits, key=lambda p: (-(p.h + 2 * p.keep_out), -(p.w + 2 * p.keep_out)))
         plates: list[list[Placed]] = []
         plate: list[Placed] = []
         y = self.y_range[0]
         while left:
             row = [left.pop(0)]
-            x_after = max(self.x_range[0], x_min.get(row[0].key, self.x_range[0])) + row[0].w + 2 * row[0].reserve + self.gap
+            x_after = lo(row[0]) + row[0].w + 2 * row[0].keep_out + self.gap
             closed = self.solo_row_above is not None and row[0].info.size[2] > self.solo_row_above
             for o in list(left):
                 if closed:
                     break
-                start = max(x_after, x_min.get(o.key, self.x_range[0]))
-                if start + o.w + 2 * o.reserve <= self.x_range[1]:
+                start = max(x_after, lo(o))
+                if start + o.w + 2 * o.keep_out <= hi(o):
                     row.append(o)
                     left.remove(o)
-                    x_after = start + o.w + 2 * o.reserve + self.gap
+                    x_after = start + o.w + 2 * o.keep_out + self.gap
                     closed = self.solo_row_above is not None and o.info.size[2] > self.solo_row_above
                 elif self.keep_order:
                     break  # the next object in print order starts the next row
-            row_h = max(r.h + 2 * r.reserve for r in row)
+            row_h = max(r.h + 2 * r.keep_out for r in row)
             if y + row_h > self.y_range[1] and plate:
                 plates.append(plate)
                 plate, y = [], self.y_range[0]
             x = self.x_range[0]
             for o in row:
-                o.x0, o.y0 = max(x, x_min.get(o.key, self.x_range[0])) + o.reserve, y + o.reserve
+                o.x0, o.y0 = max(x, lo(o)) + o.keep_out, y + o.keep_out
                 for ob in obstacles:
-                    while overlaps(o.rect(), ob) and o.x1 + o.reserve <= self.x_range[1]:
-                        o.x0 = ob[2] + self.gap + o.reserve
-                x = o.x1 + o.reserve + self.gap
+                    while overlaps(o.rect(), ob) and o.x1 + o.keep_out <= hi(o):
+                        o.x0 = ob[2] + self.gap + o.keep_out
+                if o.x1 + o.keep_out > hi(o) + 1e-9 or any(overlaps(o.rect(), ob) for ob in obstacles):
+                    _unplace(
+                        o,
+                        f"the row packer could not place {o.key}: its row has no room for {o.w:.1f} mm + 2 x {o.keep_out:.1f} mm "
+                        f"keep-out between the obstacles and x {hi(o):.1f} (the right limit of its extruder reach)",
+                        unplaced,
+                    )
+                    continue
+                x = o.x1 + o.keep_out + self.gap
                 plate.append(o)
             y += row_h + self.gap
         if plate:
@@ -1015,19 +1068,54 @@ class ShelfPacker:
         return Placement(plates, unplaced)
 
 
+CORNER_STEP = 1.0  # mm: run ends that move less than this between two rows are no corner (a curved wall)
+CORNER_CAP = 48  # candidates per axis from one part's corners; more are thinned evenly
+
+
+def _thin(vals: set[float], cap: int = CORNER_CAP) -> list[float]:
+    out = sorted({round(v, 1) for v in vals})
+    if len(out) <= cap:
+        return out
+    return [out[round(i * (len(out) - 1) / (cap - 1))] for i in range(cap)]
+
+
+def _corners(shape: Footprint) -> tuple[set[float], set[float], set[float], set[float]]:
+    """The internal corners of a placed outline (bed coordinates): run ends where two neighbouring rows differ by
+    CORNER_STEP or more, and those rows' edges. Returns (right ends, left ends, row tops, row bottoms); a box
+    outline gives its own edges."""
+    if not isinstance(shape, _Bands):
+        box = shape.bbox()
+        return {box[2]}, {box[0]}, {box[3]}, {box[1]}
+    rights, lefts, tops, bottoms = {shape.bbox()[2]}, {shape.bbox()[0]}, {shape.bbox()[3]}, {shape.bbox()[1]}
+    rows = shape.rows
+    for k in range(len(rows) - 1):
+        (_, y1, ra), (y0n, _, rb) = rows[k], rows[k + 1]
+        same = len(ra) == len(rb) and all(
+            abs(a0 - b0) < CORNER_STEP and abs(a1 - b1) < CORNER_STEP for (a0, a1), (b0, b1) in zip(ra, rb, strict=True)
+        )
+        if same:
+            continue
+        tops.add(y1 + shape.oy)
+        bottoms.add(y0n + shape.oy)
+        for a, b in (*ra, *rb):
+            lefts.add(a + shape.ox)
+            rights.add(b + shape.ox)
+    return rights, lefts, tops, bottoms
+
+
 @dataclass
 class BottomLeftPacker:
     """Candidate points, bottom left first, for by-layer plates (fix 4 of the plate-14 post-mortem). 0 degrees only.
 
     Parts go largest box area first. The candidates for a part are the bed corner (inside the layout edge and the
-    part's bed margin) and, for every part already on the plate, its left and bottom edges and its right and top
-    edges moved out by the larger facing spread + LINE + `gap` (only `gap` when neither side has support). A
-    candidate is legal when `pair_check` finds nothing
-    (no WARN either) against every part on the plate and every fixed part, the part with its brim (and normal-support
-    spread) stays inside the layout edges, its brim and spread stay inside the x reach of its extruders, and it keeps
-    `gap` from every obstacle. Score: the lowest top edge, then the lowest right edge. First fit over plates, so the
-    objective is the fewest plates. On the five plate-14 parts it uses 1 plate where the row packer needed 2
-    (reference 08 section 11.5)."""
+    part's bed margin) and, for every part already on the plate, its edges and the internal corners of its outline
+    (a U's pocket), moved out by the larger facing spread + LINE + `gap` (only `gap` when neither side has support).
+    They are tried in score order (the lowest top edge, then the lowest right edge), and the first legal one wins:
+    `pair_check` finds nothing (no WARN either) against every part on the plate and every fixed part, the part with
+    its brim (and normal-support spread) stays inside the layout edges, its spread stays inside the x reach of its
+    extruders, and it keeps `gap` from every obstacle. First fit over plates, so the objective is the fewest plates.
+    Plate 1 may hold only fixed parts: its index stays, so a part pushed to plate 2 is reported as such. On the five
+    plate-14 parts it uses 1 plate where the row packer needed 2 (reference 08 section 11.5)."""
 
     x_range: tuple[float, float] = (EDGE, BED - EDGE)
     y_range: tuple[float, float] = (EDGE, BED - EDGE)
@@ -1046,7 +1134,7 @@ class BottomLeftPacker:
         unplaced: dict[str, str] = {}
         plates: list[list[Placed]] = [[]]
         for p in sorted(parts, key=lambda q: -(q.w * q.h)):
-            why = _too_big(p, self.x_range, self.y_range, p.bed_margin(with_brim=False))  # a brim may be clipped
+            why = _too_big(p, self.x_range, self.y_range, p.bed_margin(with_brim=False), "spread")  # a brim may be clipped
             if why:
                 _unplace(p, f"the packer could not place {p.key}: {why}", unplaced)
                 continue
@@ -1065,11 +1153,13 @@ class BottomLeftPacker:
                 lo, hi = lo_of.get(p.key, self.x_range[0]), hi_of.get(p.key, self.x_range[1])
                 _unplace(
                     p,
-                    f"the packer could not place {p.key}: no position on an empty plate keeps it with its margins "
+                    f"the packer could not place {p.key}: no position on an empty plate keeps it with its brim and spread "
                     f"({p.margin_text()}) inside the bed area and its extruder reach (x {lo:.1f}..{hi:.1f})",
                     unplaced,
                 )
-        return Placement([pl for pl in plates if pl], unplaced)
+        while len(plates) > 1 and not plates[-1]:
+            plates.pop()
+        return Placement(plates if any(plates) else [], unplaced)
 
     def _step(self, spread: float) -> float:
         """Distance from a placed part's edge to the next candidate: spread + LINE + gap, or only the layout gap (at
@@ -1080,7 +1170,7 @@ class BottomLeftPacker:
         """A position with the whole brim inside the bed and the reach if one exists, else one where only the brim is
         clipped (Studio clips brims, Brim.cpp:1011-1138; the rules then give a WARN brim line)."""
         return self._put_once(p, others, obstacles, x_lo, x_hi, True) or (
-            p.margin > 0 and self._put_once(p, others, obstacles, x_lo, x_hi, False)
+            p.brim > 0 and self._put_once(p, others, obstacles, x_lo, x_hi, False)
         )
 
     def _put_once(
@@ -1088,7 +1178,7 @@ class BottomLeftPacker:
     ) -> bool:
         bm = p.bed_margin(with_brim=brim)
         s = p.spread
-        m = p.margin if brim else 0.0
+        m = p.brim if brim else 0.0
         lo_x = self.x_range[0] + bm[0]
         if x_lo is not None and x_lo > self.x_range[0]:  # a reach narrower than the bed: all spread inside it
             lo_x = max(lo_x, x_lo + m + s.mx)
@@ -1096,36 +1186,34 @@ class BottomLeftPacker:
         if x_hi is not None and x_hi < self.x_range[1]:
             hi_x = min(hi_x, x_hi - m - s.px)
         lo_y, hi_y = self.y_range[0] + bm[2], self.y_range[1] - bm[3]
-        xs = {lo_x}
-        ys = {lo_y}
+        xs: set[float] = {lo_x}
+        ys: set[float] = {lo_y}
         for q in others:
-            xs |= {q.x0, q.x1 + self._step(max(q.spread.px, s.mx))}
-            ys |= {q.y0, q.y1 + self._step(max(q.spread.py, s.my))}
+            rights, lefts, tops, bottoms = _corners(q.shape())
+            sx_r, sx_l = self._step(max(q.spread.px, s.mx)), self._step(max(q.spread.mx, s.px))
+            sy_t, sy_b = self._step(max(q.spread.py, s.my)), self._step(max(q.spread.my, s.py))
+            xs |= set(_thin({q.x0} | {r + sx_r for r in rights} | {a - sx_l - p.w for a in lefts}))
+            ys |= set(_thin({q.y0} | {t + sy_t for t in tops} | {b - sy_b - p.h for b in bottoms}))
         for ob in obstacles:
-            xs.add(ob[2] + self.gap + p.margin + s.mx)
-            ys.add(ob[3] + self.gap + p.margin + s.my)
+            xs.add(ob[2] + self.gap + p.brim + s.mx)
+            ys.add(ob[3] + self.gap + p.brim + s.my)
         grown = [(ob[0] - self.gap, ob[1] - self.gap, ob[2] + self.gap, ob[3] + self.gap) for ob in obstacles]
-        best: tuple[tuple[float, float], float, float] | None = None
-        for y in sorted(ys):
-            if y < lo_y - 1e-9 or y + p.h > hi_y + 1e-9:
+        cands = sorted(
+            (y + p.h, x + p.w, x, y)
+            for y in ys
+            if lo_y - 1e-9 <= y and y + p.h <= hi_y + 1e-9
+            for x in xs
+            if lo_x - 1e-9 <= x and x + p.w <= hi_x + 1e-9
+        )
+        for _, _, x, y in cands:
+            p.x0, p.y0 = x, y
+            if any(overlaps(p.rect(), ob) for ob in grown):
                 continue
-            for x in sorted(xs):
-                if x < lo_x - 1e-9 or x + p.w > hi_x + 1e-9:
-                    continue
-                score = (y + p.h, x + p.w)
-                if best is not None and score >= best[0]:
-                    continue
-                p.x0, p.y0 = x, y
-                if any(overlaps(p.rect(), ob) for ob in grown):
-                    continue
-                if any(pair_check(p, q) is not None for q in others):
-                    continue
-                best = (score, x, y)
-        if best is None:
-            return False
-        p.x0, p.y0 = best[1], best[2]
-        p.placed, p.why_not = True, ""
-        return True
+            if any(pair_check(p, q) is not None for q in others):
+                continue
+            p.placed, p.why_not = True, ""
+            return True
+        return False
 
 
 def describe(placed: list[Placed]) -> list[str]:

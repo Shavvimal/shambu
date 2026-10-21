@@ -17,6 +17,13 @@ machine, the filament slot and every resolved setting that changes support. Each
 `--no-check` and has no prime tower: it measures the support, it is not a clash test (the clash test is the plate's
 own `build --slice`).
 
+Design: `SpreadProbe` is the port the pipeline calls (`measure(ProbeRequest) -> ProbeResult`); `StudioProbe` is
+its adapter over `StudioCLI` (the only implementation that runs Studio), and the tests use a fake probe and a fake
+StudioCLI that writes fixture G-code. `parse_support` is a pure function over G-code lines. Every failure (no
+slice, no G-code, a bad archive, no model extrusion, a file that cannot be read or written) raises a `StudioError`
+that names the path; the pipeline then keeps the estimate and warns. An unreadable cache entry is logged and sliced
+again.
+
 Not here: per-z bands (the mask is the projection of every layer), merged parts (they keep the estimate), rotation.
 """
 
@@ -36,16 +43,16 @@ from typing import Protocol
 from . import assemble as A
 from . import presets as P
 from .errors import BambuError, StudioError
-from .layout import SUPPORT_MASK_CELL, Footprint, RasterFootprint, Spread, is_tree, mask_from_points
+from .layout import SUPPORT_MASK_CELL, Footprint, RasterFootprint, Spread, clipped_at_bed, mask_from_points
 from .studio import CliCommand, MeshInfo, StudioCLI
 
 log = logging.getLogger(__name__)
 
 SUPPORT_FEATURES = frozenset({"Support", "Support interface", "Support transition"})
 NOT_MODEL = SUPPORT_FEATURES | {"Brim", "Skirt", "Prime tower", "Wipe tower", "Custom"}
-# Settings that change where support goes; their resolved values are part of the cache key.
-SUPPORT_KEY_PARTS = ("support", "raft", "tree", "layer_height", "bridge", "overhang", "brim_object_gap", "wall_loops", "line_width")
-CACHE_FORMAT = 2  # bump when the cached fields change
+# Bump when a cached measurement may be wrong or its fields change. 3: E-only unretractions no longer count as
+# extrusion (they moved the model box to the travel destination: the cradle's -x spread read 9.1 for 14.9 mm).
+CACHE_FORMAT = 3
 _NUM = re.compile(r"([XYEIJ])(-?\d+(?:\.\d*)?|-?\.\d+)")
 
 
@@ -63,7 +70,9 @@ def parse_support(lines: Iterable[str], step: float = 0.4) -> ParsedSupport:
     """Read a G-code. With object labels (`; start printing object` / `; stop printing object`, written when the
     plate holds two or more objects) only moves inside them count. A solo slice has no labels (live, Studio
     02.08.02.61): then every move after the first `; CHANGE_LAYER` counts. `Custom` moves (start G-code, purge line)
-    never count. Lines and arcs (G2/G3) are sampled every `step` mm."""
+    never count. Lines and arcs (G2/G3) are sampled every `step` mm. A move with a positive E but no XY path (the
+    unretraction `G1 E.8` after a travel, before the next feature comment) is not an extrusion: it would put the
+    previous feature at the travel destination. An arc whose endpoints coincide is a full circle and counts."""
     feat = ""
     inside = labelled = layered = False
     x: float | None = None
@@ -105,6 +114,8 @@ def parse_support(lines: Iterable[str], step: float = 0.4) -> ParsedSupport:
                         a1 += 2 * math.pi
                 n = max(2, math.ceil(abs(a1 - a0) * r / step))
                 pts = [(cx + r * math.cos(a0 + (a1 - a0) * k / n), cy + r * math.sin(a0 + (a1 - a0) * k / n)) for k in range(n + 1)]
+            elif nx == x and ny == y:  # an unretraction or a pure E move: no path on the bed
+                continue
             else:
                 n = max(1, math.ceil(math.hypot(nx - x, ny - y) / step)) if cls == "support" else 1
                 pts = [(x + (nx - x) * k / n, y + (ny - y) * k / n) for k in range(n + 1)]
@@ -129,12 +140,6 @@ def parse_support(lines: Iterable[str], step: float = 0.4) -> ParsedSupport:
         max(0.0, support[3] - model[3]),
     )
     return ParsedSupport(sides, mb, points[where])
-
-
-def parse_support_spread(lines: Iterable[str]) -> tuple[float, float, float, float] | None:
-    """Per side (-x, +x, -y, +y): how far support extrusions reach past the box of the model extrusions, mm, 0 when
-    the support stays inside. None: no model extrusion. See `parse_support`."""
-    return parse_support(lines).sides
 
 
 @dataclass(frozen=True)
@@ -186,22 +191,39 @@ class StudioProbe:
             try:
                 self._version = str(self.studio.version())
             except (BambuError, OSError) as e:
-                self._version = f"unknown ({e})"
+                log.warning("Bambu Studio's version is unknown (%s): the support probe cache keys on 'unknown'", e)
+                self._version = "unknown"
         return self._version
 
     def cache_path(self, req: ProbeRequest) -> Path:
-        mesh = hashlib.sha256(req.stl.read_bytes()).hexdigest()
-        eff = self._eff(req)
-        keys = {k: str(v) for k, v in sorted(eff.items()) if any(t in k for t in SUPPORT_KEY_PARTS)}
-        keys["@studio"] = self.studio_version()
-        keys["@machine"] = str(self.machine.get("name", ""))
-        keys["@filament"] = str(req.filament)
-        keys["@format"] = str(CACHE_FORMAT)
-        sh = hashlib.sha1(json.dumps(keys, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+        """`<cache>/<mesh sha256>-<orientation>-<hash>.json`. The hash covers everything that feeds the slice: the
+        Studio version, the complete resolved machine preset, every resolved filament preset, the process with the
+        part's own settings, the filament slot and the cache format."""
+        try:
+            mesh = hashlib.sha256(req.stl.read_bytes()).hexdigest()
+        except OSError as e:
+            raise StudioError(f"the support probe of {req.key}: cannot read {req.stl}: {e}") from e
+        feed = {
+            "studio": self.studio_version(),
+            "machine": self.machine,
+            "filaments": self.filaments,
+            "settings": self._eff(req),
+            "slot": req.filament,
+            "map": self.filament_map,
+            "bed": self.bed_type,
+            "format": CACHE_FORMAT,
+        }
+        sh = hashlib.sha1(json.dumps(feed, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
         orient = re.sub(r"[^A-Za-z0-9_.+-]", "_", req.orientation or "as-is")
         return self.cache / f"{mesh}-{orient}-{sh}.json"
 
     def measure(self, req: ProbeRequest) -> ProbeResult:
+        try:
+            return self._measure(req)
+        except OSError as e:  # a directory or file the probe cannot create, read or write
+            raise StudioError(f"the support probe of {req.key}: {getattr(e, 'filename', None) or self.cache}: {e}") from e
+
+    def _measure(self, req: ProbeRequest) -> ProbeResult:
         eff = self._eff(req)
         cp = self.cache_path(req)
         got: tuple[tuple[float, float, float, float], RasterFootprint | None] | None = None
@@ -230,7 +252,7 @@ class StudioProbe:
                 ),
                 encoding="utf-8",
             )
-        spread = Spread(*got[0], source="probe", tree=is_tree(eff), note="support measured by a solo slice")
+        spread = Spread(*got[0], source="probe", tree=clipped_at_bed(eff), note="support measured by a solo slice")
         return ProbeResult(spread, got[1])
 
     def _slice(self, req: ProbeRequest, cp: Path) -> tuple[tuple[float, float, float, float], RasterFootprint | None]:
