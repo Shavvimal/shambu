@@ -17,7 +17,8 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
   keeps a support mask, cached under `<outdir>/.probe/`). A pair needs the larger spread of the two plus a 1 mm line
   allowance, not the sum. Footprints are raster silhouettes of the oriented mesh (0.5 mm), not bounding boxes.
   `BottomLeftPacker` places by-layer plates (fewest plates, pocket candidates); `ShelfPacker` stays for
-  print-by-object. Brims are clipped by Studio and no longer fail a pair, the bed edge or the reach (`WARN brim`).
+  print-by-object. Known limit: the five plate-14 parts without `at` pack on two plates even with measured spreads;
+  the printed one-plate layout needs `at` for the feeler and the cradle (Studio's own arrange exits -21 on them). Brims are clipped by Studio and no longer fail a pair, the bed edge or the reach (`WARN brim`).
   Raft and enforced layers count as support (`needs_support`).
 - Report: every check line carries a kind: `FAIL body overlap`, `WARN margin rule` (shambu's estimate, the slice
   decides), `WARN brim`, `PLACEMENT NOT DONE` (the packer gave up; no part is printed at the origin), a plate-split

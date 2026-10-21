@@ -592,8 +592,10 @@ check, and on exit -101 the report names the two spec keys from the log line.
 The five parts (124.2 x 135 x 218, 40.6 x 58.8 x 32.1, 58.6 x 60.7 x 47.8, 50 x 226.4 x 64, 22.1 x 99 x 28.9): the row
 packer put them on 2 plates even at zero margin (a heuristic answer) (the 226 mm feeler opens a row, the bed above the housing stays empty).
 `BottomLeftPacker` (candidate points at placed parts' edges plus spread + 1 + gap, lowest top edge then lowest right
-edge, first fit, 0 degrees only) fits them on 1 plate with the estimates and with the measured spreads (unit tests).
-Studio's arrange on the same five parts exits -21 with and without rotations. The row packer stays for print-by-object
+edge, first fit, 0 degrees only) fits box stand-ins of them on 1 plate with the measured spreads (unit tests). A known
+limit of this release: the five plate-14 parts without `at` pack on two plates even with measured spreads (live,
+2026-10-21: the feeler alone on plate 2); the printed one-plate layout needs `at` for the feeler and the cradle (the
+cradle sits in the feeler's pocket); Studio's own arrange exits -21 on the same parts, with and without rotations. The row packer stays for print-by-object
 plates and filament groups. A part that fits nowhere is reported once ("PLACEMENT NOT DONE", with the arithmetic) and
 is never checked at a position nobody chose.
 

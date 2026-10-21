@@ -61,6 +61,7 @@ The time numbers are Studio's kinematic prediction (`prediction` in `slice_info.
 
 - How far tree supports really spread on tall parts, measured on more than two parts; whether the spread fades with z for an overhanging neighbour.
 - Why D.7 ran at 0.75 x Studio and E7a at 1.05 x. A non-Standard speed level on D.7 is the most likely cause and was not logged; the watch log now records it.
+- The packer does not find the nested layout: the five plate-14 parts without `at` pack on two plates even with measured spreads; the printed one-plate layout needs `at` for the feeler and the cradle (the cradle in the feeler's pocket); Studio's own arrange exits -21 on the same parts. A documented limit of 0.4.0.
 - Studio's conflict check is not deterministic at a 0.25 mm gap (2 of 4 identical checked slices exited 0), and one of four identical slices of the front-tower layout crashed with -139 in tree support and passed on rerun.
 
 ## 7. Interim rule (before 0.4.0 is installed)
