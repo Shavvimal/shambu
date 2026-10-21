@@ -666,11 +666,11 @@ def test_patch_move_needs_both_signs(capsys, tmp_path):
 
 def test_patch_tower_one_plate(capsys, tmp_path):
     path = _geo(tmp_path, plates=3)
-    code, _out, _ = run(capsys, "--json", "patch", str(path), "--tower", "120,30@2")
+    code, _out, _ = run(capsys, "--json", "patch", str(path), "--tower", "90,100@2")
     assert code == 0
     from shambu.threemf import Project
 
-    assert Project(str(path)).project_settings["wipe_tower_x"] == ["208", "120", "208"]
+    assert Project(str(path)).project_settings["wipe_tower_x"] == ["208", "90", "208"]
 
 
 def _with_settings(src, dest, ps):
@@ -786,12 +786,45 @@ def test_slice_verb_tower_leaves_the_input(capsys, tmp_path, monkeypatch, resolv
 
     src = _geo(tmp_path)
     raw = src.read_bytes()
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True, wipe_tower_x=["90"], wipe_tower_y=["100"]), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "--tower", "90,100", "-o", str(tmp_path / "o.gcode.3mf"))
+    assert code == 0 and src.read_bytes() == raw
+    assert any("wipe_tower_x ['90']" in n for n in one_json(out)["notes"])
+    assert not list(tmp_path.glob(".o.gcode.3mf.shambu"))
+
+
+def test_slice_verb_strict_tower_verify_refuses_an_export_without_the_spot(capsys, tmp_path, monkeypatch, resolver):
+    from test_edits import SequenceStudio
+
+    src = _geo(tmp_path)
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])  # Studio "lost" the tower
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    dest = tmp_path / "o.gcode.3mf"
+    code, out, _ = run(capsys, "--json", "slice", str(src), "--tower", "90,100", "-o", str(dest))
+    doc = one_json(out)
+    assert code == 1 and not dest.exists()
+    assert any(v.startswith("wipe_tower_x in file is") for v in doc["verify_problems"]), doc["verify_problems"]
+
+
+def test_slice_verb_repairs_an_unsliced_cli_export_first(capsys, tmp_path, monkeypatch, resolver):
+    """`slice --settings-from` and a bare `slice` take the RepairNozzleStats path: an export with extruder_nozzle_stats []
+    would exit -100 on every CLI slice."""
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[], extruder_max_nozzle_count=["1", "1"])
+    raw = src.read_bytes()
     studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
-    code, out, _ = run(capsys, "--json", "slice", str(src), "--tower", "120,30", "-o", str(tmp_path / "o.gcode.3mf"))
-    assert code == 0 and src.read_bytes() == raw
-    assert any("wipe_tower_x ['120']" in n for n in one_json(out)["notes"])
-    assert not list(tmp_path.glob(".o.gcode.3mf.shambu"))
+    from conftest import MACHINE, PROCESS
+
+    spec = write_spec(tmp_path, printer=MACHINE, process={"base": PROCESS})
+    code, out, _ = run(capsys, "--json", "slice", str(src), "--settings-from", str(spec), "-o", str(tmp_path / "o.gcode.3mf"))
+    doc = one_json(out)
+    assert code == 0 and src.read_bytes() == raw, doc
+    assert any(n.startswith("repaired before slicing (extruder_nozzle_stats []") for n in doc["notes"]), doc["notes"]
+    sliced_input = studio.calls[0][1][-1] if studio.calls else ""
+    assert sliced_input.endswith("repaired.3mf"), studio.calls
 
 
 def test_slice_verb_pins_prime_volume_in_both_passes(capsys, tmp_path, monkeypatch, resolver):

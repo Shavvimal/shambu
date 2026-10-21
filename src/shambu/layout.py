@@ -197,7 +197,7 @@ def support_spread(params: Mapping | None, height: float, probe: Spread | None =
 
 
 def spec_spread(margin: float) -> Spread:
-    """The part's `brim_margin` from the spec: it replaces brim and support margin together, on every side, and at the
+    """The part's `brim_margin` from the spec: it replaces brim and support spread together, on every side, and at the
     bed edge too (it is the user's number, not a tree spread that Studio clips)."""
     return Spread(margin, margin, margin, margin, "spec", False, "spec brim_margin")
 

@@ -3,8 +3,12 @@ after an added filament, `shambu slice` (checked passes and the --no-check pass)
 hatch with its run folder. `facade.Bambu` exposes each as a method; `cli.py` only parses argv and prints.
 
 Design: plain functions over an injected `StudioCLI` (or a test fake with the same `run()`), a `PresetResolver` and
-paths. Every Studio call goes through `StudioCLI.run` (rubric 2). Every file this module writes is a scratch file in a
-temporary or run folder, or the requested output, which is replaced only after the run succeeded.
+paths. Every Studio call goes through `StudioCLI.run` (rubric 2). `shambu slice` shares the build's pieces: the
+checked and --no-check passes (`build.two_pass_slice`, whose -101 pair comes from `studio.conflicts_in_log`), the
+RepairNozzleStats path for an unsliced CLI export, the read-back (`summarise`) and the strict tower verify
+(`build.verify_tower`); its "Checks skipped" lines are `report.checks_skipped_lines`. Every file this module writes is
+a scratch file in a temporary or run folder, or the requested output, which is replaced only after the run succeeded
+and the export verified.
 
 Not here: building a project from a spec (`build.py`), the edits themselves (`edits.py`), the archive writer
 (`threemf.py`).
@@ -22,9 +26,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import presets as P
-from .build import _estimate, summarise, two_pass_slice
+from .build import _estimate, summarise, two_pass_slice, verify_tower
 from .edits import AddFilament, EditError, EditSet, SetTower, check_preset, slot_from_export, slot_from_preset, slot_presets
 from .errors import BambuError, StudioError
+from .patches import PatchSet, RepairNozzleStats
 from .spec import Spec
 from .studio import CliCommand, RunResult, StudioCLI
 from .threemf import Project
@@ -128,10 +133,11 @@ class SliceResult:
     checks_skipped: dict | None
     estimates: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    verify_problems: list[str] = field(default_factory=list)  # the read-back of the export (re-slice and tower)
 
     @property
     def ok(self) -> bool:
-        return self.run.ok
+        return self.run.ok and not self.verify_problems
 
     def to_json(self) -> dict:
         return {
@@ -142,6 +148,7 @@ class SliceResult:
             "checks_skipped": self.checks_skipped,
             "estimates": self.estimates,
             "notes": self.notes,
+            "verify_problems": self.verify_problems,
         }
 
 
@@ -192,6 +199,14 @@ def slice_project(
         es = EditSet([SetTower(*tower)])
         es.apply(str(src), str(inp))
         notes += es.notes
+    n_ext = len(P.machine_facts(project.project_settings)["extruders"])
+    why = Project(str(inp)).reslice_problems(n_ext)
+    if why:  # an unsliced CLI export: every CLI slice of it exits -100 until the nozzle stats are repaired
+        rep = work / "repaired.3mf"
+        notes += [f"repaired before slicing ({x})" for x in why] + PatchSet([RepairNozzleStats()]).apply(str(inp), str(rep))
+        if inp != src:
+            inp.unlink(missing_ok=True)
+        inp = rep
     if settings_from is not None:
         machine = resolver.for_cli("machine", settings_from.printer)
         process = resolver.for_cli("process", settings_from.process.base, settings_from.process.set, settings_from.process.name)
@@ -209,7 +224,15 @@ def slice_project(
 
     plates = (plate,) if plate else (tuple(range(1, n_plates + 1)) if n_plates > 1 else (0,))
     rr, skipped = two_pass_slice(
-        studio, make, name=stem, outputdir=work, timeout=timeout, expect_output=tmp_dest, no_check=no_check, plates=plates
+        studio,
+        make,
+        name=stem,
+        outputdir=work,
+        timeout=timeout,
+        expect_output=tmp_dest,
+        no_check=no_check,
+        plates=plates,
+        known=set(project.object_names()),
     )
     if inp != src:
         inp.unlink(missing_ok=True)
@@ -221,6 +244,14 @@ def slice_project(
             raise EditError(f"Studio exited 0 but its export {tmp_dest} does not read back ({e}); {dest} is unchanged") from e
         by_id = {sp.id: sp for sp in rr.plates()}
         estimates = [_estimate(pl, by_id.get(pl["id"])) for pl in s["plates"] if pl.get("slice")]
+        back = Project(str(tmp_dest))
+        problems = [f"not re-sliceable by the CLI: {x}" for x in back.reslice_problems(n_ext)]
+        spots = {i: (tower[0], tower[1]) for i in range(n_plates) if tower[2] in (None, i + 1)} if tower else {}
+        problems += verify_tower(back.project_settings, n_plates, {}, spots, "--tower")
+        if problems:  # the export stays in the run folder: it is not the slice the command asked for
+            res = SliceResult(src, dest, rr, skipped, estimates=estimates, notes=notes, verify_problems=problems)
+            notes.append(f"logs, Studio's result.json and the unverified export: {work}")
+            return res
         os.replace(tmp_dest, dest)
         rr = RunResult(rr.cmd, rr.status, rr.code, rr.seconds, rr.log, rr.result, dest)
     res = SliceResult(src, dest, rr, skipped, estimates=estimates, notes=notes)

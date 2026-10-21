@@ -30,7 +30,7 @@ JSON shape:
                          "at": [10, 10],                    # optional: the bbox min corner on the bed
                          "support_spread": [21, 0.5, 0.5, 3]},  # optional: mm of support past the box on -x, +x, -y, +y
                                             # (else a solo slice with --probe-supports, else an estimate); "brim_margin": 5.2
-                                            # replaces brim and support margin on every side
+                                            # replaces brim and support spread on every side
                         {"name": "label", "parts": [{"path": "/abs/label.stl", "filament": 1},
                                                     {"path": "/abs/text.stl", "filament": 2}]}],
               "pause_at_z": [4.2],

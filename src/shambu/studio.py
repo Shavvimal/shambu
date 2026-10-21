@@ -167,6 +167,17 @@ def conflicts_in_log(text: str, known: Collection[str] = ()) -> list[tuple[str, 
     return out
 
 
+def conflict_phrase(a: str, b: str | None) -> str:
+    """One wording for an exit -101 pair, used by `build` (export_fails) and the two-pass slice: "crossing G-code paths
+    between A and B (exit -101)", or the unsplit line when `conflicts_in_log` could not split it (b None)."""
+    if b is None:
+        return f"crossing G-code paths (exit -101) between '{a}', which shambu cannot split into two object names"
+    return f"crossing G-code paths between {a} and {b} (exit -101)"
+
+
+NO_PAIR = "crossing G-code paths (exit -101), and its log names no objects"
+
+
 def arrange_failed_plate(text: str) -> int | None:
     """The 1-based plate of an exit -21 (`run:arrange failed: ... plate index 0`), or None when the log does not say."""
     m = _ARRANGE_FAILED.search(text)

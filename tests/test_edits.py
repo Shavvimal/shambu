@@ -4,6 +4,7 @@ the --no-check second slicing pass. Offline: a geometry fixture with real meshes
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import re
 import zipfile
@@ -14,10 +15,11 @@ import pytest
 
 from conftest import GEO_BODY_AT, VARIANTS, FakeStudio, geo_plate_origin, make_3mf, make_geo_3mf, write_box_stl
 from shambu import edits as E
-from shambu.build import Pipeline, conflict_pair, two_pass_slice
+from shambu import layout as L
+from shambu.build import Pipeline, two_pass_slice
 from shambu.errors import BambuError, ProjectError, StudioError
 from shambu.patches import PatchSet, SetFilamentMap
-from shambu.studio import CliCommand, RunResult
+from shambu.studio import CliCommand, RunResult, conflicts_in_log
 from shambu.threemf import MODEL, Project
 
 
@@ -431,10 +433,6 @@ def test_add_filament_from_preset_warns(tmp_path):
     assert len(Project(str(tmp_path / "two.3mf")).project_settings["flush_volumes_matrix"]) == 8
 
 
-MAP_XFAIL = "set_filament_map collapses the variant blocks; fixed in the tower worktree, marker removed at merge"
-
-
-@pytest.mark.xfail(reason=MAP_XFAIL, strict=False)
 def test_set_filament_map_keeps_variant_blocks(tmp_path):
     path = make_geo_3mf(tmp_path / "two.3mf", filaments=2)
     PatchSet([SetFilamentMap((1, 2))]).apply(str(path))
@@ -520,11 +518,11 @@ def test_move_touches_only_the_item_transform(tmp_path, geo_file):
 # ---------------------------------------------------------------------------- 21-22 tower
 def test_tower_per_plate_vector(tmp_path):
     path = make_geo_3mf(tmp_path / "p3.3mf", plates=3)
-    E.EditSet([E.SetTower(120, 30, plate=2)]).apply(str(path), str(tmp_path / "a.3mf"))
+    E.EditSet([E.SetTower(90, 100, plate=2)]).apply(str(path), str(tmp_path / "a.3mf"))
     ps = Project(str(tmp_path / "a.3mf")).project_settings
-    assert ps["wipe_tower_x"] == ["208", "120", "208"] and ps["wipe_tower_y"] == ["208", "30", "208"]
-    E.EditSet([E.SetTower(120, 30)]).apply(str(path), str(tmp_path / "b.3mf"))
-    assert Project(str(tmp_path / "b.3mf")).project_settings["wipe_tower_x"] == ["120"] * 3
+    assert ps["wipe_tower_x"] == ["208", "90", "208"] and ps["wipe_tower_y"] == ["208", "100", "208"]
+    E.EditSet([E.SetTower(90, 100)]).apply(str(path), str(tmp_path / "b.3mf"))
+    assert Project(str(tmp_path / "b.3mf")).project_settings["wipe_tower_x"] == ["90"] * 3
 
 
 def test_tower_off_bed_raises(tmp_path, geo_file):
@@ -533,9 +531,9 @@ def test_tower_off_bed_raises(tmp_path, geo_file):
     with pytest.raises(E.EditError, match="extruder 2"):
         E.EditSet([E.SetTower(10, 30)]).apply(str(geo_file))
     with pytest.raises(E.EditError, match="no prime tower"):
-        E.EditSet([E.SetTower(120, 30)]).apply(str(make_geo_3mf(tmp_path / "one.3mf", filaments=1)))
+        E.EditSet([E.SetTower(90, 100)]).apply(str(make_geo_3mf(tmp_path / "one.3mf", filaments=1)))
     with pytest.raises(ProjectError, match="plate 2 does not exist"):
-        E.EditSet([E.SetTower(120, 30, plate=2)]).apply(str(geo_file))
+        E.EditSet([E.SetTower(90, 100, plate=2)]).apply(str(geo_file))
 
 
 # ---------------------------------------------------------------------------- idempotence per patch
@@ -544,7 +542,7 @@ def test_tower_off_bed_raises(tmp_path, geo_file):
     [
         lambda tmp: E.ReplaceMesh("body", str(write_box_stl(tmp / "body-v2.stl", (0, 0, 0), (30, 20, 10), fine=True))),
         lambda tmp: E.MoveObject("body", 70, 80),
-        lambda tmp: E.SetTower(120, 30),
+        lambda tmp: E.SetTower(90, 100),
     ],
     ids=["replace-mesh", "move", "tower"],
 )
@@ -621,9 +619,31 @@ def test_slice_no_check_two_pass(tmp_path, stls, resolver):
     assert r.project.is_file()
     doc = r.to_json()
     assert "G-code path conflict check (exit -101)" in doc["checks_skipped"]["checks"]
-    assert "found G-code path conflicts between a and b (exit -101); exported with --no-check" in doc["checks_skipped"]["report_line"]
-    assert any(w.startswith("sliced with --no-check: Studio's checks found G-code path conflicts between a and b") for w in doc["warnings"])
-    assert "exported with --no-check as the GUI would" in r.report
+    assert "found crossing G-code paths between a and b (exit -101); exported with --no-check" in doc["checks_skipped"]["report_line"]
+    assert not any("--no-check" in w for w in doc["warnings"])  # the line sits under the estimates, not in Warnings
+    est = r.report.split("## Export", 1)[1]
+    assert "- plate 1: Checks skipped: crossing G-code paths between a and b (exit -101). Exported with --no-check" in est
+    assert "Studio estimate" not in r.checks_skipped["report_line"]  # the estimate line alone names the estimate
+    # the --no-check export still gets the build's strict verify (re-slice check and the tower plan's vectors)
+    assert any(v.startswith("wipe_tower_x in file is") for v in r.verify_problems or [])
+
+
+def test_checks_skipped_lines_one_per_plate():
+    from shambu.report import checks_skipped_lines
+
+    cs = {
+        "skipped": True,
+        "report_line": "slice: ...",
+        "plates": [
+            {"plate": 1, "kind": "skippable", "reason": "crossing G-code paths between a and b (exit -101)"},
+            {"plate": 2, "kind": "ok", "reason": "passed the checks"},
+            {"plate": 3, "kind": "skippable", "reason": "empty layers or overlap: x (exit -100)"},
+        ],
+    }
+    lines = checks_skipped_lines(cs)
+    assert [x.split(": Checks skipped: ")[0] for x in lines] == ["- plate 1", "- plate 3"]
+    assert checks_skipped_lines({"skipped": False, "report_line": "slice: the plate failed"}) == ["- slice: the plate failed"]
+    assert checks_skipped_lines(None) == []
 
 
 def test_no_check_does_not_mask_unprintable(tmp_path):
@@ -644,7 +664,7 @@ def test_no_check_one_pass_when_the_first_slice_passes(tmp_path):
 def test_no_check_pair_not_in_log_still_continues(tmp_path):
     studio = SequenceStudio(make_3mf(tmp_path / "f.3mf", sliced=True), codes=[-101, 0], logs=["nothing useful\n"])
     _, skipped = _two_pass(studio, tmp_path)
-    assert skipped and skipped["pair"] is None and "pair not found in the log" in skipped["report_line"]
+    assert skipped and skipped["pair"] is None and "its log names no objects" in skipped["report_line"]
 
 
 def test_no_check_keeps_both_passes_logs_and_results(tmp_path):
@@ -668,8 +688,8 @@ def test_no_check_checks_every_plate(tmp_path):
     assert "--no-check" in runs[3] and "--slice=0" in runs[3]
     assert rr.ok and skipped
     assert [(p["plate"], p["kind"]) for p in skipped["plates"]] == [(1, "skippable"), (2, "ok"), (3, "skippable")]
-    assert "plate 1: G-code path conflicts between a and b" in skipped["report_line"]
-    assert "plate 3: G-code path conflicts between c and d" in skipped["report_line"]
+    assert "plate 1: crossing G-code paths between a and b (exit -101)" in skipped["report_line"]
+    assert "plate 3: crossing G-code paths between c and d (exit -101)" in skipped["report_line"]
 
 
 def test_no_check_exception_exit_100_is_not_retried(tmp_path):
@@ -687,10 +707,20 @@ def test_no_check_slicing_warning_exit_100_is_retried(tmp_path):
     assert rr.ok and skipped and "empty layers or overlap: Empty layers around bottom (exit -100)" in skipped["report_line"]
 
 
-def test_conflict_pair_parses_studio_log_line():
+def test_two_pass_uses_the_one_conflict_parser(tmp_path):
+    """studio.conflicts_in_log reads the timestamped line, splits at the known CLI names (a name may hold " and "), and
+    the two-pass line reads as export_fails does."""
     line = "[2026-10-21 15:35:34.720818] [0x00000001f34c2180] [error]   gcode path conflicts found between camera_housing_v2_print and housing_print\n"
-    assert conflict_pair(line) == ("camera_housing_v2_print", "housing_print")
-    assert conflict_pair("no conflict here") is None
+    assert conflicts_in_log(line) == [("camera_housing_v2_print", "housing_print")]
+    assert conflicts_in_log("no conflict here") == []
+    log = "[error]   gcode path conflicts found between nut and bolt_1 and base_1\n"
+    studio = SequenceStudio(make_3mf(tmp_path / "f.3mf", sliced=True), codes=[-101, 0], logs=[log, ""])
+    _, skipped = two_pass_slice(
+        studio, _cmd, name="x", outputdir=tmp_path, timeout=10, expect_output=tmp_path / "x.gcode.3mf", no_check=True,
+        known={"nut and bolt_1", "base_1"},
+    )  # fmt: skip
+    assert skipped and skipped["pair"] == ["nut and bolt_1", "base_1"]
+    assert "Studio's checks found crossing G-code paths between nut and bolt_1 and base_1 (exit -101);" in skipped["report_line"]
 
 
 def test_pipeline_no_check_needs_slice(tmp_path, stls, resolver):
@@ -850,7 +880,7 @@ def test_settings_patch_on_a_sliced_archive_declares_the_invalidation(tmp_path):
     path = make_geo_3mf(tmp_path / "sliced.3mf", sliced=True)
     PatchSet([SetBedType("Textured PEI Plate")]).apply(str(path), str(tmp_path / "a.3mf"))
     assert "Metadata/plate_1.gcode" not in entries(tmp_path / "a.3mf")
-    E.EditSet([E.SetTower(120, 30)]).apply(str(path), str(tmp_path / "b.3mf"))  # declares SLICE_TOUCHES + model settings
+    E.EditSet([E.SetTower(90, 100)]).apply(str(path), str(tmp_path / "b.3mf"))  # declares SLICE_TOUCHES + model settings
     b = entries(tmp_path / "b.3mf")
     assert "Metadata/plate_1.gcode" not in b and "Metadata/plate_1.gcode.md5" not in b and "Metadata/plate_1.json" not in b
     assert b"<plate" not in b["Metadata/slice_info.config"]
@@ -985,7 +1015,7 @@ def test_move_checks_every_instance_of_a_neighbour(tmp_path):
     )
     es = E.EditSet([E.MoveObject("body", 90, 95)])
     es.apply(str(path), str(tmp_path / "out.3mf"))
-    assert any("label (instance 1)" in n and "bounding boxes" in n for n in es.notes)
+    assert any("label (instance 1)" in n and n.startswith("  FAIL") for n in es.notes)
     assert not any("label (instance 0)" in n for n in es.notes)
 
 
@@ -1000,8 +1030,8 @@ def test_replace_mesh_anchor_min_keeps_a_sink(tmp_path):
 
 def test_tower_footprint_must_fit_extruder_two(tmp_path, geo_file):
     with pytest.raises(E.EditError, match=r"x 13\.\.64.*extruder 2"):  # x 21 passes the corner, not the 8 mm brim
-        E.EditSet([E.SetTower(21, 30)]).apply(str(geo_file))
-    E.EditSet([E.SetTower(29, 30)]).apply(str(geo_file), str(tmp_path / "ok.3mf"))
+        E.EditSet([E.SetTower(21, 100)]).apply(str(geo_file))
+    E.EditSet([E.SetTower(29, 100)]).apply(str(geo_file), str(tmp_path / "ok.3mf"))
 
 
 def test_tower_refuses_non_finite_values(geo_file):
@@ -1016,7 +1046,7 @@ def test_final_combined_pass_is_classified(tmp_path):
     assert len(runs) == 4 and "--no-check" in runs[3]
     assert rr.ok and skipped and skipped["skipped"]
     assert [(p["plate"], p["kind"]) for p in skipped["plates"]] == [(1, "ok"), (2, "ok"), (0, "skippable")]
-    assert "all plates together: G-code path conflicts between a and b" in skipped["report_line"]
+    assert "all plates together: crossing G-code paths between a and b (exit -101)" in skipped["report_line"]
 
 
 def test_variant_lookup_maps_hybrid_to_standard():
@@ -1096,7 +1126,6 @@ def test_replace_mesh_verify_checks_the_written_triangles(tmp_path, geo_file):
         rm.verify(Project(str(out)), Project(str(geo_file)))
 
 
-@pytest.mark.xfail(reason=MAP_XFAIL, strict=False)
 def test_add_filament_then_map_keeps_the_blocks(tmp_path):
     path = one_filament(tmp_path)
     E.EditSet([add_patch(path), SetFilamentMap((1, 2))]).apply(str(path), str(tmp_path / "two.3mf"))
@@ -1208,3 +1237,42 @@ def test_studio_hatch_rewrites_a_relative_assemble_list(tmp_path):
     assert copy_path.parent == run_dir.resolve()
     assert json.loads(copy_path.read_text())["plates"][0]["objects"][0]["path"] == str((root / "parts" / "a.stl").resolve())
     assert json.loads((root / "list.json").read_text())["plates"][0]["objects"][0]["path"] == "parts/a.stl"  # the user's file stays
+
+
+# ---------------------------------------------------------------------------- edits on silhouettes (integration)
+def _l_body(tmp_path, path):
+    """The body becomes an L (x 0..30 y 0..8, plus x 0..10 y 8..20) inside the same 30 x 20 box: a notch x 10..30,
+    y 8..20, as the printed layout's camera shell sat in the housing's notch."""
+    from conftest import box_facets
+    from shambu import mesh as M
+
+    stl = M.write_stl(tmp_path / "l.stl", box_facets((0, 0, 0), (30, 8, 10)) + box_facets((0, 8, 0), (10, 20, 10)))
+    replace(path, stl)
+    return path
+
+
+def test_move_into_a_notch_passes_on_silhouettes_and_fails_on_boxes(tmp_path):
+    path = _l_body(tmp_path, make_geo_3mf(tmp_path / "l.3mf"))
+    notch = (GEO_BODY_AT[0] + 14, GEO_BODY_AT[1] + 10)  # 2 mm above the L's foot, 4 mm right of its upright
+    out = tmp_path / "moved.3mf"
+    es = E.EditSet([E.MoveObject("label", *notch, strict=True)])  # strict: any FAIL line raises
+    es.apply(str(path), str(out))
+    assert any(n.startswith("  OK: label: clearance on silhouettes to 1 other object(s)") and "no FAIL" in n for n in es.notes)
+    p = Project(str(out))
+    obj = E.find_object(p, "label")
+    lo, hi = E._Geometry(p).world_box(obj)
+
+    def boxes(a, b):
+        return L.pair_check(dataclasses.replace(a, footprint=None), dataclasses.replace(b, footprint=None))
+
+    fails = [c for c in E.layout_checks(p, obj, lo, hi, 1, E._Geometry(p), clear=boxes) if not c.ok]
+    assert [c.kind for c in fails] == ["body"] and "intersect" in fails[0].text
+
+
+def test_tower_checks_the_other_objects_outlines(tmp_path):
+    path = make_geo_3mf(tmp_path / "t.3mf")
+    with pytest.raises(E.EditError, match="body"):
+        E.EditSet([E.SetTower(GEO_BODY_AT[0], GEO_BODY_AT[1])]).apply(str(path), str(tmp_path / "o.3mf"))
+    es = E.EditSet([E.SetTower(150, 150)])
+    es.apply(str(path), str(tmp_path / "o.3mf"))
+    assert any("clear of every object" in n for n in es.notes)

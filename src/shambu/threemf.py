@@ -333,6 +333,10 @@ class Project:
                 return m.text
         return None
 
+    def object_names(self) -> list[str]:
+        """The objects' names in `model_settings.config` order (the CLI names a conflict log line uses)."""
+        return [_meta(o, "name") or "" for o in self._objects()]
+
     def _objects(self) -> list[ET.Element]:
         return self.model_settings.findall("object")
 

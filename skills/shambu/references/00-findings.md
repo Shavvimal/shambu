@@ -208,8 +208,11 @@ v02.08.02.61. Details and the run table: `03-3mf-format.md` section 8 and `06-sl
   `filament_maps` "1 2". The slice exits 0 with no `could not found extruder_type` line and the same 18 h 0 min,
   480.7 g as the untouched file (a `--load-filaments` reload had given 16 h 29, 509.0 g).
 - `--move camera_housing_v2_print=+5,+5` and back: only `3D/3dmodel.model` changed, and the round trip is byte-identical
-  apart from the dropped `plate_1.json`. At the original position the move check prints the FAIL line
-  "camera_housing_v2_print and housing_print overlap", the pair of the -101 below.
+  apart from the dropped `plate_1.json`. The move check is the layout checker's pair rule on silhouettes
+  (`layout.pair_check`, the estimated spread, the 1 mm line allowance). On the E7a cradle project at the original
+  position (integration run, 2026-10-21): no FAIL, one WARN ("20.9 mm apart; support reaches 21.8 mm (estimated)"); by
+  boxes the same pair FAILs ("the footprints touch (0.8 mm apart)"). The first edits run used boxes and printed
+  "camera_housing_v2_print and housing_print overlap" there, the pair of the -101 below.
 - `shambu slice FILE --no-check` slices checked first (per plate) and adds a `--no-check` pass only after a skippable
   -101 or -100. On the plate-14 project with the E7a housing the checked pass exited -101 ("conflicts between
   camera_housing_v2_print and housing_print"), the second pass exported 16 h 58 min, 457.8 g, and the report says what

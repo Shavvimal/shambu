@@ -21,6 +21,25 @@ STANDING_WARNINGS = (
 FEATURE_TIME_ROLES = ("Support", "Support interface", "Prime tower", "Flush", "Travel")
 
 
+def checks_skipped_lines(cs: dict | None) -> list[str]:
+    """The `--no-check` record (build.two_pass_slice) as report lines under the estimates: one `Checks skipped:` line
+    per plate whose checked pass found a skippable problem, or the one line that says why no unchecked pass ran."""
+    if not cs:
+        return []
+    if not cs.get("skipped"):
+        return ["- " + cs["report_line"]]
+    recs = [r for r in cs.get("plates", []) if r.get("kind") == "skippable"]
+    per_plate = any(r["plate"] for r in cs.get("plates", []))
+    out = []
+    for r in recs:
+        where = f"plate {r['plate']}" if r["plate"] else ("all plates together" if per_plate else "plate 1")
+        out.append(
+            f"- {where}: Checks skipped: {r['reason']}. Exported with --no-check as the GUI would: the conflict and "
+            "support-necessity checks did not run on this G-code, so look at that spot in the preview before printing."
+        )
+    return out
+
+
 def estimate_lines(sl: dict, calibration: list[dict] | None = None, printer_model: str | None = None) -> list[str]:
     """Report lines for one entry of BuildResult.estimates(). Each number names its source: slice_info.config,
     result.json (seconds per feature, tower plus flush grams) or the G-code parser (support grams, filament changes
@@ -212,6 +231,7 @@ def render(r: BuildResult) -> str:
             out.append("- calibration file not read: `shambu calibrate --show` names the problem")
         for sl in r.estimates():
             out += estimate_lines(sl, cal, pl.facts.get("printer_model"))
+        out += checks_skipped_lines(r.checks_skipped)
         out += ["- VERIFY FAIL: " + x for x in (r.verify_problems or [])]
     if r.run is not None and not r.run.ok:
         out += ["", "## Next", "- The export failed (above): nothing to open. Fix the spec or the part and build again."]

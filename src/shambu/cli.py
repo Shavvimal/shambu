@@ -45,7 +45,7 @@ from .patches import (
     SetObjectSetting,
     SetPrintSequence,
 )
-from .report import estimate_lines
+from .report import checks_skipped_lines, estimate_lines
 from .spec import Spec
 from .studio import CliCommand
 
@@ -1056,10 +1056,10 @@ class Slice(Command):
             out.emit({"error": f"EditError: {e}"}, [f"EditError: {e}"])
             return 1
         lines = [f"slice {r.file.name}: {r.run.summary()}"]
-        if r.checks_skipped:
-            lines.append("- " + r.checks_skipped["report_line"])
         for est in r.estimates:
             lines += estimate_lines(est)
+        lines += checks_skipped_lines(r.checks_skipped)
+        lines += ["- VERIFY FAIL: " + x for x in r.verify_problems]
         lines += ["- " + n.strip() for n in r.notes]
         if r.ok:
             lines.append(f"- output {r.output}")

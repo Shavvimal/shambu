@@ -21,7 +21,12 @@ Format facts (reference 03 section 2, and `03-3mf-format.md` "Project edits"):
 Design: each edit is a frozen dataclass Command (`apply`, `describe`, `touches`, `verify`) that the `EditSet`
 Composite runs, like `patches.py`. Reading is ElementTree; writing is targeted text substitution of the one `<mesh>`
 or `transform` attribute, so every other byte of an entry stays. The STL and the preset are read through `mesh.py`
-and the caller; the clearance test is one injectable function (`CLEARANCE`).
+and the caller. The layout lines of `--move`, `--tower` and replace-mesh are the layout checker's own: each object
+becomes a `layout.Placed` with its silhouette (`layout.RasterFootprint` from the project's meshes; the bounding box
+with a WARN when a mesh does not rasterise), its brim and its estimated support spread (`layout.support_spread`), and
+the pair test is one injectable function (`CLEARANCE`, default `layout.pair_check`: FAIL and WARN as `shambu check`).
+The tower test is `tower.FootprintClearance` over the same parts: an outline or a measured spread FAILs, an estimate
+WARNs.
 
 This module is planning core: no zipfile, no subprocess, and it writes no file itself. It computes the new bytes;
 `threemf.Project.save()` writes the temporary archive, runs the verify hook on it and renames it (its atomic writer
@@ -43,6 +48,7 @@ from pathlib import Path
 
 from . import layout as L
 from . import mesh as M
+from . import tower as T
 from .errors import BambuError, ProjectError
 from .patches import Patch, PatchSet
 from .presets import machine_facts
@@ -504,59 +510,144 @@ def _context(project: Project, plate: int | None = None) -> L.Context:
     return L.Context(_bed(project), {i + 1: e for i, e in enumerate(fmap)}, tpu)
 
 
-def _placed(key: str, lo: Vec, hi: Vec, origin: tuple[float, float], filament: int, also: set[int], margin: float) -> L.Placed:
+SPREAD_KEYS = (
+    "enable_support",
+    "support_type",
+    "enforce_support_layers",
+    "raft_layers",
+    "raft_first_layer_expansion",
+    "brim_type",
+    "brim_width",
+)
+
+
+def _params(project: Project, obj: _Obj) -> dict:
+    """The object's own setting over the project's, for the keys the brim and the support spread read."""
+    ps = project.project_settings
+    out = {}
+    for k in SPREAD_KEYS:
+        v = _meta(obj.ms, k)
+        if v is None:
+            v = ps.get(k)
+            v = v[0] if isinstance(v, list) and v else v
+        if v not in (None, ""):
+            out[k] = str(v)
+    return out
+
+
+def _outline(geo: _Geometry, obj: _Obj, item: Sequence[float] | None = None) -> tuple[L.Footprint | None, str]:
+    """The object's XY silhouette (`layout.RasterFootprint`, every printing part through component then item), and ""
+    or, when it does not rasterise, None and the reason: the checks then use the bounding box (as `build` does)."""
+    t_item = obj.item if item is None else list(item)
+    facets: list[M.Facet] = []
+    try:
+        for c in obj.comps:
+            m = geo.mesh(c)
+            full = _compose(t_item, c.transform)
+            w = [_apply(full, v) for v in m.vertices]
+            facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
+        return L.RasterFootprint.from_silhouette(M.silhouette(facets)), ""
+    except BambuError as e:
+        return None, str(e)
+
+
+def _placed(
+    key: str,
+    lo: Vec,
+    hi: Vec,
+    origin: tuple[float, float],
+    filament: int,
+    also: set[int],
+    brim: float,
+    spread: L.Spread = L.NO_SPREAD,
+    footprint: L.Footprint | None = None,
+) -> L.Placed:
     size = _size(lo, hi)
     x0, y0 = lo[0] - origin[0], lo[1] - origin[1]
     info = MeshInfo(Path(key), size, (x0, y0, lo[2]), (x0 + size[0], y0 + size[1], hi[2]), True, 0, 1, 0.0)
-    return L.Placed(key, info, filament, x0, y0, margin, True, frozenset(also))
+    return L.Placed(key, info, filament, x0, y0, brim, True, frozenset(also), spread=spread, footprint=footprint)
 
 
-def _margin(project: Project, obj: _Obj) -> float:
-    ps = project.project_settings
-    params = {
-        "brim_type": _meta(obj.ms, "brim_type") or ps.get("brim_type", "auto_brim"),
-        "brim_width": _meta(obj.ms, "brim_width") or ps.get("brim_width", "5"),
-    }
-    return L.brim_margin(params)
-
-
-def bbox_clear(a: L.Placed, b: L.Placed) -> bool:
-    """The default clearance test of two placed objects: their bounding boxes with brim margins do not overlap."""
-    return not L.overlaps(a.rect(), b.rect())
-
-
-# The clearance test that --move (and replace-mesh's WARN lines) use. ONE function of two L.Placed, so the merge can bind
-# it to the layout work's footprint (silhouette) test without touching the callers: edits.CLEARANCE = <footprint test>.
-CLEARANCE: Callable[[L.Placed, L.Placed], bool] = bbox_clear
-
-
-def layout_checks(
-    project: Project, obj: _Obj, lo: Vec, hi: Vec, plate: int, geo: _Geometry, clear: Callable[[L.Placed, L.Placed], bool] | None = None
-) -> list[L.Check]:
-    """Bed edges, extruder reach (every filament the object uses, through the plate's own filament map) and clearance
-    to every instance of every other object on the plate (`clear`, default CLEARANCE: bounding boxes with brim margins).
-    The slice is the real clash test; these lines say what to look at."""
-    clear = clear or CLEARANCE
-    origin = _origin(project, plate)
+def _object_placed(
+    project: Project, geo: _Geometry, obj: _Obj, label: str, lo: Vec, hi: Vec, plate: int, item: Sequence[float] | None = None
+) -> tuple[L.Placed, str]:
+    """One object as the layout checker sees it: its silhouette, brim and support spread (`layout.support_spread`, an
+    estimate: a project carries no probe), and the reason when the box stands in for the outline."""
+    params = _params(project, obj)
     main, also = _object_filaments(project, obj)
-    me = _placed(obj.name, lo, hi, origin, main, also, _margin(project, obj))
-    ctx = _context(project, plate)
-    checks = list(L.InsideBed().check([me], ctx)) + list(L.ExtruderReach().check([me], ctx))
+    fp, why = _outline(geo, obj, item)
+    spread = L.support_spread(params, hi[2] - lo[2])
+    return _placed(label, lo, hi, _origin(project, plate), main, also, L.brim_margin(params), spread, fp), why
+
+
+# The pair test that --move, --tower and replace-mesh's WARN lines use: the layout checker's own (`layout.pair_check`,
+# silhouettes, the max of the facing spreads, the line allowance), so `patch` and `check` give the same FAIL and WARN.
+CLEARANCE: Callable[[L.Placed, L.Placed], L.Check | None] = L.pair_check
+
+
+def plate_objects(project: Project, plate: int, skip: str | None = None) -> tuple[list[L.Placed], list[str]]:
+    """Every instance of every object on `plate` (but the object id `skip`) as placed parts, and a WARN text per object
+    whose outline did not rasterise (its box stands in)."""
+    geo = _Geometry(project)
     root = _root(project)
+    out: list[L.Placed] = []
+    boxed: list[str] = []
     for o in project.model_settings.findall("object"):
-        if o.get("id") == obj.oid:
+        if o.get("id") == skip:
             continue
         other = _object(project, o, root)
         where = _instance_plates(project, other.oid)
-        om, oa = _object_filaments(project, other)
         for k, text in enumerate(other.item_texts or [other.item_text]):
             if where.get(k, _plate_of(project, other.oid)) != plate:
                 continue
-            olo, ohi = geo.world_box(other, parse_transform(text))
+            item = parse_transform(text)
+            olo, ohi = geo.world_box(other, item)
             label = other.name if other.n_items <= 1 else f"{other.name} (instance {k})"
-            them = _placed(label, olo, ohi, origin, om, oa, _margin(project, other))
-            if not clear(me, them):
-                checks.append(L.Check(False, f"{me.key} and {them.key} overlap (bounding boxes with brim margins)"))
+            them, why = _object_placed(project, geo, other, label, olo, ohi, plate, item)
+            if why:
+                boxed.append(f"{label}: the clearance uses the bounding box, not the outline: {why}")
+            out.append(them)
+    return out, boxed
+
+
+def layout_checks(
+    project: Project,
+    obj: _Obj,
+    lo: Vec,
+    hi: Vec,
+    plate: int,
+    geo: _Geometry,
+    clear: Callable[[L.Placed, L.Placed], L.Check | None] | None = None,
+) -> list[L.Check]:
+    """Bed edges, extruder reach (every filament the object uses, through the plate's own filament map) and the pair
+    rule against every instance of every other object on the plate (`clear`, default CLEARANCE: `layout.pair_check`
+    on silhouettes with the estimated support spread). The object's outline is read from `project` as it now stands
+    (after the edit), at the world box `lo`..`hi`. Kinds and FAIL/WARN as `shambu check`: the slice is the real clash
+    test, these lines say what to look at."""
+    clear = clear or CLEARANCE
+    fresh = find_object(project, obj.name)
+    me, why = _object_placed(project, _Geometry(project), fresh, obj.name, lo, hi, plate)
+    ctx = _context(project, plate)
+    checks = list(L.InsideBed().check([me], ctx)) + list(L.ExtruderReach().check([me], ctx))
+    others, boxed = plate_objects(project, plate, skip=obj.oid)
+    if why:
+        boxed.insert(0, f"{obj.name}: the clearance uses the bounding box, not the outline: {why}")
+    checks += [L.Check(True, b, "margin") for b in boxed]
+    for them in others:
+        c = clear(me, them)
+        if c is not None:
+            checks.append(c)
+    kind = "silhouettes" if not boxed else "silhouettes (boxes where noted)"
+    hard = sum(1 for c in checks if not c.ok)
+    checks.append(
+        L.Check(
+            True,
+            f"{obj.name}: clearance on {kind} to {len(others)} other object(s) on plate {plate}, {L.LINE:g} mm line allowance, "
+            f"support spread {me.spread.describe() if me.spread.most() > 0 else 'none'}: "
+            + ("no FAIL" if not hard else f"{hard} FAIL line(s)"),
+            "summary",
+        )
+    )
     return checks
 
 
@@ -827,8 +918,8 @@ class ReplaceMesh:
         ]
         plate = _plate_of(p, obj.oid)
         for c in layout_checks(p, obj, lo1, hi1, plate, geo):
-            if not c.ok:
-                p.notes.append(f"  WARN: {c.text}")
+            if not c.ok or c.warn:
+                p.notes.append(f"  WARN: {c.text}")  # a replacement never fails on layout: the slice decides
 
     def verify(self, p: Project, before: Project | None = None) -> None:
         """Re-open check: the object's sub-mesh has the STL's triangle count, its centred bbox and its triangles."""
@@ -863,7 +954,7 @@ class MoveObject:
         return f"object '{self.object_name}': moved {to}" + (f" on plate {self.plate}" if self.plate else "")
 
     def absolute(self, p: Project) -> MoveObject:
-        """The same move as an absolute min-corner target on `p` (EditSet resolves a relative move against its input
+        """The same move as an absolute min corner target on `p` (EditSet resolves a relative move against its input
         once, so the PatchSet records the target and applying it again is a no-op)."""
         if not self.relative:
             return self
@@ -921,9 +1012,11 @@ class MoveObject:
         )
         world_lo = (nlo[0] + o_dst[0], nlo[1] + o_dst[1], nlo[2])
         world_hi = (nhi[0] + o_dst[0], nhi[1] + o_dst[1], nhi[2])
-        fails = [c for c in layout_checks(p, obj, world_lo, world_hi, dst, _Geometry(p)) if not c.ok]
-        for c in fails:
-            p.notes.append(f"  FAIL: {c.text}")
+        checks = layout_checks(p, obj, world_lo, world_hi, dst, _Geometry(p))
+        fails = [c for c in checks if not c.ok]
+        for c in checks:
+            if not c.ok or c.warn or c.kind == "summary":
+                p.notes.append(f"  {'FAIL' if not c.ok else 'WARN' if c.warn else 'OK'}: {c.text}")
         if fails and self.strict:
             raise EditError(f"--strict: the move of '{self.object_name}' breaks a layout rule: " + "; ".join(c.text for c in fails))
 
@@ -994,6 +1087,25 @@ class SetTower:
                     f"{foot}, outside extruder {e}'s reach x {r['x'][0]:g}..{r['x'][1]:g} y {r['y'][0]:g}..{r['y'][1]:g}, and a "
                     f"filament on {'plate ' + str(self.plate) if self.plate else 'the project'} maps to extruder {e}"
                 )
+        rect = (x0, y0, x1, y1)
+        clear_notes: list[str] = []
+        for pl in plates:  # the objects on the plate, as `check` places the tower (tower.FootprintClearance)
+            objs, boxed = plate_objects(p, pl)
+            test = T.FootprintClearance.of(objs)
+            hits = test.relaxed().blocking(rect)
+            if hits:
+                raise EditError(
+                    f"{foot}, and on plate {pl} it comes within the {L.LINE:g} mm line allowance of "
+                    + ", ".join(f"{n} (x {r[0]:.1f}..{r[2]:.1f} y {r[1]:.1f}..{r[3]:.1f})" for n, r in hits)
+                    + " (its outline or its measured spread)"
+                )
+            near = test.estimates_within(rect)
+            clear_notes += [f"  WARN: {b}" for b in boxed]
+            clear_notes.append(
+                f"  WARN: plate {pl}: the tower is within the estimated support spread of {', '.join(near)}; the slice decides"
+                if near
+                else f"  OK: plate {pl}: the tower is clear of every object ({len(objs)}): {test.describe()}"
+            )
         for key, v in (("wipe_tower_x", self.x), ("wipe_tower_y", self.y)):
             old = ps.get(key)
             vals = [str(x) for x in old] if isinstance(old, list) else ([str(old)] if old not in (None, "") else [])
@@ -1010,6 +1122,7 @@ class SetTower:
             f"tower: wipe_tower_x {ps['wipe_tower_x']}, wipe_tower_y {ps['wipe_tower_y']} (estimated footprint "
             f"x {x0:g}..{x1:g} y {y0:g}..{y1:g}; Studio sizes the depth from the flush volumes at slice time)"
         )
+        p.notes += clear_notes
 
     def verify(self, p: Project, before: Project | None = None) -> None:
         ps = p.project_settings

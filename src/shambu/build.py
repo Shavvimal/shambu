@@ -21,7 +21,7 @@ import re
 import shutil
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -44,7 +44,18 @@ from .patches import (
 )
 from .probe import ProbeRequest, SpreadProbe, StudioProbe
 from .spec import FileRef, LayoutSpec, PartSpec, Spec
-from .studio import CliCommand, MeshInfo, OrientResult, RunResult, SlicedPlate, StudioCLI, arrange_failed_plate, conflicts_in_log
+from .studio import (
+    NO_PAIR,
+    CliCommand,
+    MeshInfo,
+    OrientResult,
+    RunResult,
+    SlicedPlate,
+    StudioCLI,
+    arrange_failed_plate,
+    conflict_phrase,
+    conflicts_in_log,
+)
 from .threemf import Project
 
 log = logging.getLogger(__name__)
@@ -377,14 +388,11 @@ class BuildResult:
                 by_cli.setdefault(x.cli_name, []).append(x)
         pairs = conflicts_in_log(text, by_cli)
         if not pairs:
-            return ["Studio found crossing G-code paths (exit -101), and its log names no objects. Move the parts apart and build again."]
+            return [f"Studio found {NO_PAIR}. Move the parts apart and build again."]
         out = []
         for a, b in pairs:
             if b is None:
-                out.append(
-                    f"Studio found crossing G-code paths (exit -101) between '{a}', which shambu cannot split into two object names. "
-                    "Move the parts apart and build again."
-                )
+                out.append(f"Studio found {conflict_phrase(a, None)}. Move the parts apart and build again.")
                 continue
 
             def name(cli: str) -> str:
@@ -405,9 +413,7 @@ class BuildResult:
                 who, f, side, src = (qa, fa, sa, qa.spread.source) if fa >= fb else (qb, fb, sb, qb.spread.source)
                 if f > 0:
                     reach = f" ({who.key}'s support reaches {f:.1f} mm on {side}" + (", estimated)" if src == "estimate" else ")")
-            out.append(
-                f"Studio found crossing G-code paths between {name(a)} and {name(b)} (exit -101). Move them apart{reach} and build again."
-            )
+            out.append(f"Studio found {conflict_phrase(name(a), name(b))}. Move them apart{reach} and build again.")
         return out
 
     def slicer_warnings(self) -> list[str]:
@@ -487,15 +493,8 @@ NO_CHECK_SKIPPED = (
     "support-necessity check (floating cantilevers and regions)",
     "exit -100 on empty-layer or overlap warnings",
 )
-_CONFLICT = re.compile(r"gcode path conflicts found between (.+?) and (.+?)\s*$", re.M)
 _SLICING_WARNINGS = re.compile(r"found slicing warnings: (.+?)(?:, no_check=\d)?\s*$", re.M)
 _ERROR_LINE = re.compile(r"\[error\]\s+(.+?)\s*$", re.M)
-
-
-def conflict_pair(log_text: str) -> tuple[str, str] | None:
-    """The two objects of Studio's 'gcode path conflicts found between A and B' log line (exit -101), or None."""
-    m = _CONFLICT.search(log_text)
-    return (m.group(1), m.group(2)) if m else None
 
 
 def _log_text(rr: RunResult) -> str:
@@ -505,9 +504,10 @@ def _log_text(rr: RunResult) -> str:
         return ""
 
 
-def checked_outcome(rr: RunResult, plate: int) -> dict:
+def checked_outcome(rr: RunResult, plate: int, known: Collection[str] = ()) -> dict:
     """One checked pass: `ok`, `skippable` (-101, or -100 with Studio's slicing-warning line) or `fail`, with what the log
-    says. The record keeps the pass's own log and result.json paths."""
+    says. A -101 pair comes from `studio.conflicts_in_log` (`known`: the CLI object names) and reads as `export_fails`
+    does (`studio.conflict_phrase`). The record keeps the pass's own log and result.json paths."""
     text = _log_text(rr)
     rec: dict = {
         "plate": plate,
@@ -519,17 +519,16 @@ def checked_outcome(rr: RunResult, plate: int) -> dict:
     if rr.code == 0 and rr.ok:
         rec.update(kind="ok", reason="passed the checks")
     elif rr.code == -101:
-        pair = conflict_pair(text)
+        pairs = conflicts_in_log(text, known)
+        first = pairs[0] if pairs else None
         rec.update(
             kind="skippable",
-            pair=list(pair) if pair else None,
-            reason=f"G-code path conflicts between {pair[0]} and {pair[1]}"
-            if pair
-            else f"G-code path conflicts (pair not found in the log {rr.log})",
+            pair=list(first) if first is not None and first[1] is not None else None,
+            reason="; ".join(conflict_phrase(a, b) for a, b in pairs) if pairs else NO_PAIR,
         )
     elif rr.code == -100 and _SLICING_WARNINGS.search(text):
         m = _SLICING_WARNINGS.search(text)
-        rec.update(kind="skippable", pair=None, reason=f"empty layers or overlap: {m.group(1) if m else ''}")
+        rec.update(kind="skippable", pair=None, reason=f"empty layers or overlap: {m.group(1) if m else ''} (exit -100)")
     else:
         errs = _ERROR_LINE.findall(text)
         rec.update(kind="fail", reason=errs[-1] if errs else rr.meaning())
@@ -542,6 +541,43 @@ def _moved(rr: RunResult, src: Path, dest: Path) -> RunResult:
     return replace(rr, output=dest)
 
 
+def _finite(v) -> float | None:
+    try:
+        f = float(str(v))
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def verify_tower(
+    ps: Mapping, n_plates: int, wrote: Mapping[str, str], spots: Mapping[int, tuple[float, float]], who: str = "the tower plan"
+) -> list[str]:
+    """The strict tower verify, for `build` and `shambu slice`: every key in `wrote` is in the file with that finite
+    number, and when any plate has a spot (`spots`: 0-based plate -> (x, y)) `wipe_tower_x/y` hold one value per plate
+    with those values (Studio's `get_at` falls back to the FIRST value for a short vector, so a short vector misplaces
+    later towers)."""
+    probs: list[str] = []
+    for k, want in wrote.items():
+        got = ps.get(k)
+        if k not in ps:
+            probs.append(f"{k} is missing from the file, {who} wrote {want!r}")
+        elif _finite(got) is None or _finite(got) != _finite(want):
+            probs.append(f"{k} in file is {got!r}, {who} wrote {want!r}")
+    if not spots:
+        return probs
+    for axis, j in (("x", 0), ("y", 1)):
+        key = f"wipe_tower_{axis}"
+        vec = ps.get(key)
+        if not isinstance(vec, list) or len(vec) < n_plates:
+            probs.append(f"{key} in file is {vec!r}: it needs one value per plate ({n_plates})")
+            continue
+        for i, xy in spots.items():
+            got_v = _finite(vec[i])
+            if got_v is None or abs(got_v - xy[j]) > 0.01:
+                probs.append(f"plate {i + 1} {key} in file is {vec!r}, {who} put it at {xy[j]:g}")
+    return probs
+
+
 def two_pass_slice(
     studio: StudioCLI,
     make_cmd: Callable[[bool, int, Path], CliCommand],
@@ -552,6 +588,7 @@ def two_pass_slice(
     expect_output: Path,
     no_check: bool,
     plates: Sequence[int] = (0,),
+    known: Collection[str] = (),
 ) -> tuple[RunResult, dict | None]:
     """Without `no_check`: one checked slice of every plate (or of `plates[0]`). With it: one checked pass per plate in
     `plates` (`(0,)` = all at once, for a one-plate project), each in its own folder under `<outputdir>/<name>.passes/`
@@ -574,7 +611,7 @@ def two_pass_slice(
         rr = studio.run(
             make_cmd(False, plate, d), name=f"{name}-checked", outputdir=d, timeout=timeout, expect_output=d / expect_output.name
         )
-        runs.append((rr, checked_outcome(rr, plate)))
+        runs.append((rr, checked_outcome(rr, plate, known)))
 
     for pl in plates:
         checked(pl, "checked" if len(plates) == 1 else f"checked-plate-{pl}")
@@ -607,7 +644,7 @@ def two_pass_slice(
             return f"plate {r['plate']}: "
         return "all plates together: " if len(plates) > 1 else ""
 
-    found = "; ".join(label(r) + f"{r['reason']} (exit {r['exit']})" for r in skippable)
+    found = "; ".join(label(r) + r["reason"] for r in skippable)
     look = "at that pair" if all(r.get("pair") for r in skippable) and len(skippable) == 1 else "at each of these"
     line = (
         f"slice: Studio's checks found {found}; exported with --no-check as the GUI would, with a serious warning. Check the "
@@ -691,9 +728,7 @@ class Pipeline:
                     result.run = self.export(plan, result.inputs, result.project, timeout, do_slice, no_check=True)
                 else:
                     result.run = self.export(plan, result.inputs, result.project, timeout, do_slice)
-                result.checks_skipped = self.checks_skipped
-                if result.checks_skipped and result.checks_skipped.get("skipped") and result.run.ok:
-                    plan.warnings.append("sliced with --no-check: " + result.checks_skipped["report_line"].removeprefix("slice: "))
+                result.checks_skipped = self.checks_skipped  # report.checks_skipped_lines: under the estimates
                 if result.run.ok:
                     result.patches = self.patch(plan, result.project, do_slice)
                     result.verify_problems = self.verify(plan, result.project, do_slice)
@@ -1468,6 +1503,7 @@ class Pipeline:
                 expect_output=project,
                 no_check=no_check,
                 plates=tuple(range(1, len(plan.plates) + 1)) if len(plan.plates) > 1 else (0,),
+                known={x.cli_name for x in plan.parts if x.cli_name},
             )
         else:
             rr = self.studio.run(
@@ -1581,44 +1617,12 @@ class Pipeline:
 
     @staticmethod
     def _verify_tower(plan: Plan, ps: dict) -> list[str]:
-        """The tower size and on/off planning wrote into the process, and each planned plate's spot, in the file. Every
-        key planning wrote must be in the file with a finite number; `wipe_tower_x/y` must hold one value per plate
-        (Studio's `get_at` falls back to the FIRST value for a short vector, so a short vector misplaces later towers)."""
-        probs: list[str] = []
+        """The strict tower verify of a build (`verify_tower`): the keys tower planning wrote and each planned spot."""
         if not any(p.tower is not None for p in plan.plates):
-            return probs
-
-        def num(v) -> float | None:
-            try:
-                f = float(str(v))
-            except (TypeError, ValueError):
-                return None
-            return f if math.isfinite(f) else None
-
-        for k in TOWER_KEYS:
-            if k not in plan.process:
-                continue
-            got, want = ps.get(k), plan.process[k]
-            g = num(got)
-            if k not in ps:
-                probs.append(f"{k} is missing from the file, the tower plan wrote {want!r}")
-            elif g is None or g != num(want):
-                probs.append(f"{k} in file is {got!r}, the tower plan wrote {want!r}")
-        active = [(i, p.tower.footprint) for i, p in enumerate(plan.plates) if p.tower is not None and p.tower.footprint is not None]
-        if not active:
-            return probs
-        for axis in ("x", "y"):
-            key = f"wipe_tower_{axis}"
-            vec = ps.get(key)
-            if not isinstance(vec, list) or len(vec) < len(plan.plates):
-                probs.append(f"{key} in file is {vec!r}: it needs one value per plate ({len(plan.plates)})")
-                continue
-            for i, fp in active:
-                want_v = fp.x if axis == "x" else fp.y
-                got_v = num(vec[i])
-                if got_v is None or abs(got_v - want_v) > 0.01:
-                    probs.append(f"plate {i + 1} {key} in file is {vec!r}, the tower plan put it at {want_v:g}")
-        return probs
+            return []
+        wrote = {k: plan.process[k] for k in TOWER_KEYS if k in plan.process}
+        spots = {i: (p.tower.footprint.x, p.tower.footprint.y) for i, p in enumerate(plan.plates) if p.tower and p.tower.footprint}
+        return verify_tower(ps, len(plan.plates), wrote, spots, "the tower plan")
 
     def report(self, r: BuildResult) -> str:
         from .report import render

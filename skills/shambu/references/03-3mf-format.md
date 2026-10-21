@@ -687,7 +687,7 @@ A GUI save puts the placement on the item (component identity); a shambu build p
 identity); a CLI re-export folds a one-part object into the item. The part `matrix`, `source_offset_*`,
 `<assemble_item>` and `plate_N.json` are not authoritative: moving an object changes the item translation only.
 Plates after the first sit at world offsets `(col * W * 1.2, -row * D * 1.2)`, `cols = compute_colum_count(n)`
-(PartPlate.cpp:4536-4548, PartPlate.hpp:38-50); `--move X,Y@PLATE` gives plate-local min-corner coordinates.
+(PartPlate.cpp:4536-4548, PartPlate.hpp:38-50); `--move X,Y@PLATE` gives the plate-local min corner.
 
 **Meshes.** Each sub-mesh is written re-centred on its bbox centre (bbs_3mf.cpp:5366); `source_offset_*` of the part is
 that centre in the STL's own frame. The GUI's "replace with STL" keeps the volume transform and shifts it by
@@ -713,7 +713,11 @@ a plain export.
 
 **Prime tower.** `wipe_tower_x/y` are per-plate vectors of the tower's MIN corner, plate-local (BambuStudio.cpp:4481-4486,
 Print.cpp:2423). The CLI estimates the footprint as `x - brim .. x + width + brim`; `--tower` checks
-`x - 8 .. x + max(prime_tower_width, 35) + 8` against the bed and x against extruder 2's reach when a filament maps to it.
+`x - 8 .. x + max(prime_tower_width, 35) + 8` against the bed, x against extruder 2's reach when a filament maps to it,
+and every object on the plate as `check` places the tower (`tower.FootprintClearance`: within the 1 mm line allowance
+of an outline is an error, inside an estimated support spread a WARN note). `--move` and `--replace-mesh` report the
+same pair rule as `check` (`layout.pair_check` on silhouettes from the project's meshes, the bounding box with a WARN
+when a mesh does not rasterise); `--strict` turns a FAIL line into an error.
 
 **`--no-check`.** It skips the conflict check (-101), the support-necessity check and the -100 exit on empty-layer or
 overlap warnings; -102..-105 and validate errors still exit (BambuStudio.cpp:6192, 6418, 6974, 7185-7212). Studio exits
