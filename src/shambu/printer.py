@@ -750,6 +750,7 @@ class StatusDecoder:
 
     def decode(self, report: dict, serial: str, ip: str) -> Status:
         p = report.get("print", {})
+        secrets = outward_secrets(serial, ip)
         dev = p.get("device", {}) or {}
         nozzles = []
         noz_infos = {n.get("id"): n for n in ((dev.get("nozzle") or {}).get("info") or [])}
@@ -806,8 +807,8 @@ class StatusDecoder:
             p.get("mc_remaining_time"),
             p.get("layer_num"),
             p.get("total_layer_num"),
-            p.get("subtask_name"),
-            p.get("gcode_file"),
+            scrub(p.get("subtask_name"), secrets),  # free text: the user can name a job after anything
+            scrub(p.get("gcode_file"), secrets),
             bed_c,
             bed_t or None,
             cham,
@@ -822,7 +823,7 @@ class StatusDecoder:
             speed_level=_int_or_none(p.get("spd_lvl")),
             speed_percent=_int_or_none(p.get("spd_mag")),
             stages=stages,
-            task_id=None if task_id in (None, "") else str(task_id),
+            task_id=None if task_id in (None, "") else scrub(str(task_id), secrets),
             raw=report,
         )
 
@@ -1361,6 +1362,23 @@ class WatchError:
         }
 
 
+def outward_secrets(serial: str = "", ip: str = "") -> list[str]:
+    """Every value no printer output or log may carry: the known serials, their masks and the access codes
+    (`conf.sensitive_values`), plus this printer's serial, masked serial and endpoint."""
+    vals = set(conf.sensitive_values()) | {v for v in (serial, conf.mask(serial) if serial else "", ip) if v and len(v) >= 4}
+    return sorted(vals, key=len, reverse=True)
+
+
+def scrub(text: str | None, secrets: list[str]) -> str | None:
+    """`text` with every value in `secrets` replaced by '<redacted>' (None stays None). The one sanitiser at the printer
+    output and log boundary: job names, file names and G-code labels are free text."""
+    if text is None:
+        return None
+    for v in secrets:
+        text = text.replace(v, "<redacted>")
+    return text
+
+
 RAW_SECRET = ("access", "password", "passwd", "token", "ticket", "secret", "auth")
 RAW_DROP = ("net", "wifi_signal", "ipcam", "sn", "dev_id", "serial")  # network, camera URL (holds the IP), serial keys
 
@@ -1371,6 +1389,7 @@ def public_raw(report: dict, ip: str, serial: str) -> dict:
     whose "code" would hide `gcode_state`), and any text
         that names the IP, the serial or the masked serial replaced by '<redacted>'."""
     masked = conf.mask(serial)
+    secrets = outward_secrets(serial, ip)  # a known access code under an ordinary key too
 
     def clean(x):
         if isinstance(x, dict):
@@ -1381,7 +1400,7 @@ def public_raw(report: dict, ip: str, serial: str) -> dict:
             }
         if isinstance(x, list):
             return [clean(v) for v in x]
-        if isinstance(x, str) and ((ip and ip in x) or (serial and serial in x) or masked in x):
+        if isinstance(x, str) and ((ip and ip in x) or (serial and serial in x) or masked in x or any(v in x for v in secrets)):
             return "<redacted>"
         return x
 

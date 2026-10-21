@@ -510,6 +510,26 @@ def _finite(v) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def sliced_problems(project: Project, summary: dict, plates: Collection[int] | None = None) -> list[str]:
+    """What a sliced export lacks, for `build --slice` and `shambu slice` alike: G-code at all, and per plate (every
+    plate, or the ids in `plates`) its `Metadata/plate_N.gcode` entry and its slice results, and no G-code outside the
+    printable area. [] for a complete slice."""
+    probs = []
+    if not summary["sliced"]:
+        probs.append("the file holds no G-code although a slice was requested")
+    names = set(project.names())
+    for pl in summary["plates"]:
+        if plates is not None and pl["id"] not in plates:
+            continue
+        if f"Metadata/plate_{pl['id']}.gcode" not in names:
+            probs.append(f"plate {pl['id']} has no G-code entry (Metadata/plate_{pl['id']}.gcode)")
+        if not pl.get("slice"):
+            probs.append(f"plate {pl['id']} has no slice results")
+        elif pl["slice"].get("outside") == "true":
+            probs.append(f"plate {pl['id']}: the slicer reports G-code outside the printable area")
+    return probs
+
+
 def verify_tower(
     ps: Mapping, n_plates: int, wrote: Mapping[str, str], spots: Mapping[int, tuple[float, float]], who: str = "the tower plan"
 ) -> list[str]:
@@ -1502,14 +1522,8 @@ class Pipeline:
         pr = Project(str(project))
         s = pr.summary()
         ps = pr.project_settings
-        if sliced and not s["sliced"]:
-            probs.append("the file holds no G-code although --slice was requested")
         if sliced:
-            for pl in s["plates"]:
-                if not pl.get("slice"):
-                    probs.append(f"plate {pl['id']} has no slice results")
-                elif pl["slice"].get("outside") == "true":
-                    probs.append(f"plate {pl['id']}: the slicer reports G-code outside the printable area")
+            probs += sliced_problems(pr, s)
         cols = [f["filament_colour"][0].upper() for f in plan.filaments]
         if [c.upper() for c in ps.get("filament_colour", [])] != cols:
             probs.append(f"filament colours in file {ps.get('filament_colour')} differ from {cols}")

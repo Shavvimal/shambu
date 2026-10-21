@@ -17,6 +17,7 @@ Not here: building a project from a spec (`build.py`), the edits themselves (`ed
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import os
 import re
@@ -27,9 +28,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import presets as P
-from .build import DEFAULT_COLOURS, _estimate, summarise, two_pass_slice, verify_tower
+from .build import DEFAULT_COLOURS, _estimate, sliced_problems, summarise, two_pass_slice, verify_tower
 from .edits import AddFilament, EditError, EditSet, FilamentSlot, SetTower, check_preset, slot_from_export, slot_from_preset, slot_presets
-from .errors import BambuError, StudioError
+from .errors import BambuError, FileError, StudioError
 from .patches import PatchSet, RepairNozzleStats
 from .spec import Spec
 from .studio import CliCommand, RunResult, StudioCLI
@@ -39,7 +40,26 @@ FILAMENT_ARG = re.compile(r"(?P<preset>.+?)(?::(?P<colour>#[0-9A-Fa-f]{6}(?:[0-9
 VARIANT_MISS = "could not found extruder_type"
 
 
+def _fs_errors(op: str):
+    """Translate an OSError escaping `op` into FileError naming the operation and the path (a folder that is a file,
+    an unwritable output or scratch directory, a full disk): a traceback is never the CLI's answer."""
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(*a, **kw):
+            try:
+                return fn(*a, **kw)
+            except OSError as e:
+                where = f" {e.filename}" if e.filename else ""
+                raise FileError(f"{op}: cannot create, write or replace{where} ({e.strerror or e})") from e
+
+        return inner
+
+    return wrap
+
+
 # ---------------------------------------------------------------------------- add a filament
+@_fs_errors("add-filament")
 def add_filament_patch(
     studio: StudioCLI | None, resolver: P.PresetResolver, file: str, arg: str, allow_duplicate: bool = False
 ) -> AddFilament:
@@ -99,6 +119,7 @@ def _noted(slot: FilamentSlot, warn: str) -> FilamentSlot:
     return dataclasses.replace(slot, notes=(warn, *slot.notes)) if warn else slot
 
 
+@_fs_errors("verify slice")
 def verify_filaments(studio: StudioCLI, path: str) -> str:
     """The verify slice: slice plate 1 of the patched archive and look for Studio's variant-lookup miss
     (PrintConfig.cpp:8935), which runs when a slice applies the config, not on a plain export. Only exit 0 with a
@@ -121,10 +142,17 @@ def verify_filaments(studio: StudioCLI, path: str) -> str:
     return f"verify slice: Studio sliced plate 1 (exit 0, success); no '{VARIANT_MISS}' in its log"
 
 
+@_fs_errors("patch")
 def apply_edits(studio: StudioCLI | None, path: str, edits: EditSet, out: str | None = None, verify: bool = True) -> list[str]:
     """Apply an EditSet. With an AddFilament, `verify` and Studio present, the verify slice runs on the temporary archive
-    before it replaces the destination, so a failure leaves the destination as it was."""
-    if verify and studio is not None and any(isinstance(x, AddFilament) for x in edits.patches):
+    before it replaces the destination, so a failure leaves the destination as it was. An added filament on an archive a
+    CLI slice cannot read (`Project.reslice_problems`: an unsliced CLI export's `extruder_nozzle_stats []`) repairs it
+    first, in the same transaction: RepairNozzleStats runs before AddFilament, so the new slot's variant block is
+    appended to repaired blocks and the verify slice sees a re-sliceable file."""
+    adds = any(isinstance(x, AddFilament) for x in edits.patches)
+    if adds and Project(path).reslice_problems() and not any(isinstance(x, RepairNozzleStats) for x in edits.patches):
+        edits.patches.insert(0, RepairNozzleStats())
+    if verify and studio is not None and adds:
         lines: list[str] = []
         done = edits.apply(path, out, check=lambda tmp: lines.append(verify_filaments(studio, tmp)))
         edits.notes += lines
@@ -168,6 +196,7 @@ def slice_output(src: Path, out: str | None) -> Path:
     return dest if dest != src else src.with_name(f"{stem}.resliced.gcode.3mf")
 
 
+@_fs_errors("slice")
 def slice_project(
     studio: StudioCLI,
     resolver: P.PresetResolver,
@@ -253,7 +282,9 @@ def slice_project(
         by_id = {sp.id: sp for sp in rr.plates()}
         estimates = [_estimate(pl, by_id.get(pl["id"])) for pl in s["plates"] if pl.get("slice")]
         back = Project(str(tmp_dest))
-        problems = [f"not re-sliceable by the CLI: {x}" for x in back.reslice_problems(n_ext)]
+        wanted = {plate} if plate else None
+        problems = sliced_problems(back, back.summary(features=False), wanted)  # an unsliced "success" never replaces dest
+        problems += [f"not re-sliceable by the CLI: {x}" for x in back.reslice_problems(n_ext)]
         spots = {i: (tower[0], tower[1]) for i in range(n_plates) if tower[2] in (None, i + 1)} if tower else {}
         problems += verify_tower(back.project_settings, n_plates, {}, spots, "--tower")
         if problems:  # the export stays in the run folder: it is not the slice the command asked for
@@ -270,6 +301,7 @@ def slice_project(
 
 
 # ---------------------------------------------------------------------------- shambu studio --
+@_fs_errors("studio")
 def studio_raw(studio: StudioCLI, raw: list[str], cwd: Path, out_dir: Path, timeout: int = 1200) -> dict:
     """Run a raw Studio argument list under `CliCommand.parse`'s rules (StudioError when refused) and keep the run
     folder `<out_dir>/studio-runs/<UTC stamp>/`: command.json, the log, result.json, exit.txt."""

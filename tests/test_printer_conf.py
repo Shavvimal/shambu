@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -470,3 +471,38 @@ def test_cli_watch_without_an_access_code_is_a_setup_record(tmp_path, monkeypatc
     assert lines[1]["category"] == "setup" and lines[1]["gave_up"] is True
     for s in (MASKED, SERIAL, SENTINEL_IP):
         assert s not in out and s not in log.read_text(encoding="utf-8")
+
+
+def test_free_text_printer_fields_are_scrubbed_everywhere(stream, capsys, tmp_path):
+    """The access code and the serial in a task name, a subtask_name and the G-code file name: status --json, the watch
+    output, the watch log and its header (the --gcode3mf file name) carry none of them."""
+    import sys
+    import zipfile
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_calibrate import gcode
+
+    r = timed_report("FINISH", layer=3, remaining=0, subtask_name=f"job {SENTINEL} for {SERIAL}", gcode_file=f"/sd/{SENTINEL}.gcode")
+    stream.script = [r]
+    assert cli.main(["--json", "printer", "status", "--ip", SENTINEL_IP]) == 0
+    out = capsys.readouterr().out
+    assert SENTINEL not in out and SERIAL not in out and json.loads(out)["task"] == "job <redacted> for <redacted>"
+    g3 = tmp_path / f"{SENTINEL}-plate.gcode.3mf"
+    with zipfile.ZipFile(g3, "w") as z:
+        z.writestr("Metadata/project_settings.config", "{}")
+        z.writestr("Metadata/model_settings.config", "<config/>")
+        z.writestr("Metadata/plate_1.gcode", gcode("PETG"))
+    log = tmp_path / "w.jsonl"
+    stream.script = [r]
+    assert cli.main(["--json", "printer", "watch", "--ip", SENTINEL_IP, "--log", str(log), "--gcode3mf", str(g3)]) == 0
+    out = capsys.readouterr().out
+    text = log.read_text(encoding="utf-8")
+    for s in (SENTINEL, SERIAL):
+        assert s not in text and s not in out
+    assert json.loads(text.splitlines()[0])["gcode3mf"] == "<redacted>-plate.gcode.3mf"
+
+
+def test_public_raw_scrubs_a_known_access_code_under_an_ordinary_key(conf_file):
+    raw = {"print": {"note": f"code {SENTINEL}", "gcode_state": "RUNNING"}}
+    got = printer.public_raw(raw, "10.0.0.9", SERIAL)
+    assert got["print"]["note"] == "<redacted>" and got["print"]["gcode_state"] == "RUNNING"

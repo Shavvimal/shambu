@@ -1018,3 +1018,57 @@ def test_slice_verb_tower_takes_the_planned_tower_size(capsys, tmp_path, monkeyp
     doc = one_json(out)
     assert code == 0, doc
     assert any("x 228.0..252.0 y 178.0..215.8" in n for n in doc["notes"])
+
+
+def test_slice_verb_refuses_an_unsliced_export_after_exit_0(capsys, tmp_path, monkeypatch, resolver):
+    """Fault injection: Studio exits 0 but writes an unsliced archive. The previous good output stays."""
+    from test_edits import SequenceStudio
+
+    src = make_3mf(tmp_path / "in.3mf")
+    dest = tmp_path / "o.gcode.3mf"
+    dest.write_bytes(b"previous good output")
+    studio = SequenceStudio(make_3mf(tmp_path / "unsliced.3mf"), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(dest))
+    doc = one_json(out)
+    assert code == 1 and dest.read_bytes() == b"previous good output"
+    assert "the file holds no G-code although a slice was requested" in doc["verify_problems"]
+    assert "plate 1 has no G-code entry (Metadata/plate_1.gcode)" in doc["verify_problems"]
+
+
+def test_filesystem_errors_are_exit_3_with_one_json_document(capsys, tmp_path, monkeypatch, resolver):
+    """Directory creation, output replacement and log writes that fail come back as FileError (exit 3), never a
+    traceback."""
+    from test_edits import SequenceStudio
+
+    blocker = tmp_path / "a-file"
+    blocker.write_text("x")
+    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    code, out, _ = run(capsys, "--json", "studio", "--out", str(blocker), "--", "--help")  # the run folder under a file
+    assert code == 3 and one_json(out)["error"].startswith("FileError: studio: cannot create")
+    src = make_3mf(tmp_path / "in.3mf")
+    code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(blocker / "o.gcode.3mf"))  # output folder is a file
+    assert code == 3 and one_json(out)["error"].startswith("FileError: slice:")
+
+    from shambu import runs  # only the runs module's os.replace fails
+
+    def no_replace(a, b):
+        raise PermissionError(13, "Permission denied", str(b))
+
+    monkeypatch.setattr(runs.os, "replace", no_replace)
+    code, out, _ = run(capsys, "--json", "slice", str(src), "-o", str(tmp_path / "o.gcode.3mf"))
+    doc = one_json(out)
+    assert code == 3 and "Permission denied" in doc["error"] and "o.gcode.3mf" in doc["error"]
+    monkeypatch.undo()
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    orig = Path.write_text
+
+    def no_log(self, *a, **kw):
+        if self.name == "exit.txt":
+            raise OSError(28, "No space left on device", str(self))
+        return orig(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", no_log)
+    code, out, _ = run(capsys, "--json", "studio", "--out", str(tmp_path / "runs"), "--", "--help")
+    assert code == 3 and "No space left on device" in one_json(out)["error"]

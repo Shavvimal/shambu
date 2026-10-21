@@ -1185,10 +1185,11 @@ def _watch(a, svc, out: Output) -> int:
     """`printer watch`: one document per poll on stdout; with --log, one JSON line per poll (and a header line) in the
     file. Exit 0 when the print reached a final state or the poll limit, 3 after --max-errors failed reads in a row or
     when the log cannot be opened or written."""
+    from . import conf
     from .calibrate import CalibrationError
     from .conf import DataFileError
     from .errors import ProjectError
-    from .printer import WatchError, utc_iso
+    from .printer import WatchError, outward_secrets, utc_iso
 
     if a.every < 1 or a.max_errors < 1 or a.max_polls < 1:
         return usage(out, "--every, --max-errors and --max-polls must be 1 or more")
@@ -1207,6 +1208,8 @@ def _watch(a, svc, out: Output) -> int:
                 out.emit({"error": msg}, [msg])
                 return 1
             header.update(gcode3mf=Path(a.gcode3mf).name, gcode=entry, track=track.to_json())
+            # the file name and the G-code's labels are free text: the printer boundary's sanitiser applies to them too
+            header = json.loads(conf.scrub_text(json.dumps(header), outward_secrets()))
     log_f = None
     code = 0
 

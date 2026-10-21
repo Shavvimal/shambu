@@ -1342,3 +1342,18 @@ def test_tower_edit_on_one_filament_with_smooth_timelapse(tmp_path):
     path = make_geo_3mf(tmp_path / "s.3mf", filaments=1, timelapse_type="1")
     E.EditSet([E.SetTower(90, 100)]).apply(str(path), str(tmp_path / "o.3mf"))
     assert Project(str(tmp_path / "o.3mf")).project_settings["wipe_tower_x"] == ["90"]
+
+
+def test_add_filament_repairs_an_unsliced_cli_export_first(tmp_path):
+    """An unsliced CLI export (`extruder_nozzle_stats []`): the edit repairs the stats in the same transaction, before
+    the new slot, so the result is re-sliceable and slot 2 keeps its variant block."""
+    from shambu import runs
+
+    path = make_geo_3mf(tmp_path / "u.3mf", filaments=1, extruder_nozzle_stats=[], extruder_max_nozzle_count=["1", "1"])
+    assert Project(str(path)).reslice_problems()
+    es = E.EditSet([add_patch(path)])
+    runs.apply_edits(None, str(path), es, str(tmp_path / "two.3mf"))
+    p = Project(str(tmp_path / "two.3mf"))
+    assert p.reslice_problems() == [] and p.n_filaments() == 2
+    ps = p.project_settings
+    assert len(ps["filament_extruder_variant"]) == len(ps["filament_self_index"]) and "2" in ps["filament_self_index"]

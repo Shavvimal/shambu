@@ -155,7 +155,14 @@ def make_3mf(
     entries += [
         (
             "Metadata/slice_info.config",
-            b'<?xml version="1.0"?>\n<config>\n  <header/>\n' + (b'  <plate id="1"/>\n' if sliced else b"") + b"</config>\n",
+            b'<?xml version="1.0"?>\n<config>\n  <header/>\n'
+            + (
+                b'  <plate>\n    <metadata key="index" value="1"/>\n    <metadata key="prediction" value="1234"/>\n'
+                b'    <metadata key="weight" value="10.0"/>\n  </plate>\n'
+                if sliced
+                else b""
+            )
+            + b"</config>\n",
             zipfile.ZIP_DEFLATED,
         ),
         ("Metadata/filament_sequence.json", b'{"plate_1":{"sequence":[]}}', zipfile.ZIP_DEFLATED),
@@ -843,7 +850,14 @@ def make_geo_3mf(
         ("Metadata/model_settings.config", ms.encode(), zipfile.ZIP_DEFLATED),
         (
             "Metadata/slice_info.config",
-            b'<?xml version="1.0"?>\n<config>\n  <header/>\n' + (b'  <plate id="1"/>\n' if sliced else b"") + b"</config>\n",
+            b'<?xml version="1.0"?>\n<config>\n  <header/>\n'
+            + (
+                b'  <plate>\n    <metadata key="index" value="1"/>\n    <metadata key="prediction" value="1234"/>\n'
+                b'    <metadata key="weight" value="10.0"/>\n  </plate>\n'
+                if sliced
+                else b""
+            )
+            + b"</config>\n",
             zipfile.ZIP_DEFLATED,
         ),
         ("Metadata/filament_sequence.json", b'{"plate_1":{"sequence":[]}}', zipfile.ZIP_DEFLATED),
