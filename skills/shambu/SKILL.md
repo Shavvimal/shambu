@@ -13,7 +13,7 @@ send a job. Request: $ARGUMENTS
 ## Before you start (standing rules)
 
 1. Before the first shambu command of a task (before the spec is written): `shambu --version` (it must print:
-   shambu 0.5.0), then `shambu doctor --json --expect-version 0.5.0`. Exit 3 with `"shambu": {"match": false}`
+   shambu 0.5.1), then `shambu doctor --json --expect-version 0.5.1`. Exit 3 with `"shambu": {"match": false}`
    (`MISMATCH` and a `Fix:` line) means another version is on PATH. A usage error on `--expect-version` means one
    older than 0.4.0. Either way: stop, give both versions and the fix (`/shambu:setup update`). Never use
    `uv run --project`, a checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`.

@@ -56,17 +56,20 @@ As a Claude Code plugin:
 /shambu:setup
 ```
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.0"`) and runs
+To update later: `/plugin marketplace update shambu` (it updates the installed plugin and reloads when the panel
+closes), then `/shambu:setup update`.
+
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.1"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.0"
-shambu doctor --expect-version 0.5.0
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.1"
+shambu doctor --expect-version 0.5.1
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu@v0.5.0" shambu doctor --expect-version 0.5.0
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.5.1" shambu doctor --expect-version 0.5.1
 ```
 
 ## Usage
