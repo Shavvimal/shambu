@@ -1185,3 +1185,374 @@ def test_no_probe_flag_on_check_build_and_sweep():
     p = cli.build_parser()
     for argv in (["check", "s.json", "--no-probe"], ["build", "s.json", "--no-probe"], ["sweep", "s.json", "--no-probe"]):
         assert p.parse_args(argv).no_probe is True
+
+
+# ---------------------------------------------------------------------------- 0.5.0: login, list, forget, --printer, one-shot codes
+P_SERIAL = "00X0TEST0000999"
+P_OTHER = "01P0TEST0000123"
+P_CODE = "SENTINEL-CODE-8812"
+P_IP = "10.0.0.9"
+P_NEW_IP = "192.168.1.20"
+P_MASKED = "00X…999"
+P_STAMP = "2026-10-01T08:00:00Z"
+
+
+class LanReader:
+    """Stands in for MqttReader: records (ip, serial, insecure) and whether the code was the expected one, never the code."""
+
+    seen: list = []
+    codes_ok: list = []
+    refuse = False
+
+    def __init__(self, ip, serial, access_code, wait=8.0, insecure=False):
+        LanReader.seen.append((ip, serial, insecure))
+        LanReader.codes_ok.append(access_code == P_CODE)
+        self.ip = ip
+
+    def read(self):
+        from shambu import printer
+
+        if LanReader.refuse:
+            raise printer.LoginRefused(f"the printer at {self.ip} refused the MQTT login")
+        return {"print": {"gcode_state": "IDLE"}, "_tls_verified": True}
+
+
+@pytest.fixture
+def lan(monkeypatch):
+    from shambu import printer
+
+    LanReader.seen, LanReader.codes_ok, LanReader.refuse = [], [], False
+    monkeypatch.setattr(printer, "MqttReader", LanReader)
+    monkeypatch.setattr(printer, "certificate_serial", lambda ip, deadline=None: P_SERIAL)
+    return LanReader
+
+
+@pytest.fixture
+def studio_conf(tmp_path, monkeypatch):
+    from shambu import conf
+
+    p = tmp_path / "BambuStudio.conf"
+    p.write_text(json.dumps({"app": {"user_last_selected_machine": P_SERIAL}, "access_code": {P_SERIAL: P_CODE}}))
+    monkeypatch.setattr(conf, "CONF", p)
+    monkeypatch.setattr(conf, "APPSUPPORT", tmp_path)
+    return p
+
+
+def code_stdin(monkeypatch, text=P_CODE + "\n"):
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+
+
+def a_profile(name="x2d", serial=P_SERIAL, ip=P_IP, mode="lan"):
+    from shambu.profiles import Profile
+
+    return Profile(name, serial, ip, mode, False, P_STAMP, P_STAMP)
+
+
+def store_profiles(*profiles, default=None):
+    from shambu import conf
+    from shambu.profiles import ProfileSet
+
+    conf.save_profiles(ProfileSet(default=default or profiles[0].name, printers=tuple(profiles)))
+
+
+def stored():
+    from shambu import conf
+
+    return json.loads(conf.PRINTERS.read_text()) if conf.PRINTERS.is_file() else None
+
+
+def test_login_from_studio_stores_the_profile_and_the_code(capsys, lan, studio_conf, offline):
+    code, out, err = run(capsys, "printer", "login", "--from-studio", "--ip", P_IP, "--mode", "lan")
+    assert code == 0
+    assert out.startswith(f"profile printer: serial {P_MASKED}, code stored, mode lan, read at ") and out.rstrip().endswith("(default)")
+    assert offline.vault.items == {P_SERIAL: P_CODE}
+    (p,) = stored()["printers"]
+    assert (p["name"], p["serial"], p["ip"], p["mode"], p["insecure"]) == ("printer", P_SERIAL, P_IP, "lan", False)
+    assert p["verified"] and p["added"] and lan.codes_ok == [True]
+    assert P_CODE not in out + err and P_SERIAL not in out + err and P_IP not in out + err
+
+
+def test_login_ip_takes_the_serial_from_the_certificate(capsys, lan, monkeypatch, offline):
+    code_stdin(monkeypatch)
+    code, out, err = run(capsys, "--json", "printer", "login", "--ip", P_IP, "--access-code-stdin", "--name", "x2d")
+    assert code == 0
+    assert one_json(out) == {
+        "name": "x2d",
+        "serial_masked": P_MASKED,
+        "mode": "unknown",
+        "verified": stored()["printers"][0]["verified"],
+        "default": True,
+        "code_stored": True,
+    }
+    assert stored()["printers"][0]["serial"] == P_SERIAL and lan.seen == [(P_IP, P_SERIAL, False)]
+    assert offline.vault.items == {P_SERIAL: P_CODE} and P_CODE not in out + err
+
+
+def test_login_ip_serial_mismatch_writes_nothing(capsys, lan, monkeypatch, offline):
+    code_stdin(monkeypatch)
+    code, out, err = run(capsys, "printer", "login", "--ip", P_IP, "--serial", P_OTHER, "--access-code-stdin")
+    assert code == 3
+    assert "presents a certificate for printer" in err and P_MASKED not in err and P_IP not in err  # main redacts both
+    assert stored() is None and offline.vault.items == {} and lan.seen == []
+    assert P_CODE not in out + err
+
+
+def test_login_refresh_keeps_added_and_serial_and_moves_the_ip(capsys, lan, monkeypatch, offline):
+    store_profiles(a_profile())
+    code_stdin(monkeypatch)
+    code, out, _ = run(capsys, "printer", "login", "--printer", "x2d", "--ip", P_NEW_IP, "--access-code-stdin")
+    assert code == 0 and out.startswith(f"profile x2d: serial {P_MASKED}, code stored, mode lan, ")
+    (p,) = stored()["printers"]
+    assert (p["serial"], p["ip"], p["added"], p["mode"]) == (P_SERIAL, P_NEW_IP, P_STAMP, "lan")
+    assert p["verified"] != P_STAMP and lan.seen == [(P_NEW_IP, P_SERIAL, False)]
+
+
+def test_login_default_profile_when_nothing_is_given(capsys, lan, monkeypatch, offline):
+    store_profiles(a_profile())
+    code_stdin(monkeypatch)
+    assert run(capsys, "printer", "login", "--access-code-stdin", "--mode", "cloud")[0] == 0
+    assert stored()["printers"][0]["mode"] == "cloud" and lan.seen == [(P_IP, P_SERIAL, False)]
+
+
+@pytest.mark.parametrize(
+    ("argv", "words"),
+    [
+        (["--printer", "x2d", "--serial", P_OTHER], "--serial does not match profile x2d"),
+        ([], "--from-studio"),
+        (["--ip", P_IP, "--insecure"], "--insecure cannot read the printer's certificate"),
+        (["--from-studio", "--access-code-stdin"], "--from-studio takes the serial"),
+        (["--from-studio", "--serial", P_SERIAL], "--from-studio takes the serial"),
+        (["--printer", "nope"], "no printer profile named 'nope'"),
+    ],
+)
+def test_login_usage_errors_before_any_read(capsys, lan, monkeypatch, offline, argv, words):
+    if argv[:2] == ["--printer", "x2d"]:
+        store_profiles(a_profile())
+    code_stdin(monkeypatch)
+    code, out, _ = run(capsys, "printer", "login", *argv)
+    assert code == 2 and words in out
+    assert lan.seen == [] and offline.vault.items == {} and P_OTHER not in out
+
+
+def test_login_refused_writes_nothing(capsys, lan, monkeypatch, offline):
+    lan.refuse = True
+    code_stdin(monkeypatch)
+    code, out, err = run(capsys, "printer", "login", "--ip", P_IP, "--access-code-stdin")
+    assert code == 3 and "LoginRefused" in err and "refused the MQTT login" in err
+    assert stored() is None and offline.vault.items == {} and P_CODE not in out + err and P_IP not in err
+
+
+@pytest.mark.parametrize("previous", [None, "OLD-CODE-1234"])
+def test_login_profile_write_failure_restores_the_vault(capsys, lan, monkeypatch, offline, previous):
+    from shambu import conf
+    from shambu.conf import DataFileError
+
+    if previous:
+        offline.vault.items[P_SERIAL] = previous
+
+    def fails(ps, path=None):
+        raise DataFileError("printers.json: cannot write it (No space left on device)")
+
+    monkeypatch.setattr(conf, "save_profiles", fails)
+    code_stdin(monkeypatch)
+    code, _out, err = run(capsys, "printer", "login", "--ip", P_IP, "--access-code-stdin")
+    assert code == 3 and "DataFileError" in err
+    assert offline.vault.items == ({P_SERIAL: previous} if previous else {})
+    assert ("put", P_SERIAL) in offline.vault.calls
+
+
+def test_login_access_code_file(capsys, lan, tmp_path, offline):
+    f = tmp_path / "code.txt"
+    f.write_text(P_CODE + "\nsecond line\n")
+    code, out, err = run(capsys, "printer", "login", "--ip", P_IP, "--access-code-file", str(f))
+    assert code == 0 and offline.vault.items == {P_SERIAL: P_CODE} and lan.codes_ok == [True]
+    assert P_CODE not in out + err
+    code, out, _ = run(capsys, "printer", "login", "--ip", P_IP, "--access-code-file", str(tmp_path / "none.txt"))
+    assert code == 2 and "cannot read it" in out
+
+
+@pytest.mark.parametrize(("text", "words"), [("\n", "empty"), ("has space\n", "no space, quote or backslash"), ("", "empty")])
+def test_login_bad_code_is_usage(capsys, lan, monkeypatch, text, words):
+    code_stdin(monkeypatch, text)
+    code, out, _ = run(capsys, "printer", "login", "--ip", P_IP, "--access-code-stdin")
+    assert code == 2 and words in out and lan.seen == []
+
+
+def test_login_without_a_terminal_or_a_code_flag_is_usage(capsys, lan, monkeypatch):
+    code_stdin(monkeypatch, P_CODE + "\n")  # a pipe, not a terminal: never read without the flag
+    code, out, _ = run(capsys, "printer", "login", "--ip", P_IP)
+    assert code == 2 and "no access code: give --access-code-stdin or --access-code-file" in out and lan.seen == []
+
+
+def test_login_prompt_that_would_echo_is_usage(capsys, lan, monkeypatch):
+    import getpass
+    import io
+    import sys
+    import warnings
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    def echoing(prompt=""):
+        warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning, stacklevel=2)
+        return P_CODE
+
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(getpass, "getpass", echoing)
+    code, out, err = run(capsys, "printer", "login", "--ip", P_IP)
+    assert code == 2 and "cannot hide the access code" in out and lan.seen == [] and P_CODE not in out + err
+
+
+def test_login_prompt_on_a_terminal(capsys, lan, monkeypatch, offline):
+    import getpass
+    import io
+    import sys
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    prompts = []
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": prompts.append(prompt) or f"  {P_CODE}  ")
+    assert run(capsys, "printer", "login", "--ip", P_IP)[0] == 0
+    assert prompts == ["LAN access code (not shown): "] and offline.vault.items == {P_SERIAL: P_CODE}
+
+
+def test_list_text_and_json(capsys):
+    store_profiles(a_profile(), a_profile("p1s", P_OTHER, None, "cloud"))
+    code, out, err = run(capsys, "printer", "list")
+    assert code == 0
+    assert out.splitlines() == [
+        f"x2d  {P_MASKED}  {P_IP}  lan  verified 08:00  (default)",
+        "p1s  01P…123  -  cloud  verified 08:00",
+    ]
+    code, out, _ = run(capsys, "--json", "printer", "list")
+    d = one_json(out)
+    assert code == 0 and d["default"] == "x2d" and d["config_dir"]
+    assert [(p["name"], p["serial"], p["ip"]) for p in d["printers"]] == [("x2d", P_MASKED, P_IP), ("p1s", "01P…123", None)]
+    assert P_SERIAL not in out + err and P_OTHER not in out
+
+
+def test_list_without_profiles_is_exit_1(capsys):
+    code, out, _ = run(capsys, "printer", "list")
+    assert code == 1 and out.strip() == "no printer profiles: run shambu printer login"
+    code, out, _ = run(capsys, "--json", "printer", "list")
+    assert code == 1 and one_json(out)["printers"] == []
+
+
+def test_forget_removes_the_profile_and_the_code(capsys, offline):
+    store_profiles(a_profile(), a_profile("p1s", P_OTHER, None))
+    offline.vault.items.update({P_SERIAL: P_CODE, P_OTHER: "OTHER-CODE-1"})
+    code, out, err = run(capsys, "printer", "forget", "--printer", "x2d")
+    assert code == 0 and out.strip() == f"forgot profile x2d (serial {P_MASKED}); code removed"
+    assert offline.vault.items == {P_OTHER: "OTHER-CODE-1"}
+    assert [p["name"] for p in stored()["printers"]] == ["p1s"] and stored()["default"] == "p1s"
+    code, out, _ = run(capsys, "printer", "forget", "--printer", "p1s", "--keep-code")
+    assert code == 0 and out.strip().endswith("; code kept") and offline.vault.items == {P_OTHER: "OTHER-CODE-1"}
+    assert stored()["printers"] == [] and P_CODE not in out + err
+
+
+def test_forget_needs_a_name_and_an_existing_profile(capsys):
+    assert run(capsys, "printer", "forget")[0] == 2
+    code, _, err = run(capsys, "printer", "forget", "--printer", "nope")
+    assert code == 3 and "ProfileError" in err
+
+
+def test_forget_keeps_a_code_another_profile_still_uses(monkeypatch, offline):
+    """The schema keeps serials unique, so two profiles never share one on disk; the guard is still checked."""
+    from shambu import conf
+    from shambu.profiles import ProfileSet
+
+    shared = ProfileSet("x2d", (a_profile(), a_profile("twin")))
+    monkeypatch.setattr(conf, "locked_profiles", lambda fn, path=None: fn(shared))
+    monkeypatch.setattr(conf, "save_profiles", lambda ps, path=None: None)
+    offline.vault.items[P_SERIAL] = P_CODE
+    r = Bambu().forget("x2d")
+    assert (r["code_removed"], r["note"]) == (False, None) and offline.vault.items == {P_SERIAL: P_CODE}
+
+
+def test_forget_reports_a_vault_failure_after_the_removal(capsys, offline):
+    from shambu.vault import VaultError
+
+    store_profiles(a_profile())
+    offline.vault.items[P_SERIAL] = P_CODE
+    offline.vault.error = VaultError("credentials.json: cannot write it (Permission denied)")
+    code, out, _ = run(capsys, "printer", "forget", "--printer", "x2d")
+    assert code == 0 and "code: the profile is gone but the code could not be removed" in out and stored()["printers"] == []
+
+
+@pytest.mark.parametrize("argv", [["printer", "status"], ["doctor"], ["check", "SPEC"]])
+def test_unknown_printer_profile_is_usage_before_any_read(capsys, lan, monkeypatch, tmp_path, argv):
+    reads = []
+    monkeypatch.setattr(Bambu, "loaded_filaments", lambda self, *a, **k: reads.append(1))
+    argv = [str(write_spec(tmp_path)) if x == "SPEC" else x for x in argv]
+    code, out, _ = run(capsys, *argv, "--printer", "nope")
+    assert code == 2 and "no printer profile named 'nope'" in out
+    assert reads == [] and lan.seen == []
+
+
+def test_doctor_lines_without_a_profile_are_unchanged(capsys):
+    code, out, _ = run(capsys, "doctor", "--no-printer")
+    assert code == 0 and not any(x.startswith("printer profile") for x in out.splitlines())
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer")
+    c = one_json(out)["config"]
+    assert (c["printer_profile"], c["profiles"]) == (None, 0) and c["config_dir"]
+
+
+def test_doctor_shows_the_selected_profile(capsys):
+    store_profiles(a_profile())
+    code, out, _ = run(capsys, "doctor", "--no-printer")
+    (line,) = [x for x in out.splitlines() if x.startswith("printer profile")]
+    assert line.startswith(f"printer profile x2d (default): serial {P_MASKED}, mode lan, last login 08:00, TLS verified; 1 profile(s) in ")
+    assert P_IP not in out and P_SERIAL not in out
+    code, out, _ = run(capsys, "--json", "doctor", "--no-printer", "--printer", "x2d")
+    assert code == 0
+    assert one_json(out)["config"]["printer_profile"] == {
+        "name": "x2d",
+        "default": True,
+        "serial": P_MASKED,
+        "mode": "lan",
+        "verified": P_STAMP,
+        "insecure": False,
+    }
+
+
+def test_main_scrubs_a_code_and_an_ip_in_an_error(capsys, monkeypatch):
+    from shambu.errors import PrinterError
+
+    class Svc:
+        def status(self):
+            raise PrinterError(f"the printer at {P_IP} said {P_CODE}")
+
+    monkeypatch.setattr(Bambu, "printer", lambda self, *a, **k: Svc())
+    for argv in (["printer", "status"], ["--json", "printer", "status"]):
+        code_stdin(monkeypatch)
+        code, out, err = run(capsys, *argv, "--access-code-stdin")
+        assert code == 3 and "PrinterError: the printer at <ip> said <redacted>" in out + err
+        assert P_CODE not in out + err and P_IP not in out + err
+
+
+def test_status_with_a_one_shot_code_and_a_profile(capsys, lan, monkeypatch, offline):
+    store_profiles(a_profile())
+    offline.vault.items[P_SERIAL] = "STORED-CODE-1"
+    code_stdin(monkeypatch)
+    code, out, err = run(capsys, "--json", "printer", "status", "--printer", "x2d", "--access-code-stdin")
+    assert code == 0 and lan.codes_ok == [True] and lan.seen == [(P_IP, P_SERIAL, False)]  # the flag wins over the stored code
+    assert P_CODE not in out + err and "STORED-CODE-1" not in out + err
+
+
+def test_commands_without_studio_config_or_codes(capsys, monkeypatch):
+    from shambu import printer
+
+    monkeypatch.setattr(printer.ArpProbe, "find", lambda self: [{"ip": P_IP, "method": "arp+8883"}])
+    monkeypatch.setattr(printer.SubnetProbe, "find", lambda self: [{"ip": P_NEW_IP, "method": "subnet+8883"}])
+    code, out, _ = run(capsys, "printer", "discover")
+    assert code == 0 and out.splitlines() == [f"{P_IP}  (arp+8883)", f"{P_NEW_IP}  (subnet+8883)"]
+    assert run(capsys, "doctor", "--no-printer")[0] == 0
+    assert run(capsys, "printer", "list")[0] == 1

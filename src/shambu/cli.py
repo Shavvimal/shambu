@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
-from . import __version__, recipes
+from . import __version__, conf, recipes
 from .edits import (
     EditError,
     EditSet,
@@ -27,7 +27,7 @@ from .edits import (
     ReplaceMesh,
     SetTower,
 )
-from .errors import BambuError, BuildError, ProjectError, StudioError
+from .errors import BambuError, BuildError, ConfError, PrinterError, ProjectError, StudioError
 from .facade import Bambu
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
@@ -136,6 +136,80 @@ def _printer_flags(p: argparse.ArgumentParser) -> None:
     """The printer read that check, build, sweep and doctor make before resolving a spec's filaments."""
     p.add_argument("--no-printer", action="store_true", help='do not read the printer; take the GUI presets for "loaded" filaments (WARN)')
     p.add_argument("--ip", dest="printer_ip", help="the printer's IP when LAN discovery does not find it")
+    _profile_flags(p)
+
+
+def _profile_flags(p: argparse.ArgumentParser, serial: bool = True) -> None:
+    """The printer profile and the one-shot code flags every command that reads the printer takes."""
+    p.add_argument("--printer", dest="printer_profile", metavar="NAME", help="the printer profile to read (default: the default profile)")
+    if serial:
+        p.add_argument("--serial", help="the printer's serial (default: the profile's, else Bambu Studio's selected printer)")
+    p.add_argument("--access-code-file", metavar="FILE", help="read the LAN access code from the first line of FILE (this run only)")
+    p.add_argument("--access-code-stdin", action="store_true", help="read the LAN access code from the first line of stdin (this run only)")
+
+
+ACCESS_CODE_PROMPT = "LAN access code (not shown): "
+NO_CODE = "no access code: give --access-code-stdin or --access-code-file, or run login on a terminal"
+UNSAFE_CODE = "the access code must be 4 to 128 characters with no space, quote or backslash"
+
+
+def read_access_code(a: argparse.Namespace, out: Output) -> str | int:
+    """The LAN access code from `--access-code-file` (first line), `--access-code-stdin` (first line) or a no-echo
+    prompt on a terminal; else a usage error (exit 2). The only read of stdin in shambu. A prompt that would echo
+    (`getpass.GetPassWarning`) is a usage error too. The code is registered with `conf.remember_secret` and never printed."""
+    import getpass
+    import warnings
+
+    from .vault import safe_code
+
+    if a.access_code_file:
+        try:
+            with open(a.access_code_file, encoding="utf-8") as f:
+                text = f.readline()
+        except (OSError, ValueError) as e:
+            return usage(
+                out, f"--access-code-file {a.access_code_file}: cannot read it ({getattr(e, 'strerror', None) or type(e).__name__})"
+            )
+    elif a.access_code_stdin:
+        text = sys.stdin.readline()
+    elif sys.stdin.isatty() and sys.stderr.isatty():
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            try:
+                text = getpass.getpass(ACCESS_CODE_PROMPT)
+            except getpass.GetPassWarning:
+                return usage(out, "this terminal cannot hide the access code: give --access-code-stdin or --access-code-file")
+            except EOFError:
+                return usage(out, NO_CODE)
+    else:
+        return usage(out, NO_CODE)
+    code = text.strip()
+    if not code:
+        return usage(out, "the access code is empty")
+    if not safe_code(code):
+        return usage(out, UNSAFE_CODE)
+    conf.remember_secret(code)
+    return code
+
+
+def _use_printer(a: argparse.Namespace, app: Bambu, out: Output, *, serial: str | None, insecure: bool = False) -> int | None:
+    """Set the printer selection on `app` before any network step: the profile (an unknown name is a usage error, exit
+    2), the serial, the TLS flag and a one-shot code when a code flag is set. None when the read can go ahead, else the
+    exit code. A damaged printers.json stays an environment error (exit 3)."""
+    app.printer_profile = a.printer_profile
+    app.printer_serial = serial
+    app.printer_insecure = insecure
+    ps = conf.load_profiles()
+    try:
+        conf.select_profile(a.printer_profile, ps)
+    except ConfError as e:
+        return usage(out, str(e))
+    if a.access_code_file or a.access_code_stdin:
+        code = read_access_code(a, out)
+        if isinstance(code, int):
+            return code
+        app.printer_code = code
+    return None
 
 
 def _mismatch_flag(p: argparse.ArgumentParser) -> None:
@@ -202,6 +276,21 @@ def shambu_lines(d: dict) -> list[str]:
     ]
 
 
+def profile_lines(c: dict) -> list[str]:
+    """doctor's printer profile line; none when no profile is selected (the 0.4.0 lines stay as they were)."""
+    p = c.get("printer_profile")
+    if p is None:
+        return []
+    if "error" in p:
+        return [f"printer profile: {p['error']}"]
+    when = p["verified"][11:16] if p.get("verified") else "never"
+    tls = "TLS check off (--insecure)" if p["insecure"] else "TLS verified"
+    return [
+        f"printer profile {p['name']}{' (default)' if p['default'] else ''}: serial {p['serial']}, mode {p['mode']}, "
+        f"last login {when}, {tls}; {c.get('profiles')} profile(s) in {c.get('config_dir')}"
+    ]
+
+
 def studio_lines(st: dict) -> list[str]:
     if "error" in st:
         return [f"Bambu Studio: {st['error']} (tested {st['tested']})"]
@@ -241,6 +330,11 @@ class Doctor(Command):
             return usage(out, f"--printer-timeout {a.printer_timeout:g}: give a finite number of seconds above 0")
         app.printer_ip = a.printer_ip
         app.printer_timeout = a.printer_timeout
+        app.printer_profile = a.printer_profile
+        if not a.no_printer:
+            stop = _use_printer(a, app, out, serial=a.serial)
+            if stop is not None:
+                return stop
         d = app.doctor(
             printer=not a.no_printer,
             expected=a.expect_version,
@@ -256,6 +350,7 @@ class Doctor(Command):
         lines.append(
             f"selected printer {c.get('selected_printer_serial')}, access code stored: {c.get('has_access_code')}, single_instance {c.get('single_instance')}"
         )
+        lines += profile_lines(c)
         m = d.get("machine", {})
         if "bed" in m:
             lines.append(
@@ -647,6 +742,10 @@ class Sweep(Command):
         from . import sweep as S
 
         app.printer_ip = a.printer_ip
+        if not a.no_printer:
+            stop = _use_printer(a, app, out, serial=a.serial)
+            if stop is not None:
+                return stop
 
         try:  # a bad spec, variant file or part key is a failed check (exit 1), not an environment error
             try:
@@ -750,6 +849,10 @@ class Check(Command):
         if isinstance(spec, int):
             return spec
         app.printer_ip = a.printer_ip
+        if not a.no_printer:
+            stop = _use_printer(a, app, out, serial=a.serial)
+            if stop is not None:
+                return stop
         r = app.build(
             spec,
             export=False,
@@ -786,6 +889,10 @@ class Build(Command):
             return spec
         app.listeners.append(lambda ev, d: log.info("%s %s", ev, {k: v for k, v in d.items() if k != "argv"}))
         app.printer_ip = a.printer_ip
+        if not a.no_printer:
+            stop = _use_printer(a, app, out, serial=a.serial)
+            if stop is not None:
+                return stop
         kw = {"no_check": True} if a.no_check else {}
         r = app.build(
             spec,
@@ -1156,12 +1263,13 @@ class Open(Command):
         return 0
 
 
-@command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw")
+@command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw | login | list | forget")
 class Printer(Command):
     def configure(self, p):
-        p.add_argument("action", choices=("status", "filaments", "watch", "discover", "raw"))
+        p.add_argument("action", choices=("status", "filaments", "watch", "discover", "raw", "login", "list", "forget"))
         p.add_argument("--ip")
         p.add_argument("--serial")
+        _profile_flags(p, serial=False)
         p.add_argument("--wait", type=float, default=8.0)
         p.add_argument(
             "--every", type=int, default=300, help="watch interval in seconds (at most 60 near the start and the end of a print)"
@@ -1183,21 +1291,29 @@ class Printer(Command):
             action="store_true",
             help="skip TLS verification against Bambu's CA and the serial (the access code then goes to an unverified endpoint)",
         )
+        p.add_argument("--name", help="login: the profile name (default: the profile's own, else 'printer')")
+        p.add_argument("--default", action="store_true", help="login: make this profile the default")
+        p.add_argument("--mode", choices=("lan", "cloud"), help="login: the printer's connection mode, as set on its touchscreen")
+        p.add_argument("--from-studio", action="store_true", help="login: take the serial and the code from Bambu Studio's config")
+        p.add_argument("--keep-code", action="store_true", help="forget: keep the stored access code")
 
     def run(self, a, app, out):
-        from .printer import READ_TIMEOUT_S, ArpProbe, SsdpListen
+        from .printer import READ_TIMEOUT_S
 
         # one read's timeout: 15 s at the default --wait 8, and --wait plus 7 s (connect and grace) above that
         app.printer_timeout = max(READ_TIMEOUT_S, a.wait + 7)
-        svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "discover":
-            hits = ArpProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])
-            out.emit(
-                hits,
-                [f"{h['ip']}  ({h['method']}" + (f", {h.get('model')} {h.get('connect')}" if h.get("model") else "") + ")" for h in hits]
-                or ["no printer found"],
-            )
-            return 0 if hits else 1
+            return _discover(a, out)
+        if a.action == "list":
+            return _list(out)
+        if a.action == "forget":
+            return _forget(a, app, out)
+        if a.action == "login":
+            return _login(a, app, out)
+        stop = _use_printer(a, app, out, serial=a.serial, insecure=a.insecure)
+        if stop is not None:
+            return stop
+        svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "raw":
             print(json.dumps(svc.public_report(), indent=1, default=str))
             return 0
@@ -1210,6 +1326,112 @@ class Printer(Command):
             out.emit(lf.to_json(), lf.lines())
             return 0
         return _watch(a, svc, out)
+
+
+def _scrubbed(out: Output, doc, lines: list[str]) -> None:
+    """Emit `doc` and `lines` with every known access code removed (`conf.secret_values`: the masked serial and the IP
+    stay, on purpose)."""
+    secrets = conf.secret_values()
+    out.emit(json.loads(conf.scrub_text(json.dumps(_jsonable(doc)), secrets)), [conf.scrub_text(x, secrets) for x in lines])
+
+
+def _discover(a, out: Output) -> int:
+    """`printer discover`: the ARP table, then the default-route /24, then (with --ssdp) an SSDP listen. No credential."""
+    from .printer import ArpProbe, SsdpListen, SubnetProbe
+
+    hits = ArpProbe().find() + SubnetProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])
+    _scrubbed(
+        out,
+        hits,
+        [f"{h['ip']}  ({h['method']}" + (f", {h.get('model')} {h.get('connect')}" if h.get("model") else "") + ")" for h in hits]
+        or ["no printer found"],
+    )
+    return 0 if hits else 1
+
+
+def _hhmm(stamp: str | None) -> str:
+    return stamp[11:16] if stamp else "never"
+
+
+def _list(out: Output) -> int:
+    """`printer list`: one line per profile. The one place shambu prints a printer's IP."""
+    ps = conf.load_profiles()
+    doc = {"config_dir": str(conf.PRINTERS.parent), "default": ps.default, "printers": [p.public() for p in ps.printers]}
+    if not ps.printers:
+        _scrubbed(out, doc, ["no printer profiles: run shambu printer login"])
+        return 1
+    lines = [
+        f"{p.name}  {conf.mask(p.serial)}  {p.ip or '-'}  {p.mode}  verified {_hhmm(p.verified)}"
+        + ("  (default)" if p.name == ps.default else "")
+        for p in ps.printers
+    ]
+    _scrubbed(out, doc, lines)
+    return 0
+
+
+def _forget(a, app: Bambu, out: Output) -> int:
+    if not a.printer_profile:
+        return usage(out, "forget needs --printer NAME (shambu printer list shows the names)")
+    r = app.forget(a.printer_profile, a.keep_code)
+    what = (
+        f"code: {r['note']}"
+        if r["note"]
+        else ("code removed" if r["code_removed"] else "code kept" if a.keep_code else "no code was stored")
+    )
+    _scrubbed(out, r, [f"forgot profile {r['name']} (serial {r['serial_masked']}); {what}"])
+    return 0
+
+
+LOGIN_FORMS = (
+    "login needs a printer: shambu printer login --ip IP [--serial SERIAL], shambu printer login --printer NAME [--ip IP], "
+    "or shambu printer login --from-studio"
+)
+
+
+def _login(a, app: Bambu, out: Output) -> int:
+    """`printer login`: check the flags, read the code, read the printer once with it, then store the profile and the
+    code. Exit 0, 2 for bad usage, 3 when the printer refuses the code or cannot be read (nothing is stored then)."""
+    if a.from_studio and (a.serial or a.access_code_file or a.access_code_stdin):
+        return usage(out, "--from-studio takes the serial and the code from Bambu Studio's config: drop --serial and the access code flags")
+    ps = conf.load_profiles()
+    profile = None
+    if a.printer_profile is not None:
+        try:
+            profile = conf.select_profile(a.printer_profile, ps)
+        except ConfError as e:
+            return usage(out, str(e))
+    elif not a.from_studio and a.ip is None:
+        profile = ps.selected(None)
+        if profile is None:
+            return usage(out, LOGIN_FORMS)
+    if profile is not None and not a.from_studio and a.serial and a.serial.casefold() != profile.serial.casefold():
+        return usage(
+            out, f"--serial does not match profile {profile.name}: enrol another printer with --ip IP --serial SERIAL --name OTHER"
+        )
+    if a.insecure and not a.from_studio and not a.serial and profile is None:
+        return usage(out, "--insecure cannot read the printer's certificate: give --serial")
+    code = None
+    if not a.from_studio:
+        got = read_access_code(a, out)
+        if isinstance(got, int):
+            return got
+        code = got
+    app.printer_profile = a.printer_profile
+    r = app.login(
+        ip=a.ip,
+        serial=a.serial,
+        code=code,
+        from_studio=a.from_studio,
+        name=a.name,
+        make_default=a.default,
+        insecure=a.insecure,
+        mode=a.mode,
+    )
+    line = f"profile {r.name}: serial {r.serial_masked}, code stored, mode {r.mode}, read at {_hhmm(r.verified)}" + (
+        " (default)" if r.default else ""
+    )
+    _scrubbed(out, r, [line])
+    return 0
 
 
 def _gcode_track(path: str, plate: int | None):
@@ -1242,6 +1464,10 @@ def _watch(a, svc, out: Output) -> int:
         return usage(out, "--every, --max-errors and --max-polls must be 1 or more")
     if a.gcode3mf and not a.log:
         return usage(out, "--gcode3mf ties a --log to the file it watches: give --log too")
+    try:  # register the code the chain holds (the credentials file too) before the header text is scrubbed
+        svc.prepare_secrets()
+    except (PrinterError, ConfError):
+        pass  # a missing serial or code: the first poll reports it (the setup record)
     header: dict | None = None
     if a.log:
         header = {"kind": "header", "shambu_version": __version__, "started_at": utc_iso(time.time()), "every_s": a.every}
@@ -1437,8 +1663,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         app = Bambu()
         return _REGISTRY[a.cmd].run(a, app, out)
-    except BambuError as e:
-        msg = f"{type(e).__name__}: {e}"
+    except BambuError as e:  # the text may name an IP, a host or a serial, and must never hold a code
+        msg = conf.redact_identifiers(conf.scrub_text(f"{type(e).__name__}: {e}"))
         if a.json:
             print(json.dumps({"error": msg}))
         else:
