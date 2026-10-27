@@ -551,8 +551,8 @@ else. So a refused login is always handed back to the user.
    `--serial` or the CN of the certificate at `--ip` (`certificate_serial`: one TLS handshake against Studio's CA
    bundle, no MQTT, no credential). A `--serial` that differs from the CN fails, and nothing is written.
 4. Validates the draft profile (name, clash) before any read.
-5. Reads the printer once with the code: at `--ip`, else at the profile's IP, else (only `--from-studio` without
-   `--ip`) after discovery (ARP, then the default-route /24); TLS verified, MQTT CONNECT, one `pushall`, a full report.
+5. Reads the printer once with the code: at `--ip`, else at the profile's IP, else, when it has no IP (in practice
+   `--from-studio` without `--ip`), after discovery (ARP, then the default-route /24); TLS verified unless `--insecure`, MQTT CONNECT, one `pushall`, a full report.
    A refusal is exit 3 and writes nothing.
 6. Under the profiles lock: stores the code in `credentials.json`, then writes the profile with `verified` set and the
    IP the read used. If the profile write fails, the previous code (or none) is put back.

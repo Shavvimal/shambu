@@ -55,7 +55,7 @@ the same local read.
 - The watch log's `login` and `setup` categories name `shambu printer login` beside Studio.
 - `doctor` prints one `printer profile ...` line in its config section when a profile is selected (name, masked
   serial, mode, last login as `HH:MM UTC`, TLS flag, whether `credentials.json` holds a code for the serial as `code:
-  stored|none`, profile count, config dir). Doctor's `access code stored` field still describes Studio's config only.
+  stored|none|unreadable`, profile count, config dir). Doctor's `access code stored` field still describes Studio's config only.
   A damaged `printers.json` is an error in that line, and the rest of the report still runs; the other commands that
   read profiles exit 3 and name the file.
 - The UTC label: doctor's profile line (`last login HH:MM UTC`), the `login` hand-back (`read at HH:MM UTC`) and

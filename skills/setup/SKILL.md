@@ -51,7 +51,8 @@ predates 0.4.0: run step 2. Exit 3 with `skill expects 0.5.0: MISMATCH` means th
 and how it was installed, the Bambu Studio version and binary, the profile sources (Application Support copy first,
 then the app bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is
 stored (the code itself is never printed), with a profile the line `printer profile <name> (default): serial
-<masked>, mode lan|cloud|unknown, last login HH:MM UTC, TLS verified; N profile(s) in <config dir>`, the machine's
+<masked>, mode lan|cloud|unknown, last login HH:MM UTC, TLS verified|TLS check off (--insecure), code:
+stored|none|unreadable; N profile(s) in <config dir>`, the machine's
 bed and per-extruder reach, the spools loaded on the printer (`loaded on the printer (read HH:MM ...)`, one line per
 nozzle with the resolved preset name, and a `MISMATCH` line when the GUI's last-used filament differs), and the
 recipe list. `loaded on the printer: not read (...)` means the printer was not read: check it is on, pass `--ip
