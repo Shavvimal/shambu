@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-27
+
+### Changed
+- setup skill, step 5: updating the plugin is `/plugin marketplace update shambu` then `/reload-plugins`; the
+  marketplace update bumps the installed plugin itself, so `/plugin update shambu@shambu` is only for the case where
+  it reports no bump. The README gains the same two-line update note.
+
 ## [0.5.0] - 2026-10-27
 
 Printer profiles for LAN-only mode and cloud mode. On 2026-10-27 the X2D went to LAN-only mode and regenerated its
