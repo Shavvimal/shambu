@@ -1,10 +1,14 @@
-"""profiles.py: the printer-profile schema, the validators and the Profile/ProfileSet types. Pure: no file, no vault."""
+"""profiles.py: the printer-profile schema, the validators and the Profile/ProfileSet types; conf.py: printers.json I/O."""
 
 from __future__ import annotations
+
+import json
+import threading
 
 import pytest
 
 from shambu import conf
+from shambu.errors import ConfError
 from shambu.profiles import (
     CLASH,
     PROFILES_VERSION,
@@ -187,3 +191,171 @@ def test_remove_moves_the_default():
     with pytest.raises(ProfileError) as e:
         ps.remove("nope")
     assert str(e.value) == UNKNOWN and "nope" not in str(e.value)
+
+
+# ---------------------------------------------------------------------------- printers.json (conf.py)
+def two() -> ProfileSet:
+    return ProfileSet.from_dict(doc(entry(), entry(name="garage", serial=SERIAL2, ip=None)))
+
+
+def test_load_of_a_missing_file_is_an_empty_set(tmp_path):
+    assert conf.load_profiles() == ProfileSet(None, ())
+    assert conf.load_profiles(tmp_path / "printers.json") == ProfileSet()
+
+
+def test_save_then_load_round_trips_and_leaves_only_the_file(tmp_path):
+    p = tmp_path / "shambu" / "printers.json"
+    assert conf.save_profiles(two(), p) == p
+    assert conf.load_profiles(p) == two()
+    assert json.loads(p.read_text())["version"] == 1
+    assert [x.name for x in p.parent.iterdir()] == ["printers.json"]  # no temp file left
+    assert p.stat().st_mode & 0o777 == 0o600
+
+
+def test_save_uses_the_default_path():
+    assert conf.save_profiles(two()) == conf.PRINTERS
+    assert conf.load_profiles() == two()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{not json " + SERIAL,
+        json.dumps(doc(entry(), version=2)),
+        json.dumps([entry()]),
+        json.dumps(doc({k: v for k, v in entry().items() if k != "verified"})),
+        json.dumps(doc(entry(name="10.0.0.40"), default=None)),
+    ],
+)
+def test_a_damaged_file_is_refused_without_its_content(tmp_path, text):
+    p = tmp_path / "printers.json"
+    p.write_text(text)
+    with pytest.raises(ConfError) as e:
+        conf.load_profiles(p)
+    assert str(e.value) == REFUSAL
+    assert SERIAL not in str(e.value) and "10.0.0" not in str(e.value) and e.value.__cause__ is None
+
+
+def test_save_refuses_an_invalid_set_and_writes_nothing(tmp_path):
+    p = tmp_path / "printers.json"
+    bad = ProfileSet(default="desk", printers=(Profile(**entry(name="x2d.local")),))
+    with pytest.raises(ConfError) as e:
+        conf.save_profiles(bad, p)
+    assert str(e.value) == REFUSAL and "x2d.local" not in str(e.value)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_write_failure_is_a_data_file_error(tmp_path, monkeypatch):
+    def boom(*a):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(conf.os, "replace", boom)
+    with pytest.raises(conf.DataFileError, match="No space left"):
+        conf.save_profiles(two(), tmp_path / "printers.json")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_concurrent_updates_both_land(tmp_path):
+    """Thread A holds the lock inside its change; thread B's update waits for it and then sees A's profile."""
+    p = tmp_path / "printers.json"
+    inside, release = threading.Event(), threading.Event()
+
+    def slow(ps):
+        inside.set()
+        release.wait(5)
+        return ps.upsert(Profile.from_dict(entry()))
+
+    a = threading.Thread(target=conf.update_profiles, args=(slow, p))
+    a.start()
+    assert inside.wait(5)
+    b = threading.Thread(
+        target=conf.update_profiles, args=(lambda ps: ps.upsert(Profile.from_dict(entry(name="garage", serial=SERIAL2))), p)
+    )
+    b.start()
+    b.join(0.3)
+    assert b.is_alive()  # B waits on the lock
+    release.set()
+    a.join(5)
+    b.join(5)
+    assert sorted(x.name for x in conf.load_profiles(p).printers) == ["desk", "garage"]
+
+
+def test_update_returns_the_saved_set():
+    ps = conf.update_profiles(lambda ps: ps.upsert(Profile.from_dict(entry())))
+    assert ps == conf.load_profiles() and ps.default == "desk"
+
+
+def test_locked_profiles_serialises_two_commits_and_lets_fn_save(tmp_path):
+    p = tmp_path / "printers.json"
+    inside, release = threading.Event(), threading.Event()
+    seen: list[tuple[str, ...]] = []
+
+    def commit(new: dict, wait: bool):
+        def fn(ps):
+            seen.append(tuple(x.name for x in ps.printers))
+            if wait:
+                inside.set()
+                release.wait(5)
+            conf.save_profiles(ps.upsert(Profile.from_dict(new)), p)  # the save inside the lock
+            return new["name"]
+
+        return fn
+
+    out: list[str] = []
+    a = threading.Thread(target=lambda: out.append(conf.locked_profiles(commit(entry(), True), p)))
+    a.start()
+    assert inside.wait(5)
+    b = threading.Thread(target=lambda: out.append(conf.locked_profiles(commit(entry(name="garage", serial=SERIAL2), False), p)))
+    b.start()
+    b.join(0.3)
+    assert b.is_alive() and seen == [()]  # B has not loaded yet
+    release.set()
+    a.join(5)
+    b.join(5)
+    assert out == ["desk", "garage"] and seen == [(), ("desk",)]  # B saw A's commit
+    assert [x.name for x in conf.load_profiles(p).printers] == ["desk", "garage"]
+
+
+def test_select_profile_default_by_name_and_unknown(tmp_path):
+    ps = two()
+    assert conf.select_profile(None, ps).name == "desk"
+    assert conf.select_profile("garage", ps).serial == SERIAL2
+    assert conf.select_profile(None, ProfileSet()) is None
+    with pytest.raises(ConfError) as e:
+        conf.select_profile("nope", ps)
+    assert str(e.value) == "no printer profile named 'nope': shambu printer list"
+    p = tmp_path / "printers.json"
+    conf.save_profiles(ps, p)
+    assert conf.select_profile("garage", path=p).serial == SERIAL2
+    assert conf.select_profile(None) is None  # no file at conf.PRINTERS
+
+
+def test_sensitive_values_hold_every_profile_serial_and_its_mask(tmp_path, monkeypatch):
+    conf.save_profiles(two())
+    conf.remember_secret(SENTINEL)
+    vals = conf.sensitive_values()  # no Studio config
+    for s in (SERIAL, SERIAL2, conf.mask(SERIAL), conf.mask(SERIAL2), SENTINEL):
+        assert s in vals
+    studio = tmp_path / "BambuStudio.conf"
+    studio.write_text(
+        json.dumps({"app": {"user_last_selected_machine": "00X0STUDIO00777"}, "access_code": {"00X0STUDIO00777": "abcd1234"}})
+    )
+    monkeypatch.setattr(conf, "CONF", studio)
+    vals = conf.sensitive_values()
+    for s in (SERIAL, SERIAL2, conf.mask(SERIAL), "00X0STUDIO00777", conf.mask("00X0STUDIO00777"), "abcd1234", SENTINEL):
+        assert s in vals
+    assert SERIAL not in conf.secret_values() and conf.mask(SERIAL) not in conf.secret_values()  # codes only
+
+
+def test_sensitive_values_survive_a_damaged_profile_file():
+    conf.PRINTERS.write_text("{damaged")
+    conf.remember_secret(SENTINEL)
+    assert conf.sensitive_values() == [SENTINEL]
+
+
+def test_the_missing_code_text_names_both_ways_to_fix_it():
+    with pytest.raises(ConfError) as e:
+        conf.access_code(SERIAL, {"access_code": {}})
+    assert str(e.value) == (
+        f"no access code for serial {conf.mask(SERIAL)}: run shambu printer login, or open the printer once in Bambu Studio's Device tab"
+    )

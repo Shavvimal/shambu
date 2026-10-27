@@ -14,7 +14,13 @@ rate, startup offset, poll times, speed levels, flags) and never a file name, an
 path.
 
 `~/Library/Application Support/shambu/printers.json` (`PRINTERS`) holds the printer profiles (profiles.py has the
-schema). `_atomic_write()` and `_locked()` are the write and lock helpers both data files use.
+schema): a version, the default name and, per printer, its name, serial, last known IP, model, mode, code source, TLS
+flag, dates and revision. It never holds an access code (vault.py keeps the code in the Keychain), a token or a path.
+`load_profiles()` and `save_profiles()` read and write it (written 0600, atomic), `update_profiles()` does
+load-change-save and `locked_profiles()` runs a caller's whole commit, both under a file lock on `printers.json.lock`
+beside it. `select_profile()` picks a profile by name or the default. A damaged file is refused with the fixed
+`profiles.REFUSAL` text, never with its content. `_atomic_write()` and `_locked()` are the write and lock helpers both
+data files use.
 
 The runtime secret set holds every LAN access code this process read from any source (Studio's config, the vault, a
 one-shot flag): `remember_secret()` adds one, `forget_secrets()` clears the set. `sensitive_values()` and
@@ -33,9 +39,12 @@ import re
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from .errors import BambuError, ConfError
+
+if TYPE_CHECKING:
+    from .profiles import Profile, ProfileSet
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -89,7 +98,9 @@ def access_code(serial: str | None = None, conf: dict | None = None) -> str:
         raise ConfError("no printer selected in Bambu Studio (app.user_last_selected_machine is empty)")
     codes = conf.get("access_code", {})
     if serial not in codes:
-        raise ConfError(f"no access code stored for serial {mask(serial)}; open the printer once in Studio's Device tab")
+        raise ConfError(
+            f"no access code for serial {mask(serial)}: run shambu printer login, or open the printer once in Bambu Studio's Device tab"
+        )
     return codes[serial]
 
 
@@ -217,15 +228,22 @@ def _longest_first(vals: set[str]) -> list[str]:
 
 
 def sensitive_values(conf: dict | None = None) -> list[str]:
-    """The runtime secrets plus the serials, their masks and the access codes in Studio's config: text no shambu
-    output may carry. Only the runtime secrets when the config cannot be read."""
+    """The runtime secrets, every profile serial and its mask, plus the serials, their masks and the access codes in
+    Studio's config: text no shambu output may carry. A source that cannot be read adds nothing."""
     vals = set(_RUNTIME_SECRETS)
+    serials: set[str] = set()
+    try:
+        serials |= {p.serial for p in load_profiles().printers}
+    except (ConfError, DataFileError, OSError, ValueError):
+        pass  # an unreadable or damaged profile file holds nothing this process can compare with: no serial to add
     try:
         c = conf or load()
     except (ConfError, OSError, ValueError):
-        return _longest_first(vals)
-    serials = {str(k) for k in (c.get("access_code") or {})} | {str(selected_serial(c) or "")}
-    codes = {str(v) for v in (c.get("access_code") or {}).values() if v}
+        c = None
+    codes: set[str] = set()
+    if c:
+        serials |= {str(k) for k in (c.get("access_code") or {})} | {str(selected_serial(c) or "")}
+        codes = {str(v) for v in (c.get("access_code") or {}).values() if v}
     vals |= {s for s in serials if s} | {mask(s) for s in serials if len(s) > 6} | codes
     return _longest_first(vals)
 
@@ -341,6 +359,73 @@ def _locked(p: Path, fn: Callable[[], T]) -> T:
         return fn()
     finally:
         lock.close()  # closing the file releases the lock
+
+
+def _read_profiles(p: Path) -> ProfileSet:
+    from .profiles import REFUSAL, ProfileError, ProfileSet
+
+    if not p.is_file():
+        return ProfileSet(None, ())
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise DataFileError(f"{p}: cannot read it ({e.strerror})") from e
+    except ValueError:
+        raise ConfError(REFUSAL) from None  # a fixed text: it never echoes the file's content
+    try:
+        return ProfileSet.from_dict(d)
+    except ProfileError:
+        raise ConfError(REFUSAL) from None
+
+
+def load_profiles(path: Path | None = None) -> ProfileSet:
+    """The stored printer profiles; an empty set when the file does not exist. ConfError(REFUSAL) for a file that is
+    not a valid version-1 printers document, DataFileError when it cannot be read."""
+    return _read_profiles(path or PRINTERS)
+
+
+def save_profiles(ps: ProfileSet, path: Path | None = None) -> Path:
+    """Write the profiles atomically (temp file, then `os.replace`). ConfError(REFUSAL) and nothing written when the
+    set does not validate."""
+    from .profiles import REFUSAL, ProfileError, validate_document
+
+    p = path or PRINTERS
+    doc = ps.to_dict()
+    try:
+        validate_document(doc)
+    except ProfileError:
+        raise ConfError(REFUSAL) from None
+    _atomic_write(p, doc, prefix=".printers-")
+    return p
+
+
+def update_profiles(change: Callable[[ProfileSet], ProfileSet], path: Path | None = None) -> ProfileSet:
+    """Load, `change`, save, under the lock on `printers.json.lock` beside the file. Returns the saved set."""
+    p = path or PRINTERS
+
+    def run() -> ProfileSet:
+        ps = change(_read_profiles(p))
+        save_profiles(ps, p)
+        return ps
+
+    return _locked(p, run)
+
+
+def locked_profiles(fn: Callable[[ProfileSet], T], path: Path | None = None) -> T:
+    """`fn(profiles)` under the same lock as `update_profiles`, so a whole commit (a login or a forget) runs as one
+    critical section against other shambu processes. `fn` may call `save_profiles` itself (not `update_profiles`)."""
+    p = path or PRINTERS
+    return _locked(p, lambda: fn(_read_profiles(p)))
+
+
+def select_profile(name: str | None, ps: ProfileSet | None = None, path: Path | None = None) -> Profile | None:
+    """The profile named `name`, or the default one when `name` is None (None when there is none). ConfError when no
+    profile has that name; the user-typed name is the only text from outside the code in that message."""
+    ps = ps if ps is not None else load_profiles(path)
+    p = ps.selected(name)
+    if p is None and name is not None:
+        raise ConfError(f"no printer profile named {name!r}: shambu printer list")
+    return p
 
 
 def hms_table(serial_prefix: str = "20P", lang: str = "en") -> dict:
