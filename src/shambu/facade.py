@@ -540,18 +540,20 @@ class Bambu:
             old = current.by_serial(serial)
             p = Profile(name, serial, read_ip, mode, insecure, added=old.added if old is not None else now, verified=now)
             new = current.upsert(p, default=make_default, secrets=conf.sensitive_values())
-            previous = store.get(serial)
-            store.put(serial, code)
+            stored = new.by_serial(serial)
+            key = stored.serial if stored is not None else serial  # the profile's stored case is the credential key
+            previous = store.get(key)
+            store.put(key, code)
             try:
                 conf.save_profiles(new)
             except BaseException:
                 try:
                     if previous is None:
-                        store.delete(serial)
+                        store.delete(key)
                     else:
-                        store.put(serial, previous)
+                        store.put(key, previous)
                 except VaultError as e:  # the write failure is the error to report; this one is logged
-                    log.warning("could not restore the stored access code for %s (%s)", conf.mask(serial), type(e).__name__)
+                    log.warning("could not restore the stored access code for %s (%s)", conf.mask(key), type(e).__name__)
                 raise
             return new
 

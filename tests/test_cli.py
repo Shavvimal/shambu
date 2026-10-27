@@ -1894,3 +1894,16 @@ def test_login_new_printer_stores_the_certificate_case_of_the_serial(capsys, lan
     (p,) = stored()["printers"]
     assert p["serial"] == P_SERIAL and lan.seen == [(P_IP, P_SERIAL, False)]
     assert offline.vault.items == {P_SERIAL: P_CODE}
+
+
+def test_login_by_ip_keeps_the_credential_key_of_an_existing_lower_case_profile(capsys, lan, monkeypatch, offline):
+    """A profile stored with a lower-case serial and an old code; `login --ip` resolves the upper-case certificate
+    serial: one profile, one credential key (the stored case), the new code under it, nothing under the other case."""
+    store_profiles(a_profile(serial=P_SERIAL.lower()))
+    offline.vault.items[P_SERIAL.lower()] = "OLD-CODE-0001"
+    code_stdin(monkeypatch)
+    code, _, err = run(capsys, "printer", "login", "--ip", P_IP, "--access-code-stdin")
+    assert code == 0, err
+    (p,) = stored()["printers"]
+    assert p["serial"] == P_SERIAL.lower()
+    assert offline.vault.items == {P_SERIAL.lower(): P_CODE}
