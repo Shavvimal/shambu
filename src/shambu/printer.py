@@ -5,9 +5,32 @@ subscribe to `device/<serial>/report`, publish exactly one `pushall`, and read t
 pushes are exempt from Bambu's Authorization Control, so this works without Developer Mode.
 Nothing here starts, pauses, stops or changes a print, and nothing but `pushall` is published.
 
-Design: `Discovery` strategies find the IP (ARP + port probe, passive SSDP). `MqttReader` adapts
-paho-mqtt to one call. `StatusDecoder` turns the raw report into a `Status`. `PrinterService`
-is the facade the CLI uses.
+Design: `Discovery` strategies find the IP (ARP + port probe, the default-route subnet, passive SSDP). `MqttReader`
+adapts paho-mqtt to one call. `StatusDecoder` turns the raw report into a `Status`. `PrinterService` is the facade the
+CLI uses.
+
+Credentials: a chain of stateless `CredentialSource`s (`PrinterService.sources`; `(StudioCredentials(),)` by default):
+`OneShotCredentials` (a code from a one-shot flag), `ProfileCredentials` (the profile's serial and its Keychain code)
+and `StudioCredentials` (Studio's config; None when the file or the key is absent). `resolve()` takes the serial
+first (`serial` given by the caller, then the first source with one, then, with `ip` given and TLS verified, the CN
+of the certificate at that IP), then the code for that serial (the first source with one; `ConfError` when none has
+it), then the IP (`ip`, then `profile_ip`, then discovery). It returns a `Resolved` that names the source of each.
+
+Staged discovery: `discovery` is a tuple of passes (`ArpProbe`, then `SubnetProbe` on the profile path). A hit counts
+when `accept` is None (the hit that names the serial, else the first) or `accept(hit)` is True; the passes go on
+until a hit is accepted. No credential leaves the process during the choice of a candidate.
+
+Typed read result: every read (`raw_report`, `public_report`, `status`, `filaments`, each `watch` poll) returns a
+`ReadResult` (report, `Resolved`, `Relocation | None`) to the caller's thread, and `after_read` hears it there, only
+when the worker returned in time. The printer's report never populates a `ReadResult`: `_Collector` merges any
+top-level key the printer sends, so no report key carries authority. Only one branch builds a `Relocation`: on the
+profile path (`ip_source == "profile"`, a `profile` set, TLS verified), a `cannot connect` at the profile IP runs one
+`relocate` step (the staged discovery with `accept`, then one more MQTT read at the accepted host). The service
+writes nothing; the facade's `after_read` commits the proposal.
+
+`certificate_serial(ip)` reads the CN of the certificate at `ip` (a TLS handshake against Studio's CA bundle, no SNI,
+no MQTT). Its trust boundary: a chain-valid CN proves that a Bambu device answers at that IP, not that it is the
+intended printer. The CN must be serial-shaped, and the MQTT read that follows pins that serial.
 
 Trust: discovery only proposes an IP (the first host that answers on 8883). TLS fails closed. By
 default Studio's CA bundle must exist, the chain must verify, and the certificate must name the
@@ -43,6 +66,7 @@ from __future__ import annotations
 
 import calendar
 import copy
+import ipaddress
 import json
 import logging
 import math
@@ -56,13 +80,18 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from . import conf
 from .errors import ConfError, PrinterError
+from .vault import Vault, VaultError
+
+if TYPE_CHECKING:
+    from .profiles import Profile
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
+C = TypeVar("C", bound=ssl.SSLContext)
 
 CA_FILE = Path("/Applications/BambuStudio.app/Contents/Resources/cert/printer.cer")
 PUSHALL = {"pushing": {"sequence_id": "1", "command": "pushall", "version": 1, "push_target": 1}}
@@ -223,7 +252,7 @@ class ArpProbe:
         w = max(self.probe_window_s, math.ceil(n_hosts / threads) * self.timeout)
         return w if limit is None else max(0.0, min(w, limit))
 
-    def probe_hosts(self, hosts: list[str], limit: float | None = None) -> list[dict]:
+    def probe_hosts(self, hosts: list[str], limit: float | None = None, method: str = "arp+8883") -> list[dict]:
         self.shortfall = None
         if not hosts:
             return []
@@ -261,7 +290,7 @@ class ArpProbe:
         if n < len(hosts):
             self.shortfall = f"{n} of {len(hosts)} hosts probed before the {window:g} s probe window ended"
             log.warning("port probe: %s", self.shortfall)
-        return [{"ip": h, "method": "arp+8883"} for h in hosts if h in found]  # ARP order, not finish order
+        return [{"ip": h, "method": method} for h in hosts if h in found]  # input order, not finish order
 
     def find(self) -> list[dict]:
         self.timings = {}
@@ -272,6 +301,69 @@ class ArpProbe:
         t1 = time.monotonic()
         hits = self.probe_hosts(hosts, left)
         self.timings["probe"] = round(time.monotonic() - t1, 2)
+        return hits
+
+
+_ROUTE_IF = re.compile(r"^\s*interface:\s*([A-Za-z0-9]+)\s*$", re.M)
+_IFCONFIG_INET = re.compile(r"^\s*inet (\d+\.\d+\.\d+\.\d+) netmask 0x([0-9A-Fa-f]{8})\b", re.M)
+
+
+def subnet_hosts(route_text: str, ifconfig_text: str, limit_prefix: int = 24) -> list[str]:
+    """The other hosts of the network of the interface that carries the default route, in numeric order. `route_text`
+    is `route -n get default`, `ifconfig_text` is `ifconfig <interface>`. `[]` when the mask is wider than
+    /`limit_prefix` or a text does not parse."""
+    if not _ROUTE_IF.search(route_text or ""):
+        return []
+    m = _IFCONFIG_INET.search(ifconfig_text or "")
+    if not m:
+        return []
+    prefix = bin(int(m.group(2), 16)).count("1")
+    try:
+        own = ipaddress.IPv4Interface(f"{m.group(1)}/{prefix}")
+    except ValueError:
+        return []
+    if prefix < limit_prefix:
+        return []
+    return [str(h) for h in own.network.hosts() if h != own.ip]
+
+
+@dataclass
+class SubnetProbe(ArpProbe):
+    """The second discovery pass: the hosts of the default-route interface's network (/24 or narrower) that are not in
+    the ARP table and answer on 8883. It runs `route -n get default` and `ifconfig <interface>` (bounded by
+    `arp_timeout`), never scans a network wider than /24, and sends nothing but a TCP connect to a candidate. It is
+    always the pass after `ArpProbe`, never the only one. A runner failure gives no hosts and a `shortfall`."""
+
+    def with_deadline(self, seconds: float | None) -> SubnetProbe:
+        return replace(self, deadline_s=seconds)
+
+    def interface_hosts(self) -> list[str]:
+        """The other hosts of the default-route network (see `subnet_hosts`). Raises what the runner raises."""
+        r = self.runner(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=self.arp_timeout)
+        m = _ROUTE_IF.search(r.stdout or "")
+        if not m:
+            return []
+        i = self.runner(["ifconfig", m.group(1)], capture_output=True, text=True, timeout=self.arp_timeout)
+        return subnet_hosts(r.stdout or "", i.stdout or "")
+
+    def find(self) -> list[dict]:
+        self.timings = {}
+        self.shortfall = None
+        t0 = time.monotonic()
+        why = "the default-route network is wider than /24 or could not be read, so no subnet scan"
+        try:
+            hosts = self.interface_hosts()
+        except Exception as e:  # noqa: BLE001 - the runner is injectable; any failure means no subnet pass, never a crash
+            log.warning("reading the default-route network failed (%s: %s); no subnet scan", type(e).__name__, e)
+            hosts, why = [], f"the default-route network could not be read ({type(e).__name__}), so no subnet scan"
+        if not hosts:
+            self.shortfall = why
+            self.timings["subnet"] = round(time.monotonic() - t0, 2)
+            return []
+        skip = set(self.hosts())
+        left = None if self.deadline_s is None else self.deadline_s - (time.monotonic() - t0)
+        hits = self.probe_hosts([h for h in hosts if h not in skip], left, method="subnet+8883")
+        self.timings["subnet"] = round(time.monotonic() - t0, 2)
         return hits
 
 
@@ -408,27 +500,73 @@ class SerialPinnedContext(ssl.SSLContext):
         )
 
 
-def tls_context(serial: str, insecure: bool = False) -> SerialPinnedContext:
-    """Verified context by default: Studio's CA bundle, chain and name (= serial) checked. A missing CA bundle raises; it
-    never falls back to an unverified context. `insecure=True` gives CERT_NONE and no name check, on request only."""
-    ctx = SerialPinnedContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.expected_serial = serial
-    if insecure:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+def _ca_context(cls: type[C]) -> C:
+    """A client context of class `cls` that trusts only Studio's printer CA bundle, with CERT_REQUIRED. A missing or
+    unloadable bundle raises; nothing falls back to an unverified context. The caller sets the name check."""
     if not CA_FILE.is_file():
         raise PrinterError(f"printer CA bundle not found at {CA_FILE} (install Bambu Studio), or pass --insecure to skip TLS verification")
+    ctx = cls(ssl.PROTOCOL_TLS_CLIENT)
     try:
         ctx.load_verify_locations(str(CA_FILE))
     except (ssl.SSLError, OSError) as e:
         raise PrinterError(f"cannot load printer CA bundle {CA_FILE}: {e}") from e
     ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.check_hostname = True
-    ctx.hostname_checks_common_name = True  # Bambu printer certificates carry the serial as CN
     if hasattr(ssl, "VERIFY_X509_STRICT"):
         ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # Python 3.13: Bambu's CA fails the strict profile
     return ctx
+
+
+def tls_context(serial: str, insecure: bool = False) -> SerialPinnedContext:
+    """Verified context by default: Studio's CA bundle, chain and name (= serial) checked. A missing CA bundle raises; it
+    never falls back to an unverified context. `insecure=True` gives CERT_NONE and no name check, on request only."""
+    if insecure:
+        ctx = SerialPinnedContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.expected_serial = serial
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    ctx = _ca_context(SerialPinnedContext)
+    ctx.expected_serial = serial
+    ctx.check_hostname = True
+    ctx.hostname_checks_common_name = True  # Bambu printer certificates carry the serial as CN
+    return ctx
+
+
+_SERIAL_CN = re.compile(r"[A-Za-z0-9]{8,32}")
+
+
+def certificate_serial(ip: str, deadline: float | None = None) -> str:
+    """The printer serial that the certificate at `ip`:8883 names (its first subject CN). One TLS handshake against
+    Studio's CA bundle, no SNI and no name check, then close: no MQTT CONNECT, no credential. `deadline` (seconds)
+    bounds the connect and the handshake below CONNECT_S and HANDSHAKE_S.
+
+    Trust boundary: a chain-valid CN proves that a Bambu device answers at `ip`, not that it is the intended printer.
+    The CN must be serial-shaped; the MQTT read that follows pins that serial."""
+    ctx = _ca_context(ssl.SSLContext)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    connect_s = CONNECT_S if deadline is None else max(0.1, min(CONNECT_S, deadline))
+    handshake_s = HANDSHAKE_S if deadline is None else max(0.1, min(HANDSHAKE_S, deadline))
+    sock = None
+    try:
+        sock = socket.create_connection((ip, 8883), timeout=connect_s)
+        sock.settimeout(handshake_s)
+        tls = ctx.wrap_socket(sock, server_hostname=None)
+        try:
+            cert: dict = dict(tls.getpeercert() or {})
+        finally:
+            tls.close()
+    except ssl.SSLError as e:
+        raise PrinterError(f"TLS verification failed for the host at {ip}: {e}") from None
+    except OSError as e:
+        raise PrinterError(f"cannot connect to {ip}:8883: {e}") from None
+    finally:
+        if sock is not None:
+            sock.close()
+    cns = [v for rdn in cert.get("subject", ()) for k, v in rdn if k == "commonName"]
+    if not cns or not _SERIAL_CN.fullmatch(cns[0]):
+        raise PrinterError(f"the certificate at {ip} names no printer")
+    return cns[0]
 
 
 def deep_merge(dst: dict, src: dict) -> dict:
@@ -490,6 +628,10 @@ class _Collector:
     def snapshot(self) -> dict:
         with self.lock:
             return copy.deepcopy(self.report)
+
+
+class LoginRefused(PrinterError):
+    """The printer refused the MQTT login: the access code is wrong for that printer (`refused the MQTT login`)."""
 
 
 @dataclass
@@ -556,7 +698,7 @@ class MqttReader:
             except Exception:  # noqa: BLE001
                 pass
         if col.refused is not None:
-            raise PrinterError(
+            raise LoginRefused(
                 f"printer {conf.mask(self.serial)} at {self.ip} refused the MQTT login ({col.refused}): check the LAN access code in Studio"
             )
         report = col.snapshot()
@@ -1083,6 +1225,135 @@ class FilamentDecoder:
         )
 
 
+# ---------------------------------------------------------------------------------- credentials
+class CredentialSource(Protocol):
+    """Where a serial and its access code can come from. Stateless: no timings and no cache, so overlapping reads on
+    one service share nothing. A method returns None when the source has nothing, and raises only when the source is
+    broken (an unreadable file, a Keychain failure)."""
+
+    @property
+    def name(self) -> str: ...
+
+    def serial(self) -> str | None: ...
+
+    def code(self, serial: str) -> str | None: ...
+
+
+@dataclass(frozen=True)
+class OneShotCredentials:
+    """A code from a one-shot flag (`--access-code-file`, `--access-code-stdin`). It names no serial."""
+
+    value: str = field(repr=False)
+    name: str = field(default="flag", init=False)
+
+    def serial(self) -> str | None:
+        return None
+
+    def code(self, serial: str) -> str | None:
+        conf.remember_secret(self.value)
+        return self.value or None
+
+
+@dataclass(frozen=True)
+class ProfileCredentials:
+    """A printer profile's serial and, when its `code_source` is `keychain`, the code the vault holds for that serial.
+    A vault failure becomes a `PrinterError` that names the Keychain."""
+
+    profile: Profile
+    vault: Vault = field(repr=False)
+    name: str = field(default="keychain", init=False)
+
+    def serial(self) -> str | None:
+        return self.profile.serial
+
+    def code(self, serial: str) -> str | None:
+        if self.profile.code_source != "keychain" or serial != self.profile.serial:
+            return None
+        try:
+            return self.vault.get(serial)
+        except VaultError as e:
+            raise PrinterError(f"the Keychain could not give the access code for {conf.mask(serial)}: {e}") from None
+
+
+@dataclass(frozen=True)
+class StudioCredentials:
+    """Bambu Studio's config: the selected serial and the code Studio stored for a serial. Both return None when the
+    config file is absent or lacks the key; this source never raises for absence."""
+
+    load: Callable[[], dict] = field(default=conf.load, repr=False)
+    name: str = field(default="studio", init=False)
+
+    def _conf(self) -> dict | None:
+        try:
+            return self.load()
+        except ConfError:
+            return None
+
+    def serial(self) -> str | None:
+        c = self._conf()
+        return None if c is None else conf.selected_serial(c)
+
+    def code(self, serial: str) -> str | None:
+        c = self._conf()
+        code = None if c is None else (c.get("access_code") or {}).get(serial)
+        if not code:
+            return None
+        conf.remember_secret(code)
+        return code
+
+
+SOURCE_LABELS = {"flag": "a one-shot flag", "keychain": "the Keychain", "studio": "Bambu Studio's config"}
+_LAN_HINT = (
+    "The printer can regenerate it when LAN-only mode is toggled, when the refresh icon next to the code is pressed, "
+    "after some firmware updates, and sometimes after a reboot. Read the code off the touchscreen and run: "
+    "shambu printer login --printer NAME"
+)
+_CLOUD_HINT = (
+    "Open Bambu Studio once so it fetches the current code from your account, then run: shambu printer login --from-studio --printer NAME"
+)
+REFUSAL_HINT = {
+    "lan": _LAN_HINT,
+    "cloud": _CLOUD_HINT,
+    "unknown": f"In LAN-only mode: {_LAN_HINT}\nIn cloud mode: {_CLOUD_HINT}",
+}
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """What one read uses, and where each part came from. Sources: "flag", "profile", "studio", "keychain",
+    "certificate", or the discovery method of the hit ("arp+8883", "subnet+8883", "ssdp")."""
+
+    ip: str
+    serial: str
+    code: str = field(repr=False)
+    ip_source: str
+    serial_source: str
+    code_source: str
+
+
+@dataclass(frozen=True)
+class Relocation:
+    """A proposal: the profile's printer answered at `new_ip`, not `old_ip`. Built only by the relocation branch of
+    `PrinterService`, never from a report key. The facade commits it only if the profile still has that name, serial
+    and `revision`."""
+
+    profile_name: str
+    serial: str
+    old_ip: str
+    new_ip: str
+    revision: int
+
+
+@dataclass
+class ReadResult:
+    """One read: the report as the printer sent it (with the transport keys), what the read used, and a relocation
+    proposal or None."""
+
+    report: dict
+    resolved: Resolved
+    relocation: Relocation | None = None
+
+
 # ---------------------------------------------------------------------------------- service
 @dataclass
 class _Attempt:
@@ -1092,22 +1363,29 @@ class _Attempt:
     started: float = field(default_factory=time.monotonic)
     timings: dict[str, float] = field(default_factory=dict)
     abandoned: bool = False
+    depth: int = 0  # how many timed steps are open; a nested step gives the step name back to its outer step
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
 class PrinterService:
-    """Facade: serial and access code from Studio's config, IP from discovery or the caller.
+    """Facade: serial and access code from the credential chain (`sources`), IP from the caller, the profile or
+    discovery.
 
     `insecure=True` turns off TLS verification for every read (the CLI's `--insecure`). Leave it off: a verified read
     proves the host at the IP is the selected printer before the access code leaves this machine.
 
     `timeout_s` bounds one whole read (credentials, discovery, MQTT): the read runs in a worker thread, and when the
     timeout runs out the caller gets `PrinterError("timed out after 15 s in <step>")`. The expired attempt's thread is not
-    stopped: it is a daemon, it finishes or dies with the process, and it never calls `on_step` or writes `timings`
-    again. That is fine for the CLI; a long-lived caller keeps such a thread until its socket times out.
-    `on_step(name, seconds)` hears each step of the current read as it ends (`credentials`, `arp`, `probe`, `mqtt`);
-    `timings` holds the steps of the last read."""
+    stopped: it is a daemon, it finishes or dies with the process, and it never calls `on_step`, `after_read` or writes
+    `timings` again. That is fine for the CLI; a long-lived caller keeps such a thread until its socket times out.
+    `on_step(name, seconds)` hears each step of the current read as it ends (`credentials`, `keychain`, `cert`, `arp`,
+    `probe`, `subnet`, `relocate`, `mqtt`); `timings` holds the steps of the last read.
+
+    Profile path (set by the facade): `sources` holds `ProfileCredentials`, `profile` the profile, `profile_ip` its
+    address (the only slot a relocation updates), `accept` the identity check of a discovery hit, and `after_read`
+    hears each `ReadResult` on the caller's thread (an exception from it propagates to the caller). `cert_serial` is
+    `certificate_serial`, injectable for tests."""
 
     ip: str | None = None
     serial: str | None = None
@@ -1117,6 +1395,12 @@ class PrinterService:
     insecure: bool = False
     timeout_s: float | None = READ_TIMEOUT_S
     on_step: Callable[[str, float], None] | None = field(default=None, repr=False)
+    sources: tuple[CredentialSource, ...] = field(default_factory=lambda: (StudioCredentials(),), repr=False)
+    profile: Profile | None = None
+    profile_ip: str | None = None
+    accept: Callable[[dict], bool] | None = field(default=None, repr=False)
+    after_read: Callable[[ReadResult], None] | None = field(default=None, repr=False)
+    cert_serial: Callable[[str, float | None], str] = field(default=certificate_serial, repr=False)
     timings: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _local: threading.local = field(default_factory=threading.local, init=False, repr=False)
 
@@ -1141,16 +1425,22 @@ class PrinterService:
     @contextmanager
     def _timed(self, name: str) -> Iterator[None]:
         a = self._attempt()
+        outer = a.step if a.depth else None
         a.step = name
+        a.depth += 1
         t0 = time.monotonic()
         try:
             yield
         finally:
+            a.depth -= 1
             self._record(a, name, round(time.monotonic() - t0, 2))
+            if outer is not None:
+                a.step = outer
 
     def _bounded(self, fn: Callable[[], T]) -> T:
         """`fn()` within `timeout_s` in a worker thread with its own attempt state, or PrinterError naming the step it
-        was in. No timeout: the same attempt state, in the caller's thread."""
+        was in. No timeout: the same attempt state, in the caller's thread. A `ReadResult` that came back in time goes
+        to `after_read` here, on the caller's thread; an abandoned attempt's result is dropped."""
         attempt = _Attempt()
         self.timings = attempt.timings
         box: dict = {}
@@ -1177,37 +1467,110 @@ class PrinterService:
                 raise PrinterError(f"timed out after {self.timeout_s:g} s in {attempt.step}")
         if "error" in box:
             raise box["error"]
-        return box["value"]
+        value = box["value"]
+        if self.after_read is not None and isinstance(value, ReadResult):
+            self.after_read(value)
+        return value
 
-    def resolve(self) -> tuple[str, str, str]:
-        """IP, serial, code. Discovery only proposes a host: the TLS name check (or, insecure, the report topic) in
-        `MqttReader.read` confirms it is the selected printer. An SSDP hit that names the serial wins over other hits."""
-        with self._timed("credentials"):  # serial and access code from Studio's config
-            c = conf.load()
-            serial = self.serial or conf.selected_serial(c)
-            if not serial:
-                raise PrinterError("no printer selected in Bambu Studio (Device tab)")
-            code = conf.access_code(serial, c)
-        ip = self.ip
+    def _remaining(self, a: _Attempt) -> float | None:
+        """What is left of the read's timeout; None: no timeout."""
+        if not self.timeout_s or self.timeout_s <= 0:
+            return None
+        return max(0.1, self.timeout_s - (time.monotonic() - a.started))
+
+    def _chain_serial(self) -> tuple[str | None, str | None]:
+        """(serial, source) from the caller's `serial`, then the first source that names one. No network."""
+        if self.serial:
+            return self.serial, "flag"
+        for src in self.sources:
+            serial = src.serial()
+            if serial:
+                return serial, ("profile" if src.name == "keychain" else src.name)
+        return None, None
+
+    def _chain_code(self, serial: str) -> tuple[str | None, str | None]:
+        """(code, source) from the first source that has a code for `serial`. Only the profile source's lookup is
+        timed (`keychain`), and only when it is consulted. No network."""
+        for src in self.sources:
+            if src.name == "keychain":
+                with self._timed("keychain"):
+                    code = src.code(serial)
+            else:
+                code = src.code(serial)
+            if code:
+                return code, src.name
+        return None, None
+
+    def prepare_secrets(self) -> None:
+        """Run the serial and code lookup of the chain (no network, no certificate read) so that a code the chain
+        holds is registered with `conf.remember_secret` before any output. A missing serial or code registers
+        nothing and is not an error; a broken source (a Keychain failure) still raises."""
+        serial, _ = self._chain_serial()
+        if not serial:
+            return
+        for src in self.sources:
+            code = src.code(serial)
+            if code:
+                conf.remember_secret(code)
+                return
+
+    def resolve(self) -> Resolved:
+        """Serial, then code, then IP. Discovery only proposes a host: the TLS name check (or, insecure, the report
+        topic) in `MqttReader.read` confirms it is the selected printer. With `accept` None, a hit that names the
+        serial wins over other hits; otherwise the first hit `accept` takes."""
+        with self._timed("credentials"):
+            serial, serial_source = self._chain_serial()
+            if not serial and self.ip and not self.insecure:
+                with self._timed("cert"):
+                    serial, serial_source = self.cert_serial(self.ip, self._remaining(self._attempt())), "certificate"
+            if not serial or not serial_source:
+                raise PrinterError("no printer selected: run shambu printer login, or select it in Bambu Studio (Device tab)")
+            code, code_source = self._chain_code(serial)
+            if not code or not code_source:
+                raise ConfError(
+                    f"no access code for serial {conf.mask(serial)}: run shambu printer login, "
+                    "or open the printer once in Bambu Studio's Device tab"
+                )
+        if self.ip:
+            ip, ip_source = self.ip, "flag"
+        elif self.profile_ip:
+            ip, ip_source = self.profile_ip, "profile"
+        else:
+            ip, ip_source = self._discover(serial)
+        return Resolved(ip, serial, code, ip_source, serial_source, code_source)
+
+    def _discover(self, serial: str) -> tuple[str, str]:
+        """(ip, method) of the first accepted hit over the staged passes in `discovery`, or the no-host PrinterError."""
+        a = self._attempt()
         gaps: list[str] = []
-        if not ip:
-            a = self._attempt()
-            for proto in self.discovery:
-                d = proto.with_deadline(self._discovery_deadline(a))
-                a.step = "discovery"
-                hits = d.find()
-                for name, dt in d.timings.items():
-                    self._record(a, name, dt)
-                if d.shortfall:
-                    gaps.append(d.shortfall)
-                if hits:
-                    named = [h for h in hits if h.get("serial") == serial]
-                    ip = (named or hits)[0]["ip"]
-                    break
-        if not ip:
-            why = f" ({'; '.join(gaps)})" if gaps else ""
-            raise PrinterError(f"no host on this LAN answers on port 8883{why}. Is the printer on and on this network? Pass --ip.")
-        return ip, serial, code
+        rejected = 0
+        for proto in self.discovery:
+            d = proto.with_deadline(self._discovery_deadline(a))
+            a.step = "discovery"
+            hits = d.find()
+            for name, dt in d.timings.items():
+                self._record(a, name, dt)
+            if d.shortfall:
+                gaps.append(d.shortfall)
+            if not hits:
+                continue
+            if self.accept is None:
+                named = [h for h in hits if h.get("serial") == serial]
+                h = (named or hits)[0]
+                return h["ip"], str(h.get("method") or "discovery")
+            for h in hits:
+                try:
+                    ok = bool(self.accept(h))
+                except PrinterError as e:  # the identity check could not read the host: it is not the printer
+                    log.info("discovery hit skipped: %s", e)
+                    ok = False
+                if ok:
+                    return h["ip"], str(h.get("method") or "discovery")
+                rejected += 1
+        if rejected:
+            gaps.append(f"{rejected} host(s) answered but none is printer {conf.mask(serial)}")
+        why = f" ({'; '.join(gaps)})" if gaps else ""
+        raise PrinterError(f"no host on this LAN answers on port 8883{why}. Is the printer on and on this network? Pass --ip.")
 
     def _discovery_deadline(self, a: _Attempt) -> float | None:
         """What is left of the read's timeout once the connect and the TLS handshake are kept back; None: no timeout."""
@@ -1215,38 +1578,74 @@ class PrinterService:
             return None
         return max(0.5, self.timeout_s - (time.monotonic() - a.started) - CONNECT_S - HANDSHAKE_S)
 
-    def _read(self, ip: str, serial: str, code: str) -> dict:
+    def _read(self, r: Resolved, ip: str | None = None) -> dict:
+        ip = ip or r.ip
         if self.insecure:
             log.warning("TLS verification is off: the access code goes to whatever answers at %s", ip)
-        with self._timed("mqtt"):
-            report = (self.reader_factory or MqttReader)(ip, serial, code, self.wait, self.insecure).read()
-        if self.insecure and report.get("_topic", f"device/{serial}/report") != f"device/{serial}/report":
-            raise PrinterError(f"host {ip} answered for another device, not printer {conf.mask(serial)}")
+        try:
+            with self._timed("mqtt"):
+                report = (self.reader_factory or MqttReader)(ip, r.serial, r.code, self.wait, self.insecure).read()
+        except LoginRefused as e:
+            raise LoginRefused(self._refusal_text(str(e), r.code_source, ip)) from None
+        if self.insecure and report.get("_topic", f"device/{r.serial}/report") != f"device/{r.serial}/report":
+            raise PrinterError(f"host {ip} answered for another device, not printer {conf.mask(r.serial)}")
         return report
 
-    def _resolve_and_read(self) -> tuple[str, str, dict]:
-        ip, serial, code = self.resolve()
-        return ip, serial, self._read(ip, serial, code)
+    def _refusal_text(self, base: str, code_source: str, ip: str) -> str:
+        label = SOURCE_LABELS.get(code_source, code_source)
+        who = f", profile {self.profile.name}" if self.profile is not None else ""
+        mode = self.profile.mode if self.profile is not None else "unknown"
+        hint = REFUSAL_HINT.get(mode, REFUSAL_HINT["unknown"])
+        hint = hint.replace("--printer NAME", f"--printer {self.profile.name}" if self.profile is not None else f"--ip {ip}")
+        return f"{base} (source: {label}{who})\n{hint}"
+
+    def _resolve_and_read(self) -> ReadResult:
+        r = self.resolve()
+        try:
+            return ReadResult(self._read(r), r)
+        except LoginRefused:
+            raise
+        except PrinterError as e:
+            if not (str(e).startswith("cannot connect") and r.ip_source == "profile" and not self.insecure and self.profile is not None):
+                raise
+            return self._relocate(r, e, self.profile)
+
+    def _relocate(self, r: Resolved, original: PrinterError, profile: Profile) -> ReadResult:
+        """One `relocate` step: the staged discovery (with `accept`), then one more MQTT read at the accepted host. Only
+        this branch builds a `Relocation`. No accepted host or a failed second read re-raises the original error with
+        the profile's expected address; a refused login at the new host is raised as it is."""
+        stamp = profile.verified[11:16] if profile.verified else "never"
+        expected = f" The profile {profile.name} expected {r.ip} (last verified {stamp})."
+        try:
+            with self._timed("relocate"):
+                new_ip, method = self._discover(r.serial)
+            report = self._read(r, new_ip)
+        except LoginRefused:
+            raise
+        except PrinterError:
+            raise PrinterError(f"{original}{expected}") from None
+        moved = replace(r, ip=new_ip, ip_source=method)
+        return ReadResult(report, moved, Relocation(profile.name, r.serial, r.ip, new_ip, profile.revision))
 
     def raw_report(self) -> dict:
         """The merged report as the printer sent it, with shambu's transport keys. Internal: print `public_report`."""
-        return self._bounded(self._resolve_and_read)[2]
+        return self._bounded(self._resolve_and_read).report
 
     def public_report(self) -> dict:
         """The report for `printer raw`: `public_raw()` of one read, which removes the transport metadata (`_topic`
         names the full serial), the network and wifi fields, secret-looking keys, and any text naming the IP or the
         serial."""
-        ip, serial, report = self._bounded(self._resolve_and_read)
-        return public_raw(report, ip, serial)
+        res = self._bounded(self._resolve_and_read)
+        return public_raw(res.report, res.resolved.ip, res.resolved.serial)
 
     def status(self) -> Status:
-        ip, serial, report = self._bounded(self._resolve_and_read)
-        return StatusDecoder(conf.hms_table(serial[:3])).decode(report, serial, ip)
+        res = self._bounded(self._resolve_and_read)
+        return StatusDecoder(conf.hms_table(res.resolved.serial[:3])).decode(res.report, res.resolved.serial, res.resolved.ip)
 
     def filaments(self, resolver=None, printer_preset: str | None = None) -> LoadedFilaments:
         """The spools in each nozzle and slot, from the same single `pushall` as `status()`. Read-only."""
-        ip, serial, report = self._bounded(self._resolve_and_read)
-        return FilamentDecoder(resolver, printer_preset).decode(report, serial, ip)
+        res = self._bounded(self._resolve_and_read)
+        return FilamentDecoder(resolver, printer_preset).decode(res.report, res.resolved.serial, res.resolved.ip)
 
     def watch(
         self,
@@ -1317,15 +1716,16 @@ class PrinterService:
         return poll_interval(every_s, st, None if running_since is None else clock() - running_since)
 
 
+SETUP_MESSAGE = "shambu is not set up for the printer (shambu printer login, or Bambu Studio's Device tab)"
 ERROR_CATEGORIES = (  # (category, words in the PrinterError text, the fixed message a watch log holds)
     ("timeout", ("timed out",), "the read timed out"),
     ("tls", ("TLS", "certificate", "CA bundle"), "the TLS check of the printer failed"),
-    ("login", ("refused the MQTT login",), "the printer refused the MQTT login (check the LAN access code in Studio)"),
+    ("login", ("refused the MQTT login",), "the printer refused the access code (run shambu printer login, or check the code in Studio)"),
     ("discovery", ("no host on this LAN",), "no printer answered on port 8883 on this LAN"),
     ("identity", ("another device",), "the host answered for another device"),
     ("report", ("no full report", "no report"), "the printer sent no full report in time"),
     ("connect", ("cannot connect",), "the connection to the printer failed"),
-    ("setup", ("paho-mqtt missing", "no printer selected", "no access code"), "shambu or Bambu Studio is not set up for the printer"),
+    ("setup", ("paho-mqtt missing", "no printer selected", "no access code"), SETUP_MESSAGE),
 )
 
 
@@ -1333,7 +1733,7 @@ def error_category(e: BaseException) -> tuple[str, str]:
     """(category, fixed message) for a failed read. The message never quotes the exception: the lower layers put the
     IP, the host name, the masked serial and the TLS names in their text, and a watch log must hold none of them."""
     if isinstance(e, ConfError):  # Studio's config: no printer selected, no access code (its text names the serial)
-        return "setup", "shambu or Bambu Studio is not set up for the printer"
+        return "setup", SETUP_MESSAGE
     text = str(e)
     for cat, words, msg in ERROR_CATEGORIES:
         if any(w in text for w in words):
