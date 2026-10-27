@@ -471,8 +471,10 @@ class Bambu:
         (`printer_profile`, or the default when no `ip` is given) pins the serial and `ip` overrides its address; else
         `ip` names a new printer whose serial is `serial` or the CN of its certificate (they must agree). `pin` is the
         serial the CLI checked before its prompt: the profile is read again under the lock before the printer read and
-        once more in the commit, and a profile whose serial is no longer `pin` is ConfError (nothing read or written);
-        a supplied `serial` is never replaced by the profile's. The read must
+        once more in the commit, and a profile whose serial is no longer `pin` is ConfError (nothing read or written).
+        Serials compare case-insensitively: a selected profile's stored serial is the one read, stored and written (a
+        supplied `serial` that is not it is ConfError), and a new printer's serial takes the certificate CN's case when
+        TLS verified it (as typed under `insecure`). The read must
         succeed before anything is written: a refused code (`LoginRefused`), a wrong host or a timeout writes nothing.
         The commit runs under the profiles lock; when printers.json cannot be written after the code was stored, the
         previous code (or none) is put back."""
@@ -488,8 +490,10 @@ class Bambu:
                 selected = conf.locked_profiles(lambda current: conf.select_profile(self.printer_profile, current))
             if selected is not None:
                 self._check_pin(selected, pin)
+                if serial and serial.casefold() != selected.serial.casefold():
+                    raise ConfError(f"--serial does not match profile {selected.name}")
                 existing = service_profile = selected
-                serial = serial or selected.serial
+                serial = selected.serial  # the profile's case: a case-only different --serial names the same printer
                 ip = ip or selected.ip
                 # `insecure` stays the flag as given: a refresh without --insecure turns the TLS check back on
             else:
@@ -499,7 +503,7 @@ class Bambu:
                     cn = printer_mod.certificate_serial(ip, self.printer_timeout)
                     if serial and cn.casefold() != serial.casefold():
                         raise PrinterError(f"the host at {ip} presents a certificate for printer {conf.mask(cn)}, not {conf.mask(serial)}")
-                    serial = serial or cn
+                    serial = cn  # the certificate is the authority on the serial's case
                 if not serial:
                     raise PrinterError("--insecure cannot read the printer's certificate: give --serial")
                 existing = ps.by_serial(serial)

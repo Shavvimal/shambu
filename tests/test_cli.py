@@ -1861,3 +1861,36 @@ def test_login_refresh_without_insecure_turns_the_tls_check_back_on(capsys, lan,
     code_stdin(monkeypatch)
     assert run(capsys, "printer", "login", "--printer", "x2d", "--insecure", "--access-code-stdin")[0] == 0
     assert lan.seen[-1] == (P_IP, P_SERIAL, True) and stored()["printers"][0]["insecure"] is True
+
+
+# ---------------------------------------------------------------------------- serial case on login
+def test_login_refresh_with_a_case_only_different_serial_keeps_the_canonical_serial(capsys, lan, monkeypatch, offline):
+    """The pin check is case-insensitive; the profile's stored serial is the one read, stored and written."""
+    store_profiles(a_profile())
+    code_stdin(monkeypatch)
+    code, _, err = run(capsys, "printer", "login", "--printer", "x2d", "--serial", P_SERIAL.lower(), "--access-code-stdin")
+    assert code == 0, err
+    (p,) = stored()["printers"]
+    assert (p["name"], p["serial"], p["added"]) == ("x2d", P_SERIAL, P_STAMP)
+    assert lan.seen == [(P_IP, P_SERIAL, False)] and offline.vault.items == {P_SERIAL: P_CODE}
+
+
+def test_login_rename_with_a_case_only_different_serial_keeps_one_profile(capsys, lan, monkeypatch, offline):
+    store_profiles(a_profile())
+    code_stdin(monkeypatch)
+    argv = ("printer", "login", "--printer", "x2d", "--serial", P_SERIAL.lower(), "--name", "renamed", "--access-code-stdin")
+    code, _, err = run(capsys, *argv)
+    assert code == 0, err
+    d = stored()
+    (p,) = d["printers"]
+    assert (p["name"], p["serial"], p["added"]) == ("renamed", P_SERIAL, P_STAMP) and d["default"] == "renamed"
+    assert offline.vault.items == {P_SERIAL: P_CODE}
+
+
+def test_login_new_printer_stores_the_certificate_case_of_the_serial(capsys, lan, monkeypatch, offline):
+    code_stdin(monkeypatch)
+    code, _, err = run(capsys, "printer", "login", "--ip", P_IP, "--serial", P_SERIAL.lower(), "--access-code-stdin")
+    assert code == 0, err
+    (p,) = stored()["printers"]
+    assert p["serial"] == P_SERIAL and lan.seen == [(P_IP, P_SERIAL, False)]
+    assert offline.vault.items == {P_SERIAL: P_CODE}
