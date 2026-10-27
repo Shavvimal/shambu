@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 import pytest
@@ -443,7 +444,7 @@ def test_save_profiles_refuses_a_symlinked_file(tmp_path):
         conf.save_profiles(ProfileSet(None, ()), link)
     assert str(e.value) == f"{link}: not a regular file; remove it and retry"
     assert link.is_symlink() and target.read_text() == empty and [x.name for x in link.parent.iterdir()] == ["printers.json"]
-    with pytest.raises(conf.DataFileError, match="not a regular file"):  # the same through update_profiles
+    with pytest.raises(conf.DataFileError, match="regular file"):  # the same through update_profiles (refused on its load)
         conf.update_profiles(lambda ps: ps, link)
     assert link.is_symlink() and target.read_text() == empty
 
@@ -502,3 +503,47 @@ def test_a_name_holding_another_entrys_serial_is_refused():
     with pytest.raises(ProfileError):
         validate_document(doc(entry(name=f"n{SERIAL2.lower()}"), entry(name="b", serial=SERIAL2), default=None))
     validate_document(doc(entry(), entry(name="b", serial=SERIAL2)))
+
+
+# ---------------------------------------------------------------------------- private reads (core round 3)
+def test_a_symlinked_printers_file_is_refused_on_load(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps(doc(entry())))
+    link = tmp_path / "printers.json"
+    link.symlink_to(target)
+    with pytest.raises(conf.DataFileError) as e:
+        conf.load_profiles(link)
+    assert str(e.value) == f"{link}: not a private regular file; remove it and retry"
+    assert SERIAL not in str(e.value)
+
+
+def test_a_fifo_at_the_printers_path_is_refused_without_blocking(tmp_path):
+    fifo = tmp_path / "printers.json"
+    os.mkfifo(fifo, 0o600)
+    done = threading.Event()
+    box: dict = {}
+
+    def run():
+        try:
+            conf.load_profiles(fifo)
+        except conf.DataFileError as e:
+            box["error"] = str(e)
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    assert done.wait(2.0), "a FIFO at the path blocked the load"
+    assert box["error"] == f"{fifo}: not a private regular file; remove it and retry"
+
+
+def test_a_directory_or_another_users_printers_file_is_refused(tmp_path, monkeypatch):
+    d = tmp_path / "dir" / "printers.json"
+    d.mkdir(parents=True)
+    with pytest.raises(conf.DataFileError, match="not a private regular file"):
+        conf.load_profiles(d)
+    p = tmp_path / "printers.json"
+    conf.save_profiles(ProfileSet(None, ()), p)
+    assert conf.load_profiles(p).printers == ()  # this user's regular file loads
+    monkeypatch.setattr(conf.os, "getuid", lambda: os.stat(p).st_uid + 1)
+    with pytest.raises(conf.DataFileError, match="not a private regular file"):
+        conf.load_profiles(p)

@@ -1404,7 +1404,8 @@ def test_a_refused_login_names_the_source_and_the_hint(fake_paho):
 
 
 @pytest.mark.parametrize(
-    ("mode", "want", "absent"), [("lan", "--printer x2d", "--from-studio"), ("cloud", "--from-studio --printer x2d", "touchscreen")]
+    ("mode", "want", "absent"),
+    [("lan", "--printer x2d", "--from-studio"), ("cloud", "then run: shambu printer login --from-studio", "touchscreen")],
 )
 def test_a_refused_profile_login_gives_the_mode_hint(fake_paho, mode, want, absent):
     fake_paho(rc=5)
@@ -1416,6 +1417,8 @@ def test_a_refused_profile_login_gives_the_mode_hint(fake_paho, mode, want, abse
         svc.status()
     text = str(e.value)
     assert "(source: the credentials file, profile x2d)\n" in text and want in text and absent not in text
+    if mode == "cloud":  # the CLI refuses --from-studio with --printer (usage, exit 2): the hint names neither
+        assert text.endswith("then run: shambu printer login --from-studio") and "--printer x2d" not in text
 
 
 def test_error_category_messages_are_pinned():
@@ -1675,3 +1678,134 @@ def test_certificate_serial_with_no_time_left_does_not_connect(cert_env, monkeyp
     with pytest.raises(PrinterError, match="no time left for the TLS handshake"):
         printer.certificate_serial("10.0.0.9", deadline=0.2)
     assert cert_env.seen["closed"] and "wrap_kw" not in cert_env.seen
+
+
+# ---------------------------------------------------------------------------- core round 3
+def test_a_vault_error_text_is_scrubbed_before_it_reaches_the_printer_error():
+    conf.remember_secret(SENTINEL)
+    v = MemoryVault(items={SERIAL: SENTINEL}, error=VaultError(f"damaged near {SENTINEL} in the file"))
+    with pytest.raises(PrinterError) as e:
+        printer.ProfileCredentials(PROFILE, v).code(SERIAL)
+    assert SENTINEL not in str(e.value) and "damaged near <redacted> in the file" in str(e.value)
+
+
+def test_subnet_hosts_takes_the_longest_prefix_whatever_the_line_order():
+    wide = "\tinet 10.0.0.5 netmask 0xffff0000 broadcast 10.0.255.255\n"
+    narrow = "\tinet 10.0.0.6 netmask 0xffffff00 broadcast 10.0.0.255\n"
+    head = "en0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n"
+    a = printer.subnet_hosts(ROUTE, head + wide + narrow)
+    b = printer.subnet_hosts(ROUTE, head + narrow + wide)
+    assert a == b and len(a) == 252  # the /24, without both local addresses
+    assert "10.0.0.5" not in a and "10.0.0.6" not in a and a[-1] == "10.0.0.254"
+
+
+def test_arp_probe_bounds_arp_by_the_deadline():
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(kw.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, ARP_AN, "")
+
+    probe = printer.ArpProbe(runner=runner, probe=lambda ip, port, t: ip == "10.0.0.9")
+    assert probe.with_deadline(0.5).find() == [{"ip": "10.0.0.9", "method": "arp+8883"}]
+    assert calls == [0.5]
+    spent = probe.with_deadline(0.0)
+    assert spent.find() == [] and calls == [0.5]  # no time left: arp -an does not run
+    assert spent.shortfall == "no time left for arp -an, so no ARP discovery"
+
+
+def test_a_first_pass_inside_the_reserve_still_runs_bounded_by_what_is_left(monkeypatch):
+    deadlines = []
+
+    class Rec(_Pass):
+        def with_deadline(self, seconds):
+            deadlines.append(seconds)
+            return super().with_deadline(seconds)
+
+    svc = printer.PrinterService(
+        serial=SERIAL,
+        sources=(printer.OneShotCredentials(SENTINEL),),
+        discovery=(Rec([]), Rec([])),
+        cert_serial=_certs({}),
+        timeout_s=15.0,
+    )
+    monkeypatch.setattr(svc, "_left", lambda a: 0.3)  # a short timeout: inside the MQTT reserve from the start
+    with pytest.raises(PrinterError) as e:
+        svc.resolve()
+    assert deadlines == [0.3]  # the first pass ran, bounded by what is left; the second did not start
+    assert "(1 discovery pass(es) not run before the timeout)" in str(e.value)
+
+
+def test_verified_discovery_on_a_large_lan_keeps_time_for_the_identity_check():
+    """Codex's reproduction: 1000 ARP hosts, only the printer answers at once and every other host takes its probe
+    timeout, so the sweep fills its whole window. With 15 s, the sweep must leave the identity check its allowance."""
+    others = [f"10.0.{i // 250 + 1}.{i % 250 + 1}" for i in range(1000)]
+    table = "".join(f"? ({ip}) at 0:1:2:3:4:5 on en0 ifscope [ethernet]\n" for ip in [NEW_IP, *others])
+
+    def runner(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, table, "")
+
+    def probe(ip, port, timeout):
+        if ip == NEW_IP:
+            return True
+        time.sleep(timeout)
+        return False
+
+    seen = []
+    svc = printer.PrinterService(
+        serial=SERIAL,
+        sources=(printer.OneShotCredentials(SENTINEL),),
+        discovery=(printer.ArpProbe(runner=runner, probe=probe),),
+        reader_factory=_Rec(),
+        cert_serial=_certs({NEW_IP: SERIAL}, seen),
+        timeout_s=15.0,
+    )
+    res = svc._bounded(svc._resolve_and_read)
+    assert res.resolved.ip == NEW_IP and "identity" in svc.timings
+    assert [ip for ip, _ in seen] == [NEW_IP]
+    assert 0 < seen[0][1] <= printer.CONNECT_S + printer.HANDSHAKE_S
+    assert svc.timings["probe"] <= 15.0 - (printer.CONNECT_S + printer.HANDSHAKE_S) - printer.IDENTITY_S + 0.5
+
+
+def test_last_resolved_is_cleared_by_an_overlapping_read_that_fails():
+    made = []
+    b_started = threading.Event()
+
+    class Reader:
+        def __init__(self, *a):
+            made.append(self)
+            self.n = len(made)
+
+        def read(self):
+            if self.n == 1:  # A: succeeds once B is running
+                b_started.wait(2.0)
+                return full()
+            if self.n == 2:  # B: fails after A returned
+                b_started.set()
+                time.sleep(0.3)
+                raise PrinterError("the printer closed the connection")
+            return full()
+
+    svc = _profile_svc(reader_factory=Reader, timeout_s=5.0)
+    box: dict = {}
+
+    def run(key):
+        try:
+            box[key] = svc.status()
+        except PrinterError as e:
+            box[key] = e
+
+    a = threading.Thread(target=run, args=("a",))
+    a.start()
+    deadline = time.monotonic() + 2.0
+    while not made and time.monotonic() < deadline:
+        time.sleep(0.01)
+    b = threading.Thread(target=run, args=("b",))
+    b.start()
+    a.join(3.0)
+    assert not isinstance(box["a"], PrinterError) and svc.last_resolved is not None  # A set it on completion
+    b.join(3.0)
+    assert isinstance(box["b"], PrinterError)
+    assert svc.last_resolved is None  # B finished last, with an error
+    svc.status()
+    assert svc.last_resolved is not None and svc.last_resolved.ip == "10.0.0.9"
