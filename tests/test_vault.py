@@ -1,18 +1,16 @@
-"""vault.py: the shape checks, SecurityVault (the Keychain through `security -i`, with a fake runner and one opt-in
-real round trip), MemoryVault (the test fake and second Vault implementation) and the runtime secret set in conf.py
-that every vault read feeds."""
+"""vault.py: the shape checks, FileVault (the 0600 credentials file in the config dir), MemoryVault (the test fake and
+second Vault implementation) and the runtime secret set in conf.py that every vault read feeds."""
 
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-from pathlib import Path
+import stat
+import threading
 
 import pytest
 
 from shambu import conf, vault
-from shambu.vault import MemoryVault, SecurityVault, UnavailableVault, VaultError, safe_code, safe_serial
+from shambu.vault import BAD_FILE, FileVault, MemoryVault, VaultError, safe_code, safe_serial
 
 SERIAL = "00X0TEST0000999"
 SERIAL2 = "00X0TEST0000888"
@@ -71,9 +69,9 @@ def test_memory_vault_refuses_unsafe_values_before_recording():
 
 
 def test_memory_vault_error_propagates():
-    v = MemoryVault(items={SERIAL: CODE}, error=VaultError("keychain locked"))
+    v = MemoryVault(items={SERIAL: CODE}, error=VaultError("file locked"))
     for call in (lambda: v.get(SERIAL), lambda: v.put(SERIAL, CODE), lambda: v.delete(SERIAL)):
-        with pytest.raises(VaultError, match="keychain locked"):
+        with pytest.raises(VaultError, match="file locked"):
             call()
     assert v.calls == [("get", SERIAL), ("put", SERIAL), ("delete", SERIAL)]
     assert v.items == {SERIAL: CODE}
@@ -95,191 +93,152 @@ def test_default_vault_in_tests_is_the_shared_fake(offline):
     assert vault.default_vault().get(SERIAL) == CODE
 
 
-def test_default_vault_is_the_keychain():
+def test_default_vault_is_the_credentials_file():
     v = REAL_DEFAULT_VAULT()
-    assert isinstance(v, SecurityVault)
-    assert (v.binary, v.service, v.timeout) == (Path("/usr/bin/security"), "shambu", 5.0)
+    assert isinstance(v, FileVault) and v.path is None and v._path() == conf.CREDENTIALS
 
 
-# ---------------------------------------------------------------------------- SecurityVault over a fake runner
-class FakeRunner:
-    """Records `(argv, kwargs)` per call and returns the configured CompletedProcess, or raises `error`."""
-
-    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "", error: BaseException | None = None):
-        self.returncode, self.stdout, self.stderr, self.error = returncode, stdout, stderr, error
-        self.calls: list[tuple[list[str], dict]] = []
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append((argv, kwargs))
-        if self.error is not None:
-            raise self.error
-        return subprocess.CompletedProcess(argv, self.returncode, self.stdout, self.stderr)
+# ---------------------------------------------------------------------------- FileVault
+def _mode(p) -> int:
+    return stat.S_IMODE(p.stat().st_mode)
 
 
-def _vault(**kw) -> tuple[SecurityVault, FakeRunner]:
-    runner = FakeRunner(**kw)
-    return SecurityVault(runner=runner), runner
-
-
-def _assert_framing(runner: FakeRunner) -> None:
-    assert runner.calls
-    for argv, kw in runner.calls:
-        assert argv == ["/usr/bin/security", "-i"]
-        assert "-v" not in argv and "-q" not in argv
-        assert kw["input"].endswith("\n") and kw["input"].count("\n") == 1
-        assert kw["timeout"] == 5.0 and kw["capture_output"] is True and kw["text"] is True
-
-
-def test_put_sends_the_code_on_stdin_only():
-    v, runner = _vault()
+def test_file_vault_round_trip_creates_a_private_file_in_a_private_dir(tmp_path):
+    p = tmp_path / "config" / "shambu" / "credentials.json"
+    v = FileVault(p)
+    assert v.get(SERIAL) is None and not p.exists()
     v.put(SERIAL, CODE)
-    _assert_framing(runner)
-    argv, kw = runner.calls[0]
-    assert CODE not in " ".join(argv)
-    assert kw["input"] == f"add-generic-password -U -a {SERIAL} -s shambu -T /usr/bin/security -w {CODE}\n"
-    assert CODE in conf.secret_values()
+    assert v.get(SERIAL) == CODE
+    assert json.loads(p.read_text()) == {"version": 1, "codes": {SERIAL: CODE}}
+    assert _mode(p) == 0o600 and _mode(p.parent) == 0o700
+    assert sorted(x.name for x in p.parent.iterdir()) == ["credentials.json", "credentials.json.lock"]  # no temp file
+    v.put(SERIAL, "12345678")  # put replaces
+    assert v.get(SERIAL) == "12345678"
     assert CODE not in repr(v)
 
 
-def test_get_missing_item_is_none():
-    v, runner = _vault(returncode=44, stderr="security: SecKeychainSearchCopyNext: The specified item could not be found.")
-    assert v.get(SERIAL) is None
-    _assert_framing(runner)
-    assert runner.calls[0][1]["input"] == f"find-generic-password -a {SERIAL} -s shambu -w\n"
+def test_file_vault_holds_two_serials_and_delete_says_whether_there_was_one(tmp_path):
+    v = FileVault(tmp_path / "credentials.json")
+    assert v.delete(SERIAL) is False
+    v.put(SERIAL, CODE)
+    v.put(SERIAL2, "87654321")
+    assert (v.get(SERIAL), v.get(SERIAL2)) == (CODE, "87654321")
+    assert v.delete(SERIAL) is True
+    assert v.delete(SERIAL) is False
+    assert (v.get(SERIAL), v.get(SERIAL2)) == (None, "87654321")
 
 
-def test_get_returns_the_code_and_registers_it():
-    v, runner = _vault(stdout=CODE + "\n")
-    assert CODE not in conf.secret_values()
-    assert v.get(SERIAL) == CODE
-    assert CODE in conf.secret_values()
-    _assert_framing(runner)
-
-
-def test_get_strips_only_one_newline():
-    v, _ = _vault(stdout="abcd \n\n")
-    assert v.get(SERIAL) == "abcd \n"
-
-
-def test_get_empty_item_is_an_error():
-    v, _ = _vault(stdout="\n")
-    with pytest.raises(VaultError, match="is empty") as e:
-        v.get(SERIAL)
-    assert SERIAL not in str(e.value) and conf.mask(SERIAL) in str(e.value)
-
-
-def test_get_failure_redacts_a_known_code_in_stderr():
-    conf.remember_secret(CODE)  # a code this process already read
-    v, _ = _vault(returncode=1, stderr="security: weird " + CODE + " " + "x" * 300)
-    with pytest.raises(VaultError, match=r"could not read the Keychain item \(exit 1: security: weird <redacted> x") as e:
-        v.get(SERIAL)
-    assert CODE not in str(e.value) and len(str(e.value)) < 300
-
-
-def test_put_failure_redacts_the_code_before_truncation():
-    v, _ = _vault(returncode=1, stderr="x" * 190 + CODE + " more")
+def test_file_vault_refuses_a_file_others_can_read(tmp_path):
+    p = tmp_path / "credentials.json"
+    p.write_text(json.dumps({"version": 1, "codes": {SERIAL: CODE}}))
+    p.chmod(0o644)
     with pytest.raises(VaultError) as e:
-        v.put(SERIAL, CODE)
-    text = str(e.value)
-    assert "<redacted>" in text and CODE not in text and CODE[:6] not in text
-    assert "could not write the Keychain item (exit 1:" in text
-
-
-def test_put_duplicate_is_an_error():
-    v, _ = _vault(returncode=45, stderr="security: The specified item already exists in the keychain.")
-    with pytest.raises(VaultError, match="already exists") as e:
-        v.put(SERIAL, CODE)
-    assert CODE not in str(e.value) and SERIAL not in str(e.value)
-    assert CODE not in conf.secret_values()  # a failed write registers nothing
+        FileVault(p).get(SERIAL)
+    assert str(e.value) == f"{p} must be private: chmod 600 {p}"
+    assert CODE not in str(e.value) and CODE not in conf.secret_values()
 
 
 @pytest.mark.parametrize(
-    ("serial", "code"), [(SERIAL, "ab cd1234"), (SERIAL, "-abc1234"), (SERIAL, 'ab"cd1234'), ("bad serial", CODE), ("short", CODE)]
+    "text",
+    [
+        "{not json " + CODE,
+        json.dumps([CODE]),
+        json.dumps({"version": 2, "codes": {SERIAL: CODE}}),
+        json.dumps({"version": True, "codes": {SERIAL: CODE}}),
+        json.dumps({"version": 1, "codes": [CODE]}),
+        json.dumps({"version": 1, "codes": {SERIAL: CODE}, "extra": 1}),
+        json.dumps({"version": 1, "codes": {SERIAL: 12345678}}),
+        json.dumps({"version": 1, "codes": {"bad serial": CODE}}),
+    ],
 )
-def test_put_refuses_unsafe_values_before_any_subprocess(serial, code):
-    v, runner = _vault()
+def test_file_vault_refuses_a_damaged_file_with_a_fixed_text(tmp_path, text):
+    p = tmp_path / "credentials.json"
+    p.write_text(text)
+    p.chmod(0o600)
     with pytest.raises(VaultError) as e:
-        v.put(serial, code)
-    assert runner.calls == []
-    assert code not in str(e.value) and serial not in str(e.value)
+        FileVault(p).get(SERIAL)
+    assert str(e.value) == BAD_FILE and CODE not in str(e.value) and e.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("serial", "code"), [(SERIAL, "ab cd1234"), (SERIAL, "-abc1234"), (SERIAL, "abc"), ("bad serial", CODE), ("short", CODE)]
+)
+def test_file_vault_put_refuses_unsafe_values_before_any_write(tmp_path, serial, code):
+    p = tmp_path / "config" / "credentials.json"
+    with pytest.raises(VaultError) as e:
+        FileVault(p).put(serial, code)
+    assert str(e.value) == vault.UNSAFE and code not in str(e.value) and serial not in str(e.value)
+    assert not p.parent.exists()
 
 
 @pytest.mark.parametrize("op", ["get", "delete"])
-def test_get_and_delete_refuse_an_unsafe_serial(op):
-    v, runner = _vault()
+def test_file_vault_get_and_delete_refuse_an_unsafe_serial(tmp_path, op):
     with pytest.raises(VaultError, match="serial"):
-        getattr(v, op)("bad serial; rm")
-    assert runner.calls == []
+        getattr(FileVault(tmp_path / "credentials.json"), op)("bad serial; rm")
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_unsafe_code_text_is_fixed():
-    v, _ = _vault()
-    with pytest.raises(VaultError) as e:
-        v.put(SERIAL, "ab cd1234")
-    assert str(e.value) == vault.UNSAFE_CODE
+def test_file_vault_get_registers_the_code(tmp_path):
+    p = tmp_path / "credentials.json"
+    FileVault(p).put(SERIAL, CODE)
+    conf.forget_secrets()
+    assert CODE not in conf.secret_values()
+    assert FileVault(p).get(SERIAL) == CODE
+    assert CODE in conf.secret_values() and conf.scrub_text(f"code {CODE}") == "code <redacted>"
 
 
-@pytest.mark.parametrize(("returncode", "result"), [(44, False), (0, True)])
-def test_delete(returncode, result):
-    v, runner = _vault(returncode=returncode)
-    assert v.delete(SERIAL) is result
-    _assert_framing(runner)
-    assert runner.calls[0][1]["input"] == f"delete-generic-password -a {SERIAL} -s shambu\n"
+def test_file_vault_default_path_follows_the_patched_constant():
+    v = FileVault()
+    v.put(SERIAL, CODE)
+    assert conf.CREDENTIALS.is_file() and _mode(conf.CREDENTIALS) == 0o600 and _mode(conf.CREDENTIALS.parent) == 0o700
+    assert v.get(SERIAL) == CODE
 
 
-def test_delete_failure_is_an_error():
-    v, _ = _vault(returncode=51, stderr="security: denied")
-    with pytest.raises(VaultError, match=r"could not delete the Keychain item \(exit 51: security: denied\)"):
-        v.delete(SERIAL)
+def test_file_vault_write_failure_is_a_vault_error_without_the_code(tmp_path, monkeypatch):
+    def boom(*a):
+        raise OSError(28, "No space left on device")
 
-
-def test_no_security_binary_is_unavailable():
-    v, _ = _vault(error=FileNotFoundError(2, "No such file or directory"))
-    for call in (lambda: v.get(SERIAL), lambda: v.put(SERIAL, CODE), lambda: v.delete(SERIAL)):
-        with pytest.raises(UnavailableVault) as e:
-            call()
-        assert str(e.value) == vault.UNAVAILABLE
-
-
-def test_timeout_names_a_keychain_dialog():
-    v, _ = _vault(error=subprocess.TimeoutExpired(["/usr/bin/security", "-i"], 5.0))
-    with pytest.raises(VaultError, match=r"no answer within 5 s \(a Keychain dialog may be waiting\)") as e:
-        v.put(SERIAL, CODE)
+    monkeypatch.setattr(conf.os, "replace", boom)
+    with pytest.raises(VaultError, match="No space left") as e:
+        FileVault(tmp_path / "credentials.json").put(SERIAL, CODE)
     assert CODE not in str(e.value)
+    assert [x.name for x in tmp_path.iterdir()] == ["credentials.json.lock"]
 
 
-def test_other_os_error_is_a_vault_error():
-    v, _ = _vault(error=PermissionError(13, "Permission denied"))
-    with pytest.raises(VaultError, match=r"cannot run security \(Permission denied\)"):
-        v.get(SERIAL)
+def test_two_concurrent_puts_both_land(tmp_path, monkeypatch):
+    """Thread A holds the lock inside its load; thread B's put waits for it and then sees A's code."""
+    p = tmp_path / "credentials.json"
+    inside, release = threading.Event(), threading.Event()
+    real = FileVault._load
 
+    def slow(self, path):
+        if threading.current_thread().name == "a":
+            inside.set()
+            release.wait(5)
+        return real(self, path)
 
-@pytest.mark.integration
-@pytest.mark.skipif(
-    os.environ.get("SHAMBU_INTEGRATION") != "1" or not Path("/usr/bin/security").exists(), reason="needs SHAMBU_INTEGRATION=1 and macOS"
-)
-def test_keychain_round_trip():
-    v = SecurityVault(service="shambu-test")
-    first, second = "TEST-code-0001", "a1._:@+=/-Z9"  # the update uses every allowed character class
-    try:
-        v.put(SERIAL, first)
-        assert v.get(SERIAL) == first
-        v.put(SERIAL, second)  # -U updates in place
-        assert v.get(SERIAL) == second
-        assert v.delete(SERIAL) is True
-        assert v.get(SERIAL) is None
-        assert v.delete(SERIAL) is False
-    finally:
-        v.delete(SERIAL)  # nothing left in the Keychain, whatever failed above
+    monkeypatch.setattr(FileVault, "_load", slow)
+    a = threading.Thread(target=FileVault(p).put, args=(SERIAL, CODE), name="a")
+    a.start()
+    assert inside.wait(5)
+    b = threading.Thread(target=FileVault(p).put, args=(SERIAL2, "87654321"), name="b")
+    b.start()
+    b.join(0.3)
+    assert b.is_alive()  # B waits on the lock
+    release.set()
+    a.join(5)
+    b.join(5)
+    assert json.loads(p.read_text())["codes"] == {SERIAL: CODE, SERIAL2: "87654321"}
 
 
 # ---------------------------------------------------------------------------- the runtime secret set in conf.py
-def test_remember_secret_ignores_empty_and_keeps_the_length_rule():
+def test_remember_secret_ignores_empty_and_keeps_every_length():
     conf.remember_secret("")
-    conf.remember_secret("abc")  # held, but shorter than 4: not a scrub value (it would scrub ordinary words)
+    conf.remember_secret("abc")  # a runtime secret of any length is scrubbed
     conf.remember_secret("abcd")
     conf.remember_secret(CODE)
-    assert conf.sensitive_values() == [CODE, "abcd"] == conf.secret_values()
+    assert conf.sensitive_values() == [CODE, "abcd", "abc"] == conf.secret_values()
+    assert conf.scrub_text("x abc y") == "x <redacted> y"
 
 
 def test_sensitive_values_hold_runtime_secrets_with_no_studio_config():

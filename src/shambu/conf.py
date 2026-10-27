@@ -5,7 +5,7 @@ selected printer serial, the presets last used in the GUI, the bed type index, a
 access code per serial. The access code is returned only by `access_code()` and must never be
 printed or written to disk by callers.
 
-shambu's own data file lives beside it: `~/Library/Application Support/shambu/calibration.json`
+shambu's calibration file lives beside it: `~/Library/Application Support/shambu/calibration.json`
 (`CALIBRATION`), the measured prints `shambu calibrate --add` stores. `load_calibration()` and
 `save_calibration()` read and write it (atomic: a temp file, then `os.replace`), and
 `update_calibration()` does load-change-save under a file lock. It holds a list of prints with the
@@ -13,19 +13,27 @@ fixed fields of `calibrate.validate_print` (a session fingerprint, date, printer
 rate, startup offset, poll times, speed levels, flags) and never a file name, an IP, a serial, an access code or a
 path.
 
-`~/Library/Application Support/shambu/printers.json` (`PRINTERS`) holds the printer profiles (profiles.py has the
-schema): a version, the default name and, per printer, its name, serial, last known IP, model, mode, code source, TLS
-flag, dates and revision. It never holds an access code (vault.py keeps the code in the Keychain), a token or a path.
-`load_profiles()` and `save_profiles()` read and write it (written 0600, atomic), `update_profiles()` does
-load-change-save and `locked_profiles()` runs a caller's whole commit, both under a file lock on `printers.json.lock`
-beside it. `select_profile()` picks a profile by name or the default. A damaged file is refused with the fixed
-`profiles.REFUSAL` text, never with its content. `_atomic_write()` and `_locked()` are the write and lock helpers both
-data files use.
+The config dir (`config_dir()`): `$SHAMBU_CONFIG_DIR` when it is set and not empty, else `$XDG_CONFIG_HOME/shambu` when
+`XDG_CONFIG_HOME` is set and not empty, else `~/.config/shambu`. There is no fallback to the repository. shambu creates
+it 0700 (a folder that already exists keeps its mode) and writes every file in it 0600, atomic. It holds two files:
 
-The runtime secret set holds every LAN access code this process read from any source (Studio's config, the vault, a
-one-shot flag): `remember_secret()` adds one, `forget_secrets()` clears the set. `sensitive_values()` and
-`secret_values()` include it even when Studio's config cannot be read, so `scrub_text` removes a code wherever it came
-from.
+- `printers.json` (`PRINTERS`): the printer profiles (profiles.py has the schema): a version, the default name and, per
+  printer, its name, serial, last known IP, mode, TLS flag and dates. It never holds an access code, a token or a path.
+  `load_profiles()` and `save_profiles()` read and write it, `update_profiles()` does load-change-save and
+  `locked_profiles()` runs a caller's whole commit, both under a file lock on `printers.json.lock` beside it.
+  `select_profile()` picks a profile by name or the default. A damaged file is refused with the fixed
+  `profiles.REFUSAL` text, never with its content.
+- `credentials.json` (`CREDENTIALS`): the LAN access code per serial, read and written only by `vault.FileVault`. It
+  never holds a name, an IP, a token or a path.
+
+`_atomic_write()` and `_locked()` are the write and lock helpers every data file uses.
+
+The runtime secret set holds every LAN access code this process read from any source (Studio's config, the
+credentials file, a one-shot flag): `remember_secret()` adds one of any length. The runtime identifier set holds every
+profile serial this process loaded and its mask (`remember_identifier()`). `forget_secrets()` clears both.
+`sensitive_values()` and `secret_values()` include them even when Studio's config cannot be read or is malformed, so
+`scrub_text` removes a code wherever it came from. Neither reads `printers.json`: a scrub helper does no file I/O
+beyond Studio's config.
 """
 
 from __future__ import annotations
@@ -53,7 +61,22 @@ APPSUPPORT = Path.home() / "Library/Application Support/BambuStudio"
 CONF = APPSUPPORT / "BambuStudio.conf"
 CALIBRATION = Path.home() / "Library/Application Support/shambu/calibration.json"
 CALIBRATION_VERSION = 1
-PRINTERS = Path.home() / "Library/Application Support/shambu/printers.json"
+
+
+def config_dir() -> Path:
+    """shambu's config dir: `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu` (an empty
+    variable counts as unset)."""
+    own = os.environ.get("SHAMBU_CONFIG_DIR")
+    if own:
+        return Path(own).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "shambu"
+    return Path.home() / ".config" / "shambu"
+
+
+PRINTERS = config_dir() / "printers.json"
+CREDENTIALS = config_dir() / "credentials.json"
 PRINTERS_VERSION = 1
 BED_TYPES = {
     "0": "Default Plate",
@@ -65,17 +88,27 @@ BED_TYPES = {
 }
 SECRET_RE = ("access", "code", "token", "ticket", "pass", "secret")
 _RUNTIME_SECRETS: set[str] = set()  # every code this process read, from any source; never printed or written
+_RUNTIME_IDENTIFIERS: set[str] = set()  # every profile serial this process loaded, and its mask
 
 
 def remember_secret(value: str) -> None:
-    """Add a code this process read to the runtime secret set, so every outward text scrubs it. Ignores ''."""
+    """Add a code this process read to the runtime secret set, so every outward text scrubs it. Any length; ignores ''."""
     if value:
         _RUNTIME_SECRETS.add(value)
 
 
+def remember_identifier(serial: str) -> None:
+    """Add a profile serial and its mask (when the serial is longer than 6) to the runtime identifier set."""
+    if serial:
+        _RUNTIME_IDENTIFIERS.add(serial)
+        if len(serial) > 6:
+            _RUNTIME_IDENTIFIERS.add(mask(serial))
+
+
 def forget_secrets() -> None:
-    """Empty the runtime secret set (the tests call it between tests)."""
+    """Empty the runtime secret and identifier sets (the tests call it between tests)."""
     _RUNTIME_SECRETS.clear()
+    _RUNTIME_IDENTIFIERS.clear()
 
 
 def load() -> dict:
@@ -91,7 +124,7 @@ def selected_serial(conf: dict | None = None) -> str | None:
 
 
 def access_code(serial: str | None = None, conf: dict | None = None) -> str:
-    """The LAN access code for a serial. Keep it in memory; never log it."""
+    """The LAN access code for a serial, registered with `remember_secret`. Keep it in memory; never log it."""
     conf = conf or load()
     serial = serial or selected_serial(conf)
     if not serial:
@@ -101,7 +134,10 @@ def access_code(serial: str | None = None, conf: dict | None = None) -> str:
         raise ConfError(
             f"no access code for serial {mask(serial)}: run shambu printer login, or open the printer once in Bambu Studio's Device tab"
         )
-    return codes[serial]
+    code = codes[serial]
+    if isinstance(code, str):
+        remember_secret(code)
+    return code
 
 
 def mask(serial: str) -> str:
@@ -224,40 +260,44 @@ def redact_identifiers(text: str) -> str:
 
 
 def _longest_first(vals: set[str]) -> list[str]:
-    return sorted((v for v in vals if len(v) >= 4), key=len, reverse=True)
+    return sorted((v for v in vals if v), key=len, reverse=True)
 
 
-def sensitive_values(conf: dict | None = None) -> list[str]:
-    """The runtime secrets, every profile serial and its mask, plus the serials, their masks and the access codes in
-    Studio's config: text no shambu output may carry. A source that cannot be read adds nothing."""
-    vals = set(_RUNTIME_SECRETS)
-    serials: set[str] = set()
-    try:
-        serials |= {p.serial for p in load_profiles().printers}
-    except (ConfError, DataFileError, OSError, ValueError):
-        pass  # an unreadable or damaged profile file holds nothing this process can compare with: no serial to add
+def _studio_values(conf: dict | None) -> tuple[set[str], set[str]]:
+    """(serials, codes) from Studio's config: empty sets when it cannot be read or does not have the expected shape (a
+    non-dict root or `access_code`, a non-str value). Scrubbing never breaks on a malformed config."""
     try:
         c = conf or load()
     except (ConfError, OSError, ValueError):
-        c = None
-    codes: set[str] = set()
-    if c:
-        serials |= {str(k) for k in (c.get("access_code") or {})} | {str(selected_serial(c) or "")}
-        codes = {str(v) for v in (c.get("access_code") or {}).values() if v}
-    vals |= {s for s in serials if s} | {mask(s) for s in serials if len(s) > 6} | codes
-    return _longest_first(vals)
+        return set(), set()
+    if not isinstance(c, dict):
+        return set(), set()
+    codes_map = c.get("access_code")
+    if not isinstance(codes_map, dict):
+        codes_map = {}
+    app = c.get("app")
+    selected = app.get("user_last_selected_machine") if isinstance(app, dict) else None
+    serials = {k for k in codes_map if isinstance(k, str) and k}
+    if isinstance(selected, str) and selected:
+        serials.add(selected)
+    codes = {v for v in codes_map.values() if isinstance(v, str) and v}
+    return serials, codes
+
+
+def sensitive_values(conf: dict | None = None) -> list[str]:
+    """The runtime secrets and identifiers (any length), plus the serials, their masks and the access codes in Studio's
+    config (4 characters or more): text no shambu output may carry. No profile file I/O; an unreadable or malformed
+    Studio config adds nothing."""
+    serials, codes = _studio_values(conf)
+    studio = serials | {mask(s) for s in serials if len(s) > 6} | codes
+    return _longest_first(set(_RUNTIME_SECRETS) | set(_RUNTIME_IDENTIFIERS) | {v for v in studio if len(v) >= 4})
 
 
 def secret_values(conf: dict | None = None) -> list[str]:
     """The codes only (the runtime secrets plus Studio's codes, no serial and no mask): what `printer list` and
     `printer discover` scrub, because they show the masked serial on purpose."""
-    vals = set(_RUNTIME_SECRETS)
-    try:
-        c = conf or load()
-    except (ConfError, OSError, ValueError):
-        return _longest_first(vals)
-    vals |= {str(v) for v in (c.get("access_code") or {}).values() if v}
-    return _longest_first(vals)
+    _serials, codes = _studio_values(conf)
+    return _longest_first(set(_RUNTIME_SECRETS) | {v for v in codes if len(v) >= 4})
 
 
 def scrub_text(text: str, values: list[str] | None = None) -> str:
@@ -299,16 +339,18 @@ def _write_calibration(p: Path, prints: list[dict]) -> None:
     _atomic_write(p, {"version": CALIBRATION_VERSION, "prints": prints}, ".calibration-")
 
 
-def _atomic_write(p: Path, doc: dict, prefix: str) -> None:
-    """Write the already-validated `doc` to `p` as JSON: a temp file named `prefix...` beside it, then `os.replace`.
+def _atomic_write(p: Path, doc: dict, prefix: str, mode: int = 0o600) -> None:
+    """Write the already-validated `doc` to `p` as JSON: a temp file named `prefix...` beside it, set to `mode` before
+    anything is written, then `os.replace`. A missing folder is created 0700 (one that exists keeps its mode).
     DataFileError when the folder or the file cannot be written; the temp file never stays behind."""
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=prefix, suffix=".json")
     except OSError as e:
         raise DataFileError(f"{p.parent}: cannot write there ({e.strerror})") from e
     failure: OSError | None = None
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(doc, f, indent=1, allow_nan=False)
             f.write("\n")
@@ -345,9 +387,10 @@ def update_calibration(change: Callable[[list[dict]], list[dict]], path: Path | 
 
 def _locked(p: Path, fn: Callable[[], T]) -> T:
     """`fn()` under an exclusive `fcntl.flock` on `<p>.lock` beside `p` (created when missing), so two shambu
-    processes never interleave a load-change-save of the same file. DataFileError when it cannot be locked."""
+    processes never interleave a load-change-save of the same file. A missing folder is created 0700. DataFileError when
+    it cannot be locked."""
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = open(p.with_name(p.name + ".lock"), "a")  # closed in the finally below
     except OSError as e:
         raise DataFileError(f"{p}: cannot create its lock file ({e.strerror})") from e
@@ -373,14 +416,18 @@ def _read_profiles(p: Path) -> ProfileSet:
     except ValueError:
         raise ConfError(REFUSAL) from None  # a fixed text: it never echoes the file's content
     try:
-        return ProfileSet.from_dict(d)
+        ps = ProfileSet.from_dict(d, secrets=sensitive_values())
     except ProfileError:
         raise ConfError(REFUSAL) from None
+    for x in ps.printers:
+        remember_identifier(x.serial)
+    return ps
 
 
 def load_profiles(path: Path | None = None) -> ProfileSet:
-    """The stored printer profiles; an empty set when the file does not exist. ConfError(REFUSAL) for a file that is
-    not a valid version-1 printers document, DataFileError when it cannot be read."""
+    """The stored printer profiles; an empty set when the file does not exist. Every serial is registered with
+    `remember_identifier`. ConfError(REFUSAL) for a file that is not a valid version-1 printers document (a name that
+    holds a known secret included), DataFileError when it cannot be read."""
     return _read_profiles(path or PRINTERS)
 
 
@@ -392,7 +439,7 @@ def save_profiles(ps: ProfileSet, path: Path | None = None) -> Path:
     p = path or PRINTERS
     doc = ps.to_dict()
     try:
-        validate_document(doc)
+        validate_document(doc, sensitive_values())
     except ProfileError:
         raise ConfError(REFUSAL) from None
     _atomic_write(p, doc, prefix=".printers-")
@@ -413,7 +460,10 @@ def update_profiles(change: Callable[[ProfileSet], ProfileSet], path: Path | Non
 
 def locked_profiles(fn: Callable[[ProfileSet], T], path: Path | None = None) -> T:
     """`fn(profiles)` under the same lock as `update_profiles`, so a whole commit (a login or a forget) runs as one
-    critical section against other shambu processes. `fn` may call `save_profiles` itself (not `update_profiles`)."""
+    critical section against other shambu processes. `fn` may call `save_profiles` itself (not `update_profiles`).
+
+    A login commit runs `vault.FileVault.put` inside `fn`; `FileVault` takes its own lock on `credentials.json.lock`.
+    So a login commit holds the profiles lock and, inside it, the credentials lock: in that order, always."""
     p = path or PRINTERS
     return _locked(p, lambda: fn(_read_profiles(p)))
 

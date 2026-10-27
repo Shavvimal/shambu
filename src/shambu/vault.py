@@ -1,64 +1,53 @@
-"""The LAN access code at rest: one macOS Keychain item per printer serial (service `shambu`), reached through
-`/usr/bin/security`.
+"""The LAN access code at rest: one 0600 JSON file, `credentials.json` in shambu's config dir (`conf.CREDENTIALS`).
 
 What it handles: the `Vault` Protocol (get, put, delete a code by serial), the shape checks a serial and a code must
-pass before they reach the secure store (`safe_serial`, `safe_code`), `SecurityVault` (the Keychain), `MemoryVault`
-(the in-memory implementation the tests use) and `default_vault()`. Every code read from a vault is registered with
-`conf.remember_secret`, so every outward text can scrub it.
-
-The stdin protocol: `SecurityVault` runs `security -i` (argv is only the binary and `-i`, never `-v` or `-q`) and
-writes one command to its stdin, so the code never sits on a command line another process can read. The framing
-rule: exactly one command and one trailing newline, nothing else. `security -i` returns the status of the last
-command it ran, so a missing newline runs nothing (exit 0) and a second blank line masks a failed lookup (exit 0).
-On `get` the code comes back on the child's captured stdout: that is IPC with a trusted binary, not output.
-
-The ACL: the application that creates an item is trusted to read it without a prompt. That application is
-`security` itself, and `-T /usr/bin/security` makes it explicit. A locked keychain or a changed ACL can still show a
-Keychain dialog, and `timeout` bounds the wait for it.
+pass before they are stored (`safe_serial`, `safe_code`), `FileVault` (the file), `MemoryVault` (the in-memory
+implementation the tests use) and `default_vault()`. The file is `{"version": 1, "codes": {"<serial>": "<code>"}}`,
+written atomically with mode 0600 under a lock on `credentials.json.lock`; a file with any group or other permission
+bit is refused. Every code read from a vault is registered with `conf.remember_secret`, so every outward text can scrub
+it.
 
 What it does not do: printer profiles (profiles.py, conf.py), IP addresses, Bambu Studio's config (conf.py) or any
-network access. A code never appears in a repr, an error text, a log line or a command line.
+network access. A code never appears in a repr, an error text or a log line.
+
+Threat model: the file gets the same protection as Bambu Studio's own plain-text config against another process that
+runs as the same user, with a tighter file mode, and it lives outside any repository. It does not protect the code
+from that user's own processes or from anyone who can read that user's files.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn, Protocol
+from typing import Protocol, TypeVar
 
 from . import conf
 from .errors import BambuError
 
-SERVICE = "shambu"
-SECURITY = Path("/usr/bin/security")
-UNAVAILABLE = "no secure store on this platform (no /usr/bin/security); pass --access-code-file or --access-code-stdin per command"
+T = TypeVar("T")
+
+CREDENTIALS_VERSION = 1
 UNSAFE = "a printer serial must be 8 to 32 letters or digits, and a code 4 to 128 characters with no space, quote or backslash"
-UNSAFE_CODE = "the access code holds characters the Keychain write cannot carry (4 to 128 of letters, digits and ._:@+=/-, no leading -)"
+BAD_FILE = (
+    'the credentials file is not a shambu credentials document (want {"version": 1, "codes": {...}}): '
+    "move it away and run shambu printer login again"
+)
 
-Runner = Callable[..., "subprocess.CompletedProcess[str]"]
-
-# Exit statuses of `security`: errSecItemNotFound (44) and errSecDuplicateItem (45).
-_NOT_FOUND = 44
-_DUPLICATE = 45
-
-# At least four characters (so `sensitive_values` keeps it), no whitespace, quote or backslash, no leading '-'.
+# At least four characters, no whitespace, quote or backslash, no leading '-'.
 _SAFE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+=/-]{3,127}")
 _SAFE_SERIAL = re.compile(r"[A-Za-z0-9]{8,32}")
 
 
 class VaultError(BambuError):
-    """The secure store refused or failed a read, a write or a delete, or a serial or code has an unsafe shape."""
-
-
-class UnavailableVault(VaultError):
-    """There is no secure store on this platform: the code must come from a one-shot flag."""
+    """The credentials store refused or failed a read, a write or a delete, or a serial or code has an unsafe shape."""
 
 
 def safe_code(code) -> bool:
-    """True when `code` is a string the secure store can take as one argument: 4 to 128 safe characters."""
+    """True when `code` is 4 to 128 safe characters (a sanity rule for user input)."""
     return isinstance(code, str) and _SAFE_CODE.fullmatch(code) is not None
 
 
@@ -87,7 +76,7 @@ class Vault(Protocol):
 class MemoryVault:
     """A `Vault` in a dict: the test fake and the second implementation of the Protocol. `calls` records
     `(op, serial)` and never the code; when `error` is set, every call raises it after recording the call. Unsafe
-    serials and codes are refused before anything is recorded, as the Keychain vault refuses them."""
+    serials and codes are refused before anything is recorded, as `FileVault` refuses them."""
 
     items: dict[str, str] = field(default_factory=dict, repr=False)
     calls: list[tuple[str, str]] = field(default_factory=list)
@@ -122,76 +111,93 @@ class MemoryVault:
 
 
 @dataclass
-class SecurityVault:
-    """A `Vault` in the macOS Keychain, through `security -i` with the command (and so the code) on stdin. Serials
-    and codes are checked before any subprocess runs; every failure is a VaultError (UnavailableVault when there is
-    no `security` binary) whose text never holds the code."""
+class FileVault:
+    """A `Vault` in `credentials.json`. `path` None means `conf.CREDENTIALS`, read at each call. Serials and codes are
+    checked before any file is touched; every failure is a VaultError whose text never holds a code."""
 
-    binary: Path = SECURITY
-    service: str = SERVICE
-    timeout: float = 5.0
-    runner: Runner = field(default=subprocess.run, repr=False)  # injectable: tests pass a fake
+    path: Path | None = None
 
-    def _run(self, words: list[str], secret: str = "") -> subprocess.CompletedProcess[str]:
-        """Run one `security -i` command: argv is the binary and `-i` only, stdin is the command and one newline."""
+    def _path(self) -> Path:
+        return self.path if self.path is not None else conf.CREDENTIALS
+
+    def _load(self, p: Path) -> dict[str, str]:
+        """The codes in the file; {} when it does not exist. VaultError for a file that is not private or not a
+        version-1 credentials document."""
         try:
-            return self.runner([str(self.binary), "-i"], input=" ".join(words) + "\n", capture_output=True, text=True, timeout=self.timeout)
+            fd = os.open(p, os.O_RDONLY)
         except FileNotFoundError:
-            raise UnavailableVault(UNAVAILABLE) from None
-        except subprocess.TimeoutExpired:
-            raise VaultError(f"security gave no answer within {self.timeout:g} s (a Keychain dialog may be waiting)") from None
+            return {}
         except OSError as e:
-            reason = str(e.strerror or e.errno)
-            raise VaultError(f"cannot run security ({reason.replace(secret, '<redacted>') if secret else reason})") from None
+            raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
+        with os.fdopen(fd, encoding="utf-8") as f:
+            if os.fstat(f.fileno()).st_mode & 0o077:
+                raise VaultError(f"{p} must be private: chmod 600 {p}")
+            try:
+                d = json.loads(f.read())
+            except OSError as e:
+                raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
+            except ValueError:
+                raise VaultError(BAD_FILE) from None
+        if (
+            not isinstance(d, dict)
+            or set(d) != {"version", "codes"}
+            or type(d["version"]) is not int
+            or d["version"] != CREDENTIALS_VERSION
+            or not isinstance(d["codes"], dict)
+            or not all(safe_serial(k) and safe_code(v) for k, v in d["codes"].items())
+        ):
+            raise VaultError(BAD_FILE)
+        return dict(d["codes"])
 
-    def _raise(self, r: subprocess.CompletedProcess[str], what: str, secret: str = "") -> NoReturn:
-        """Raise VaultError for a failed command: stderr with `secret` and every code this process knows redacted
-        first, then cut to 200 characters (a cut first could leave part of a code that no longer matches)."""
-        text = conf.scrub_text((r.stderr or "").strip(), ([secret] if secret else []) + conf.secret_values())[:200]
-        raise VaultError(f"security could not {what} the Keychain item (exit {r.returncode}: {text})")
+    def _save(self, p: Path, codes: dict[str, str]) -> None:
+        conf._atomic_write(p, {"version": CREDENTIALS_VERSION, "codes": codes}, ".credentials-", mode=0o600)
+
+    def _change(self, p: Path, fn: Callable[[dict[str, str]], T]) -> T:
+        """`fn(codes)` under the lock on `credentials.json.lock`; a lock or write failure becomes a VaultError."""
+        try:
+            return conf._locked(p, lambda: fn(self._load(p)))
+        except conf.DataFileError as e:
+            raise VaultError(str(e)) from None
 
     def get(self, serial: str) -> str | None:
-        """The code for `serial`, registered with `conf.remember_secret`; None when there is no item."""
+        """The code for `serial`, registered with `conf.remember_secret`; None when there is none."""
         if not safe_serial(serial):
             raise VaultError(UNSAFE)
-        r = self._run(["find-generic-password", "-a", serial, "-s", self.service, "-w"])
-        if r.returncode == _NOT_FOUND:
-            return None
-        if r.returncode != 0:
-            self._raise(r, "read")
-        out = r.stdout or ""
-        code = out[:-1] if out.endswith("\n") else out
-        if not code:
-            raise VaultError(f"the Keychain item for {conf.mask(serial)} is empty")
-        conf.remember_secret(code)
-        return code
+        code = self._load(self._path()).get(serial)
+        if code:
+            conf.remember_secret(code)
+        return code or None
 
     def put(self, serial: str, code: str) -> None:
-        """Store `code` for `serial`, updating any item there in place (`-U`)."""
-        if not safe_serial(serial):
+        """Store `code` for `serial`, replacing any code there."""
+        if not safe_serial(serial) or not safe_code(code):
             raise VaultError(UNSAFE)
-        if not safe_code(code):
-            raise VaultError(UNSAFE_CODE)
-        r = self._run(["add-generic-password", "-U", "-a", serial, "-s", self.service, "-T", str(self.binary), "-w", code], secret=code)
-        if r.returncode == _DUPLICATE:
-            raise VaultError(f"a Keychain item for {conf.mask(serial)} already exists and security could not update it")
-        if r.returncode != 0:
-            self._raise(r, "write", secret=code)
+        p = self._path()
+
+        def run(codes: dict[str, str]) -> None:
+            codes[serial] = code
+            self._save(p, codes)
+
+        self._change(p, run)
         conf.remember_secret(code)
 
     def delete(self, serial: str) -> bool:
-        """Remove the item for `serial`; False when there was none."""
+        """Remove the code for `serial`; False when there was none."""
         if not safe_serial(serial):
             raise VaultError(UNSAFE)
-        r = self._run(["delete-generic-password", "-a", serial, "-s", self.service])
-        if r.returncode == _NOT_FOUND:
-            return False
-        if r.returncode != 0:
-            self._raise(r, "delete")
-        return True
+        p = self._path()
+
+        def run(codes: dict[str, str]) -> bool:
+            if serial not in codes:
+                return False
+            del codes[serial]
+            self._save(p, codes)
+            return True
+
+        return self._change(p, run)
 
 
 def default_vault() -> Vault:
-    """The vault the commands use: the Keychain. Callers call it lazily, at use; the tests' `offline` fixture patches
-    it. With no `/usr/bin/security`, every call raises UnavailableVault."""
-    return SecurityVault()
+    """The vault the commands use: the credentials file in the config dir. Callers call it lazily, at use; the tests'
+    `offline` fixture patches it."""
+    return FileVault()

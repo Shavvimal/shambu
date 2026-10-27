@@ -25,10 +25,11 @@ FIXTURES = Path(__file__).parent / "fixtures"
 @pytest.fixture(autouse=True)
 def offline(monkeypatch, tmp_path_factory):
     """No test touches the LAN or this Mac's Bambu Studio config: the facade's printer read fails as an unreachable
-    printer does (the WARN fallback), BambuStudio.conf and printers.json are absent, `vault.default_vault()` returns
-    one `MemoryVault` per test and the runtime secret set starts and ends empty. A test that wants a report or a config
-    monkeypatches `Bambu.loaded_filaments`, `conf.CONF` or `conf.PRINTERS` again on top of this; a test that requests
-    `offline` by name seeds the vault through `offline.vault`."""
+    printer does (the WARN fallback), BambuStudio.conf is absent, printers.json and credentials.json are missing files
+    in a config dir that does not exist yet (so its 0700 creation runs), `vault.default_vault()` returns one
+    `MemoryVault` per test and the runtime secret and identifier sets start and end empty. A test that wants a report or
+    a config monkeypatches `Bambu.loaded_filaments`, `conf.CONF` or `conf.PRINTERS` again on top of this; a test that
+    requests `offline` by name seeds the vault through `offline.vault`."""
 
     def unreachable(self, *a, **k):
         raise PrinterError("no printer in tests")
@@ -36,7 +37,9 @@ def offline(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
     monkeypatch.setattr(conf, "CONF", tmp_path_factory.mktemp("conf") / "no-such-BambuStudio.conf")
     monkeypatch.setattr(conf, "CALIBRATION", tmp_path_factory.mktemp("calibration") / "no-such-calibration.json")
-    monkeypatch.setattr(conf, "PRINTERS", tmp_path_factory.mktemp("printers") / "no-such-printers.json")
+    config = tmp_path_factory.mktemp("config") / "shambu"  # not created: the first write makes it 0700
+    monkeypatch.setattr(conf, "PRINTERS", config / "printers.json")
+    monkeypatch.setattr(conf, "CREDENTIALS", config / "credentials.json")
     fake = vault.MemoryVault()
     monkeypatch.setattr(vault, "default_vault", lambda: fake)
     conf.forget_secrets()

@@ -781,13 +781,10 @@ PROFILE = profiles.Profile(
     name="x2d",
     serial=SERIAL,
     ip="10.0.0.9",
-    model=None,
     mode="lan",
-    code_source="keychain",
     insecure=False,
     added="2026-10-01T10:00:00Z",
     verified="2026-10-20T09:15:00Z",
-    revision=3,
 )
 NEW_IP = "10.0.0.42"
 
@@ -847,13 +844,14 @@ def _profile_svc(vault=None, **kw):
     v = vault if vault is not None else MemoryVault(items={SERIAL: SENTINEL})
     kw.setdefault("sources", (printer.ProfileCredentials(PROFILE, v),))
     kw.setdefault("timeout_s", None)
-    return printer.PrinterService(profile=PROFILE, profile_ip=PROFILE.ip, **kw)
+    kw.setdefault("ip", PROFILE.ip)  # the facade passes the profile's IP as `ip`
+    return printer.PrinterService(profile=PROFILE, **kw)
 
 
-def test_chain_order_one_shot_then_keychain_then_studio(monkeypatch, tmp_path):
+def test_chain_order_one_shot_then_profile_then_studio(monkeypatch, tmp_path):
     _service_conf(monkeypatch, tmp_path)  # Studio holds SENTINEL for SERIAL
     rec = _Rec()
-    keychain = printer.ProfileCredentials(PROFILE, MemoryVault(items={SERIAL: "KEYCHAIN-CODE-1"}))
+    stored = printer.ProfileCredentials(PROFILE, MemoryVault(items={SERIAL: "STORED-CODE-1"}))
     one_shot = printer.OneShotCredentials("FLAG-CODE-2")
     studio = printer.StudioCredentials()
 
@@ -863,11 +861,11 @@ def test_chain_order_one_shot_then_keychain_then_studio(monkeypatch, tmp_path):
         )
         return rec.seen[-1][1], res.resolved.code_source, res.resolved.serial_source
 
-    assert used(one_shot, keychain, studio) == ("FLAG-CODE-2", "flag", "profile")  # the one-shot names no serial
-    assert used(keychain, studio) == ("KEYCHAIN-CODE-1", "keychain", "profile")
+    assert used(one_shot, stored, studio) == ("FLAG-CODE-2", "flag", "profile")  # the one-shot names no serial
+    assert used(stored, studio) == ("STORED-CODE-1", "profile", "profile")
     assert used(printer.ProfileCredentials(PROFILE, MemoryVault()), studio) == (SENTINEL, "studio", "profile")
     assert used(studio) == (SENTINEL, "studio", "studio")
-    assert "FLAG-CODE-2" not in repr(one_shot) and "KEYCHAIN-CODE-1" not in repr(keychain)
+    assert "FLAG-CODE-2" not in repr(one_shot) and "STORED-CODE-1" not in repr(stored)
 
 
 def test_a_fake_source_satisfies_the_protocol_and_serial_comes_before_code():
@@ -889,7 +887,7 @@ def test_a_one_shot_code_with_no_serial_takes_the_serial_from_the_certificate():
     res = svc._bounded(svc._resolve_and_read)
     assert (res.resolved.serial, res.resolved.serial_source, res.resolved.code_source) == (SERIAL, "certificate", "flag")
     assert seen[0][0] == "10.0.0.9" and 0 < seen[0][1] <= 15.0
-    assert list(svc.timings) == ["cert", "credentials", "mqtt"]
+    assert list(svc.timings) == ["credentials", "mqtt"]  # the certificate read is inside the credentials step
 
 
 def test_no_serial_anywhere_is_a_setup_error():
@@ -933,30 +931,34 @@ def test_no_studio_config_with_an_ip_and_a_one_shot_code_reads():
     assert printer.StudioCredentials().serial() is None and printer.StudioCredentials().code(SERIAL) is None
 
 
-def test_the_keychain_step_is_timed_only_when_the_profile_source_is_consulted():
+def test_a_profile_read_times_only_credentials_and_mqtt():
     v = MemoryVault(items={SERIAL: SENTINEL})
-    svc = _profile_svc(v, ip="10.0.0.9", reader_factory=_Rec())
-    svc.status()
-    assert list(svc.timings) == ["keychain", "credentials", "mqtt"]
-    svc = _profile_svc(
-        v, ip="10.0.0.9", reader_factory=_Rec(), sources=(printer.OneShotCredentials(SENTINEL), printer.ProfileCredentials(PROFILE, v))
-    )
-    svc.status()
+    svc = _profile_svc(v, reader_factory=_Rec())
+    res = svc._bounded(svc._resolve_and_read)
     assert list(svc.timings) == ["credentials", "mqtt"]
+    assert (res.resolved.ip, res.resolved.ip_source, res.resolved.serial_source, res.resolved.code_source) == (
+        "10.0.0.9",
+        "profile",
+        "profile",
+        "profile",
+    )
+    svc = _profile_svc(v, ip=None, reader_factory=_Rec())  # no `ip`: the profile's IP is the fallback
+    assert svc._bounded(svc._resolve_and_read).resolved.ip_source == "profile"
+    svc = _profile_svc(v, ip="10.0.0.77", reader_factory=_Rec())  # the caller's override is a flag
+    assert svc._bounded(svc._resolve_and_read).resolved.ip_source == "flag"
 
 
-def test_a_profile_without_a_keychain_code_or_with_another_serial_gives_none():
+def test_a_profile_for_another_serial_gives_none():
     v = MemoryVault(items={SERIAL: SENTINEL})
-    assert printer.ProfileCredentials(dataclasses.replace(PROFILE, code_source="studio"), v).code(SERIAL) is None
     assert printer.ProfileCredentials(PROFILE, v).code("00X0OTHER000111") is None
     assert v.calls == []
 
 
-def test_a_keychain_failure_names_the_keychain():
-    v = MemoryVault(items={SERIAL: SENTINEL}, error=VaultError("security exited 51"))
+def test_a_vault_failure_names_the_credentials_file():
+    v = MemoryVault(items={SERIAL: SENTINEL}, error=VaultError("damaged"))
     with pytest.raises(PrinterError) as e:
         printer.ProfileCredentials(PROFILE, v).code(SERIAL)
-    assert str(e.value) == f"the Keychain could not give the access code for {conf.mask(SERIAL)}: security exited 51"
+    assert str(e.value) == f"the credentials file could not give the access code for {conf.mask(SERIAL)}: damaged"
 
 
 ROUTE = """   route to: default
@@ -1023,19 +1025,130 @@ def test_subnet_probe_wide_mask_or_runner_failure_gives_a_shortfall(caplog):
     assert any("no subnet scan" in r.getMessage() for r in caplog.records)
 
 
-def test_accept_skips_a_foreign_hit_and_goes_on_to_the_subnet_pass(monkeypatch, tmp_path):
+OTHER = "00X0OTHER000111"
+
+
+def _certs(table, seen=None):
+    def cert(ip, deadline):
+        if seen is not None:
+            seen.append((ip, deadline))
+        x = table.get(ip, OTHER)
+        if isinstance(x, Exception):
+            raise x
+        return x
+
+    return cert
+
+
+def test_a_foreign_hit_is_skipped_and_the_subnet_pass_runs(monkeypatch, tmp_path):
     _service_conf(monkeypatch, tmp_path)
     probe = lambda ip, port, t: ip in ("10.0.0.9", NEW_IP)  # noqa: E731 - 10.0.0.9 is another 8883 host
-    rec = _Rec()
+    rec, seen = _Rec(), []
     svc = printer.PrinterService(
+        serial=SERIAL,
         discovery=(printer.ArpProbe(runner=_runner(), probe=probe), printer.SubnetProbe(runner=_runner(), probe=probe)),
         reader_factory=rec,
-        accept=lambda h: h["ip"] == NEW_IP,
+        cert_serial=_certs({NEW_IP: SERIAL.lower()}, seen),  # any case
     )
     res = svc._bounded(svc._resolve_and_read)
     assert (res.resolved.ip, res.resolved.ip_source) == (NEW_IP, "subnet+8883")
-    assert rec.seen == [(NEW_IP, SENTINEL)]
-    assert list(svc.timings) == ["credentials", "arp", "probe", "subnet", "mqtt"]
+    assert rec.seen == [(NEW_IP, SENTINEL)]  # no credential to the foreign host
+    assert [ip for ip, _ in seen] == ["10.0.0.9", NEW_IP] and all(0 < d <= 15.0 for _, d in seen)
+    assert list(svc.timings) == ["credentials", "arp", "probe", "subnet", "identity", "mqtt"]
+
+
+def test_a_profile_without_an_ip_checks_each_hit():
+    hits = [{"ip": "10.0.0.50", "method": "arp+8883"}, {"ip": NEW_IP, "method": "arp+8883"}]
+    rec = _Rec()
+    prof = dataclasses.replace(PROFILE, ip=None)
+    svc = printer.PrinterService(
+        profile=prof,
+        sources=(printer.ProfileCredentials(prof, MemoryVault(items={SERIAL: SENTINEL})),),
+        reader_factory=rec,
+        discovery=(_Pass(hits),),
+        cert_serial=_certs({NEW_IP: SERIAL}),
+        timeout_s=None,
+    )
+    res = svc._bounded(svc._resolve_and_read)
+    assert (res.resolved.ip, res.resolved.serial_source) == (NEW_IP, "profile") and rec.seen == [(NEW_IP, SENTINEL)]
+
+
+def test_a_check_that_raises_skips_the_hit(caplog):
+    hits = [{"ip": "10.0.0.50", "method": "arp+8883"}, {"ip": NEW_IP, "method": "arp+8883"}]
+    cert = _certs({"10.0.0.50": PrinterError("TLS verification failed for the host at 10.0.0.50: x"), NEW_IP: SERIAL})
+    svc = printer.PrinterService(
+        serial=SERIAL, sources=(printer.OneShotCredentials(SENTINEL),), discovery=(_Pass(hits),), reader_factory=_Rec(), cert_serial=cert
+    )
+    with caplog.at_level("INFO", logger="shambu.printer"):
+        assert svc._bounded(svc._resolve_and_read).resolved.ip == NEW_IP
+    assert any("discovery hit skipped: TLS verification failed" in r.getMessage() for r in caplog.records)
+
+
+def test_insecure_takes_the_first_hit_without_a_check():
+    def no_check(*a):
+        raise AssertionError("no certificate check under --insecure")
+
+    hits = [{"ip": "10.0.0.50", "method": "arp+8883"}, {"ip": NEW_IP, "method": "arp+8883"}]
+    svc = printer.PrinterService(
+        serial=SERIAL,
+        insecure=True,
+        sources=(printer.OneShotCredentials(SENTINEL),),
+        discovery=(_Pass(hits),),
+        reader_factory=_Rec(report={**full(), "_topic": TOPIC}),
+        cert_serial=no_check,
+    )
+    res = svc._bounded(svc._resolve_and_read)
+    assert res.resolved.ip == "10.0.0.50" and "identity" not in svc.timings
+    svc.insecure, svc.check_candidates = False, False  # the check can be turned off
+    assert svc._bounded(svc._resolve_and_read).resolved.ip == "10.0.0.50"
+
+
+def test_a_studio_serial_keeps_the_first_hit_rule(monkeypatch, tmp_path):
+    """The no-profile path is 0.4.0's: no certificate check, the same steps."""
+    _service_conf(monkeypatch, tmp_path)
+
+    def no_check(*a):
+        raise AssertionError("no certificate check on the Studio path")
+
+    svc = printer.PrinterService(
+        discovery=(_Pass([{"ip": "10.0.0.9", "method": "arp+8883"}]),), reader_factory=_Rec(), cert_serial=no_check
+    )
+    assert svc.status().ip == "10.0.0.9" and list(svc.timings) == ["credentials", "fake", "mqtt"]
+
+
+def test_slow_identity_checks_time_out_in_the_identity_step():
+    rec = _Rec()
+
+    def slow(ip, deadline):
+        time.sleep(0.4)
+        return OTHER
+
+    hits = [{"ip": f"10.0.0.{i}", "method": "arp+8883"} for i in range(50, 60)]
+    svc = printer.PrinterService(
+        serial=SERIAL,
+        sources=(printer.OneShotCredentials(SENTINEL),),
+        discovery=(_Pass(hits),),
+        reader_factory=rec,
+        cert_serial=slow,
+        timeout_s=0.3,
+    )
+    with pytest.raises(PrinterError) as e:
+        svc.status()
+    assert str(e.value) == "timed out after 0.3 s in identity"
+    time.sleep(0.6)
+    assert rec.seen == []  # the code never left
+
+
+def test_the_identity_checks_stop_when_the_deadline_is_spent(monkeypatch):
+    seen = []
+    hits = [{"ip": f"10.0.0.{i}", "method": "arp+8883"} for i in range(50, 53)]
+    svc = printer.PrinterService(serial=SERIAL, sources=(printer.OneShotCredentials(SENTINEL),), discovery=(_Pass(hits),), timeout_s=5.0)
+    svc.cert_serial = _certs({}, seen)
+    left = iter([1.0, 0.0, -1.0])
+    monkeypatch.setattr(svc, "_left", lambda a: next(left))
+    with pytest.raises(PrinterError, match=r"1 host\(s\) answered but none is printer"):
+        svc.resolve()
+    assert [ip for ip, _ in seen] == ["10.0.0.50"]
 
 
 def test_an_arp_hit_ends_discovery_before_the_subnet_pass(monkeypatch, tmp_path):
@@ -1052,7 +1165,9 @@ def test_an_arp_hit_ends_discovery_before_the_subnet_pass(monkeypatch, tmp_path)
 
 def test_no_accepted_hit_keeps_the_no_host_text(monkeypatch, tmp_path):
     _service_conf(monkeypatch, tmp_path)
-    svc = printer.PrinterService(discovery=(_Pass([{"ip": "10.0.0.9", "method": "arp+8883"}]),), accept=lambda h: False, timeout_s=None)
+    svc = printer.PrinterService(
+        serial=SERIAL, discovery=(_Pass([{"ip": "10.0.0.9", "method": "arp+8883"}]),), cert_serial=_certs({}), timeout_s=None
+    )
     with pytest.raises(PrinterError) as e:
         svc.status()
     assert str(e.value).startswith("no host on this LAN answers on port 8883 (1 host(s) answered but none is printer ")
@@ -1112,7 +1227,7 @@ def cert_env(monkeypatch, tmp_path):
 def test_certificate_serial_reads_the_cn_without_sni(cert_env):
     assert printer.certificate_serial("10.0.0.9", deadline=1.5) == SERIAL
     s = cert_env.seen
-    assert s["addr"] == ("10.0.0.9", 8883) and s["connect"] == 1.5 and s["handshake"] == 1.5
+    assert s["addr"] == ("10.0.0.9", 8883) and s["connect"] == 1.5 and 1.4 < s["handshake"] <= 1.5
     assert s["wrap_kw"] == {"server_hostname": None}  # no SNI
     assert (s["check_hostname"], s["verify_mode"]) == (False, ssl.CERT_REQUIRED) and s["closed"]
     printer.certificate_serial("10.0.0.9")
@@ -1138,6 +1253,25 @@ def test_certificate_serial_error_texts(cert_env, monkeypatch, tmp_path):
     monkeypatch.setattr(printer, "CA_FILE", tmp_path / "missing.cer")
     with pytest.raises(PrinterError, match="CA bundle not found"):
         printer.certificate_serial("10.0.0.9")
+
+
+def test_certificate_serial_handshake_gets_what_the_connect_left(cert_env, monkeypatch):
+    real = printer.socket.create_connection
+
+    def slow_connect(addr, timeout=None):
+        time.sleep(0.3)
+        return real(addr, timeout)
+
+    monkeypatch.setattr(printer.socket, "create_connection", slow_connect)
+    printer.certificate_serial("10.0.0.9", deadline=1.0)
+    assert cert_env.seen["connect"] == 1.0 and cert_env.seen["handshake"] <= 0.71
+
+
+def test_certificate_serial_handshake_timeout_text(cert_env):
+    cert_env.wrap_exc = TimeoutError("_ssl.c:999: The handshake operation timed out")
+    with pytest.raises(PrinterError) as e:
+        printer.certificate_serial("10.0.0.9", deadline=1.0)
+    assert str(e.value) == "TLS handshake with 10.0.0.9:8883 timed out" and cert_env.seen["closed"]
 
 
 # ---------------------------------------------------------------------------- refused login
@@ -1169,7 +1303,7 @@ def test_a_refused_profile_login_gives_the_mode_hint(fake_paho, mode, want, abse
     with pytest.raises(printer.LoginRefused) as e:
         svc.status()
     text = str(e.value)
-    assert "(source: the Keychain, profile x2d)\n" in text and want in text and absent not in text
+    assert "(source: the credentials file, profile x2d)\n" in text and want in text and absent not in text
 
 
 def test_error_category_messages_are_pinned():
@@ -1180,112 +1314,36 @@ def test_error_category_messages_are_pinned():
     assert [c for c, _, _ in printer.ERROR_CATEGORIES] == ["timeout", "tls", "login", "discovery", "identity", "report", "connect", "setup"]
 
 
-# ---------------------------------------------------------------------------- typed read result and after_read
-def test_after_read_runs_on_the_callers_thread_for_every_read(monkeypatch, tmp_path):
-    _service_conf(monkeypatch, tmp_path)
-    got = []
-    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=_Rec(), after_read=lambda r: got.append((threading.get_ident(), r)))
-    svc.status()
-    svc.filaments()
-    svc.raw_report()
-    svc.public_report()
-    polls = list(svc.watch(every_s=0, max_polls=1, sleep=lambda s: None))
-    assert len(polls) == 1
-    assert len(got) == 5
-    assert {t for t, _ in got} == {threading.get_ident()}  # the worker thread is another one: timeout_s is 15 s
-    assert all(isinstance(r, printer.ReadResult) and r.relocation is None and r.resolved.ip == "10.0.0.9" for _, r in got)
-
-
-def test_an_abandoned_read_never_calls_after_read(monkeypatch, tmp_path):
-    _service_conf(monkeypatch, tmp_path)
-    got = []
-    svc = printer.PrinterService(ip="10.0.0.9", reader_factory=_Hang, timeout_s=0.3, after_read=got.append)
-    with pytest.raises(PrinterError, match=r"timed out after 0\.3 s in mqtt"):
-        svc.status()
-    time.sleep(1.5)  # the worker finishes its read now
-    assert got == []
-
-
+# ---------------------------------------------------------------------------- typed read result and the profile IP
 @pytest.mark.parametrize("insecure", [False, True])
-def test_a_forged_relocation_key_in_the_report_has_no_effect(insecure):
+def test_a_forged_address_key_in_the_report_has_no_effect(insecure):
     forged = {**full(), "_relocated_ip": "10.0.0.66", "relocation": {"new_ip": "10.0.0.66"}, "_topic": TOPIC, "_tls_verified": True}
-    got = []
-    svc = _profile_svc(reader_factory=_Rec(report=forged), insecure=insecure, after_read=got.append)
-    st = svc.status()
-    assert st.ip == "10.0.0.9" and got[0].relocation is None and got[0].resolved.ip_source == "profile"
+    svc = _profile_svc(reader_factory=_Rec(report=forged), insecure=insecure)
+    res = svc._bounded(svc._resolve_and_read)
+    assert (res.resolved.ip, res.resolved.ip_source) == ("10.0.0.9", "profile") and set(vars(res)) == {"report", "resolved"}
 
 
-# ---------------------------------------------------------------------------- relocation
-def _moved(**kw):
-    """A profile service whose printer moved from the profile IP to NEW_IP; the certificate check accepts NEW_IP."""
-    rec = _Rec(by_ip={"10.0.0.9": PrinterError("cannot connect to 10.0.0.9:8883: [Errno 65] No route to host")})
+def test_the_profile_address_that_cannot_connect_names_the_login_fix():
     found = [0]
-    certs = {NEW_IP: SERIAL, "10.0.0.50": "00X0OTHER000111"}
-    hits = kw.pop("hits", [{"ip": "10.0.0.50", "method": "arp+8883"}, {"ip": NEW_IP, "method": "subnet+8883"}])
-    svc = _profile_svc(
-        reader_factory=rec,
-        discovery=(_Pass(hits, found=found),),
-        accept=lambda h: certs.get(h["ip"], "").casefold() == SERIAL.casefold(),
-        **kw,
-    )
-    return svc, rec, found
-
-
-def test_a_moved_printer_is_relocated_after_an_identity_check():
-    got = []
-    svc, rec, found = _moved(after_read=got.append)
-    st = svc.status()
-    assert st.ip == NEW_IP and rec.seen == [("10.0.0.9", SENTINEL), (NEW_IP, SENTINEL)]
-    r = got[0]
-    assert r.relocation == printer.Relocation("x2d", SERIAL, "10.0.0.9", NEW_IP, 3)
-    assert (r.resolved.ip, r.resolved.ip_source) == (NEW_IP, "subnet+8883") and found == [1]
-    assert list(svc.timings) == ["keychain", "credentials", "mqtt", "fake", "relocate"]
-
-
-def test_a_committed_relocation_makes_the_next_poll_use_the_new_ip():
-    def commit(r):
-        if r.relocation is not None:
-            svc.profile_ip = r.relocation.new_ip
-
-    svc, rec, found = _moved(after_read=commit)
-    svc.timeout_s = 5.0
-    polls = list(svc.watch(every_s=0, max_polls=2, until_idle=False, sleep=lambda s: None))
-    assert [p.ip for p in polls] == [NEW_IP, NEW_IP]
-    assert found == [1]  # no rediscovery on the second poll
-    assert rec.seen[-1] == (NEW_IP, SENTINEL)
-
-
-def test_no_matching_host_gives_the_original_error_and_the_profile_address():
-    svc, rec, _ = _moved(hits=[{"ip": "10.0.0.50", "method": "arp+8883"}])
+    rec = _Rec(by_ip={"10.0.0.9": PrinterError("cannot connect to 10.0.0.9:8883: [Errno 65] No route to host")})
+    svc = _profile_svc(reader_factory=rec, discovery=(_Pass([{"ip": NEW_IP, "method": "arp+8883"}], found=found),))
     with pytest.raises(PrinterError) as e:
         svc.status()
     assert str(e.value) == (
-        "cannot connect to 10.0.0.9:8883: [Errno 65] No route to host The profile x2d expected 10.0.0.9 (last verified 09:15)."
+        "cannot connect to 10.0.0.9:8883: [Errno 65] No route to host The profile x2d expected this address (last login 09:15); "
+        "run: shambu printer login --printer x2d --ip <new ip>, or shambu printer discover"
     )
-    assert rec.seen == [("10.0.0.9", SENTINEL)]  # no credential to the foreign host
-
-
-def test_a_failed_second_read_gives_the_original_error():
-    svc, rec, _ = _moved()
-    rec.by_ip[NEW_IP] = PrinterError("connected to 10.0.0.42 but no report on device/x/report within 8 s")
-    with pytest.raises(
-        PrinterError, match=r"^cannot connect to 10\.0\.0\.9:8883: .* The profile x2d expected 10\.0\.0\.9 \(last verified 09:15\)\.$"
-    ):
+    assert printer.error_category(e.value)[0] == "connect" and found == [0]  # no rediscovery, nothing written
+    svc.profile = dataclasses.replace(PROFILE, verified=None)
+    with pytest.raises(PrinterError, match=r"\(last login never\)"):
         svc.status()
-
-
-def test_relocation_is_skipped_under_insecure_and_off_the_profile_path():
-    svc, _rec, found = _moved(insecure=True)
-    with pytest.raises(PrinterError) as e:
+    svc = _profile_svc(ip="10.0.0.77", reader_factory=_Rec(by_ip={"10.0.0.77": PrinterError("cannot connect to 10.0.0.77:8883: x")}))
+    with pytest.raises(PrinterError) as e:  # the caller's --ip is not the profile's
         svc.status()
-    assert str(e.value).startswith("cannot connect") and "The profile" not in str(e.value) and found == [0]
-    svc, _rec, found = _moved(ip="10.0.0.9")  # an explicit --ip is the caller's: never relocated
-    with pytest.raises(PrinterError, match=r"^cannot connect"):
-        svc.status()
-    assert found == [0]
+    assert "The profile" not in str(e.value)
 
 
-def test_prepare_secrets_registers_a_keychain_code_without_network():
+def test_prepare_secrets_registers_a_stored_code_without_network():
     conf.forget_secrets()
     v = MemoryVault(items={SERIAL: SENTINEL})
 
@@ -1299,5 +1357,5 @@ def test_prepare_secrets_registers_a_keychain_code_without_network():
     printer.PrinterService(sources=(printer.ProfileCredentials(PROFILE, MemoryVault()),), cert_serial=no_network).prepare_secrets()
     printer.PrinterService(sources=(), cert_serial=no_network).prepare_secrets()  # no serial: nothing, no error
     assert SENTINEL not in conf.sensitive_values()
-    with pytest.raises(PrinterError, match="Keychain"):
+    with pytest.raises(PrinterError, match="credentials file"):
         _profile_svc(MemoryVault(error=VaultError("locked"))).prepare_secrets()

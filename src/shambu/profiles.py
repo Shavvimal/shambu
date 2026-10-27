@@ -1,12 +1,11 @@
 """Printer profiles: the schema, the validator and the pure Profile/ProfileSet types for printers.json. No I/O (conf.py
 reads and writes the file), no access code (vault.py), no network.
 
-A profile names one printer: its serial, its last known IP, its model, the connection mode, where its code is kept
-(`keychain`, `studio` or unknown), whether the TLS check is skipped, when it was added and last verified, and a
-revision that every change increments (so a stale relocation proposal is detected even when the IP is the same).
-`validate_profile` and `validate_document` refuse anything else with the fixed `REFUSAL` text: no extra key, no
-identifier (IP, host name, masked serial) or known secret in a name, typed fields only. A refusal never echoes the
-refused content.
+A profile names one printer: its serial, its last known IP, the connection mode, whether the TLS check is skipped, when
+it was added and when its last successful `login` was (`verified`). The model, the firmware and where the code is kept
+are not stored: shambu derives them when it needs them. `validate_profile` and `validate_document` refuse anything else
+with the fixed `REFUSAL` text: no extra key, no identifier (IP, host name, masked serial), serial or known secret in a
+name, no IPv6 scope id, typed fields only. A refusal never echoes the refused content.
 """
 
 from __future__ import annotations
@@ -14,24 +13,24 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 
 from . import conf
 from .errors import BambuError
 
 PROFILES_VERSION = 1
 MODES = ("lan", "cloud", "unknown")
-CODE_SOURCES = ("keychain", "studio")
 REFUSAL = "a printer profile must match the schema: fixed fields, typed values, no identifier or secret in a name"
 CLASH = "another printer profile already has that name"
 UNKNOWN = "no printer profile has that name"
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 _SERIAL = re.compile(r"[A-Za-z0-9]{8,32}")
-_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
-_KEYS = frozenset({"name", "serial", "ip", "model", "mode", "code_source", "insecure", "added", "verified", "revision"})
+_STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_KEYS = frozenset({"name", "serial", "ip", "mode", "insecure", "added", "verified"})
 _DOC_KEYS = frozenset({"version", "default", "printers"})
-_MODEL_MAX = 40
 
 identifying = conf.identifying  # one detector (conf.py) for the profile names and every outward text
 
@@ -41,11 +40,14 @@ class ProfileError(BambuError):
 
 
 def _holds_secret(v: str, secrets: Iterable[str]) -> bool:
-    return any(s and s in v for s in secrets)
+    """True when any non-empty secret is in `v`, case-insensitively."""
+    low = v.casefold()
+    return any(s and s.casefold() in low for s in secrets)
 
 
 def _ip(v) -> bool:
-    if not isinstance(v, str):
+    """An IPv4 or IPv6 address with no scope id (`%`)."""
+    if not isinstance(v, str) or "%" in v:
         return False
     try:
         ipaddress.ip_address(v)
@@ -55,54 +57,50 @@ def _ip(v) -> bool:
 
 
 def _stamp(v) -> bool:
-    return isinstance(v, str) and _STAMP.fullmatch(v) is not None
+    """A UTC time stamp `YYYY-MM-DDTHH:MM:SSZ` in ASCII digits that is a real date and time."""
+    if not isinstance(v, str) or _STAMP.fullmatch(v) is None:
+        return False
+    try:
+        datetime.strptime(v, _STAMP_FORMAT)
+    except ValueError:
+        return False
+    return True
 
 
 def validate_profile(d, secrets: Iterable[str] = ()) -> None:
-    """Raises ProfileError(REFUSAL) unless `d` is one printer profile with exactly the schema's keys and valid values."""
+    """Raises ProfileError(REFUSAL) unless `d` is one printer profile with exactly the schema's keys and valid values.
+    `name` and `ip` must hold none of `secrets`; `name` must also hold neither the serial nor its mask (any case)."""
     secrets = tuple(secrets)
     if not isinstance(d, dict) or set(d) != _KEYS:
         raise ProfileError(REFUSAL)
-    name, serial, ip, model = d["name"], d["serial"], d["ip"], d["model"]
+    name, serial, ip = d["name"], d["serial"], d["ip"]
+    if not isinstance(serial, str) or _SERIAL.fullmatch(serial) is None:
+        raise ProfileError(REFUSAL)
     ok = (
         isinstance(name, str)
         and _NAME.fullmatch(name) is not None
         and not identifying(name)
-        and not _holds_secret(name, secrets)
-        and isinstance(serial, str)
-        and _SERIAL.fullmatch(serial) is not None
-        and (ip is None or _ip(ip))
-        and (
-            model is None
-            or (
-                isinstance(model, str)
-                and 0 < len(model) <= _MODEL_MAX
-                and model.isprintable()
-                and not identifying(model)
-                and not _holds_secret(model, secrets)
-            )
-        )
+        and not _holds_secret(name, (*secrets, serial, conf.mask(serial)))
+        and (ip is None or (_ip(ip) and not _holds_secret(ip, secrets)))
         and d["mode"] in MODES
-        and (d["code_source"] is None or d["code_source"] in CODE_SOURCES)
         and type(d["insecure"]) is bool
         and _stamp(d["added"])
         and (d["verified"] is None or _stamp(d["verified"]))
-        and type(d["revision"]) is int
-        and d["revision"] >= 0
     )
     if not ok:
         raise ProfileError(REFUSAL)
 
 
-def validate_document(doc) -> None:
+def validate_document(doc, secrets: Iterable[str] = ()) -> None:
     """Raises ProfileError(REFUSAL) unless `doc` is a version-1 printers document: valid profiles, unique names and
     serials, and a default that is None or the name of an entry."""
+    secrets = tuple(secrets)
     if not isinstance(doc, dict) or set(doc) != _DOC_KEYS:
         raise ProfileError(REFUSAL)
     if type(doc["version"]) is not int or doc["version"] != PROFILES_VERSION or not isinstance(doc["printers"], list):
         raise ProfileError(REFUSAL)
     for d in doc["printers"]:
-        validate_profile(d)
+        validate_profile(d, secrets)
     names = [d["name"] for d in doc["printers"]]
     serials = [d["serial"] for d in doc["printers"]]
     if len(set(names)) != len(names) or len(set(serials)) != len(serials):
@@ -113,23 +111,21 @@ def validate_document(doc) -> None:
 
 @dataclass(frozen=True)
 class Profile:
-    """One printer: its serial, last known IP, model, mode, where its code is kept, and the bookkeeping fields."""
+    """One printer: its serial, last known IP, mode, TLS flag, when it was added and when its last successful `login`
+    was (`verified`). The serial and the IP stay out of the repr."""
 
     name: str
-    serial: str
-    ip: str | None
-    model: str | None
+    serial: str = field(repr=False)
+    ip: str | None = field(repr=False)
     mode: str
-    code_source: str | None
     insecure: bool
     added: str
     verified: str | None
-    revision: int = 0
 
     @classmethod
-    def from_dict(cls, d) -> Profile:
+    def from_dict(cls, d, secrets: Iterable[str] = ()) -> Profile:
         """The profile in `d`, validated first (ProfileError on any refusal)."""
-        validate_profile(d)
+        validate_profile(d, secrets)
         return cls(**d)
 
     def to_dict(self) -> dict:
@@ -138,13 +134,10 @@ class Profile:
             "name": self.name,
             "serial": self.serial,
             "ip": self.ip,
-            "model": self.model,
             "mode": self.mode,
-            "code_source": self.code_source,
             "insecure": self.insecure,
             "added": self.added,
             "verified": self.verified,
-            "revision": self.revision,
         }
 
     def public(self) -> dict:
@@ -173,11 +166,11 @@ class ProfileSet:
             return self.get(self.default) if self.default is not None else None
         return self.get(name)
 
-    def upsert(self, p: Profile, default: bool = False) -> ProfileSet:
-        """The set with `p` added, or replacing the profile with the same serial whatever its name (its `added` kept,
-        its `revision` incremented). ProfileError when another serial already has the name. The first profile
-        becomes the default; `default=True` makes `p` the default."""
-        validate_profile(p.to_dict())
+    def upsert(self, p: Profile, default: bool = False, secrets: Iterable[str] = ()) -> ProfileSet:
+        """The set with `p` added, or replacing the profile with the same serial whatever its name (its `added` kept).
+        ProfileError(CLASH) when another serial already has the name, ProfileError(REFUSAL) when `p` does not validate
+        against `secrets`. The first profile becomes the default; `default=True` makes `p` the default."""
+        validate_profile(p.to_dict(), secrets)
         old = self.by_serial(p.serial)
         clash = self.get(p.name)
         if clash is not None and clash.serial != p.serial:
@@ -185,7 +178,7 @@ class ProfileSet:
         if old is None:
             printers = (*self.printers, p)
         else:
-            p = replace(p, added=old.added, revision=old.revision + 1)
+            p = replace(p, added=old.added)
             printers = tuple(p if x.serial == p.serial else x for x in self.printers)
         new_default = self.default
         if old is not None and self.default == old.name:
@@ -206,9 +199,9 @@ class ProfileSet:
         return ProfileSet(default=new_default, printers=printers)
 
     @classmethod
-    def from_dict(cls, doc) -> ProfileSet:
-        """The set in a printers document, validated first (ProfileError on any refusal)."""
-        validate_document(doc)
+    def from_dict(cls, doc, secrets: Iterable[str] = ()) -> ProfileSet:
+        """The set in a printers document, validated first against `secrets` (ProfileError on any refusal)."""
+        validate_document(doc, secrets)
         return cls(default=doc["default"], printers=tuple(Profile(**d) for d in doc["printers"]))
 
     def to_dict(self) -> dict:

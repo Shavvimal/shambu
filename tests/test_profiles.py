@@ -24,6 +24,7 @@ from shambu.profiles import (
 SERIAL = "00X0TEST0000999"
 SERIAL2 = "00X0TEST0000888"
 SENTINEL = "SENTINEL-CODE-8812"
+FULLWIDTH_YEAR = "".join(chr(0xFF10 + int(c)) for c in "2026")  # \d matches these; [0-9] does not
 
 
 def entry(**over) -> dict:
@@ -31,13 +32,10 @@ def entry(**over) -> dict:
         "name": "desk",
         "serial": SERIAL,
         "ip": "10.0.0.9",
-        "model": "Bambu Lab X2D",
         "mode": "lan",
-        "code_source": "keychain",
         "insecure": False,
         "added": "2026-10-27T09:00:00Z",
         "verified": None,
-        "revision": 0,
     }
     return d | over
 
@@ -47,14 +45,14 @@ def doc(*printers: dict, default: str | None = "desk", version=PROFILES_VERSION)
 
 
 def test_profile_round_trip():
-    d = entry(verified="2026-10-27T09:05:00Z", revision=3, ip="fe80::1", code_source=None, mode="unknown")
+    d = entry(verified="2026-10-27T09:05:00Z", ip="fe80::1", mode="unknown")
     p = Profile.from_dict(d)
     assert p.to_dict() == d
     assert p.public()["serial"] == conf.mask(SERIAL) and p.public()["ip"] == "fe80::1"
 
 
 def test_profile_set_round_trip():
-    d = doc(entry(), entry(name="garage", serial=SERIAL2, ip=None, model=None, mode="cloud", insecure=True))
+    d = doc(entry(), entry(name="garage", serial=SERIAL2, ip=None, mode="cloud", insecure=True))
     ps = ProfileSet.from_dict(d)
     assert ps.to_dict() == d
     assert ps.get("garage").serial == SERIAL2 and ps.by_serial(SERIAL).name == "desk"
@@ -84,22 +82,21 @@ def test_an_empty_document_is_valid():
         ({"ip": "10.0.0.9:8883"}, "10.0.0.9"),
         ({"ip": "printer.local"}, "printer.local"),
         ({"ip": 167772169}, "167772169"),
-        ({"model": "X2D at 10.0.0.9"}, "10.0.0.9"),
-        ({"model": "x2d.local"}, "x2d.local"),
-        ({"model": "m" * 41}, "m" * 41),
-        ({"model": "X2D\n"}, "X2D\n"),
-        ({"model": ""}, "never-in-text"),
+        ({"ip": "fe80::1%SENTINEL-CODE-8812"}, SENTINEL),  # no IPv6 scope id
+        ({"ip": "fe80::1%en0"}, "en0"),
+        ({"name": SERIAL}, SERIAL),
+        ({"name": f"x{SERIAL.lower()}"}, SERIAL.lower()),
+        ({"name": "desk-" + conf.mask(SERIAL)}, "desk-"),
+        ({"added": FULLWIDTH_YEAR + "-10-27T09:00:00Z"}, FULLWIDTH_YEAR),  # full-width digits
+        ({"added": "2026-13-27T09:00:00Z"}, "2026-13"),  # month 13
+        ({"verified": "2026-02-30T09:00:00Z"}, "2026-02-30"),
         ({"mode": "wifi"}, "wifi"),
         ({"mode": None}, "never-in-text"),
-        ({"code_source": "vault"}, "vault"),
         ({"insecure": 1}, "never-in-text"),
         ({"insecure": "false"}, "never-in-text"),
         ({"added": "2026-10-27 09:00:00"}, "2026-10-27"),
         ({"added": None}, "never-in-text"),
         ({"verified": "yesterday"}, "yesterday"),
-        ({"revision": True}, "never-in-text"),
-        ({"revision": -1}, "never-in-text"),
-        ({"revision": 1.0}, "never-in-text"),
     ],
 )
 def test_validate_profile_refuses(change, refused):
@@ -116,14 +113,34 @@ def test_validate_profile_refuses_a_missing_key_and_a_non_dict():
             validate_profile(bad)
 
 
-@pytest.mark.parametrize("field", ["name", "model"])
-def test_a_known_secret_in_a_name_is_refused(field):
-    d = entry(**{field: f"desk-{SENTINEL}"})
+def test_a_known_secret_in_a_name_or_ip_is_refused():
+    d = entry(name="desk-abcd12")
     validate_profile(d)  # no secret given: only the shape is checked
-    with pytest.raises(ProfileError) as e:
-        validate_profile(d, secrets=(SENTINEL,))
-    assert str(e.value) == REFUSAL and SENTINEL not in str(e.value)
+    for secrets in (("abcd12",), ("ABCD12",)):  # any case
+        with pytest.raises(ProfileError) as e:
+            validate_profile(d, secrets=secrets)
+        assert str(e.value) == REFUSAL and "abcd12" not in str(e.value)
+    with pytest.raises(ProfileError):
+        validate_profile(entry(ip="10.0.0.99"), secrets=("0.99",))
     validate_profile(entry(), secrets=("", SENTINEL))  # an empty secret matches nothing
+
+
+def test_validate_document_and_upsert_pass_the_secrets_through():
+    ok = doc(entry(name="desk-abcd12"), default=None)
+    validate_document(ok)
+    with pytest.raises(ProfileError):
+        validate_document(ok, secrets=("abcd12",))
+    with pytest.raises(ProfileError):
+        ProfileSet.from_dict(ok, secrets=("abcd12",))
+    with pytest.raises(ProfileError, match=f"^{REFUSAL}$"):
+        ProfileSet().upsert(Profile.from_dict(entry(name="desk-abcd12")), secrets=("abcd12",))
+
+
+def test_repr_holds_neither_the_serial_nor_the_ip():
+    p = Profile.from_dict(entry())
+    ps = ProfileSet().upsert(p)
+    for text in (repr(p), repr(ps)):
+        assert SERIAL not in text and "10.0.0.9" not in text and "desk" in text
 
 
 @pytest.mark.parametrize(
@@ -159,15 +176,14 @@ def test_the_first_profile_becomes_the_default_and_selected_none_returns_it():
     assert ps.upsert(Profile.from_dict(entry(name="garage", serial=SERIAL2)), default=True).default == "garage"
 
 
-def test_upsert_by_serial_keeps_added_and_increments_revision():
+def test_upsert_by_serial_keeps_added():
     ps = ProfileSet().upsert(Profile.from_dict(entry()))
-    again = Profile.from_dict(entry(name="office", ip="10.0.0.10", added="2026-10-28T10:00:00Z", revision=0))
+    again = Profile.from_dict(entry(name="office", ip="10.0.0.10", added="2026-10-28T10:00:00Z", verified="2026-10-28T10:00:00Z"))
     ps2 = ps.upsert(again)
     (p,) = ps2.printers
-    assert (p.name, p.ip, p.added, p.revision) == ("office", "10.0.0.10", "2026-10-27T09:00:00Z", 1)
+    assert (p.name, p.ip, p.added, p.verified) == ("office", "10.0.0.10", "2026-10-27T09:00:00Z", "2026-10-28T10:00:00Z")
     assert ps2.default == "office"  # the renamed printer stays the default
-    assert ps2.upsert(again).printers[0].revision == 2
-    assert ps.printers[0].revision == 0  # the old set is unchanged
+    assert ps.printers[0].name == "desk"  # the old set is unchanged
 
 
 def test_upsert_refuses_a_name_another_serial_has():
@@ -330,9 +346,12 @@ def test_select_profile_default_by_name_and_unknown(tmp_path):
     assert conf.select_profile(None) is None  # no file at conf.PRINTERS
 
 
-def test_sensitive_values_hold_every_profile_serial_and_its_mask(tmp_path, monkeypatch):
+def test_load_registers_every_profile_serial_and_its_mask(tmp_path, monkeypatch):
     conf.save_profiles(two())
+    conf.forget_secrets()
     conf.remember_secret(SENTINEL)
+    assert SERIAL not in conf.sensitive_values()
+    conf.load_profiles()
     vals = conf.sensitive_values()  # no Studio config
     for s in (SERIAL, SERIAL2, conf.mask(SERIAL), conf.mask(SERIAL2), SENTINEL):
         assert s in vals
@@ -345,12 +364,98 @@ def test_sensitive_values_hold_every_profile_serial_and_its_mask(tmp_path, monke
     for s in (SERIAL, SERIAL2, conf.mask(SERIAL), "00X0STUDIO00777", conf.mask("00X0STUDIO00777"), "abcd1234", SENTINEL):
         assert s in vals
     assert SERIAL not in conf.secret_values() and conf.mask(SERIAL) not in conf.secret_values()  # codes only
+    conf.forget_secrets()
+    assert SERIAL not in conf.sensitive_values()
 
 
-def test_sensitive_values_survive_a_damaged_profile_file():
-    conf.PRINTERS.write_text("{damaged")
+def test_sensitive_values_do_not_read_the_profile_file(monkeypatch):
+    def boom(p):
+        raise AssertionError("sensitive_values must not read printers.json")
+
+    monkeypatch.setattr(conf, "_read_profiles", boom)
     conf.remember_secret(SENTINEL)
     assert conf.sensitive_values() == [SENTINEL]
+
+
+def test_a_hand_edited_name_holding_a_runtime_secret_refuses_to_load(tmp_path):
+    p = tmp_path / "printers.json"
+    p.write_text(json.dumps(doc(entry(name="desk-xy12"), default=None)))
+    assert conf.load_profiles(p).printers[0].name == "desk-xy12"
+    conf.remember_secret("xy12")
+    with pytest.raises(ConfError) as e:
+        conf.load_profiles(p)
+    assert str(e.value) == REFUSAL and "xy12" not in str(e.value)
+    with pytest.raises(ConfError, match=f"^{REFUSAL}$"):
+        conf.save_profiles(ProfileSet.from_dict(doc(entry(name="desk-xy12"), default=None)), tmp_path / "other.json")
+
+
+@pytest.mark.parametrize("studio", [{"access_code": ["broken"]}, ["a", "list", "root"], {"access_code": {"S": 5}}, {"app": "x"}])
+def test_a_malformed_studio_config_never_breaks_scrubbing(tmp_path, monkeypatch, studio):
+    p = tmp_path / "BambuStudio.conf"
+    p.write_text(json.dumps(studio))
+    monkeypatch.setattr(conf, "CONF", p)
+    conf.remember_secret(SENTINEL)
+    assert conf.sensitive_values() == [SENTINEL] == conf.secret_values()
+    assert conf.scrub_text(f"x {SENTINEL}") == "x <redacted>"
+
+
+def test_access_code_registers_the_code():
+    assert not conf.CONF.exists()  # the offline fixture
+    assert conf.access_code(SERIAL, {"access_code": {SERIAL: "abcd1234"}}) == "abcd1234"
+    assert conf.scrub_text("code abcd1234 here") == "code <redacted> here"
+
+
+# ---------------------------------------------------------------------------- the config dir and the helpers
+def test_config_dir_rule(monkeypatch, tmp_path):
+    monkeypatch.setenv("SHAMBU_CONFIG_DIR", str(tmp_path / "own"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert conf.config_dir() == tmp_path / "own"
+    monkeypatch.setenv("SHAMBU_CONFIG_DIR", "")
+    assert conf.config_dir() == tmp_path / "xdg" / "shambu"
+    monkeypatch.delenv("SHAMBU_CONFIG_DIR")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert conf.config_dir() == tmp_path / "home" / ".config" / "shambu"
+
+
+def test_atomic_write_sets_the_mode_and_creates_a_private_dir(tmp_path):
+    p = tmp_path / "new" / "printers.json"
+    conf._atomic_write(p, {"version": 1}, ".printers-")
+    assert p.stat().st_mode & 0o777 == 0o600 and p.parent.stat().st_mode & 0o777 == 0o700
+    q = tmp_path / "calibration.json"
+    conf._atomic_write(q, {"version": 1}, ".calibration-", mode=0o640)
+    assert q.stat().st_mode & 0o777 == 0o640
+    tmp_path.chmod(0o755)
+    conf._atomic_write(tmp_path / "x.json", {}, ".x-")
+    assert tmp_path.stat().st_mode & 0o777 == 0o755  # a dir that exists keeps its mode
+
+
+def test_atomic_write_mkstemp_failure_is_a_data_file_error(tmp_path, monkeypatch):
+    def boom(**kw):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(conf.tempfile, "mkstemp", boom)
+    with pytest.raises(conf.DataFileError, match="cannot write there"):
+        conf._atomic_write(tmp_path / "printers.json", {"version": 1}, ".printers-")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_locked_cannot_create_the_lock_file(tmp_path):
+    parent = tmp_path / "a-file"
+    parent.write_text("")
+    with pytest.raises(conf.DataFileError, match="cannot create its lock file"):
+        conf._locked(parent / "printers.json", lambda: 1)
+
+
+def test_locked_flock_failure_is_a_data_file_error(tmp_path, monkeypatch):
+    def boom(fd, op):
+        raise OSError(35, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(conf.fcntl, "flock", boom)
+    ran = []
+    with pytest.raises(conf.DataFileError, match="cannot lock it"):
+        conf._locked(tmp_path / "printers.json", lambda: ran.append(1))
+    assert ran == []
 
 
 def test_the_missing_code_text_names_both_ways_to_fix_it():
