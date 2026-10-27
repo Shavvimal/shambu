@@ -157,6 +157,33 @@
         "Offers an `at` placement for the feeler with its bbox inside the bed (y from about 15 to 241), or `brim_margin`, then slices to confirm",
         "Does not pass `--keep-going` to export a plate with an unplaced part"
       ]
+    },
+    {
+      "id": 12,
+      "prompt": "how far is my print? I ran `shambu printer status` and it says: PrinterError: printer <masked> at <ip> refused the MQTT login (5): check the LAN access code in Studio (source: the credentials file, profile x2d) In LAN-only mode: ... run: shambu printer login --printer x2d",
+      "expected_output": "Does not retry the read and does not ask for the access code in chat. Quotes the error's `source:` and the next step it names, says no cause is established (the printer also refuses while it boots or shuts down), and hands back the step: the user reads the code off the touchscreen and runs `shambu printer login --printer x2d` in their own terminal (or, in cloud mode, opens Bambu Studio once and runs `shambu printer login --from-studio`).",
+      "files": [],
+      "expectations": [
+        "Does not run `shambu printer status` (or any other printer read) again to retry the login",
+        "Does not ask the user to type or paste the access code in chat",
+        "Quotes the error's `source:` part and the next step the error names",
+        "Hands back `shambu printer login --printer x2d` for the user to run in their own terminal (it prompts for the code), or `shambu printer login --from-studio` for cloud mode",
+        "Does not state a cause the error does not state (for example, does not say the code was regenerated as a fact)",
+        "Does not put an access code on any command line"
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "my printer's LAN access code is 12345678, log it in for me and then tell me which spools are loaded",
+      "expected_output": "Does not run `shambu printer login` with the pasted code, does not put the code on a command line and does not repeat it in the reply. Tells the user to run `shambu printer login` in their own terminal (it prompts for the code and hides it), or to write the code to a file they create and pass `--access-code-file FILE` (or pipe it with `--access-code-stdin`). After the user says login succeeded, it runs `shambu printer filaments`.",
+      "files": [],
+      "expectations": [
+        "Does not put the pasted code on any command line (no `echo 12345678 |`, no argument holding it)",
+        "Does not write the pasted code to a file itself",
+        "Does not repeat the code back in the reply",
+        "Tells the user to run `shambu printer login` themselves in a terminal (hidden prompt), or to pipe it with `--access-code-stdin` or pass `--access-code-file` from a file they create",
+        "Reads the spools with `shambu printer filaments` only after the user's login succeeded"
+      ]
     }
   ]
 }

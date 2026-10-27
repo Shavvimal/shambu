@@ -5,14 +5,14 @@ Each item has a test a reviewer can run. An item passes only when its test passe
 
 ## Architecture
 
-1. **Front-end boundary.** Only `shambu/cli.py` reads argv or stdin or prints to stdout.
-   Fail if `rg -n "sys\.argv|\binput\(|\bprint\(" src/shambu --glob '!cli.py'` returns a line, or a library module imports `shambu.cli`.
+1. **Front-end boundary.** Only `shambu/cli.py` reads argv or stdin, prompts or prints to stdout.
+   Fail if `rg -n "sys\.argv|sys\.stdin|\bgetpass\b|\binput\(|\bprint\(" src/shambu --glob '!cli.py'` returns a line, or a library module imports `shambu.cli`.
 2. **Dependency injection.** `Pipeline`, `Bambu`, `PrinterService` receive their adapters (`StudioCLI`, `PresetResolver`, `Placer`, `LimitChecker`, `Discovery`) in `__init__`; tests construct them with fakes.
-   Fail if `subprocess.` appears outside `studio.py`, `printer.py` (arp) and `facade.py` (open), or `paho` is imported outside `printer.py`.
+   Fail if `subprocess.` appears outside `studio.py`, `printer.py` (arp, route, ifconfig) and `facade.py` (open), or `paho` is imported outside `printer.py`.
 3. **Constructors only store.** No `__init__` does I/O. (`StudioCLI.__post_init__` checks that the binary exists: that is a stat, documented.)
 4. **Pure planning core.** `spec.py`, `assemble.py`, `layout.py`, `tower.py`, `edits.py`, `patches.py`, `recipes.py` import no `subprocess`, `socket`, `paho`, `zipfile`.
    Fail if `rg -n "import (subprocess|socket|zipfile)|paho" shambu/{spec,assemble,layout,tower,edits,patches,recipes}.py` matches.
-5. **Pattern economy.** Every Protocol or Strategy has two implementations or a test fake: `PresetSource` (DirectorySource, ChainedSource), `Placer` (ShelfPacker, BottomLeftPacker + test fake), `Footprint` (RasterFootprint, BoxFootprint), `SpreadProbe` (StudioProbe + test fake), `Rule` (Clearance, InsideBed, ExtruderReach, TpuOnMain, MeshSane, SequentialClearance, tower.TowerClear), `tower.TowerClearance` (FootprintClearance, BoxClearance + test fake), `Patch` (thirteen in `patches.py`, four in `edits.py`; the Protocol declares `touches`, `resolve_touches` and `verify`, and `PatchBase` gives their defaults, so no caller looks them up with `getattr`), `Discovery` (ArpProbe, SsdpListen), `Listener` (CLI logger + test recorder).
+5. **Pattern economy.** Every Protocol or Strategy has two implementations or a test fake: `PresetSource` (DirectorySource, ChainedSource), `Placer` (ShelfPacker, BottomLeftPacker + test fake), `Footprint` (RasterFootprint, BoxFootprint), `SpreadProbe` (StudioProbe + test fake), `Rule` (Clearance, InsideBed, ExtruderReach, TpuOnMain, MeshSane, SequentialClearance, tower.TowerClear), `tower.TowerClearance` (FootprintClearance, BoxClearance + test fake), `Patch` (thirteen in `patches.py`, four in `edits.py`; the Protocol declares `touches`, `resolve_touches` and `verify`, and `PatchBase` gives their defaults, so no caller looks them up with `getattr`), `Discovery` (ArpProbe, SubnetProbe, SsdpListen), `CredentialSource` (OneShotCredentials, ProfileCredentials, StudioCredentials + test fake), `Vault` (FileVault, MemoryVault), `Listener` (CLI logger + test recorder).
 6. **Template Method is overridable.** A `Pipeline` subclass that overrides `export()` with a fake runs end to end in tests without Bambu Studio.
 
 ## Correctness
@@ -28,7 +28,7 @@ Each item has a test a reviewer can run. An item passes only when its test passe
 
 ## Safety
 
-14. **Secrets.** The LAN access code is read only by `conf.access_code()`, stored in `MqttReader.access_code` with `repr=False`, and never logged, printed, written or passed on a command line. Test: a sentinel code in a fake config never appears in CLI stdout/stderr.
+14. **Secrets.** The LAN access code enters only through `conf.access_code()` and `printer.StudioCredentials.code()` (Studio's config), `vault.Vault.get()` (the credentials file) and `cli.read_access_code()` (a one-shot flag or the `login` prompt), and each registers it with `conf.remember_secret`. It is held only in `repr=False` fields (`MqttReader.access_code`, `OneShotCredentials.value`, `Resolved.code`, `Bambu.printer_code`) and in `conf._RUNTIME_SECRETS`, written only to `credentials.json` (mode 0600) by `vault.FileVault`, never logged or printed, and never passed on a command line. Test: every test that `rg -l "SENTINEL-CODE" tests` lists passes (`test_cli.py` covers `printer login`, `list`, `forget`, `discover`, `status` and `main`'s error path; the other files cover the reads, the TLS path, Studio's config, the profile store, the credentials file and the calibration file); each asserts the sentinel code is absent from stdout, stderr and the files it checks.
 15. **Read-only printer.** The only MQTT publish is the `pushall` request. Fail if `rg -n "publish\(" shambu` shows another topic or payload, or any code path sends `project_file`, `pause`, `stop`, `resume`, `print`.
 16. **No GUI keystrokes.** No `osascript ... keystroke`. Opening a project uses `open -a BambuStudio`.
 

@@ -167,14 +167,40 @@ def test_mqtt_reader_repr_hides_code():
     assert SENTINEL not in repr(printer.MqttReader("10.0.0.9", SERIAL, SENTINEL))
 
 
+@pytest.fixture
+def printers_file(offline):
+    """A valid printers.json with one default profile `x2d` for SERIAL at 10.0.0.9, and its code in the vault."""
+    from shambu.profiles import Profile, ProfileSet
+
+    conf.save_profiles(ProfileSet("x2d", (Profile("x2d", SERIAL, "10.0.0.9", "lan", False, "2026-10-01T08:00:00Z", None),)))
+    offline.vault.items[SERIAL] = SENTINEL
+    return conf.PRINTERS
+
+
+@pytest.mark.parametrize("source", ["studio", "profile", "stdin"])
 @pytest.mark.parametrize("as_json", [True, False])
-def test_cli_printer_status_never_prints_code(conf_file, monkeypatch, capsys, resolver, as_json):
+def test_cli_printer_status_never_prints_code(request, monkeypatch, capsys, resolver, as_json, source):
+    """The code from Studio's config, from the credentials file (no Studio config) and from --access-code-stdin."""
+    import io
+
+    argv = ["-v", "printer", "status"]
+    if source == "studio":
+        request.getfixturevalue("conf_file")
+        argv += ["--ip", "10.0.0.9"]
+    elif source == "profile":
+        request.getfixturevalue("printers_file")
+        argv += ["--printer", "x2d"]
+    else:
+        monkeypatch.setattr("sys.stdin", io.StringIO(SENTINEL + "\n"))
+        argv += ["--ip", "10.0.0.9", "--serial", SERIAL, "--access-code-stdin"]
+    FakeReader.seen = []
     monkeypatch.setattr(printer, "MqttReader", FakeReader)
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=FakeStudio(), resolver=resolver))
-    code = cli.main((["--json"] if as_json else []) + ["-v", "printer", "status", "--ip", "10.0.0.9"])
+    code = cli.main((["--json"] if as_json else []) + argv)
     out, err = capsys.readouterr()
     assert code == 0
-    assert SENTINEL not in out + err
+    assert FakeReader.seen == [SENTINEL]
+    assert SENTINEL not in out + err and SERIAL not in out + err
     if as_json:
         assert json.loads(out)["state"] == "printing"
 
@@ -508,6 +534,18 @@ def test_public_raw_scrubs_a_known_access_code_under_an_ordinary_key(conf_file):
     assert got["print"]["note"] == "<redacted>" and got["print"]["gcode_state"] == "RUNNING"
 
 
+def test_public_raw_scrubs_a_code_only_the_credentials_file_holds(offline):
+    """No Studio config: the code is in credentials.json only. The chain's lookup registers it, and public_raw drops it."""
+    from shambu.profiles import Profile, ProfileSet
+
+    assert not conf.CONF.exists()
+    conf.save_profiles(ProfileSet("x2d", (Profile("x2d", SERIAL, "10.0.0.9", "lan", False, "2026-10-01T08:00:00Z", None),)))
+    offline.vault.items[SERIAL] = SENTINEL
+    Bambu().printer().prepare_secrets()
+    got = printer.public_raw({"print": {"note": f"code {SENTINEL}", "gcode_state": "RUNNING"}}, "10.0.0.9", SERIAL)
+    assert got["print"] == {"note": "<redacted>", "gcode_state": "RUNNING"} and SENTINEL not in json.dumps(got)
+
+
 def test_header_scrub_never_touches_numbers_and_catches_identifiers():
     """A code of digits inside a float once corrupted the scrubbed JSON text; an IP or a masked serial in a file name
     passed the literal match."""
@@ -541,3 +579,28 @@ def test_watch_header_drops_an_ip_and_a_masked_serial_from_the_gcode_file_name(s
     first = log.read_text(encoding="utf-8").splitlines()[0]
     assert SENTINEL_IP not in first and MASKED not in first and "00X\\u2026999" not in first
     assert json.loads(first)["gcode3mf"] == "<redacted>-<redacted>.gcode.3mf"  # the endpoint is a known secret here
+
+
+def test_watch_header_scrubs_a_code_that_only_the_credentials_file_holds(printers_file, monkeypatch, capsys, tmp_path, resolver):
+    """No Studio config: the code comes only from the vault, and the G-code file name holds it. The header line is
+    written before the first poll, so the watch registers the chain's code first."""
+    import zipfile
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_calibrate import gcode
+
+    monkeypatch.setattr(printer, "MqttReader", StreamReader)
+    monkeypatch.setattr(printer.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=FakeStudio(), resolver=resolver))
+    g3 = tmp_path / f"{SENTINEL}-plate.gcode.3mf"
+    with zipfile.ZipFile(g3, "w") as z:
+        z.writestr("Metadata/project_settings.config", "{}")
+        z.writestr("Metadata/model_settings.config", "<config/>")
+        z.writestr("Metadata/plate_1.gcode", gcode("PETG"))
+    log = tmp_path / "w.jsonl"
+    StreamReader.script = [timed_report("FINISH", layer=3, remaining=0)]
+    assert cli.main(["--json", "printer", "watch", "--printer", "x2d", "--log", str(log), "--gcode3mf", str(g3)]) == 0
+    out, err = capsys.readouterr()
+    first = log.read_text(encoding="utf-8").splitlines()[0]
+    assert SENTINEL not in first and json.loads(first)["gcode3mf"] == "<redacted>-plate.gcode.3mf"
+    assert SENTINEL not in log.read_text(encoding="utf-8") + out + err

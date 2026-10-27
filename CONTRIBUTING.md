@@ -22,6 +22,7 @@ binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a 
 | A new limit rule or placer | `src/shambu/layout.py` | `references/06-slicer-rules.md`, `08-optimisation.md` section 11 and `00-findings.md` section 10 |
 | CLI flag handling | `src/shambu/studio.py` (`CliCommand`) | `references/01-source-cli.md` section 1 |
 | Printer fields | `src/shambu/printer.py` | `references/04-app-printer-control.md` |
+| Printer profiles and the credentials file | `src/shambu/profiles.py`, `conf.py`, `vault.py` | `docs/specs/2026-10-27-printer-profiles.md` |
 | Skill text | `skills/shambu/SKILL.md`, `skills/setup/SKILL.md` | the plugin docs |
 
 Every rule the code encodes about Bambu Studio should cite the reference that proved it. The

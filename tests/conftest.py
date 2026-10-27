@@ -6,33 +6,50 @@ import copy
 import json
 import os
 import shutil
+import types
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from shambu import conf
+from shambu import conf, printer, vault
 from shambu import presets as P
 from shambu.errors import PrinterError
 from shambu.facade import Bambu
 from shambu.studio import BINARY, CliCommand, MeshInfo, OrientCandidate, OrientResult, OrientTable, RunResult
 
 FIXTURES = Path(__file__).parent / "fixtures"
+IDENTITY_CONTEXT = types.SimpleNamespace(name="stand-in CA context")  # what a fake `cert_serial` receives as `ctx`
+REAL_IDENTITY_CONTEXT = printer._identity_context  # saved before `offline` patches it
 
 
 @pytest.fixture(autouse=True)
 def offline(monkeypatch, tmp_path_factory):
     """No test touches the LAN or this Mac's Bambu Studio config: the facade's printer read fails as an unreachable
-    printer does (the WARN fallback), and BambuStudio.conf is absent. A test that wants a report or a config
-    monkeypatches `Bambu.loaded_filaments` or `conf.CONF` again on top of this."""
+    printer does (the WARN fallback), BambuStudio.conf is absent, Studio's support folder is an empty tmp dir, printers.json and credentials.json are missing files
+    in a config dir that does not exist yet (so its 0700 creation runs), `vault.default_vault()` returns one
+    `MemoryVault` per test, the identity checks of discovery get a stand-in CA context (`printer._identity_context`; no
+    test reads Studio's real CA bundle) and the runtime secret and identifier sets start and end empty. A test that wants a report or
+    a config monkeypatches `Bambu.loaded_filaments`, `conf.CONF` or `conf.PRINTERS` again on top of this; a test that
+    requests `offline` by name seeds the vault through `offline.vault`."""
 
     def unreachable(self, *a, **k):
         raise PrinterError("no printer in tests")
 
     monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
     monkeypatch.setattr(conf, "CONF", tmp_path_factory.mktemp("conf") / "no-such-BambuStudio.conf")
+    monkeypatch.setattr(conf, "APPSUPPORT", tmp_path_factory.mktemp("appsupport"))  # hms_table() reads nothing real
     monkeypatch.setattr(conf, "CALIBRATION", tmp_path_factory.mktemp("calibration") / "no-such-calibration.json")
+    config = tmp_path_factory.mktemp("config") / "shambu"  # not created: the first write makes it 0700
+    monkeypatch.setattr(conf, "PRINTERS", config / "printers.json")
+    monkeypatch.setattr(conf, "CREDENTIALS", config / "credentials.json")
+    fake = vault.MemoryVault()
+    monkeypatch.setattr(vault, "default_vault", lambda: fake)
+    monkeypatch.setattr(printer, "_identity_context", lambda: IDENTITY_CONTEXT)
+    conf.forget_secrets()
+    yield types.SimpleNamespace(vault=fake)
+    conf.forget_secrets()
 
 
 MACHINE = "Test X2D 0.4 nozzle"

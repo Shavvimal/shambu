@@ -41,8 +41,9 @@ spec.json  ->  check  ->  build  ->  patch  ->  verify  ->  report.md (+ project
 - macOS with [Bambu Studio](https://bambulab.com/en/download/studio) installed (02.08.x tested; the CLI lives in the app bundle).
 - [uv](https://docs.astral.sh/uv/) (Python 3.11+ is fetched by uv if needed).
 - For the plugin: [Claude Code](https://code.claude.com/).
-- A Bambu Lab printer for the status commands (tested on an X2D; the printer must be on the same LAN and selected
-  once in Bambu Studio's Device tab so its LAN access code is stored).
+- A Bambu Lab printer for the status commands (tested on an X2D, in LAN-only and in cloud mode; the printer must be
+  on the same LAN). shambu needs its LAN access code once: `shambu printer login` stores a profile and the code, or
+  select the printer once in Bambu Studio's Device tab so Studio stores the code, as before.
 
 ## Installation
 
@@ -55,17 +56,17 @@ As a Claude Code plugin:
 /shambu:setup
 ```
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.4.0"`) and runs
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.0"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.4.0"
-shambu doctor --expect-version 0.4.0
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.0"
+shambu doctor --expect-version 0.5.0
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu@v0.4.0" shambu doctor --expect-version 0.4.0
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.5.0" shambu doctor --expect-version 0.5.0
 ```
 
 ## Usage
@@ -127,12 +128,33 @@ logged last resort for anything else.
 **4. Read the printer (read-only) and measure prints.**
 
 ```
-shambu printer filaments [--ip <printer-ip>]   # the spool in each nozzle and slot, with the preset it resolves to
+shambu printer login --ip <printer-ip> --serial <serial> --mode lan   # prompts for the LAN access code (not shown)
+shambu printer login --printer x2d --ip <new-ip>     # a known profile: a new code or a new address
+shambu printer login --from-studio --name x2d        # the serial and the code of Studio's selected printer
+shambu printer list                                  # the profiles: name, masked serial, IP, mode, last verified
+shambu printer filaments [--printer x2d]             # the spool in each nozzle and slot, with the preset it resolves to
 shambu printer status [--ip <printer-ip>]
 shambu printer watch --every 300          # until the printer leaves RUNNING/PAUSE
 shambu printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf   # log one print
 shambu calibrate --log print.jsonl --add  # store it; `calibrate --show` prints the fit per printer and material
 ```
+
+`login` reads the printer once with the code and stores the profile and the code only when that read succeeds.
+`--access-code-stdin` or `--access-code-file FILE` give the code without a prompt; on any other command they give it
+for that run only. Profiles live in `printers.json` and codes in `credentials.json` (mode 0600) in shambu's config
+dir: `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu`. A command that reads the printer
+takes the code from a one-shot flag, then from the stored code of the profile (`--printer NAME`, else the default
+profile), then from Bambu Studio's config. Both printer modes use the same local read; the mode only says where a new
+code comes from when the printer refuses the old one (the touchscreen in LAN-only mode, Studio in cloud mode).
+`shambu printer forget --printer NAME` removes a profile and its code (`--keep-code` keeps the code); when the
+forgotten profile was the default, the first remaining profile becomes the default.
+
+A read through a profile goes to the IP the profile stores and does not search; `login` always stores the IP it read
+from. The subnet pass (the default-route /24 after the ARP table) runs in `printer discover` (always), in `login`
+when it has no IP (`--from-studio` without `--ip`), and on a profile read only when the profile has no IP. When the
+printer's address changes (a new DHCP lease), a profile read fails with `cannot connect ... The profile x2d expected
+this address (last login ...); run: shambu printer login --printer x2d --ip <new ip>, or shambu printer discover`.
+Run `shambu printer discover`, then `shambu printer login --printer x2d --ip <ip>` to record the new address.
 
 Every time in a report is "Studio estimate", Studio's own prediction. The watch log stamps each poll and never
 holds the IP or the serial. A report adds the measured range of stored prints, and a calibrated time only when
@@ -150,8 +172,11 @@ Exit codes: 0 ok, 1 a check or verification failed or a patch was refused, 2 usa
 
 - The printer code subscribes to the status topic and publishes exactly one `pushall` request. It never starts,
   pauses, stops or changes a print and never uploads a file. Pull requests that add printer control are not merged.
-- The LAN access code is read from Bambu Studio's configuration, kept in memory, never printed or logged, and sent
-  only over TLS verified against Bambu's certificate authority (`--insecure` is an explicit opt-out).
+- The LAN access code comes from a one-shot flag, the credentials file (mode 0600) or Bambu Studio's configuration.
+  It is never printed, logged or passed on a command line, and it is sent only over TLS verified against Bambu's
+  certificate authority (`--insecure` is an explicit opt-out). `login --insecure` stores that choice on the profile,
+  and every later read through the profile skips the check; a `login --printer NAME` refresh without `--insecure`
+  clears it.
 - Projects are handed back for the user to open, check and print. The tool never presses Print.
 
 ## Rules the code encodes (so nobody has to remember them)
@@ -195,7 +220,7 @@ Exit codes: 0 ok, 1 a check or verification failed or a patch was refused, 2 usa
 
 | Path | What |
 |---|---|
-| `src/shambu/` | The package: `presets` (chain of profile sources, flattening), `studio` (binary adapter, `CliCommand` builder), `assemble` (assemble-list model and validation), `layout` (placer and limit rules), `mesh` (STL read/write, orientation scoring), `threemf` + `patches` (3MF read/patch commands, G-code feature usage), `spec` (typed spec, builder), `recipes`, `build` (template-method pipeline), `sweep` (variant builds and the comparison table), `report`, `printer` (discovery, MQTT reader, decoder), `conf`, `facade`, `cli` |
+| `src/shambu/` | The package: `presets` (chain of profile sources, flattening), `studio` (binary adapter, `CliCommand` builder), `assemble` (assemble-list model and validation), `layout` (placer and limit rules), `mesh` (STL read/write, orientation scoring), `threemf` + `patches` (3MF read/patch commands, G-code feature usage), `spec` (typed spec, builder), `recipes`, `build` (template-method pipeline), `sweep` (variant builds and the comparison table), `report`, `printer` (discovery, MQTT reader, decoder), `conf` (Studio's config, the config dir), `profiles` (printer profiles), `vault` (the credentials file), `facade`, `cli` |
 | `tests/` | Offline pytest suite with fakes for the binary, the profile tree and the MQTT transport |
 | `skills/shambu/` | The Claude Code skill and the reverse-engineering references |
 | `skills/setup/` | `/shambu:setup`: installs the CLI, runs `shambu doctor` |
