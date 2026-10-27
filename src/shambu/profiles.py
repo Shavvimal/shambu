@@ -67,6 +67,12 @@ def _stamp(v) -> bool:
     return True
 
 
+def valid_name(name: str) -> bool:
+    """True when `name` passes the profile name rule of `validate_profile`: 1 to 32 letters, digits, '.', '_' or '-',
+    starting with a letter or a digit, and no IP, host name or masked serial (`identifying`)."""
+    return isinstance(name, str) and _NAME.fullmatch(name) is not None and not identifying(name)
+
+
 def validate_profile(d, secrets: Iterable[str] = ()) -> None:
     """Raises ProfileError(REFUSAL) unless `d` is one printer profile with exactly the schema's keys and valid values.
     `name` and `ip` must hold none of `secrets`; `name` must also hold neither the serial nor its mask (any case)."""

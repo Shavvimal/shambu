@@ -58,6 +58,28 @@ _TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
 redact_ip = conf.redact_ip  # one detector: conf.py
 log = logging.getLogger(__name__)
 CODE_REFUSAL = "the access code must be 4 to 128 characters with no space, quote or backslash"
+STUDIO_UNREADABLE = "Bambu Studio's config could not be read or has an unexpected shape"
+
+
+def studio_login_values() -> tuple[str, str]:
+    """(serial, code) of Bambu Studio's selected printer, for `login --from-studio`: one guarded read of its config.
+    An unreadable file, bad JSON or a wrong shape is ConfError(STUDIO_UNREADABLE), a fixed text that never echoes the
+    file; a missing file, no selected printer or no code for it keep their own ConfError."""
+    try:
+        doc = conf.load()
+        if not isinstance(doc, dict) or not isinstance(doc.get("app", {}), dict) or not isinstance(doc.get("access_code", {}), dict):
+            raise TypeError("shape")
+        serial = conf.selected_serial(doc)
+        if serial is not None and not isinstance(serial, str):
+            raise TypeError("shape")
+        if not serial:
+            raise ConfError("no printer selected in Bambu Studio (app.user_last_selected_machine is empty)")
+        code = conf.access_code(serial, doc)
+        if not isinstance(code, str):
+            raise TypeError("shape")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        raise ConfError(STUDIO_UNREADABLE) from None
+    return serial, code
 
 
 def install_kind(direct_url: dict | None, installer: str | None = None) -> tuple[str, str | None]:
@@ -129,8 +151,9 @@ class LoginResult:
     code_stored: bool
 
 
-def profile_section(ps: ProfileSet, profile: Profile | None, config_dir: str) -> dict:
-    """doctor's profile keys for the config section: the selected profile (masked serial, no IP), the count and the dir."""
+def profile_section(ps: ProfileSet, profile: Profile | None, config_dir: str, code: str | None = None) -> dict:
+    """doctor's profile keys for the config section: the selected profile (masked serial, no IP, and `code`: "stored"
+    or "none" for its serial in credentials.json, never the value), the count and the dir."""
     p = None
     if profile is not None:
         p = {
@@ -140,6 +163,7 @@ def profile_section(ps: ProfileSet, profile: Profile | None, config_dir: str) ->
             "mode": profile.mode,
             "verified": profile.verified,
             "insecure": profile.insecure,
+            "code": code,
         }
     return {"printer_profile": p, "profiles": len(ps.printers), "config_dir": config_dir}
 
@@ -220,7 +244,8 @@ class Bambu:
             d["config"] = {"error": str(e)}
         try:
             ps = conf.load_profiles()
-            d["config"].update(profile_section(ps, conf.select_profile(self.printer_profile, ps), str(conf.PRINTERS.parent)))
+            prof = conf.select_profile(self.printer_profile, ps)
+            d["config"].update(profile_section(ps, prof, str(conf.PRINTERS.parent), self._code_state(prof)))
         except BambuError as e:
             d["config"].update(printer_profile={"error": conf.scrub_text(f"{type(e).__name__}: {e}")}, profiles=None)
             d["config"]["config_dir"] = str(conf.PRINTERS.parent)
@@ -256,6 +281,16 @@ class Bambu:
         d["recipes"] = [r.name for r in recipes.RECIPES]
         d["timings_s"] = timings
         return d
+
+    def _code_state(self, profile: Profile | None) -> str | None:
+        """ "stored" when credentials.json holds a code for the profile's serial, "none" when it does not, "unreadable"
+        when the file cannot be read; None without a profile. The code itself never leaves the vault."""
+        if profile is None:
+            return None
+        try:
+            return "stored" if self.vault_store().get(profile.serial) is not None else "none"
+        except VaultError:
+            return "unreadable"
 
     # ---- meshes and presets
     def info(self, path: str | Path) -> MeshInfo:
@@ -428,12 +463,16 @@ class Bambu:
         make_default: bool = False,
         insecure: bool = False,
         mode: str | None = None,
+        pin: str | None = None,
     ) -> LoginResult:
         """Read the printer once with `code`, then store the profile and the code. The CLI has checked the flags.
 
         Which printer: `from_studio` takes the serial and the code from Studio's config; else the selected profile
         (`printer_profile`, or the default when no `ip` is given) pins the serial and `ip` overrides its address; else
-        `ip` names a new printer whose serial is `serial` or the CN of its certificate (they must agree). The read must
+        `ip` names a new printer whose serial is `serial` or the CN of its certificate (they must agree). `pin` is the
+        serial the CLI checked before its prompt: the profile is read again under the lock before the printer read and
+        once more in the commit, and a profile whose serial is no longer `pin` is ConfError (nothing read or written);
+        a supplied `serial` is never replaced by the profile's. The read must
         succeed before anything is written: a refused code (`LoginRefused`), a wrong host or a timeout writes nothing.
         The commit runs under the profiles lock; when printers.json cannot be written after the code was stored, the
         previous code (or none) is put back."""
@@ -441,18 +480,18 @@ class Bambu:
         existing: Profile | None = None
         service_profile: Profile | None = None
         if from_studio:
-            serial = conf.selected_serial()
-            if not serial:
-                raise ConfError("no printer selected in Bambu Studio (app.user_last_selected_machine is empty)")
-            code = conf.access_code(serial)
+            serial, code = studio_login_values()
             existing = ps.by_serial(serial)
         else:
-            selected = self.selected_profile() if self.printer_profile is not None or ip is None else None
+            selected = None
+            if self.printer_profile is not None or ip is None:  # read again, under the lock: the prompt may have taken minutes
+                selected = conf.locked_profiles(lambda current: conf.select_profile(self.printer_profile, current))
             if selected is not None:
+                self._check_pin(selected, pin)
                 existing = service_profile = selected
-                serial = selected.serial
+                serial = serial or selected.serial
                 ip = ip or selected.ip
-                insecure = insecure or selected.insecure
+                # `insecure` stays the flag as given: a refresh without --insecure turns the TLS check back on
             else:
                 if not ip:
                     raise PrinterError("shambu printer login needs --ip for a new printer")
@@ -492,6 +531,8 @@ class Bambu:
         store = self.vault_store()
 
         def commit(current: ProfileSet) -> ProfileSet:
+            if service_profile is not None:  # the profile must still be the printer that was read
+                self._check_pin(current.get(service_profile.name), pin or serial, service_profile.name)
             old = current.by_serial(serial)
             p = Profile(name, serial, read_ip, mode, insecure, added=old.added if old is not None else now, verified=now)
             new = current.upsert(p, default=make_default, secrets=conf.sensitive_values())
@@ -512,6 +553,15 @@ class Bambu:
 
         saved = conf.locked_profiles(commit)
         return LoginResult(name, conf.mask(serial), mode, now, saved.default == name, True)
+
+    def _check_pin(self, profile: Profile | None, pin: str | None, name: str | None = None) -> None:
+        """ConfError when `profile` is gone or its serial is not `pin` (case-insensitive). The text holds the profile
+        name only: no serial, raw or masked."""
+        if pin is None:
+            return
+        if profile is None or profile.serial.casefold() != pin.casefold():
+            shown = name or self.printer_profile or (profile.name if profile is not None else "default")
+            raise ConfError(f"profile {shown} changed while login ran; retry")
 
     def forget(self, name: str, keep_code: bool = False) -> dict:
         """Remove the profile `name` (ProfileError when there is none) and, unless `keep_code` or another profile has
