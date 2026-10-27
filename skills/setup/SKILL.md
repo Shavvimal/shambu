@@ -103,10 +103,11 @@ check; a `login --printer NAME` refresh without `--insecure` clears it.
 
 ## 5. Updating
 
-1. `/plugin marketplace update shambu`: it refreshes the local copy of the repo and bumps the installed plugin to the
-   marketplace version in one step (`Updated 1 marketplace (1 plugin bumped)`).
-2. `/reload-plugins`. Only when step 1 reports no bump, run `/plugin update shambu@shambu` and reload again.
-3. Run `/shambu:setup install` again: the new setup text pins the matching tag in step 2. Not `uv tool upgrade
+1. `/plugin marketplace update shambu`: one command refreshes the marketplace and updates the plugins installed from
+   it (`Updated 1 marketplace (1 plugin bumped)`). Closing the `/plugin` panel runs `/reload-plugins` for you. Two
+   fallbacks the docs name: when the reload is left pending because it would invalidate the prompt cache, run
+   `/reload-plugins --force`; when the update reports a plugin it left for you, run `/plugin update shambu@shambu`.
+2. Run `/shambu:setup install` again: the new setup text pins the matching tag in step 2. Not `uv tool upgrade
    shambu`: it keeps the old source (a tag or a local folder). The line it runs is
    `uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@vX.Y.Z"` with the new version.
 4. `shambu doctor --expect-version 0.5.1` exits 0.

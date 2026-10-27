@@ -56,7 +56,8 @@ As a Claude Code plugin:
 /shambu:setup
 ```
 
-To update later: `/plugin marketplace update shambu`, then `/reload-plugins`, then `/shambu:setup update`.
+To update later: `/plugin marketplace update shambu` (it updates the installed plugin and reloads when the panel
+closes), then `/shambu:setup update`.
 
 `/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.1"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the

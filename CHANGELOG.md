@@ -7,9 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [0.5.1] - 2026-10-27
 
 ### Changed
-- setup skill, step 5: updating the plugin is `/plugin marketplace update shambu` then `/reload-plugins`; the
-  marketplace update bumps the installed plugin itself, so `/plugin update shambu@shambu` is only for the case where
-  it reports no bump. The README gains the same two-line update note.
+- setup skill, step 5: updating the plugin is one command, `/plugin marketplace update shambu`: per the Claude Code
+  docs it refreshes the marketplace and updates the plugins installed from it, and closing the `/plugin` panel runs
+  `/reload-plugins`. The two documented fallbacks stay: `/reload-plugins --force` when the reload is left pending,
+  `/plugin update shambu@shambu` when the update reports a plugin it left for you. The README says the same.
 
 ## [0.5.0] - 2026-10-27
 
