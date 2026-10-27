@@ -79,19 +79,37 @@ class Command:
 
 
 class Output:
+    """The one way a command prints its result. Every string value of the document (recursively; keys, numbers and
+    booleans untouched) and every text line is scrubbed of every known code and raw serial (`_scrub_values`) before it
+    is printed. A masked serial and an IP are not in that list, so `printer list` and `discover` still show them."""
+
     def __init__(self, as_json: bool):
         self.as_json = as_json
 
     def emit(self, data, text_lines: list[str] | None = None) -> None:
+        values = _scrub_values()
+        doc = _scrub_tree(_jsonable(data), values)
         if self.as_json:
-            print(json.dumps(_jsonable(data), indent=1, default=str))
+            print(json.dumps(doc, indent=1, default=str))
         else:
-            for line in text_lines if text_lines is not None else _default_lines(data):
+            for line in [conf.scrub_text(x, values) for x in text_lines] if text_lines is not None else _default_lines(doc):
                 print(line)
 
 
+def _scrub_tree(x, values: list[str]):
+    """`x` with `conf.scrub_text` applied to every str value in it, through dicts and lists. Keys and other values stay,
+    so a code equal to `true` or to a key name cannot break the document."""
+    if isinstance(x, dict):
+        return {k: _scrub_tree(v, values) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_scrub_tree(v, values) for v in x]
+    if isinstance(x, str):
+        return conf.scrub_text(x, values)
+    return x
+
+
 def usage(out: Output, msg: str) -> int:
-    """A usage error: one error document (or one line) and exit code 2."""
+    """A usage error: one error document (or one line) and exit code 2. `Output.emit` scrubs the message."""
     out.emit({"error": msg}, [msg])
     return 2
 
@@ -319,7 +337,7 @@ def profile_lines(c: dict) -> list[str]:
     tls = "TLS check off (--insecure)" if p["insecure"] else "TLS verified"
     return [
         f"printer profile {p['name']}{' (default)' if p['default'] else ''}: serial {p['serial']}, mode {p['mode']}, "
-        f"last login {when}, {tls}; {c.get('profiles')} profile(s) in {c.get('config_dir')}"
+        f"last login {when}, {tls}, code: {p.get('code') or 'none'}; {c.get('profiles')} profile(s) in {c.get('config_dir')}"
     ]
 
 
@@ -1347,7 +1365,7 @@ class Printer(Command):
             return stop
         svc = app.printer(a.ip, a.serial, a.wait, insecure=a.insecure)
         if a.action == "raw":
-            print(json.dumps(svc.public_report(), indent=1, default=str))
+            Output(True).emit(svc.public_report())  # always JSON; scrubbed as every other document
             return 0
         if a.action == "status":
             st = svc.status()
@@ -1360,20 +1378,12 @@ class Printer(Command):
         return _watch(a, svc, out)
 
 
-def _scrubbed(out: Output, doc, lines: list[str]) -> None:
-    """Emit `doc` and `lines` with every known access code removed (`conf.secret_values`: the masked serial and the IP
-    stay, on purpose)."""
-    secrets = conf.secret_values()
-    out.emit(json.loads(conf.scrub_text(json.dumps(_jsonable(doc)), secrets)), [conf.scrub_text(x, secrets) for x in lines])
-
-
 def _discover(a, out: Output) -> int:
     """`printer discover`: the ARP table, then the default-route /24, then (with --ssdp) an SSDP listen. No credential."""
     from .printer import ArpProbe, SsdpListen, SubnetProbe
 
     hits = ArpProbe().find() + SubnetProbe().find() + (SsdpListen(a.ssdp).find() if a.ssdp else [])
-    _scrubbed(
-        out,
+    out.emit(
         hits,
         [f"{h['ip']}  ({h['method']}" + (f", {h.get('model')} {h.get('connect')}" if h.get("model") else "") + ")" for h in hits]
         or ["no printer found"],
@@ -1391,14 +1401,14 @@ def _list(out: Output) -> int:
     ps = load_profiles_named()
     doc = {"config_dir": str(conf.PRINTERS.parent), "default": ps.default, "printers": [p.public() for p in ps.printers]}
     if not ps.printers:
-        _scrubbed(out, doc, ["no printer profiles: run shambu printer login"])
+        out.emit(doc, ["no printer profiles: run shambu printer login"])
         return 1
     lines = [
         f"{p.name}  {conf.mask(p.serial)}  {p.ip or '-'}  {p.mode}  verified {_hhmm(p.verified)}"
         + ("  (default)" if p.name == ps.default else "")
         for p in ps.printers
     ]
-    _scrubbed(out, doc, lines)
+    out.emit(doc, lines)
     return 0
 
 
@@ -1416,8 +1426,8 @@ def _forget(a, app: Bambu, out: Output) -> int:
         if r["note"]
         else ("code removed" if r["code_removed"] else "code kept" if a.keep_code else "no code was stored")
     )
-    _scrubbed(out, r, [f"forgot profile {r['name']} (serial {r['serial_masked']}); {what}"])
-    return 0
+    out.emit(r, [f"forgot profile {r['name']} (serial {r['serial_masked']}); {what}"])
+    return 3 if r["note"] else 0  # the profile is gone but the code is not: the environment failed
 
 
 LOGIN_FORMS = (
@@ -1428,7 +1438,16 @@ LOGIN_FORMS = (
 
 def _login(a, app: Bambu, out: Output) -> int:
     """`printer login`: check the flags, read the code, read the printer once with it, then store the profile and the
-    code. Exit 0, 2 for bad usage, 3 when the printer refuses the code or cannot be read (nothing is stored then)."""
+    code. Exit 0, 2 for bad usage, 3 when the printer refuses the code or cannot be read (nothing is stored then).
+    The serial checked here (the flag, else the profile's) goes to `Bambu.login` as the pin."""
+    from .profiles import valid_name
+
+    if a.name is not None and not valid_name(a.name):
+        return usage(
+            out,
+            "--name: a profile name is 1 to 32 letters, digits, '.', '_' or '-', starts with a letter or a digit, "
+            "and holds no IP address, host name or serial",
+        )
     if a.from_studio and (a.serial or a.access_code_file or a.access_code_stdin):
         return usage(out, "--from-studio takes the serial and the code from Bambu Studio's config: drop --serial and the access code flags")
     if a.from_studio and a.printer_profile is not None:
@@ -1457,6 +1476,7 @@ def _login(a, app: Bambu, out: Output) -> int:
             return got
         code = got
     app.printer_profile = a.printer_profile
+    app.printer_wait = a.wait
     r = app.login(
         ip=a.ip,
         serial=a.serial,
@@ -1466,11 +1486,12 @@ def _login(a, app: Bambu, out: Output) -> int:
         make_default=a.default,
         insecure=a.insecure,
         mode=a.mode,
+        pin=None if a.from_studio else (a.serial or (profile.serial if profile is not None else None)),
     )
     line = f"profile {r.name}: serial {r.serial_masked}, code stored, mode {r.mode}, read at {_hhmm(r.verified)}" + (
         " (default)" if r.default else ""
     )
-    _scrubbed(out, r, [line])
+    out.emit(r, [line])
     return 0
 
 
@@ -1663,8 +1684,8 @@ class Calibrate(Command):
             "stored": stored if show else None,
             "fits": combined if show else None,
         }
-        secrets = conf.sensitive_values()  # file names and G-code labels are free text: scrub the serial and code
-        out.emit(json.loads(conf.scrub_text(json.dumps(_jsonable(doc)), secrets)), [conf.scrub_text(x, secrets) for x in lines])
+        secrets = conf.sensitive_values()  # file names and G-code labels are free text: the masks go too, not only `emit`'s list
+        out.emit(_scrub_tree(_jsonable(doc), secrets), [conf.scrub_text(x, secrets) for x in lines])
         return 1 if errors else 0
 
 
@@ -1694,8 +1715,8 @@ def _add_json_flag(p: argparse.ArgumentParser) -> None:
                 _add_json_flag(child)
 
 
-def _error_scrub_values() -> list[str]:
-    """What `main` scrubs from an error text: every known code (`conf.secret_values`) and every raw serial (the
+def _scrub_values() -> list[str]:
+    """What `Output.emit` and `main` scrub from every output: every known code (`conf.secret_values`) and every raw serial (the
     `conf.sensitive_values` entries that are not a mask), longest first. A masked serial (`00X…999`) is not scrubbed."""
     vals = set(conf.secret_values()) | {v for v in conf.sensitive_values() if "\u2026" not in v}
     return sorted(vals, key=len, reverse=True)
@@ -1711,7 +1732,7 @@ def main(argv: list[str] | None = None) -> int:
         app = Bambu()
         return _REGISTRY[a.cmd].run(a, app, out)
     except BambuError as e:  # the text must never hold a code or a raw serial; an IP and a masked serial stay, as in 0.4.0
-        msg = conf.scrub_text(f"{type(e).__name__}: {e}", _error_scrub_values())
+        msg = conf.scrub_text(f"{type(e).__name__}: {e}", _scrub_values())
         if a.json:
             print(json.dumps({"error": msg}))
         else:

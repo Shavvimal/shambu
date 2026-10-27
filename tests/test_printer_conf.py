@@ -534,6 +534,18 @@ def test_public_raw_scrubs_a_known_access_code_under_an_ordinary_key(conf_file):
     assert got["print"]["note"] == "<redacted>" and got["print"]["gcode_state"] == "RUNNING"
 
 
+def test_public_raw_scrubs_a_code_only_the_credentials_file_holds(offline):
+    """No Studio config: the code is in credentials.json only. The chain's lookup registers it, and public_raw drops it."""
+    from shambu.profiles import Profile, ProfileSet
+
+    assert not conf.CONF.exists()
+    conf.save_profiles(ProfileSet("x2d", (Profile("x2d", SERIAL, "10.0.0.9", "lan", False, "2026-10-01T08:00:00Z", None),)))
+    offline.vault.items[SERIAL] = SENTINEL
+    Bambu().printer().prepare_secrets()
+    got = printer.public_raw({"print": {"note": f"code {SENTINEL}", "gcode_state": "RUNNING"}}, "10.0.0.9", SERIAL)
+    assert got["print"] == {"note": "<redacted>", "gcode_state": "RUNNING"} and SENTINEL not in json.dumps(got)
+
+
 def test_header_scrub_never_touches_numbers_and_catches_identifiers():
     """A code of digits inside a float once corrupted the scrubbed JSON text; an IP or a masked serial in a file name
     passed the literal match."""

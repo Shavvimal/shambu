@@ -27,7 +27,7 @@ REAL_IDENTITY_CONTEXT = printer._identity_context  # saved before `offline` patc
 @pytest.fixture(autouse=True)
 def offline(monkeypatch, tmp_path_factory):
     """No test touches the LAN or this Mac's Bambu Studio config: the facade's printer read fails as an unreachable
-    printer does (the WARN fallback), BambuStudio.conf is absent, printers.json and credentials.json are missing files
+    printer does (the WARN fallback), BambuStudio.conf is absent, Studio's support folder is an empty tmp dir, printers.json and credentials.json are missing files
     in a config dir that does not exist yet (so its 0700 creation runs), `vault.default_vault()` returns one
     `MemoryVault` per test, the identity checks of discovery get a stand-in CA context (`printer._identity_context`; no
     test reads Studio's real CA bundle) and the runtime secret and identifier sets start and end empty. A test that wants a report or
@@ -39,6 +39,7 @@ def offline(monkeypatch, tmp_path_factory):
 
     monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
     monkeypatch.setattr(conf, "CONF", tmp_path_factory.mktemp("conf") / "no-such-BambuStudio.conf")
+    monkeypatch.setattr(conf, "APPSUPPORT", tmp_path_factory.mktemp("appsupport"))  # hms_table() reads nothing real
     monkeypatch.setattr(conf, "CALIBRATION", tmp_path_factory.mktemp("calibration") / "no-such-calibration.json")
     config = tmp_path_factory.mktemp("config") / "shambu"  # not created: the first write makes it 0700
     monkeypatch.setattr(conf, "PRINTERS", config / "printers.json")
