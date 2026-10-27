@@ -12,6 +12,14 @@ shambu's own data file lives beside it: `~/Library/Application Support/shambu/ca
 fixed fields of `calibrate.validate_print` (a session fingerprint, date, printer model, material, Studio total,
 rate, startup offset, poll times, speed levels, flags) and never a file name, an IP, a serial, an access code or a
 path.
+
+`~/Library/Application Support/shambu/printers.json` (`PRINTERS`) holds the printer profiles (profiles.py has the
+schema). `_atomic_write()` and `_locked()` are the write and lock helpers both data files use.
+
+The runtime secret set holds every LAN access code this process read from any source (Studio's config, the vault, a
+one-shot flag): `remember_secret()` adds one, `forget_secrets()` clears the set. `sensitive_values()` and
+`secret_values()` include it even when Studio's config cannot be read, so `scrub_text` removes a code wherever it came
+from.
 """
 
 from __future__ import annotations
@@ -25,15 +33,19 @@ import re
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from .errors import BambuError, ConfError
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 APPSUPPORT = Path.home() / "Library/Application Support/BambuStudio"
 CONF = APPSUPPORT / "BambuStudio.conf"
 CALIBRATION = Path.home() / "Library/Application Support/shambu/calibration.json"
 CALIBRATION_VERSION = 1
+PRINTERS = Path.home() / "Library/Application Support/shambu/printers.json"
+PRINTERS_VERSION = 1
 BED_TYPES = {
     "0": "Default Plate",
     "1": "Cool Plate",
@@ -43,6 +55,18 @@ BED_TYPES = {
     "5": "Supertack Plate",
 }
 SECRET_RE = ("access", "code", "token", "ticket", "pass", "secret")
+_RUNTIME_SECRETS: set[str] = set()  # every code this process read, from any source; never printed or written
+
+
+def remember_secret(value: str) -> None:
+    """Add a code this process read to the runtime secret set, so every outward text scrubs it. Ignores ''."""
+    if value:
+        _RUNTIME_SECRETS.add(value)
+
+
+def forget_secrets() -> None:
+    """Empty the runtime secret set (the tests call it between tests)."""
+    _RUNTIME_SECRETS.clear()
 
 
 def load() -> dict:
@@ -188,17 +212,34 @@ def redact_identifiers(text: str) -> str:
     return _MASKED.sub("<redacted>", redact_ip(text))
 
 
+def _longest_first(vals: set[str]) -> list[str]:
+    return sorted((v for v in vals if len(v) >= 4), key=len, reverse=True)
+
+
 def sensitive_values(conf: dict | None = None) -> list[str]:
-    """The serials, their masks and the access codes in Studio's config: text no shambu output may carry. [] when
-    the config cannot be read (nothing to compare with)."""
+    """The runtime secrets plus the serials, their masks and the access codes in Studio's config: text no shambu
+    output may carry. Only the runtime secrets when the config cannot be read."""
+    vals = set(_RUNTIME_SECRETS)
     try:
         c = conf or load()
     except (ConfError, OSError, ValueError):
-        return []
+        return _longest_first(vals)
     serials = {str(k) for k in (c.get("access_code") or {})} | {str(selected_serial(c) or "")}
     codes = {str(v) for v in (c.get("access_code") or {}).values() if v}
-    vals = {s for s in serials if s} | {mask(s) for s in serials if len(s) > 6} | codes
-    return sorted((v for v in vals if len(v) >= 4), key=len, reverse=True)
+    vals |= {s for s in serials if s} | {mask(s) for s in serials if len(s) > 6} | codes
+    return _longest_first(vals)
+
+
+def secret_values(conf: dict | None = None) -> list[str]:
+    """The codes only (the runtime secrets plus Studio's codes, no serial and no mask): what `printer list` and
+    `printer discover` scrub, because they show the masked serial on purpose."""
+    vals = set(_RUNTIME_SECRETS)
+    try:
+        c = conf or load()
+    except (ConfError, OSError, ValueError):
+        return _longest_first(vals)
+    vals |= {str(v) for v in (c.get("access_code") or {}).values() if v}
+    return _longest_first(vals)
 
 
 def scrub_text(text: str, values: list[str] | None = None) -> str:
@@ -237,15 +278,21 @@ def _write_calibration(p: Path, prints: list[dict]) -> None:
             validate_print(r)
         except CalibrationError as e:
             raise ConfError(str(e)) from None  # a fixed text: it never echoes the refused content
+    _atomic_write(p, {"version": CALIBRATION_VERSION, "prints": prints}, ".calibration-")
+
+
+def _atomic_write(p: Path, doc: dict, prefix: str) -> None:
+    """Write the already-validated `doc` to `p` as JSON: a temp file named `prefix...` beside it, then `os.replace`.
+    DataFileError when the folder or the file cannot be written; the temp file never stays behind."""
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".calibration-", suffix=".json")
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=prefix, suffix=".json")
     except OSError as e:
         raise DataFileError(f"{p.parent}: cannot write there ({e.strerror})") from e
     failure: OSError | None = None
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"version": CALIBRATION_VERSION, "prints": prints}, f, indent=1, allow_nan=False)
+            json.dump(doc, f, indent=1, allow_nan=False)
             f.write("\n")
         os.replace(tmp, p)
     except OSError as e:
@@ -269,6 +316,18 @@ def update_calibration(change: Callable[[list[dict]], list[dict]], path: Path | 
     """Load, `change`, save, under an exclusive `fcntl.flock` on `calibration.json.lock` beside the file, so two
     `calibrate --add` runs never lose one addition. Returns the saved prints."""
     p = path or CALIBRATION
+
+    def run() -> list[dict]:
+        prints = change(_read_calibration(p))
+        _write_calibration(p, prints)
+        return prints
+
+    return _locked(p, run)
+
+
+def _locked(p: Path, fn: Callable[[], T]) -> T:
+    """`fn()` under an exclusive `fcntl.flock` on `<p>.lock` beside `p` (created when missing), so two shambu
+    processes never interleave a load-change-save of the same file. DataFileError when it cannot be locked."""
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         lock = open(p.with_name(p.name + ".lock"), "a")  # closed in the finally below
@@ -279,9 +338,7 @@ def update_calibration(change: Callable[[list[dict]], list[dict]], path: Path | 
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         except OSError as e:
             raise DataFileError(f"{p}: cannot lock it ({e.strerror})") from e
-        prints = change(_read_calibration(p))
-        _write_calibration(p, prints)
-        return prints
+        return fn()
     finally:
         lock.close()  # closing the file releases the lock
 

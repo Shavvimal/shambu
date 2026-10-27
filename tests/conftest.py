@@ -6,13 +6,14 @@ import copy
 import json
 import os
 import shutil
+import types
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from shambu import conf
+from shambu import conf, vault
 from shambu import presets as P
 from shambu.errors import PrinterError
 from shambu.facade import Bambu
@@ -24,8 +25,10 @@ FIXTURES = Path(__file__).parent / "fixtures"
 @pytest.fixture(autouse=True)
 def offline(monkeypatch, tmp_path_factory):
     """No test touches the LAN or this Mac's Bambu Studio config: the facade's printer read fails as an unreachable
-    printer does (the WARN fallback), and BambuStudio.conf is absent. A test that wants a report or a config
-    monkeypatches `Bambu.loaded_filaments` or `conf.CONF` again on top of this."""
+    printer does (the WARN fallback), BambuStudio.conf and printers.json are absent, `vault.default_vault()` returns
+    one `MemoryVault` per test and the runtime secret set starts and ends empty. A test that wants a report or a config
+    monkeypatches `Bambu.loaded_filaments`, `conf.CONF` or `conf.PRINTERS` again on top of this; a test that requests
+    `offline` by name seeds the vault through `offline.vault`."""
 
     def unreachable(self, *a, **k):
         raise PrinterError("no printer in tests")
@@ -33,6 +36,12 @@ def offline(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(Bambu, "loaded_filaments", unreachable)
     monkeypatch.setattr(conf, "CONF", tmp_path_factory.mktemp("conf") / "no-such-BambuStudio.conf")
     monkeypatch.setattr(conf, "CALIBRATION", tmp_path_factory.mktemp("calibration") / "no-such-calibration.json")
+    monkeypatch.setattr(conf, "PRINTERS", tmp_path_factory.mktemp("printers") / "no-such-printers.json")
+    fake = vault.MemoryVault()
+    monkeypatch.setattr(vault, "default_vault", lambda: fake)
+    conf.forget_secrets()
+    yield types.SimpleNamespace(vault=fake)
+    conf.forget_secrets()
 
 
 MACHINE = "Test X2D 0.4 nozzle"
