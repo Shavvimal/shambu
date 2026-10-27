@@ -137,3 +137,11 @@ The verb reference 04 planned (`04-app-printer-control.md:362`) and never shippe
 - Bambu: "Firmware Update Introducing New Authorization Control System" (16 Jan 2025, updated 17 and 20 Jan): status pushes unaffected. Developer Mode wiki (fetched as snippets only, HTTP 402).
 - Community: Doridian/OpenBambuAPI `mqtt.md`, `cloud-http.md`; the SSDP NOTIFY capture gist (Benny-Git); jonans/bsnotify (ports 2021 and 1990, SEARCH unanswered); OctoEverywhere and SimplyPrint help pages on the access code; `man security` (tested here: `-i` keeps the secret off argv, exit 44 for a missing item, no prompt when `security` is both creator and reader).
 - The 2026-10-27 session: doctor, discover, the subnet probe, the refused login, the hand edit, and the successful read at 10:57 UTC.
+
+## 11. Decisions after review (2026-10-27)
+
+- **The code lives in a 0600 file, not the Keychain.** The Keychain write failed from a non-GUI session ("User canceled the operation"), so the code lives in `credentials.json` (mode 0600) under the XDG config dir (`$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu`), beside `printers.json`. Sections 4.1, 4.2, 4.5, 5.1, 5.2, 6 and 7 are superseded where they name the Keychain, `security` or Application Support for the profile store.
+- **Relocation deferred.** A profile IP that no longer answers is one error line that names the explicit fix, `shambu printer login --printer NAME --ip <new ip>`, and `shambu printer discover`. The profile is written only by `login`.
+- **`printer probe` deferred.** `login` runs the same read, and `doctor --printer NAME` reports the profile and the read.
+- **SSDP mode detection replaced by `--mode`.** `login --mode lan|cloud` records what the touchscreen shows; with neither, the mode is `unknown`. `printer discover --ssdp N` stays.
+- **Schema cut.** `code_source`, `model` and `revision` are dropped. A profile is `name, serial, ip, mode, insecure, added, verified`, and `verified` is the time of the last successful `login`.

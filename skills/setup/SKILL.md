@@ -27,13 +27,13 @@ ls /Applications/BambuStudio.app/Contents/MacOS/BambuStudio && defaults read /Ap
 ## 2. Install or update the CLI
 
 ```
-uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@v0.4.0"
-shambu --version        # must print: shambu 0.4.0
+uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@v0.5.0"
+shambu --version        # must print: shambu 0.5.0
 ```
 
 The tag matches this setup text, and the `/shambu` skill text expects the same version. If `shambu` is not found
 afterwards, run `uv tool update-shell` and open a new shell (the uv tool bin dir must be on PATH). Alternative
-without a persistent install: `uvx --from "git+https://github.com/Shavvimal/shambu@v0.4.0" shambu doctor --expect-version 0.4.0`.
+without a persistent install: `uvx --from "git+https://github.com/Shavvimal/shambu@v0.5.0" shambu doctor --expect-version 0.5.0`.
 
 Install from the tag above, not from a local checkout: `uv tool install .` copies the code once and does not follow
 the plugin (that is how a 0.2.1 CLI ran under a 0.3.0 plugin). A checkout is for development only.
@@ -41,38 +41,54 @@ the plugin (that is how a 0.2.1 CLI ran under a 0.3.0 plugin). A checkout is for
 ## 3. Check the machine
 
 ```
-shambu --version                        # must print: shambu 0.4.0
-shambu doctor --expect-version 0.4.0
+shambu --version                        # must print: shambu 0.5.0
+shambu doctor --expect-version 0.5.0
 ```
 
 Run `shambu --version` first: every release prints it. If it shows another number, step 2 did not take: run it
 again and open a new shell. A usage error on `--expect-version` (`unrecognized arguments`) means the installed CLI
-predates 0.4.0: run step 2. Exit 3 with `skill expects 0.4.0: MISMATCH` means the same. Expected:
-the shambu version and how it was installed, the Bambu Studio version and binary, the profile sources (Application Support copy first, then the app
-bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is stored
-(the code itself is never printed), the machine's bed and per-extruder reach, the spools loaded on the printer
-(`loaded on the printer (read HH:MM ...)`, one line per nozzle with the resolved preset name, and a `MISMATCH`
-line when the GUI's last-used filament differs), and the recipe list. `loaded on the printer: not read (...)`
-means the printer was not reachable: pass `--ip <printer-ip>` or check it is on. Then:
+predates 0.4.0: run step 2. Exit 3 with `skill expects 0.5.0: MISMATCH` means the same. Expected: the shambu version
+and how it was installed, the Bambu Studio version and binary, the profile sources (Application Support copy first,
+then the app bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is
+stored (the code itself is never printed), with a profile the line `printer profile <name> (default): serial
+<masked>, mode lan|cloud|unknown, last login HH:MM UTC, TLS verified; N profile(s) in <config dir>`, the machine's
+bed and per-extruder reach, the spools loaded on the printer (`loaded on the printer (read HH:MM ...)`, one line per
+nozzle with the resolved preset name, and a `MISMATCH` line when the GUI's last-used filament differs), and the
+recipe list. `loaded on the printer: not read (...)` means the printer was not read: check it is on, pass `--ip
+<printer-ip>`, or run step 4. Then:
 
 ```
 shambu presets list filament --printer "<the machine preset doctor printed>" | head
 shambu recipes
 ```
 
-## 4. Printer read (read-only)
+## 4. Printer login (read-only)
 
 ```
-shambu printer filaments
+shambu printer login --ip <printer-ip> --serial <serial> --mode lan   # the code is prompted, not shown
+shambu printer login --from-studio                                    # or: Studio's selected printer and its code
 shambu printer status
 ```
 
-shambu reads the printer's serial and LAN access code from Bambu Studio's own configuration, finds the printer on
-the LAN, and asks for one status report over MQTT with TLS verified against Bambu's certificate authority.
-`filaments` lists the spool in each nozzle with its resolved preset name; `check` and `build` read the same
-report before every build, so this step confirms the read works. It never sends a print command. If the printer is not found, pass `--ip <printer-ip>`. If TLS verification fails
-on your firmware, `--insecure` skips it; say so to the user because the access code then travels to an unverified
-endpoint.
+The user runs the first `login` line in their own terminal (the prompt needs one), with the IP and the serial from
+the printer's touchscreen and `--mode lan` or `--mode cloud` as the touchscreen shows. Without a terminal, the code
+goes in with `--access-code-stdin` or `--access-code-file FILE`; never put it on the command line. `login` reads the
+printer once with the code and, only when that read succeeds, stores a profile in `printers.json` and the code in
+`credentials.json` (mode 0600) in shambu's config dir (`$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else
+`~/.config/shambu`). It prints `profile <name>: serial <masked>, code stored, mode lan, read at HH:MM UTC`.
+`shambu printer list` shows the profiles. After that, every command that reads the printer uses the default profile,
+or the one `--printer NAME` names; the code comes from a one-shot flag, then the stored code, then Studio's config.
+Without `--serial`, `login` takes the serial from the printer's certificate; the serial from the touchscreen is
+the stronger check that the profile names the intended printer.
+
+LAN-only mode and cloud mode use the same local read (TLS on port 8883, one status request); the mode changes only
+where a new code comes from. The printer can regenerate its code when LAN-only mode is toggled, so after a toggle
+run `login` again with the code from the touchscreen (LAN-only), or with `--from-studio` after Studio has reconnected
+(cloud).
+
+`status` and `filaments` confirm the read; `check` and `build` read the same report before every build. shambu
+never sends a print command. If TLS verification fails on your firmware, `--insecure` skips it (`login --insecure`
+needs `--serial`); say so to the user because the access code then travels to an unverified endpoint.
 
 ## 5. Updating
 
@@ -81,13 +97,16 @@ endpoint.
 3. Run `/shambu:setup install` again: the new setup text pins the matching tag in step 2. Not `uv tool upgrade
    shambu`: it keeps the old source (a tag or a local folder). The line it runs is
    `uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@vX.Y.Z"` with the new version.
-4. `shambu doctor --expect-version 0.4.0` exits 0.
+4. `shambu doctor --expect-version 0.5.0` exits 0.
 
 ## Troubleshooting
 
 - `shambu: command not found`: PATH does not include uv's tool directory; `uv tool update-shell`, new shell.
 - `StudioError: Bambu Studio binary not found`: Bambu Studio is not in `/Applications`.
-- `PrinterError: no access code stored`: open the printer once in Bambu Studio's Device tab so the code is saved.
+- `ConfError: no access code for serial <masked>`: run `shambu printer login` (step 4), or open the printer once in
+  Bambu Studio's Device tab so the code is saved.
+- `refused the MQTT login`: the code is wrong or the printer regenerated it. Read the code off the touchscreen and
+  run `shambu printer login --printer NAME` (cloud mode: open Studio once, then `login --from-studio`).
 - `paho-mqtt missing`: reinstall with the `--reinstall` line above.
 - `PresetError: filament preset 'loaded' not found`: the CLI is older than 0.3.0. Run step 2.
 - `unrecognized arguments: --expect-version`: the CLI is older than 0.4.0. Run step 2.

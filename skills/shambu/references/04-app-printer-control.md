@@ -27,6 +27,7 @@ Source references below use a sparse clone of `bambulab/BambuStudio` master at `
 | [Citations](#citations) | Source links for the claims above |
 | [Artefacts in $S](#artefacts-in-s) | Files the investigation left in the scratch workspace |
 | [Track 7 - Time and job fields, and the watch log](#track-7---time-and-job-fields-and-the-watch-log-2026-10-21) | The report's time, speed and stage keys, and `printer watch --log` with `--gcode3mf` for `shambu calibrate` |
+| [Track 8 - Printer profiles and the credentials file](#track-8---printer-profiles-and-the-credentials-file-2026-10-27) | The config dir, `printers.json` and `credentials.json`, both modes on one transport, what Studio keeps, `printer login` step by step, the trust boundary |
 
 ## TL;DR
 
@@ -347,7 +348,7 @@ Verdict: **Python, one `uv run --script` file per tool (or one package-less modu
 
 ## Recommended command set for the wrapper
 
-All subcommands are read-only unless marked. Global options: `--printer <name>` (from a local `printers.toml` with ip + serial; access code from `--access-code-file`, macOS Keychain (`security find-generic-password`), or, after an explicit opt-in, `BambuStudio.conf` `access_code.<serial>`, read in memory and never logged).
+All subcommands are read-only unless marked. Global options: `--printer <name>` (a profile in `printers.json` in shambu's config dir, with the serial, IP and mode). The access code comes from a one-shot flag (`--access-code-file`, `--access-code-stdin`), then the code `shambu printer login` stored in `credentials.json` (0600), then `BambuStudio.conf` `access_code.<serial>`; it is held in memory and never logged (Track 8).
 
 | Subcommand | Does | Needs |
 |---|---|---|
@@ -359,7 +360,7 @@ All subcommands are read-only unless marked. Global options: `--printer <name>` 
 | `slice <3mf\|stl...> --plate N --out x.gcode.3mf` | Headless CLI slice in a temp dir with `--mstpp` cap; parses `result.json`; verifies `Metadata/plate_N.gcode` | Studio binary; covered by the `bambu-3mf` skill / track 1-3 reports |
 | `gcode3mf inspect <file>` | Plates, time, filament use, bed type, nozzle map, embedded preset names | `zipfile` + XML (`slice_info.config`, `plate_N.json`, `project_settings.config`) |
 | `printer discover [--seconds 30]` | Passive SSDP listen on 2021/1990 with `SO_REUSEPORT`; prints IP, model, `DevConnect`, firmware; serial masked | UDP sockets only |
-| `printer probe` | TLS connect to 8883 (CA = Studio `printer.cer`, SNI = serial), subscribe report, **one** `pushall`, disconnect; reports whether LAN MQTT is open in the current mode | `paho-mqtt`, access code |
+| `printer probe` (deferred) | TLS connect to 8883 (CA = Studio `printer.cer`, SNI = serial), subscribe report, **one** `pushall`, disconnect; reports whether LAN MQTT is open in the current mode. Not built: `printer login` runs the same read and `doctor --printer NAME` reports the profile and the read (Track 8) | `paho-mqtt`, access code |
 | `printer status [--watch N]` | Normalised status: state, %, remaining min, layer, both nozzles (Main id 1 / Aux id 0) temp+target, bed, chamber, active extruder, AMS trays, external spools, `rtsp_url`, HMS decoded with offline text | `pushall` once, then passive reports; `hms_en_20P.json` |
 | `printer hms` | Current HMS list → long codes + English text + wiki link | Same |
 | `printer files [path]` | FTPS `NLST`/`LIST` of the printer storage (read-only) | `ftplib.FTP_TLS` implicit subclass, `prot_p()` |
@@ -468,3 +469,103 @@ the start by the first RUNNING poll and the end by the first FINISH poll.
   redacts secret-looking keys and any text that names the IP or the serial.
 - **Errors.** A log that cannot be opened, written or closed is exit 3. A Studio config problem (no printer
   selected, no access code) is one `setup` line, and the watch stops at once with exit 3.
+
+---
+
+## Track 8 - Printer profiles and the credentials file (2026-10-27)
+
+Why: on 2026-10-27 the X2D went to LAN-only mode on its touchscreen and regenerated its LAN access code (one
+observation). Studio's config still held the old code, ARP had no entry for the printer, and shambu had nowhere to keep
+an IP or a code. The design and its history: `docs/specs/2026-10-27-printer-profiles.md`.
+
+### The config dir and the two files
+
+The dir is `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu` (`conf.config_dir()`). A value
+that is empty or relative after `~` expansion counts as unset, so no file lands in a checkout. shambu creates the dir
+0700 and writes each file 0600 and atomically, under a lock file beside it. A symlink or anything that is not a regular
+file at either path is refused. `calibration.json` stays under Application Support: it is data, not config.
+
+`printers.json` (`profiles.py` has the schema; never a code):
+
+```
+{"version": 1, "default": "x2d",
+ "printers": [{"name": "x2d", "serial": "<serial>", "ip": "<ip>", "mode": "lan" | "cloud" | "unknown",
+               "insecure": false, "added": "2026-10-27T10:57:00Z", "verified": "2026-10-27T10:57:00Z"}]}
+```
+
+`verified` is the time of the last successful `login`. The model, the firmware and where the code is kept are not
+stored. A name holds no serial, mask, IP or known code.
+
+`credentials.json` (`vault.FileVault`; never a name, an IP or a path):
+
+```
+{"version": 1, "codes": {"<serial>": "<code>"}}
+```
+
+A file with a group or other permission bit, or one that another user owns, is refused. The threat model: the same
+protection as Studio's own plain-text config against another process of the same user, with a tighter mode, outside
+any repository.
+
+### Both modes, one transport
+
+The local broker on 8883 accepts `bblp` and the access code in cloud mode as well as in LAN-only mode. Evidence: shambu
+read the X2D on 2026-10-16 while the job reported `print_type: cloud` (Track 7), and read it again on 2026-10-27 at
+10:57 UTC in LAN-only mode. Status pushes are outside Authorization Control by Bambu's own list (16 Jan 2025 post), so
+neither mode needs Developer Mode for a read. This answers the open question in Track 3. The mode changes only where a
+fresh code comes from and how the printer is found. shambu does not detect the mode: SSDP heard nothing in either mode
+(Track 3, and again on 2026-10-27), so `login --mode lan|cloud` records what the touchscreen shows, else `unknown`.
+
+### What Studio keeps, and why shambu never writes it
+
+Studio master `79df7ae` (13 Oct 2026):
+
+- `BambuStudio.conf` holds the code as `access_code.<serial>` and the IP of a LAN-mode printer as
+  `user_access_dev_ip.<serial>`, encoded against `slicer_uuid` (`DeviceManager.cpp:466-535`). For a cloud printer it
+  stores no IP, and its code is whatever the cloud bind list last said (`DevManager.cpp:883-887`).
+- Studio rewrites the whole file every 5 s while its config is dirty and again on exit (`GUI_App.cpp:2999-3000`,
+  `:3716-3721`), so a write from outside lasts only while Studio is closed.
+- After a refused login Studio clears the code it held (`GUI_App.cpp:2280-2290`), so Studio's config cannot be the
+  source after a rotation in LAN-only mode until the printer is bound again in the Device tab.
+- Studio's manual IP dialog refuses a cloud-mode printer (`ReleaseNote.cpp:2050-2080`).
+
+shambu reads Studio's config as the last code source (after a one-shot flag and the credentials file) and never
+writes it. `login --from-studio` copies Studio's selected serial and code into a profile; nothing copies the other way.
+
+### `get_access_code`: never sent
+
+Studio publishes `{"system":{"command":"get_access_code"}}` on every connect (`DeviceManager.cpp:1267,2632`), and the
+printer answers with the code. It would heal a rotated code, but it is not `pushall`, and shambu publishes nothing
+else. So a refused login is always handed back to the user.
+
+### What `shambu printer login` does
+
+1. Checks the flags (usage, exit 2): `--from-studio` takes no `--serial`, code flag or `--printer`; a new printer needs
+   `--ip`; `--serial` must match the named profile; `--insecure` on a new printer needs `--serial` (the certificate
+   is unreadable without verification).
+2. Reads the code: `--access-code-file FILE` or `--access-code-stdin` (the first line), else the prompt `LAN access
+   code (not shown): ` when stdin and stderr are terminals, else usage. `--from-studio` takes Studio's selected serial
+   and its code instead. A code must be 4 to 128 characters with no space, quote or backslash.
+3. Finds the serial: Studio's (`--from-studio`), the profile's (`--printer NAME`, or the default with no `--ip`), else
+   `--serial` or the CN of the certificate at `--ip` (`certificate_serial`: one TLS handshake against Studio's CA
+   bundle, no MQTT, no credential). A `--serial` that differs from the CN fails, and nothing is written.
+4. Validates the draft profile (name, clash) before any read.
+5. Reads the printer once with the code: discovery (ARP, then the default-route /24) when no IP is known, TLS
+   verified, MQTT CONNECT, one `pushall`, a full report. A refusal is exit 3 and writes nothing.
+6. Under the profiles lock: stores the code in `credentials.json`, then writes the profile with `verified` set and the
+   IP the read used. If the profile write fails, the previous code (or none) is put back.
+7. Prints `profile x2d: serial <masked>, code stored, mode lan, read at HH:MM UTC`, plus ` (default)` when it is the
+   default. The first profile becomes the default; `--default` moves it.
+
+A refused login keeps `refused the MQTT login` (the watch log's `login` category keys on it), then names the code's
+source and the profile, then the next step for the profile's mode: LAN-only, read the code off the touchscreen and
+run `shambu printer login`; cloud, open Studio once so it fetches the code; `unknown`, both. The printer can
+regenerate its code when LAN-only mode is toggled, when the refresh icon next to the code is pressed, after some
+firmware updates and sometimes after a reboot; which of these always does it is not settled (spec section 8).
+
+### Trust boundary
+
+`login --ip` without `--serial` binds the profile to whatever Bambu-signed certificate answers at that IP. A
+chain-valid CN proves a Bambu device, not the intended one. The CN must be serial-shaped and the MQTT read that follows
+pins that serial; `--serial` from the touchscreen is the stronger binding. After enrolment, discovery with a known
+serial and TLS verified accepts only a host whose certificate names that serial, and no code goes to a host before
+that check.

@@ -13,11 +13,12 @@ send a job. Request: $ARGUMENTS
 ## Before you start (standing rules)
 
 1. Before the first shambu command of a task (before the spec is written): `shambu --version` (it must print:
-   shambu 0.4.0), then `shambu doctor --json --expect-version 0.4.0`. Exit 3 with `"shambu": {"match": false}`
+   shambu 0.5.0), then `shambu doctor --json --expect-version 0.5.0`. Exit 3 with `"shambu": {"match": false}`
    (`MISMATCH` and a `Fix:` line) means another version is on PATH. A usage error on `--expect-version` means one
    older than 0.4.0. Either way: stop, give both versions and the fix (`/shambu:setup update`). Never use
    `uv run --project`, a checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`.
-   Missing: `/shambu:setup`. doctor cannot find the printer's IP: `shambu printer discover`.
+   Missing: `/shambu:setup`. doctor cannot find the printer: `shambu printer discover`, then the user runs
+   `shambu printer login --ip IP --serial SERIAL` (or `/shambu:setup check`).
 2. doctor gives the printer preset, both nozzles' reach and height, the bed, the GUI presets, the recipes and,
    under `printer`, the spools loaded now. Use those values, not a spec from an earlier day.
 3. Write every filament as `{"preset": "loaded"}` unless the user names a spool. A pinned preset that is not the
@@ -126,11 +127,11 @@ user sets one.
 ## Commands
 
 ```
-shambu --version | doctor [--expect-version X.Y.Z] [--no-printer] [--ip IP] [--printer-timeout S]
+shambu --version | doctor [--expect-version X.Y.Z] [--no-printer] [--printer NAME] [--ip IP] [--printer-timeout S]
 shambu info FILE... | inspect project.3mf | presets list filament --contains PETG | recipes | spec [plate.json]
 shambu orient PART.stl [--native] [--write DIR] | rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] | split PART.stl -o DIR
 shambu check plate.json | build plate.json [--slice] [--no-check] [--open] [--probe-supports | --no-probe]   # both read the spools first
-       [--allow-filament-mismatch] [--no-printer] [--ip IP] [--keep-going: only with the user's yes]
+       [--allow-filament-mismatch] [--no-printer] [--printer NAME] [--ip IP] [--keep-going: only with the user's yes]
 shambu sweep plate.json [--orientations PART]... [--source own|studio] [--by-object] [--variants v.json] [--write-spec OUT.json [--pick NAME]]
 shambu patch project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:enable_support=1" --pause 1:10.2 --print-sequence "1:by object"
 shambu patch project.3mf --replace-mesh OBJECT[/PART]=new.stl [--rotate-mesh X,Y,Z | --lay-on-face NX,NY,NZ] [--anchor frame|centre|min]
@@ -140,6 +141,7 @@ shambu open project.3mf                                                # opens i
 shambu slice FILE.3mf [--plate N] [--no-check] [--tower X,Y[@PLATE]] [--settings-from plate.json]
 shambu studio [--out DIR] -- ARGS...                                   # logged raw Studio call: only with the user's yes
 shambu printer discover | printer filaments | printer status | printer watch [--every 300] [--log FILE --gcode3mf F.gcode.3mf [--wait-for-start]]
+shambu printer list | printer login ... (the user runs it: it prompts for the code) | printer forget --printer NAME   # every read takes [--printer NAME]
 shambu calibrate --log FILE --add | calibrate --show                    # store a watched print; show the fit
 ```
 
@@ -188,9 +190,17 @@ It never runs Studio's arrange and never rotates a part to pack it.
 ## Reading the printer
 
 `printer filaments` and `status` send one `pushall`. `status`, `watch` and the log never show the IP; the masked
-serial appears on stdout only. To measure a print: `printer watch --wait-for-start --log print.jsonl --gcode3mf
-plate.gcode.3mf` until FINISH, then `calibrate --log print.jsonl --add`. A calibrated time needs three qualifying
-prints of one printer model and material (`references/06-slicer-rules.md` section 11).
+serial appears on stdout only. `printer list` shows each profile's IP on purpose, because it lists the user's own
+printers; nothing else does. Never ask for the access code in chat and never put it on a command line. To measure a
+print: `printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf` until FINISH, then `calibrate
+--log print.jsonl --add`. A calibrated time needs three qualifying prints of one printer model and material
+(`references/06-slicer-rules.md` section 11).
+
+The printer refused the code (`refused the MQTT login`, exit 3): no retry, because the printer also refuses while it
+boots or shuts down. Quote the error's `source:` and its next step, then hand back: "The printer refused the access
+code. Read the code off its touchscreen and run `shambu printer login --printer NAME` in your terminal (it prompts
+for the code)." In cloud mode: "Open Bambu Studio once so it fetches the current code, then run `shambu printer
+login --from-studio`."
 
 ## References (read when the row says so)
 

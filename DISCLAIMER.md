@@ -16,9 +16,13 @@ material if its settings are wrong.
 
 ## Device and network operations
 
-shambu reads a Bambu Lab printer over the local network using the printer's own LAN access code, which it reads from
-Bambu Studio's configuration on the same machine. It subscribes to the printer's status topic and sends one status
-request. It never starts, pauses, stops or modifies a print, never uploads files, and never sends any other command.
+shambu reads a Bambu Lab printer over the local network using the printer's own LAN access code, which it takes from
+a one-shot flag, from the credentials file that `shambu printer login` writes in shambu's config dir, or from Bambu
+Studio's configuration on the same machine. It subscribes to the printer's status topic and sends one status request.
+It never starts, pauses, stops or modifies a print, never uploads files, and never sends any other command. To find
+the printer it connects to TCP 8883 on the hosts in the ARP table and, with a profile, in `login` and in `printer
+discover`, on the other hosts of the default-route network when that network is /24 or narrower; a candidate gets
+nothing but a TCP connect and, when the serial is known, a TLS handshake (see `SECURITY.md`).
 Protect your access code, your network and anything you capture; do not run the tool against a printer you do not
 control.
 

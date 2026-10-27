@@ -4,7 +4,64 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-27
+
+Printer profiles for LAN-only mode and cloud mode. On 2026-10-27 the X2D went to LAN-only mode and regenerated its
+LAN access code, Studio's config still held the old code, and shambu had nowhere to keep an IP or a code, so every
+read failed until Studio's config was edited by hand. shambu now keeps its own profiles and codes, and both modes use
+the same local read.
+
+### Added
+- Printer profiles: `printers.json` in shambu's config dir holds one entry per printer (name, serial, last IP, mode,
+  TLS flag, the dates added and last verified) and the default profile. It never holds an access code.
+- `shambu printer login` in three forms: `--ip IP [--serial SERIAL]` (a new printer), `--printer NAME [--ip IP]` (a
+  known profile, for a new code or a new address) and `--from-studio` (the serial and the code of Studio's selected
+  printer). It reads the printer once with the code and stores the profile and the code only after that read
+  succeeds. The code comes from `--access-code-file`, `--access-code-stdin` or a hidden prompt on a terminal.
+  `--name`, `--default` and `--mode` set the profile's name, the default and the mode.
+- `shambu printer list`: one line per profile (name, masked serial, IP, mode, last verified time, `(default)`); exit 1
+  when there is none. `shambu printer forget --printer NAME [--keep-code]` removes a profile and, unless
+  `--keep-code`, its stored code.
+- `--printer NAME`, `--serial`, `--access-code-file FILE` and `--access-code-stdin` on `doctor`, `check`, `build`,
+  `sweep` and every `printer` action. The two code flags read the first line and keep the code for this run only.
+- `--mode lan|cloud` on `login`: the mode the user set on the touchscreen (shambu does not detect it; a profile
+  without it says `unknown`). The mode picks the next step that a refused login names.
+- A subnet pass in discovery: after the ARP table, the other hosts of the default-route network (/24 or narrower) on
+  TCP 8883. It runs in `printer discover`, in `login` and on every read through a profile.
+- `login --ip` without `--serial` takes the serial from the CN of the printer's certificate (one TLS handshake, no
+  MQTT, no credential).
+- Identity-checked discovery: when the serial is known from a flag or a profile and TLS is verified, each discovery
+  hit must present a certificate that names that serial; a foreign host on 8883 is skipped.
+
+### Changed
+- Error text: a missing code is `no access code for serial <masked>: run shambu printer login, or open the printer
+  once in Bambu Studio's Device tab`. A refused login keeps `refused the MQTT login`, then names the code's source and
+  the profile, then the next step for the profile's mode (LAN-only: read the code off the touchscreen and run `shambu
+  printer login`; cloud: open Studio once, then `login --from-studio`; unknown: both).
+- The watch log's `login` and `setup` categories name `shambu printer login` beside Studio.
+- `doctor` prints one `printer profile ...` line in its config section when a profile is selected (name, masked
+  serial, mode, last login as `HH:MM UTC`, TLS flag, profile count, config dir). A damaged `printers.json` is an
+  error in that line, and the rest of the report still runs; the other commands that read profiles exit 3 and name
+  the file.
+- Every time that `login`, `list` and `doctor` print is labelled `HH:MM UTC`.
+- `main` scrubs every known access code and every raw serial from an error text before it prints it; a masked serial
+  stays.
+- The config dir is `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu`. A relative or
+  empty value counts as unset, so no file lands in a checkout.
+- `--printer` now shadows the argparse prefixes `--printer-timeout` and `--printer-preset`: spell both in full.
+
+### Security
+- The access code is written only to `credentials.json` (mode 0600) in the config dir. It never goes to
+  `printers.json`, to Studio's config, to argv or to any output.
+- Every code the process read, from any source, is a runtime secret: every outward text (errors, the watch header and
+  log, doctor and build warnings, `--json` output) is scrubbed of it.
+- shambu refuses a symlink, or anything that is not a regular file, at the paths of `printers.json` and
+  `credentials.json`; `credentials.json` must also belong to the user and carry no group or other permission bit.
+- Trust boundary: a first-time `login --ip` without `--serial` binds the profile to whatever Bambu-signed certificate
+  answers at that IP. A chain-valid certificate proves a Bambu device, not the intended one; `--serial` from the
+  touchscreen is the stronger binding.
+- Discovery sends nothing but a TCP connect and, with a known serial, a TLS handshake to a candidate host, and it
+  scans no network wider than /24 (SECURITY.md has the contract).
 
 ## [0.4.0] - 2026-10-21
 
