@@ -3,6 +3,12 @@
 Output is human text by default and JSON with `--json` (before or after the command name), so an agent can parse
 it. Exit codes: 0 ok, 1 a check or verification failed, the spec is invalid or a patch was refused, 2 bad usage, 3 an
 environment error (binary, config, a file that cannot be written), 130 interrupted.
+
+Printer profiles (0.5.0): `printer login` reads the printer once with a new access code and then stores the profile
+(printers.json) and the code (credentials.json, 0600); `printer list` shows the profiles; `printer forget --printer
+NAME` removes one and its code. Every command that reads the printer (check, build, sweep, doctor, printer status,
+filaments, watch and raw) takes `--printer NAME` and the one-shot code flags `--access-code-file FILE` and
+`--access-code-stdin` (the first line; this run only, never stored); `login` alone also prompts on a terminal.
 """
 
 from __future__ import annotations
@@ -45,6 +51,7 @@ from .patches import (
     SetObjectSetting,
     SetPrintSequence,
 )
+from .profiles import ProfileSet
 from .report import checks_skipped_lines, estimate_lines
 from .spec import Spec
 from .studio import CliCommand
@@ -162,6 +169,8 @@ def read_access_code(a: argparse.Namespace, out: Output) -> str | int:
 
     from .vault import safe_code
 
+    if a.access_code_file and a.access_code_stdin:
+        return usage(out, "give one of --access-code-file and --access-code-stdin, not both")
     if a.access_code_file:
         try:
             with open(a.access_code_file, encoding="utf-8") as f:
@@ -192,19 +201,42 @@ def read_access_code(a: argparse.Namespace, out: Output) -> str | int:
     return code
 
 
-def _use_printer(a: argparse.Namespace, app: Bambu, out: Output, *, serial: str | None, insecure: bool = False) -> int | None:
+def load_profiles_named() -> ProfileSet:
+    """`conf.load_profiles()`, with a damaged printers.json named: ConfError("<path>: <REFUSAL>; fix or remove the
+    file"). The path is the only added text; the file's content never appears."""
+    from .profiles import REFUSAL
+
+    try:
+        return conf.load_profiles()
+    except ConfError:  # REFUSAL; a DataFileError (cannot read it) already names the file
+        raise ConfError(f"{conf.PRINTERS}: {REFUSAL}; fix or remove the file") from None
+
+
+def _use_printer(
+    a: argparse.Namespace, app: Bambu, out: Output, *, serial: str | None, insecure: bool = False, doctor: bool = False
+) -> int | None:
     """Set the printer selection on `app` before any network step: the profile (an unknown name is a usage error, exit
     2), the serial, the TLS flag and a one-shot code when a code flag is set. None when the read can go ahead, else the
-    exit code. A damaged printers.json stays an environment error (exit 3)."""
+    exit code. A damaged printers.json is an environment error (exit 3) that names the file, except for `doctor`: it
+    skips the file when no --printer and no code flag is given, and otherwise lets its config section report the damage,
+    so doctor never stops on it."""
     app.printer_profile = a.printer_profile
     app.printer_serial = serial
     app.printer_insecure = insecure
-    ps = conf.load_profiles()
-    try:
-        conf.select_profile(a.printer_profile, ps)
-    except ConfError as e:
-        return usage(out, str(e))
-    if a.access_code_file or a.access_code_stdin:
+    has_code_flag = bool(a.access_code_file or a.access_code_stdin)
+    if not (doctor and a.printer_profile is None and not has_code_flag):
+        try:
+            ps: ProfileSet | None = load_profiles_named()
+        except ConfError:
+            if not doctor:
+                raise
+            ps = None
+        if ps is not None:
+            try:
+                conf.select_profile(a.printer_profile, ps)
+            except ConfError as e:
+                return usage(out, str(e))
+    if has_code_flag:
         code = read_access_code(a, out)
         if isinstance(code, int):
             return code
@@ -283,7 +315,7 @@ def profile_lines(c: dict) -> list[str]:
         return []
     if "error" in p:
         return [f"printer profile: {p['error']}"]
-    when = p["verified"][11:16] if p.get("verified") else "never"
+    when = _hhmm(p.get("verified"))
     tls = "TLS check off (--insecure)" if p["insecure"] else "TLS verified"
     return [
         f"printer profile {p['name']}{' (default)' if p['default'] else ''}: serial {p['serial']}, mode {p['mode']}, "
@@ -332,7 +364,7 @@ class Doctor(Command):
         app.printer_timeout = a.printer_timeout
         app.printer_profile = a.printer_profile
         if not a.no_printer:
-            stop = _use_printer(a, app, out, serial=a.serial)
+            stop = _use_printer(a, app, out, serial=a.serial, doctor=True)
             if stop is not None:
                 return stop
         d = app.doctor(
@@ -1350,12 +1382,13 @@ def _discover(a, out: Output) -> int:
 
 
 def _hhmm(stamp: str | None) -> str:
-    return stamp[11:16] if stamp else "never"
+    """The HH:MM of a UTC ISO stamp, labelled ("08:00 UTC"), or "never"."""
+    return f"{stamp[11:16]} UTC" if stamp else "never"
 
 
 def _list(out: Output) -> int:
     """`printer list`: one line per profile. The one place shambu prints a printer's IP."""
-    ps = conf.load_profiles()
+    ps = load_profiles_named()
     doc = {"config_dir": str(conf.PRINTERS.parent), "default": ps.default, "printers": [p.public() for p in ps.printers]}
     if not ps.printers:
         _scrubbed(out, doc, ["no printer profiles: run shambu printer login"])
@@ -1372,6 +1405,11 @@ def _list(out: Output) -> int:
 def _forget(a, app: Bambu, out: Output) -> int:
     if not a.printer_profile:
         return usage(out, "forget needs --printer NAME (shambu printer list shows the names)")
+    ps = load_profiles_named()  # a damaged file: exit 3, naming it
+    try:  # before the lock: an unknown name writes nothing (no config dir, no lock file)
+        conf.select_profile(a.printer_profile, ps)
+    except ConfError as e:
+        return usage(out, str(e))
     r = app.forget(a.printer_profile, a.keep_code)
     what = (
         f"code: {r['note']}"
@@ -1393,7 +1431,9 @@ def _login(a, app: Bambu, out: Output) -> int:
     code. Exit 0, 2 for bad usage, 3 when the printer refuses the code or cannot be read (nothing is stored then)."""
     if a.from_studio and (a.serial or a.access_code_file or a.access_code_stdin):
         return usage(out, "--from-studio takes the serial and the code from Bambu Studio's config: drop --serial and the access code flags")
-    ps = conf.load_profiles()
+    if a.from_studio and a.printer_profile is not None:
+        return usage(out, "--from-studio takes Bambu Studio's selected printer and --printer names a profile: give one of them")
+    ps = load_profiles_named()
     profile = None
     if a.printer_profile is not None:
         try:
@@ -1654,6 +1694,13 @@ def _add_json_flag(p: argparse.ArgumentParser) -> None:
                 _add_json_flag(child)
 
 
+def _error_scrub_values() -> list[str]:
+    """What `main` scrubs from an error text: every known code (`conf.secret_values`) and every raw serial (the
+    `conf.sensitive_values` entries that are not a mask), longest first. A masked serial (`00X…999`) is not scrubbed."""
+    vals = set(conf.secret_values()) | {v for v in conf.sensitive_values() if "\u2026" not in v}
+    return sorted(vals, key=len, reverse=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     a = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -1663,8 +1710,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         app = Bambu()
         return _REGISTRY[a.cmd].run(a, app, out)
-    except BambuError as e:  # the text may name an IP, a host or a serial, and must never hold a code
-        msg = conf.redact_identifiers(conf.scrub_text(f"{type(e).__name__}: {e}"))
+    except BambuError as e:  # the text must never hold a code or a raw serial; an IP and a masked serial stay, as in 0.4.0
+        msg = conf.scrub_text(f"{type(e).__name__}: {e}", _error_scrub_values())
         if a.json:
             print(json.dumps({"error": msg}))
         else:

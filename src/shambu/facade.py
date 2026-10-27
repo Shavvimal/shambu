@@ -4,6 +4,10 @@ Printer profiles (0.5.0): `printer()` builds the credential chain `[OneShotCrede
 `+ [ProfileCredentials]` (the selected profile and the credentials file) `+ [StudioCredentials]`; with a profile it also
 takes the profile's IP and TLS flag and scans the default-route /24 after the ARP table. `login()` reads the printer
 once with the new code and only then commits the profile and the code; `forget()` removes a profile and its code.
+
+What this module does not do: no constructor does I/O (the Studio binary, the preset tree and the credentials file
+are opened on first use), nothing here prints, and nothing reads stdin. The CLI reads a one-shot code and sets
+`printer_code`; the facade only passes it on and never stores it.
 """
 
 from __future__ import annotations
@@ -470,18 +474,11 @@ class Bambu:
         draft = Profile(name, serial, ip, mode, insecure, added=utc_iso(time.time()), verified=None)
         ps.upsert(draft, default=make_default, secrets=conf.sensitive_values())  # a bad name or a clash: before the read
 
-        used: dict[str, str] = {}
-
-        def reader(ip_: str, serial_: str, code_: str, wait_: float, insecure_: bool) -> printer_mod.MqttReader:
-            used["ip"] = ip_  # the address the read went to: the given one, the profile's or discovery's
-            return printer_mod.MqttReader(ip_, serial_, code_, wait_, insecure_)
-
         svc = PrinterService(
             ip,
             serial,
             self.printer_wait,
             discovery=(ArpProbe(), SubnetProbe()),
-            reader_factory=reader,
             insecure=insecure,
             timeout_s=self.printer_timeout,
             on_step=self.printer_progress,
@@ -489,12 +486,14 @@ class Bambu:
             profile=service_profile,
         )
         svc.raw_report()
+        resolved = svc.last_resolved  # the address the read went to: the given one, the profile's or discovery's
+        read_ip = resolved.ip if resolved is not None else ip
         now = utc_iso(time.time())
         store = self.vault_store()
 
         def commit(current: ProfileSet) -> ProfileSet:
             old = current.by_serial(serial)
-            p = Profile(name, serial, used.get("ip", ip), mode, insecure, added=old.added if old is not None else now, verified=now)
+            p = Profile(name, serial, read_ip, mode, insecure, added=old.added if old is not None else now, verified=now)
             new = current.upsert(p, default=make_default, secrets=conf.sensitive_values())
             previous = store.get(serial)
             store.put(serial, code)
@@ -506,7 +505,7 @@ class Bambu:
                         store.delete(serial)
                     else:
                         store.put(serial, previous)
-                except Exception as e:  # noqa: BLE001 - the write failure is the error to report; this one is logged
+                except VaultError as e:  # the write failure is the error to report; this one is logged
                     log.warning("could not restore the stored access code for %s (%s)", conf.mask(serial), type(e).__name__)
                 raise
             return new
