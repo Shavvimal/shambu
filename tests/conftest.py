@@ -13,13 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from shambu import conf, vault
+from shambu import conf, printer, vault
 from shambu import presets as P
 from shambu.errors import PrinterError
 from shambu.facade import Bambu
 from shambu.studio import BINARY, CliCommand, MeshInfo, OrientCandidate, OrientResult, OrientTable, RunResult
 
 FIXTURES = Path(__file__).parent / "fixtures"
+IDENTITY_CONTEXT = types.SimpleNamespace(name="stand-in CA context")  # what a fake `cert_serial` receives as `ctx`
+REAL_IDENTITY_CONTEXT = printer._identity_context  # saved before `offline` patches it
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +29,8 @@ def offline(monkeypatch, tmp_path_factory):
     """No test touches the LAN or this Mac's Bambu Studio config: the facade's printer read fails as an unreachable
     printer does (the WARN fallback), BambuStudio.conf is absent, printers.json and credentials.json are missing files
     in a config dir that does not exist yet (so its 0700 creation runs), `vault.default_vault()` returns one
-    `MemoryVault` per test and the runtime secret and identifier sets start and end empty. A test that wants a report or
+    `MemoryVault` per test, the identity checks of discovery get a stand-in CA context (`printer._identity_context`; no
+    test reads Studio's real CA bundle) and the runtime secret and identifier sets start and end empty. A test that wants a report or
     a config monkeypatches `Bambu.loaded_filaments`, `conf.CONF` or `conf.PRINTERS` again on top of this; a test that
     requests `offline` by name seeds the vault through `offline.vault`."""
 
@@ -42,6 +45,7 @@ def offline(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(conf, "CREDENTIALS", config / "credentials.json")
     fake = vault.MemoryVault()
     monkeypatch.setattr(vault, "default_vault", lambda: fake)
+    monkeypatch.setattr(printer, "_identity_context", lambda: IDENTITY_CONTEXT)
     conf.forget_secrets()
     yield types.SimpleNamespace(vault=fake)
     conf.forget_secrets()

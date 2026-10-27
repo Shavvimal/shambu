@@ -13,8 +13,9 @@ fixed fields of `calibrate.validate_print` (a session fingerprint, date, printer
 rate, startup offset, poll times, speed levels, flags) and never a file name, an IP, a serial, an access code or a
 path.
 
-The config dir (`config_dir()`): `$SHAMBU_CONFIG_DIR` when it is set and not empty, else `$XDG_CONFIG_HOME/shambu` when
-`XDG_CONFIG_HOME` is set and not empty, else `~/.config/shambu`. There is no fallback to the repository. shambu creates
+The config dir (`config_dir()`): `$SHAMBU_CONFIG_DIR` when it is set to an absolute path, else `$XDG_CONFIG_HOME/shambu`
+when `XDG_CONFIG_HOME` is set to an absolute path, else `~/.config/shambu`. A value that is empty or relative after `~`
+expansion counts as unset (the XDG spec says so), so no file lands in a checkout. There is no fallback to the repository. shambu creates
 it 0700 (a folder that already exists keeps its mode) and writes every file in it 0600, atomic. It holds two files:
 
 - `printers.json` (`PRINTERS`): the printer profiles (profiles.py has the schema): a version, the default name and, per
@@ -44,6 +45,7 @@ import json
 import logging
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -63,15 +65,24 @@ CALIBRATION = Path.home() / "Library/Application Support/shambu/calibration.json
 CALIBRATION_VERSION = 1
 
 
+def _absolute_env(name: str) -> Path | None:
+    """The variable `name` as a path after `~` expansion; None when it is unset, empty or not absolute."""
+    v = os.environ.get(name)
+    if not v:
+        return None
+    p = Path(v).expanduser()
+    return p if p.is_absolute() else None
+
+
 def config_dir() -> Path:
-    """shambu's config dir: `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu` (an empty
-    variable counts as unset)."""
-    own = os.environ.get("SHAMBU_CONFIG_DIR")
-    if own:
-        return Path(own).expanduser()
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    if xdg:
-        return Path(xdg).expanduser() / "shambu"
+    """shambu's config dir: `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu`. A variable
+    that is empty or relative after `~` expansion counts as unset."""
+    own = _absolute_env("SHAMBU_CONFIG_DIR")
+    if own is not None:
+        return own
+    xdg = _absolute_env("XDG_CONFIG_HOME")
+    if xdg is not None:
+        return xdg / "shambu"
     return Path.home() / ".config" / "shambu"
 
 
@@ -92,8 +103,9 @@ _RUNTIME_IDENTIFIERS: set[str] = set()  # every profile serial this process load
 
 
 def remember_secret(value: str) -> None:
-    """Add a code this process read to the runtime secret set, so every outward text scrubs it. Any length; ignores ''."""
-    if value:
+    """Add a code this process read to the runtime secret set, so every outward text scrubs it. Any length; ignores ''
+    and anything that is not a `str` (a numeric Studio value is not registered)."""
+    if isinstance(value, str) and value:
         _RUNTIME_SECRETS.add(value)
 
 
@@ -303,7 +315,8 @@ def secret_values(conf: dict | None = None) -> list[str]:
 def scrub_text(text: str, values: list[str] | None = None) -> str:
     """`text` with every known sensitive value (`sensitive_values`) replaced by '<redacted>'."""
     for v in sensitive_values() if values is None else values:
-        text = text.replace(v, "<redacted>")
+        if v:  # an empty value would put '<redacted>' between every character
+            text = text.replace(v, "<redacted>")
     return text
 
 
@@ -339,10 +352,26 @@ def _write_calibration(p: Path, prints: list[dict]) -> None:
     _atomic_write(p, {"version": CALIBRATION_VERSION, "prints": prints}, ".calibration-")
 
 
+def _refuse_irregular(p: Path) -> None:
+    """DataFileError when `p` is a symlink or exists and is not a regular file: a write never replaces a link."""
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise DataFileError(f"{p}: cannot check it ({e.strerror})") from e
+    if not stat.S_ISREG(st.st_mode):  # a symlink, a directory, a FIFO, a device
+        raise DataFileError(f"{p}: not a regular file; remove it and retry")
+
+
 def _atomic_write(p: Path, doc: dict, prefix: str, mode: int = 0o600) -> None:
     """Write the already-validated `doc` to `p` as JSON: a temp file named `prefix...` beside it, set to `mode` before
-    anything is written, then `os.replace`. A missing folder is created 0700 (one that exists keeps its mode).
-    DataFileError when the folder or the file cannot be written; the temp file never stays behind."""
+    anything is written, flushed and fsynced, then `os.replace`. A missing folder is created 0700 (one that exists keeps
+    its mode). DataFileError when `p` is a symlink or not a regular file (it is never replaced), or when the folder or
+    the file cannot be written; the temp file never stays behind and its descriptor is closed on every path, except
+    that a process killed between the write and the `os.replace` can leave a private (0600) `<prefix>*.json` temp file
+    beside `p`. A config directory that already exists keeps its mode."""
+    _refuse_irregular(p)
     try:
         p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=prefix, suffix=".json")
@@ -350,10 +379,12 @@ def _atomic_write(p: Path, doc: dict, prefix: str, mode: int = 0o600) -> None:
         raise DataFileError(f"{p.parent}: cannot write there ({e.strerror})") from e
     failure: OSError | None = None
     try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:  # owns the descriptor from here: closed on every path
+            os.fchmod(f.fileno(), mode)
             json.dump(doc, f, indent=1, allow_nan=False)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
     except OSError as e:
         failure = e
@@ -463,7 +494,9 @@ def locked_profiles(fn: Callable[[ProfileSet], T], path: Path | None = None) -> 
     critical section against other shambu processes. `fn` may call `save_profiles` itself (not `update_profiles`).
 
     A login commit runs `vault.FileVault.put` inside `fn`; `FileVault` takes its own lock on `credentials.json.lock`.
-    So a login commit holds the profiles lock and, inside it, the credentials lock: in that order, always."""
+    So a login commit holds the profiles lock and, inside it, the credentials lock: in that order, always. The facade
+    must never take them in the other order (the credentials lock, then the profiles lock): two processes that take
+    them in opposite orders can deadlock."""
     p = path or PRINTERS
     return _locked(p, lambda: fn(_read_profiles(p)))
 

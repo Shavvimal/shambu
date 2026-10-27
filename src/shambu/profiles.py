@@ -93,14 +93,17 @@ def validate_profile(d, secrets: Iterable[str] = ()) -> None:
 
 def validate_document(doc, secrets: Iterable[str] = ()) -> None:
     """Raises ProfileError(REFUSAL) unless `doc` is a version-1 printers document: valid profiles, unique names and
-    serials, and a default that is None or the name of an entry."""
+    serials, and a default that is None or the name of an entry. Each name and IP is checked against every serial and
+    mask in the document, not only its own, so a document the writer accepts is accepted on every later load."""
     secrets = tuple(secrets)
     if not isinstance(doc, dict) or set(doc) != _DOC_KEYS:
         raise ProfileError(REFUSAL)
     if type(doc["version"]) is not int or doc["version"] != PROFILES_VERSION or not isinstance(doc["printers"], list):
         raise ProfileError(REFUSAL)
+    serials_in_doc = [d["serial"] for d in doc["printers"] if isinstance(d, dict) and isinstance(d.get("serial"), str)]
+    ids = tuple(v for s in serials_in_doc if s for v in (s, conf.mask(s)) if v != "…")
     for d in doc["printers"]:
-        validate_profile(d, secrets)
+        validate_profile(d, (*secrets, *ids))
     names = [d["name"] for d in doc["printers"]]
     serials = [d["serial"] for d in doc["printers"]]
     if len(set(names)) != len(names) or len(set(serials)) != len(serials):

@@ -418,6 +418,36 @@ def test_config_dir_rule(monkeypatch, tmp_path):
     assert conf.config_dir() == tmp_path / "home" / ".config" / "shambu"
 
 
+def test_a_relative_config_dir_value_counts_as_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SHAMBU_CONFIG_DIR", "relative/own")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert conf.config_dir() == tmp_path / "xdg" / "shambu"  # falls through to the next rule
+    monkeypatch.setenv("XDG_CONFIG_HOME", "./xdg")
+    assert conf.config_dir() == tmp_path / "home" / ".config" / "shambu"
+    monkeypatch.setenv("SHAMBU_CONFIG_DIR", "~/own")  # a ~ value expands to an absolute path
+    assert conf.config_dir() == tmp_path / "home" / "own"
+    monkeypatch.delenv("SHAMBU_CONFIG_DIR")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "~/xdg")
+    assert conf.config_dir() == tmp_path / "home" / "xdg" / "shambu"
+
+
+def test_save_profiles_refuses_a_symlinked_file(tmp_path):
+    target = tmp_path / "target.json"
+    empty = json.dumps({"version": 1, "default": None, "printers": []})
+    target.write_text(empty)
+    link = tmp_path / "config" / "printers.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    with pytest.raises(conf.DataFileError) as e:
+        conf.save_profiles(ProfileSet(None, ()), link)
+    assert str(e.value) == f"{link}: not a regular file; remove it and retry"
+    assert link.is_symlink() and target.read_text() == empty and [x.name for x in link.parent.iterdir()] == ["printers.json"]
+    with pytest.raises(conf.DataFileError, match="not a regular file"):  # the same through update_profiles
+        conf.update_profiles(lambda ps: ps, link)
+    assert link.is_symlink() and target.read_text() == empty
+
+
 def test_atomic_write_sets_the_mode_and_creates_a_private_dir(tmp_path):
     p = tmp_path / "new" / "printers.json"
     conf._atomic_write(p, {"version": 1}, ".printers-")
@@ -464,3 +494,11 @@ def test_the_missing_code_text_names_both_ways_to_fix_it():
     assert str(e.value) == (
         f"no access code for serial {conf.mask(SERIAL)}: run shambu printer login, or open the printer once in Bambu Studio's Device tab"
     )
+
+
+def test_a_name_holding_another_entrys_serial_is_refused():
+    """A name is checked against every serial in the document, so the writer and every later load agree."""
+    validate_profile(entry(name=f"n{SERIAL2.lower()}"))  # alone, the entry passes
+    with pytest.raises(ProfileError):
+        validate_document(doc(entry(name=f"n{SERIAL2.lower()}"), entry(name="b", serial=SERIAL2), default=None))
+    validate_document(doc(entry(), entry(name="b", serial=SERIAL2)))

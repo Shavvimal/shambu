@@ -3,9 +3,10 @@
 What it handles: the `Vault` Protocol (get, put, delete a code by serial), the shape checks a serial and a code must
 pass before they are stored (`safe_serial`, `safe_code`), `FileVault` (the file), `MemoryVault` (the in-memory
 implementation the tests use) and `default_vault()`. The file is `{"version": 1, "codes": {"<serial>": "<code>"}}`,
-written atomically with mode 0600 under a lock on `credentials.json.lock`; a file with any group or other permission
-bit is refused. Every code read from a vault is registered with `conf.remember_secret`, so every outward text can scrub
-it.
+written atomically with mode 0600 under a lock on `credentials.json.lock`. A file with any group or other permission
+bit is refused, and so is a symlink, anything that is not a regular file and a file another user owns (`NOT_PRIVATE`).
+Every code a vault reads or is given is registered with `conf.remember_secret`, so every outward text can scrub it: a
+read registers every code in the file, and a put registers its code before it touches any file.
 
 What it does not do: printer profiles (profiles.py, conf.py), IP addresses, Bambu Studio's config (conf.py) or any
 network access. A code never appears in a repr, an error text or a log line.
@@ -17,9 +18,11 @@ from that user's own processes or from anyone who can read that user's files.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +39,7 @@ BAD_FILE = (
     'the credentials file is not a shambu credentials document (want {"version": 1, "codes": {...}}): '
     "move it away and run shambu printer login again"
 )
+NOT_PRIVATE = "{path}: not a regular file owned by this user; remove it and run shambu printer login again"
 
 # At least four characters, no whitespace, quote or backslash, no leading '-'.
 _SAFE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+=/-]{3,127}")
@@ -90,15 +94,16 @@ class MemoryVault:
             raise self.error
 
     def get(self, serial: str) -> str | None:
-        """The stored code, registered with `conf.remember_secret`; None when there is none."""
+        """The stored code; every stored code is registered with `conf.remember_secret`, as `FileVault` registers every
+        code in its file. None when there is none."""
         self._call("get", serial)
-        code = self.items.get(serial)
-        if code is not None:
-            conf.remember_secret(code)
-        return code
+        for c in self.items.values():
+            conf.remember_secret(c)
+        return self.items.get(serial)
 
     def put(self, serial: str, code: str) -> None:
-        """Store `code` for `serial`; VaultError for an unsafe code."""
+        """Store `code` for `serial` (registered with `conf.remember_secret` first); VaultError for an unsafe code."""
+        conf.remember_secret(code)
         if not safe_code(code):
             raise VaultError(UNSAFE)
         self._call("put", serial)
@@ -121,16 +126,27 @@ class FileVault:
         return self.path if self.path is not None else conf.CREDENTIALS
 
     def _load(self, p: Path) -> dict[str, str]:
-        """The codes in the file; {} when it does not exist. VaultError for a file that is not private or not a
-        version-1 credentials document."""
+        """The codes in the file; {} when it does not exist. VaultError for a symlink, anything that is not a regular
+        file owned by this user (`NOT_PRIVATE`), a file that is not private or not a version-1 credentials document.
+        The open never follows a link and never blocks (a FIFO at the path is refused, not waited on)."""
         try:
-            fd = os.open(p, os.O_RDONLY)
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return {}
         except OSError as e:
+            if e.errno == errno.ELOOP:  # O_NOFOLLOW met a symlink
+                raise VaultError(NOT_PRIVATE.format(path=p)) from None
             raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            os.close(fd)
+            raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():  # checked before fdopen: a directory never reaches it
+            os.close(fd)
+            raise VaultError(NOT_PRIVATE.format(path=p))
         with os.fdopen(fd, encoding="utf-8") as f:
-            if os.fstat(f.fileno()).st_mode & 0o077:
+            if st.st_mode & 0o077:
                 raise VaultError(f"{p} must be private: chmod 600 {p}")
             try:
                 d = json.loads(f.read())
@@ -147,6 +163,8 @@ class FileVault:
             or not all(safe_serial(k) and safe_code(v) for k, v in d["codes"].items())
         ):
             raise VaultError(BAD_FILE)
+        for c in d["codes"].values():  # every code in the file, not only the one asked for
+            conf.remember_secret(c)
         return dict(d["codes"])
 
     def _save(self, p: Path, codes: dict[str, str]) -> None:
@@ -163,13 +181,12 @@ class FileVault:
         """The code for `serial`, registered with `conf.remember_secret`; None when there is none."""
         if not safe_serial(serial):
             raise VaultError(UNSAFE)
-        code = self._load(self._path()).get(serial)
-        if code:
-            conf.remember_secret(code)
-        return code or None
+        return self._load(self._path()).get(serial) or None  # `_load` registered every code
 
     def put(self, serial: str, code: str) -> None:
-        """Store `code` for `serial`, replacing any code there."""
+        """Store `code` for `serial`, replacing any code there. The code is registered with `conf.remember_secret` before
+        any file is touched."""
+        conf.remember_secret(code)
         if not safe_serial(serial) or not safe_code(code):
             raise VaultError(UNSAFE)
         p = self._path()
@@ -179,7 +196,6 @@ class FileVault:
             self._save(p, codes)
 
         self._change(p, run)
-        conf.remember_secret(code)
 
     def delete(self, serial: str) -> bool:
         """Remove the code for `serial`; False when there was none."""
