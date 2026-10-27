@@ -18,11 +18,9 @@ from that user's own processes or from anyone who can read that user's files.
 
 from __future__ import annotations
 
-import errno
 import json
 import os
 import re
-import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,24 +126,18 @@ class FileVault:
     def _load(self, p: Path) -> dict[str, str]:
         """The codes in the file; {} when it does not exist. VaultError for a symlink, anything that is not a regular
         file owned by this user (`NOT_PRIVATE`), a file that is not private or not a version-1 credentials document.
-        The open never follows a link and never blocks (a FIFO at the path is refused, not waited on)."""
+        The open (`conf.open_private`) never follows a link and never blocks (a FIFO at the path is refused, not waited on)."""
         try:
-            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = conf.open_private(p, NOT_PRIVATE.format(path=p))
         except FileNotFoundError:
             return {}
-        except OSError as e:
-            if e.errno == errno.ELOOP:  # O_NOFOLLOW met a symlink
-                raise VaultError(NOT_PRIVATE.format(path=p)) from None
-            raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
-        try:
-            st = os.fstat(fd)
-        except OSError as e:
-            os.close(fd)
-            raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():  # checked before fdopen: a directory never reaches it
-            os.close(fd)
-            raise VaultError(NOT_PRIVATE.format(path=p))
+        except conf.DataFileError as e:
+            raise VaultError(str(e)) from None
         with os.fdopen(fd, encoding="utf-8") as f:
+            try:
+                st = os.fstat(f.fileno())
+            except OSError as e:
+                raise VaultError(f"{p}: cannot read it ({e.strerror})") from None
             if st.st_mode & 0o077:
                 raise VaultError(f"{p} must be private: chmod 600 {p}")
             try:

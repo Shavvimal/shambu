@@ -121,6 +121,7 @@ CONNECT_S = 3.0
 HANDSHAKE_S = 5.0
 KEEPALIVE_S = 10
 READ_TIMEOUT_S = 15.0
+IDENTITY_S = CONNECT_S  # kept back from a verified discovery sweep for the identity checks of its hits
 TRAY_NONE = 0xFFFF  # `snow` / `tray_now` value for "nothing loaded"
 SPEED_LEVELS = {1: "silent", 2: "standard", 3: "sport", 4: "ludicrous"}  # `spd_lvl`; Studio StatusPanel.cpp
 # `stg` / `stg_cur` ids -> Studio's text (DeviceManager.cpp get_stage_string, v02.08.02.61). Every id the live X2D job
@@ -219,11 +220,12 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 class ArpProbe:
     """Hosts in the ARP table that answer on 8883. On a home LAN only Bambu printers do.
 
-    Bounds (a slow resolver or a large LAN must not stall a check): `arp -an` (numeric, so no reverse DNS per entry)
-    with a 2 s timeout, then the 8883 probe on min(`workers`, hosts) threads, `timeout` s per host. The probe window
-    is max(`probe_window_s`, rounds x `timeout`), so every host gets its turn on a large LAN, and never longer than
-    the deadline `with_deadline` set. A host not probed when the window ends counts as closed, and `shortfall` says how
-    many were probed. The probe threads are daemons: a probe still blocked at the end never holds up the process exit."""
+       Bounds (a slow resolver or a large LAN must not stall a check): `arp -an` (numeric, so no reverse DNS per entry)
+       with a timeout of min(2 s, the deadline), then
+    the 8883 probe on min(`workers`, hosts) threads, `timeout` s per host. The probe window
+       is max(`probe_window_s`, rounds x `timeout`), so every host gets its turn on a large LAN, and never longer than
+       the deadline `with_deadline` set. A host not probed when the window ends counts as closed, and `shortfall` says how
+       many were probed. The probe threads are daemons: a probe still blocked at the end never holds up the process exit."""
 
     timeout: float = 0.5
     probe_window_s: float = 2.0
@@ -239,10 +241,17 @@ class ArpProbe:
         return replace(self, deadline_s=seconds)
 
     def hosts(self) -> list[str]:
+        """The ARP table's hosts. `arp -an` runs with a timeout of min(`arp_timeout`, `deadline_s`); with a deadline of 0
+        or less it does not run, and `shortfall` says so."""
+        limit = self.arp_timeout if self.deadline_s is None else min(self.arp_timeout, self.deadline_s)
+        if limit <= 0:
+            self.shortfall = "no time left for arp -an, so no ARP discovery"
+            log.warning("%s", self.shortfall)
+            return []
         try:
-            r = self.runner(["arp", "-an"], capture_output=True, text=True, timeout=self.arp_timeout)
+            r = self.runner(["arp", "-an"], capture_output=True, text=True, timeout=limit)
         except subprocess.TimeoutExpired:
-            log.warning("arp -an gave no answer within %g s; no ARP discovery", self.arp_timeout)
+            log.warning("arp -an gave no answer within %g s; no ARP discovery", limit)
             return []
         except OSError as e:
             log.warning("arp -an failed (%s); no ARP discovery", e)
@@ -298,9 +307,12 @@ class ArpProbe:
 
     def find(self) -> list[dict]:
         self.timings = {}
+        self.shortfall = None
         t0 = time.monotonic()
         hosts = self.hosts()
         self.timings["arp"] = round(time.monotonic() - t0, 2)
+        if not hosts:  # keeps a shortfall `hosts` set
+            return []
         left = None if self.deadline_s is None else self.deadline_s - (time.monotonic() - t0)
         t1 = time.monotonic()
         hits = self.probe_hosts(hosts, left)
@@ -323,9 +335,10 @@ def _prefix(mask_hex: str) -> int | None:
 
 def subnet_hosts(route_text: str, ifconfig_text: str, limit_prefix: int = 24) -> list[str]:
     """The other hosts of the default-route network, in numeric order. `route_text` is `route -n get default`,
-    `ifconfig_text` is `ifconfig <interface>`. The network is the one of the interface address that contains the
-    route's gateway; every local address of the interface is left out. `[]` when there is no gateway, no address's
-    network holds it, the mask is not contiguous or wider than /`limit_prefix`, or a text does not parse."""
+    `ifconfig_text` is `ifconfig <interface>`. The network is the most specific (longest prefix) of the interface
+    addresses' networks that contain the route's gateway, whatever the line order; every local address of the interface
+    is left out. `[]` when there is no gateway, no address's network holds it, the chosen mask is not contiguous or
+    wider than /`limit_prefix`, or a text does not parse."""
     route_text = route_text or ""
     gw = _ROUTE_GW.search(route_text)
     if not _ROUTE_IF.search(route_text) or not gw:
@@ -343,7 +356,9 @@ def subnet_hosts(route_text: str, ifconfig_text: str, limit_prefix: int = 24) ->
             own.append(ipaddress.IPv4Interface(f"{addr}/{prefix}"))
         except ValueError:
             continue
-    net = next((i.network for i in own if gateway in i.network), None)
+    nets = [i.network for i in own if gateway in i.network]
+    net = max(nets, key=lambda n: n.prefixlen) if nets else None
+
     if net is None or net.prefixlen < limit_prefix:
         return []
     local = {i.ip for i in own}
@@ -1332,8 +1347,9 @@ class ProfileCredentials:
             return None
         try:
             return self.vault.get(serial)
-        except VaultError as e:
-            raise PrinterError(f"the credentials file could not give the access code for {conf.mask(serial)}: {e}") from None
+        except VaultError as e:  # a vault text can name a path or a value read from the file: scrubbed before it goes out
+            why = conf.scrub_text(str(e))
+            raise PrinterError(f"the credentials file could not give the access code for {conf.mask(serial)}: {why}") from None
 
 
 @dataclass(frozen=True)
@@ -1374,10 +1390,8 @@ _LAN_HINT = (
     "after some firmware updates, and sometimes after a reboot. Read the code off the touchscreen and run: "
     "shambu printer login {login}"
 )
-_CLOUD_HINT = (
-    "Open Bambu Studio once so it fetches the current code from your account, then run: shambu printer login --from-studio {login}"
-)
-REFUSAL_HINT = {  # str.format templates: `{login}` is `--printer NAME` or `--ip IP`
+_CLOUD_HINT = "Open Bambu Studio once so it fetches the current code from your account, then run: shambu printer login --from-studio"
+REFUSAL_HINT = {  # str.format templates: `{login}` (LAN hint only) is `--printer NAME` or `--ip IP`; --from-studio takes neither
     "lan": _LAN_HINT,
     "cloud": _CLOUD_HINT,
     "unknown": "In LAN-only mode: " + _LAN_HINT + "\nIn cloud mode: " + _CLOUD_HINT,
@@ -1437,9 +1451,16 @@ class PrinterService:
     profile's IP (or the caller's override). `check_candidates` turns the identity check of discovery hits on (the
     default) or off. `cert_serial(ip, deadline, ctx)` is `certificate_serial`, injectable for tests.
 
-    `last_resolved` is the `Resolved` of the last read that came back in time (set on the caller's thread, never by the
-    worker and never for an abandoned read; None after a failed one), so a caller learns the IP and the sources a read
-    used without wrapping the reader."""
+    Verified discovery (a serial from a flag or a profile, TLS on, `check_candidates`) splits `timeout_s` three ways: the
+    sweep gets what is left minus the MQTT reserve (CONNECT_S + HANDSHAKE_S) and minus `IDENTITY_S`, the identity
+    checks get what is left above the MQTT reserve, and the MQTT read keeps the reserve. With the default 15 s: a sweep
+    of at most 4 s, then the checks, then 8 s for MQTT. So verified discovery needs a timeout above CONNECT_S +
+    HANDSHAKE_S + IDENTITY_S (11 s); below that, pass `--ip`.
+
+    `last_resolved` is set by every `_bounded` call when it completes, on the caller's thread (never by the worker): the
+    `Resolved` of a read that came back in time, None after a failed or timed-out one. So a caller learns the IP and the
+    sources a read used without wrapping the reader, and after overlapping reads it holds what the last one to finish
+    gave."""
 
     ip: str | None = None
     serial: str | None = None
@@ -1487,11 +1508,11 @@ class PrinterService:
 
     def _bounded(self, fn: Callable[[], T]) -> T:
         """`fn()` within `timeout_s` in a worker thread with its own attempt state, or PrinterError naming the step it
-        was in. No timeout: the same attempt state, in the caller's thread. A `ReadResult` that came back in time sets
-        `last_resolved`, on the caller's thread."""
+        was in. No timeout: the same attempt state, in the caller's thread. At its completion, on the caller's thread, it
+        sets `last_resolved`: the `Resolved` of a `ReadResult` that came back in time, else None (an error, a timeout or
+        another value)."""
         attempt = _Attempt()
         self.timings = attempt.timings
-        self.last_resolved = None
         box: dict = {}
 
         def work() -> None:
@@ -1513,12 +1534,13 @@ class PrinterService:
                 with attempt.lock:
                     attempt.abandoned = True
                     self.timings = dict(attempt.timings)  # the steps that ended in time, frozen
+                self.last_resolved = None
                 raise PrinterError(f"timed out after {self.timeout_s:g} s in {attempt.step}")
         if "error" in box:
+            self.last_resolved = None
             raise box["error"]
         value = box["value"]
-        if isinstance(value, ReadResult):
-            self.last_resolved = value.resolved
+        self.last_resolved = value.resolved if isinstance(value, ReadResult) else None
         return value
 
     def _remaining(self, a: _Attempt) -> float | None:
@@ -1597,9 +1619,10 @@ class PrinterService:
 
         With `check`, the CA context is built once before any pass, so a missing CA bundle raises at once; only a
         per-host connect, TLS or CN failure skips a hit. A check starts only while more than the MQTT reserve
-        (CONNECT_S + HANDSHAKE_S) is left of the read's timeout and gets only what is left above it; the hits not checked
-        in time are counted apart and end discovery. A pass after the first starts only while more than the reserve is
-        left; the passes not run are counted too."""
+        (CONNECT_S + HANDSHAKE_S) is left of the read's timeout and gets what is left above it, at most CONNECT_S +
+        HANDSHAKE_S; the hits not checked in time are counted apart and end discovery. The first pass starts with any
+        time left (so a short timeout still tries once), a later pass only while more than the reserve is left; the
+        passes not run are counted too. A pass's deadline is `_discovery_deadline`, never more than what is left."""
         a = self._attempt()
         ctx = _identity_context() if check else None
         reserve = CONNECT_S + HANDSHAKE_S
@@ -1612,10 +1635,13 @@ class PrinterService:
         try:
             for n, proto in enumerate(self.discovery):
                 left = self._left(a)
-                if unchecked or (n and left is not None and left <= reserve):
+                if unchecked or (left is not None and left <= (reserve if n else 0.0)):
                     not_run = len(self.discovery) - n  # the MQTT read keeps its reserve: no later pass starts
                     break
-                d = proto.with_deadline(self._discovery_deadline(a))
+                deadline = self._discovery_deadline(a, check)
+                if deadline is not None and left is not None:
+                    deadline = min(deadline, left)  # a first pass that starts inside the reserve gets only what is left
+                d = proto.with_deadline(deadline)
                 a.step = "discovery"
                 hits = d.find()
                 for name, dt in d.timings.items():
@@ -1637,7 +1663,7 @@ class PrinterService:
                     checks_ran = True
                     t0 = time.monotonic()
                     try:
-                        budget = None if left is None else left - reserve
+                        budget = None if left is None else min(left - reserve, reserve)
                         ok = self.cert_serial(h["ip"], budget, ctx).casefold() == serial.casefold()
                     except PrinterError as e:  # the identity check could not read the host: it is not the printer
                         log.info("discovery hit skipped: %s", conf.redact_identifiers(conf.scrub_text(str(e))))
@@ -1662,11 +1688,13 @@ class PrinterService:
         why = f" ({'; '.join(gaps)})" if gaps else ""
         raise PrinterError(f"no host on this LAN answers on port 8883{why}. Is the printer on and on this network? Pass --ip.")
 
-    def _discovery_deadline(self, a: _Attempt) -> float | None:
-        """What is left of the read's timeout once the connect and the TLS handshake are kept back; None: no timeout."""
+    def _discovery_deadline(self, a: _Attempt, check: bool = False) -> float | None:
+        """What is left of the read's timeout once the connect and the TLS handshake are kept back and, with `check`,
+        the identity allowance `IDENTITY_S` too; at least 0.5 s. None: no timeout."""
         if not self.timeout_s or self.timeout_s <= 0:
             return None
-        return max(0.5, self.timeout_s - (time.monotonic() - a.started) - CONNECT_S - HANDSHAKE_S)
+        keep = CONNECT_S + HANDSHAKE_S + (IDENTITY_S if check else 0.0)
+        return max(0.5, self.timeout_s - (time.monotonic() - a.started) - keep)
 
     def _read(self, r: Resolved) -> dict:
         ip = r.ip

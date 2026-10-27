@@ -27,7 +27,9 @@ it 0700 (a folder that already exists keeps its mode) and writes every file in i
 - `credentials.json` (`CREDENTIALS`): the LAN access code per serial, read and written only by `vault.FileVault`. It
   never holds a name, an IP, a token or a path.
 
-`_atomic_write()` and `_locked()` are the write and lock helpers every data file uses.
+`_atomic_write()` and `_locked()` are the write and lock helpers every data file uses. `open_private()` is the read
+side for `printers.json` and `credentials.json`: no link followed, no blocking open, a regular file this user owns.
+
 
 The runtime secret set holds every LAN access code this process read from any source (Studio's config, the
 credentials file, a one-shot flag): `remember_secret()` adds one of any length. The runtime identifier set holds every
@@ -39,6 +41,7 @@ beyond Studio's config.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import ipaddress
 import json
@@ -435,17 +438,47 @@ def _locked(p: Path, fn: Callable[[], T]) -> T:
         lock.close()  # closing the file releases the lock
 
 
+def open_private(p: Path, refusal: str | None = None) -> int:
+    """A read-only descriptor of `p`, opened without following a link and without blocking (a FIFO at the path is
+    refused, not waited on), then checked with `fstat`: a regular file this user owns. The caller closes it.
+    DataFileError(`refusal`, default "<p>: not a private regular file; remove it and retry") for a symlink, a FIFO, a
+    directory, a device or a file another user owns; DataFileError for any other open or stat failure. FileNotFoundError
+    passes through: a missing file is the caller's case."""
+    text = refusal if refusal is not None else f"{p}: not a private regular file; remove it and retry"
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        if e.errno == errno.ELOOP:  # O_NOFOLLOW met a symlink
+            raise DataFileError(text) from None
+        raise DataFileError(f"{p}: cannot read it ({e.strerror})") from None
+    try:
+        st = os.fstat(fd)
+    except OSError as e:
+        os.close(fd)
+        raise DataFileError(f"{p}: cannot read it ({e.strerror})") from None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():  # checked before any read: a directory never reaches one
+        os.close(fd)
+        raise DataFileError(text)
+    return fd
+
+
 def _read_profiles(p: Path) -> ProfileSet:
     from .profiles import REFUSAL, ProfileError, ProfileSet
 
-    if not p.is_file():
+    try:
+        fd = open_private(p)
+    except FileNotFoundError:
         return ProfileSet(None, ())
     try:
-        d = json.loads(p.read_text(encoding="utf-8"))
+        with os.fdopen(fd, encoding="utf-8") as f:  # owns the descriptor from here
+            d = json.loads(f.read())
     except OSError as e:
         raise DataFileError(f"{p}: cannot read it ({e.strerror})") from e
     except ValueError:
         raise ConfError(REFUSAL) from None  # a fixed text: it never echoes the file's content
+
     try:
         ps = ProfileSet.from_dict(d, secrets=sensitive_values())
     except ProfileError:

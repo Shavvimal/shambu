@@ -452,3 +452,25 @@ def test_remember_secret_ignores_a_value_that_is_not_text():
     conf.remember_secret(12345678)  # type: ignore[arg-type]  # a numeric Studio value
     conf.remember_secret(None)  # type: ignore[arg-type]
     assert conf.secret_values() == []
+
+
+def test_the_vault_read_goes_through_the_shared_private_open(tmp_path, monkeypatch):
+    p = _seeded(tmp_path / "credentials.json")
+    seen = []
+    real = conf.open_private
+
+    def spy(path, refusal=None):
+        seen.append((path, refusal))
+        return real(path, refusal)
+
+    monkeypatch.setattr(conf, "open_private", spy)
+    assert FileVault(p).get(SERIAL) == CODE
+    assert seen == [(p, vault.NOT_PRIVATE.format(path=p))]
+
+    def refuse(path, refusal=None):
+        raise conf.DataFileError(refusal)
+
+    monkeypatch.setattr(conf, "open_private", refuse)
+    with pytest.raises(VaultError) as e:  # conf's DataFileError reaches the caller as a VaultError, same text
+        FileVault(p).get(SERIAL)
+    assert str(e.value) == vault.NOT_PRIVATE.format(path=p)
