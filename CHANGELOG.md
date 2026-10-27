@@ -27,23 +27,40 @@ the same local read.
 - `--mode lan|cloud` on `login`: the mode the user set on the touchscreen (shambu does not detect it; a profile
   without it says `unknown`). The mode picks the next step that a refused login names.
 - A subnet pass in discovery: after the ARP table, the other hosts of the default-route network (/24 or narrower) on
-  TCP 8883. It runs in `printer discover`, in `login` and on every read through a profile.
+  TCP 8883. It runs in `printer discover` (always), in `login` when it has no IP (`--from-studio` without `--ip`), and
+  on a profile read only when the profile has no IP, which `login` never leaves. A read through a profile goes to the
+  profile's stored IP and does not search.
+- `login --insecure` stores the TLS-off choice on the profile, and every later read through that profile skips the
+  check; a `login --printer NAME` refresh without `--insecure` clears it. For a new printer, `login --insecure` needs
+  `--serial`.
 - `login --ip` without `--serial` takes the serial from the CN of the printer's certificate (one TLS handshake, no
   MQTT, no credential).
-- Identity-checked discovery: when the serial is known from a flag or a profile and TLS is verified, each discovery
-  hit must present a certificate that names that serial; a foreign host on 8883 is skipped.
+- Identity-checked discovery: when the serial came from a flag or a profile and TLS is verified, each discovery hit
+  must present a certificate that names that serial; a foreign host on 8883 is skipped. A serial from Studio's config
+  gets the 0.4.0 behaviour: a TCP connect only.
 
 ### Changed
 - Error text: a missing code is `no access code for serial <masked>: run shambu printer login, or open the printer
   once in Bambu Studio's Device tab`. A refused login keeps `refused the MQTT login`, then names the code's source and
   the profile, then the next step for the profile's mode (LAN-only: read the code off the touchscreen and run `shambu
-  printer login`; cloud: open Studio once, then `login --from-studio`; unknown: both).
+  printer login`; cloud: open Studio once, then `login --from-studio`; unknown: both). When the printer's address
+  changes, a profile read fails with `cannot connect ... The profile X expected this address (last login ...); run:
+  shambu printer login --printer X --ip <new ip>, or shambu printer discover`. With no serial from any source the
+  error is `no printer selected: run shambu printer login, or select it in Bambu Studio (Device tab)`, plus `has Bambu
+  Studio run on this Mac?` when Studio's config is absent. The `no host on this LAN` error now lists why: the hosts
+  checked that are not the printer, the candidates not checked before the timeout and the passes not run.
+- A read through a profile goes to the profile's stored IP. When the printer's address changes (a new DHCP lease),
+  the read fails with the error above and names the profile's last login; `printer discover` finds the new address
+  and `login --printer NAME --ip <ip>` records it. A read never rewrites the profile.
 - The watch log's `login` and `setup` categories name `shambu printer login` beside Studio.
 - `doctor` prints one `printer profile ...` line in its config section when a profile is selected (name, masked
-  serial, mode, last login as `HH:MM UTC`, TLS flag, profile count, config dir). A damaged `printers.json` is an
-  error in that line, and the rest of the report still runs; the other commands that read profiles exit 3 and name
-  the file.
-- Every time that `login`, `list` and `doctor` print is labelled `HH:MM UTC`.
+  serial, mode, last login as `HH:MM UTC`, TLS flag, whether `credentials.json` holds a code for the serial as `code:
+  stored|none`, profile count, config dir). Doctor's `access code stored` field still describes Studio's config only.
+  A damaged `printers.json` is an error in that line, and the rest of the report still runs; the other commands that
+  read profiles exit 3 and name the file.
+- The UTC label: doctor's profile line (`last login HH:MM UTC`), the `login` hand-back (`read at HH:MM UTC`) and
+  `printer list` (`verified HH:MM UTC`) carry it. Doctor's `loaded on the printer (read HH:MM ...)` line is unchanged
+  from 0.4.0 and shows local time.
 - `main` scrubs every known access code and every raw serial from an error text before it prints it; a masked serial
   stays.
 - The config dir is `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu`. A relative or
@@ -53,15 +70,18 @@ the same local read.
 ### Security
 - The access code is written only to `credentials.json` (mode 0600) in the config dir. It never goes to
   `printers.json`, to Studio's config, to argv or to any output.
-- Every code the process read, from any source, is a runtime secret: every outward text (errors, the watch header and
-  log, doctor and build warnings, `--json` output) is scrubbed of it.
+- Every code the process read, from any source, is a runtime secret: every CLI document and line, usage message and
+  error text (the watch header and log, doctor and build warnings, `--json` output) is scrubbed of it. Doctor's
+  printer error is redacted of IPs as before.
 - shambu refuses a symlink, or anything that is not a regular file, at the paths of `printers.json` and
   `credentials.json`; `credentials.json` must also belong to the user and carry no group or other permission bit.
 - Trust boundary: a first-time `login --ip` without `--serial` binds the profile to whatever Bambu-signed certificate
   answers at that IP. A chain-valid certificate proves a Bambu device, not the intended one; `--serial` from the
   touchscreen is the stronger binding.
-- Discovery sends nothing but a TCP connect and, with a known serial, a TLS handshake to a candidate host, and it
-  scans no network wider than /24 (SECURITY.md has the contract).
+- Discovery sends nothing but a TCP connect to a candidate host, plus a TLS handshake (the identity check) only when
+  the serial came from a flag or a profile and TLS is verified; a serial from Studio's config gets a TCP connect only.
+  The subnet pass scans no network wider than /24 and runs only where the Added list says (SECURITY.md has the
+  contract).
 
 ## [0.4.0] - 2026-10-21
 

@@ -482,8 +482,9 @@ an IP or a code. The design and its history: `docs/specs/2026-10-27-printer-prof
 
 The dir is `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu` (`conf.config_dir()`). A value
 that is empty or relative after `~` expansion counts as unset, so no file lands in a checkout. shambu creates the dir
-0700 and writes each file 0600 and atomically, under a lock file beside it. A symlink or anything that is not a regular
-file at either path is refused. `calibration.json` stays under Application Support: it is data, not config.
+0700 and writes each data file 0600 and atomically, under a lock: `printers.json.lock` and `credentials.json.lock`
+sit beside the data files, empty, created with the default umask (not 0600). A symlink or anything that is not a
+regular file at either data file's path is refused. `calibration.json` stays under Application Support: it is data, not config.
 
 `printers.json` (`profiles.py` has the schema; never a code):
 
@@ -544,13 +545,15 @@ else. So a refused login is always handed back to the user.
    is unreadable without verification).
 2. Reads the code: `--access-code-file FILE` or `--access-code-stdin` (the first line), else the prompt `LAN access
    code (not shown): ` when stdin and stderr are terminals, else usage. `--from-studio` takes Studio's selected serial
-   and its code instead. A code must be 4 to 128 characters with no space, quote or backslash.
+   and its code instead. A code must be 4 to 128 characters of letters, digits and `._:@+=/-`, the first a letter or
+   a digit (`vault.safe_code`).
 3. Finds the serial: Studio's (`--from-studio`), the profile's (`--printer NAME`, or the default with no `--ip`), else
    `--serial` or the CN of the certificate at `--ip` (`certificate_serial`: one TLS handshake against Studio's CA
    bundle, no MQTT, no credential). A `--serial` that differs from the CN fails, and nothing is written.
 4. Validates the draft profile (name, clash) before any read.
-5. Reads the printer once with the code: discovery (ARP, then the default-route /24) when no IP is known, TLS
-   verified, MQTT CONNECT, one `pushall`, a full report. A refusal is exit 3 and writes nothing.
+5. Reads the printer once with the code: at `--ip`, else at the profile's IP, else (only `--from-studio` without
+   `--ip`) after discovery (ARP, then the default-route /24); TLS verified, MQTT CONNECT, one `pushall`, a full report.
+   A refusal is exit 3 and writes nothing.
 6. Under the profiles lock: stores the code in `credentials.json`, then writes the profile with `verified` set and the
    IP the read used. If the profile write fails, the previous code (or none) is put back.
 7. Prints `profile x2d: serial <masked>, code stored, mode lan, read at HH:MM UTC`, plus ` (default)` when it is the
@@ -561,6 +564,22 @@ source and the profile, then the next step for the profile's mode: LAN-only, rea
 run `shambu printer login`; cloud, open Studio once so it fetches the code; `unknown`, both. The printer can
 regenerate its code when LAN-only mode is toggled, when the refresh icon next to the code is pressed, after some
 firmware updates and sometimes after a reboot; which of these always does it is not settled (spec section 8).
+
+`login --insecure` stores the TLS-off choice on the profile (`"insecure": true`), and every later read through that
+profile skips the check. A `login --printer NAME` refresh without `--insecure` clears it. For a new printer,
+`login --insecure` needs `--serial`.
+
+### Reads through a profile, and when the subnet pass runs
+
+A read through a profile goes to the profile's stored IP and does not search; `login` always stores the IP it read
+from. The subnet pass (the default-route /24 after the ARP table) runs in `printer discover` (always), in `login` when
+it has no IP (`--from-studio` without `--ip`), and on a profile read only when the profile has no IP, which `login`
+never leaves. A read without a profile and without `--ip` uses the ARP table only, as in 0.4.0.
+
+When the printer's address changes (a new DHCP lease), a profile read fails with `cannot connect ... The profile x2d
+expected this address (last login YYYY-MM-DD HH:MM UTC); run: shambu printer login --printer x2d --ip <new ip>, or
+shambu printer discover`. The profile is never rewritten by a read: `printer discover` finds the new address and a
+`login --printer NAME --ip <ip>` records it.
 
 ### Trust boundary
 

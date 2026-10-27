@@ -146,7 +146,15 @@ dir: `$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else `~/.config/shamb
 takes the code from a one-shot flag, then from the stored code of the profile (`--printer NAME`, else the default
 profile), then from Bambu Studio's config. Both printer modes use the same local read; the mode only says where a new
 code comes from when the printer refuses the old one (the touchscreen in LAN-only mode, Studio in cloud mode).
-`shambu printer forget --printer NAME` removes a profile and its code.
+`shambu printer forget --printer NAME` removes a profile and its code (`--keep-code` keeps the code); when the
+forgotten profile was the default, the first remaining profile becomes the default.
+
+A read through a profile goes to the IP the profile stores and does not search; `login` always stores the IP it read
+from. The subnet pass (the default-route /24 after the ARP table) runs in `printer discover` (always), in `login`
+when it has no IP (`--from-studio` without `--ip`), and on a profile read only when the profile has no IP. When the
+printer's address changes (a new DHCP lease), a profile read fails with `cannot connect ... The profile x2d expected
+this address (last login ...); run: shambu printer login --printer x2d --ip <new ip>, or shambu printer discover`.
+Run `shambu printer discover`, then `shambu printer login --printer x2d --ip <ip>` to record the new address.
 
 Every time in a report is "Studio estimate", Studio's own prediction. The watch log stamps each poll and never
 holds the IP or the serial. A report adds the measured range of stored prints, and a calibrated time only when
@@ -166,7 +174,9 @@ Exit codes: 0 ok, 1 a check or verification failed or a patch was refused, 2 usa
   pauses, stops or changes a print and never uploads a file. Pull requests that add printer control are not merged.
 - The LAN access code comes from a one-shot flag, the credentials file (mode 0600) or Bambu Studio's configuration.
   It is never printed, logged or passed on a command line, and it is sent only over TLS verified against Bambu's
-  certificate authority (`--insecure` is an explicit opt-out).
+  certificate authority (`--insecure` is an explicit opt-out). `login --insecure` stores that choice on the profile,
+  and every later read through the profile skips the check; a `login --printer NAME` refresh without `--insecure`
+  clears it.
 - Projects are handed back for the user to open, check and print. The tool never presses Print.
 
 ## Rules the code encodes (so nobody has to remember them)

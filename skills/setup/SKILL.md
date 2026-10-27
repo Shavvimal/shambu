@@ -70,16 +70,24 @@ shambu printer login --from-studio                                    # or: Stud
 shambu printer status
 ```
 
-The user runs the first `login` line in their own terminal (the prompt needs one), with the IP and the serial from
-the printer's touchscreen and `--mode lan` or `--mode cloud` as the touchscreen shows. Without a terminal, the code
-goes in with `--access-code-stdin` or `--access-code-file FILE`; never put it on the command line. `login` reads the
-printer once with the code and, only when that read succeeds, stores a profile in `printers.json` and the code in
-`credentials.json` (mode 0600) in shambu's config dir (`$SHAMBU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/shambu`, else
-`~/.config/shambu`). It prints `profile <name>: serial <masked>, code stored, mode lan, read at HH:MM UTC`.
+Never ask for the access code in chat. The user runs the first `login` line in their own terminal (the prompt hides
+the code), with the IP and the serial from the printer's touchscreen and `--mode lan` or `--mode cloud` as the
+touchscreen shows, or passes `--access-code-file FILE` with a file they wrote themselves; never put the code on the
+command line. If the user pastes a code in chat, do not repeat it or use it: ask them to run `login` themselves.
+`login` reads the printer once with the code and, only when that read succeeds, stores a profile in
+`printers.json` and the code in `credentials.json` (mode 0600) in shambu's config dir (`$SHAMBU_CONFIG_DIR`, else
+`$XDG_CONFIG_HOME/shambu`, else `~/.config/shambu`). It prints `profile <name>: serial <masked>, code stored, mode lan, read at HH:MM UTC`.
 `shambu printer list` shows the profiles. After that, every command that reads the printer uses the default profile,
 or the one `--printer NAME` names; the code comes from a one-shot flag, then the stored code, then Studio's config.
 Without `--serial`, `login` takes the serial from the printer's certificate; the serial from the touchscreen is
 the stronger check that the profile names the intended printer.
+
+A read through a profile goes to the IP the profile stores and does not search; `login` always stores the IP it read
+from. The subnet pass (the default-route /24 after the ARP table) runs in `printer discover` (always), in `login
+--from-studio` without `--ip`, and on a profile read only when the profile has no IP. When the printer's address
+changes, a read fails with `cannot connect ... The profile NAME expected this address (last login ...)`: run
+`shambu printer discover`, then `shambu printer login --printer NAME --ip <ip>`. Do not guess the cause: the printer
+can also be off.
 
 LAN-only mode and cloud mode use the same local read (TLS on port 8883, one status request); the mode changes only
 where a new code comes from. The printer can regenerate its code when LAN-only mode is toggled, so after a toggle
@@ -87,8 +95,10 @@ run `login` again with the code from the touchscreen (LAN-only), or with `--from
 (cloud).
 
 `status` and `filaments` confirm the read; `check` and `build` read the same report before every build. shambu
-never sends a print command. If TLS verification fails on your firmware, `--insecure` skips it (`login --insecure`
-needs `--serial`); say so to the user because the access code then travels to an unverified endpoint.
+never sends a print command. If TLS verification fails on your firmware, `--insecure` skips it (for a new printer,
+`login --insecure` needs `--serial`); say so to the user because the access code then travels to an unverified
+endpoint. `login --insecure` stores that choice on the profile, and every later read through the profile skips the
+check; a `login --printer NAME` refresh without `--insecure` clears it.
 
 ## 5. Updating
 
@@ -105,8 +115,11 @@ needs `--serial`); say so to the user because the access code then travels to an
 - `StudioError: Bambu Studio binary not found`: Bambu Studio is not in `/Applications`.
 - `ConfError: no access code for serial <masked>`: run `shambu printer login` (step 4), or open the printer once in
   Bambu Studio's Device tab so the code is saved.
-- `refused the MQTT login`: the code is wrong or the printer regenerated it. Read the code off the touchscreen and
-  run `shambu printer login --printer NAME` (cloud mode: open Studio once, then `login --from-studio`).
+- `refused the MQTT login`: do not state a cause and do not retry, because the printer also refuses while it boots
+  or shuts down. Quote the error's `source:` and its next step, then hand back: read the code off the touchscreen
+  and run `shambu printer login --printer NAME` (cloud mode: open Studio once, then `login --from-studio`).
+- `cannot connect ... The profile NAME expected this address`: run `shambu printer discover`, then `shambu printer
+  login --printer NAME --ip <ip>` with the address it finds.
 - `paho-mqtt missing`: reinstall with the `--reinstall` line above.
 - `PresetError: filament preset 'loaded' not found`: the CLI is older than 0.3.0. Run step 2.
 - `unrecognized arguments: --expect-version`: the CLI is older than 0.4.0. Run step 2.

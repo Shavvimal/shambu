@@ -1,6 +1,6 @@
 ---
 name: shambu
-description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It reads which spools the printer holds and uses them as the project's filaments, places parts on their outlines (never rotated) or at the corner the spec gives, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It also compares orientation and print-sequence variants, inspects, patches and edits existing .3mf or .gcode.3mf files (settings, mesh, filaments, object and tower positions), and reads a Bambu Lab printer's progress over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a print time or filament estimate, wants to change a 3MF, or asks how far the print is, even if Bambu Studio is not named. Not for designing or editing CAD parts (use a CAD skill), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
+description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It reads which spools the printer holds and uses them as the project's filaments, places parts on their outlines (never rotated) or at the corner the spec gives, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It compares orientation and print-sequence variants, inspects, patches and edits .3mf or .gcode.3mf files (settings, mesh, filaments, object and tower positions), and reads a Bambu Lab printer over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a time or filament estimate, wants to change a 3MF, asks how far the print is, or has a login or access code problem, even if Bambu Studio is not named. Not for designing or editing CAD parts (use a CAD skill), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
 argument-hint: "[stl files or project.3mf] [print notes]"
 allowed-tools: Bash(shambu *), Read
 ---
@@ -99,6 +99,36 @@ Quote the report `<outdir>/<name>.report.md`; never paraphrase its numbers. Give
   name the one test that would tell the candidates apart, and run it if it is cheap. A guess given as the reason
   is a fault, even when it sounds right.
 
+## Reading the printer (hand-backs first)
+
+Never ask for the access code in chat and never put it on a command line. If the user pastes a code, do not repeat
+or use it: they run `shambu printer login` in their own terminal (a hidden prompt), or pipe it with
+`--access-code-stdin` from a file they create. On any of these errors (exit 3), do not retry and never state a
+cause the error does not state; quote the error and hand back the next step it names.
+
+- `refused the MQTT login`: no retry, because the printer also refuses while it boots or shuts down. Quote the
+  error's `source:` and its next step, then hand back: "The printer refused the access code. Read the code off its
+  touchscreen and run `shambu printer login --printer NAME` in your terminal (it prompts for the code)." In cloud
+  mode: "Open Bambu Studio once so it fetches the current code, then run `shambu printer login --from-studio`."
+- `cannot connect ... The profile NAME expected this address (last login ...)`: the read went to the profile's
+  stored IP and nothing answered. Hand back: "Run `shambu printer discover`, then `shambu printer login --printer
+  NAME --ip <ip>` with the address it finds." Do not say the address changed: the printer can also be off.
+- `no host on this LAN answers on port 8883 (...)`: quote the reasons in the brackets, then hand back `shambu printer
+  discover` and `shambu printer login --ip IP --serial SERIAL`.
+
+A read through a profile goes to the IP the profile stores and does not search; `login` always stores the IP it read
+from. The subnet pass (the default-route /24 after the ARP table) runs in `printer discover` (always), in `login
+--from-studio` without `--ip`, and on a profile read only when the profile has no IP. `login --insecure` keeps TLS
+off for every later read through that profile until a `login --printer NAME` without `--insecure`.
+
+`printer filaments` and `status` send one `pushall`. `printer list` and `printer discover` show IPs, a refused read
+without a profile names `--ip <ip>` in its next step, and an error text keeps a typed IP (`main` scrubs codes and raw
+serials, not IPs). Only `status`, `watch`, the watch log, the JSON reports (`status`, `filaments`, `raw`) and the
+hand-back lines never show one; the masked serial appears on stdout only. To measure a print: `printer watch
+--wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf` until FINISH, then `calibrate --log print.jsonl
+--add`. A calibrated time needs three
+qualifying prints of one printer model and material (`references/06-slicer-rules.md` section 11).
+
 ## Minimal spec
 
 ```json
@@ -186,21 +216,6 @@ It never runs Studio's arrange and never rotates a part to pack it.
 - Guess an orientation for a part exported in an assembly frame: `shambu orient`, then `lay_on_face`.
 - Send keystrokes to Studio, press Print, or publish anything but one `pushall` to the printer.
 - Reuse a spec's filaments from an earlier day: Studio's swap on open resets the process to the stock preset.
-
-## Reading the printer
-
-`printer filaments` and `status` send one `pushall`. `status`, `watch` and the log never show the IP; the masked
-serial appears on stdout only. `printer list` shows each profile's IP on purpose, because it lists the user's own
-printers; nothing else does. Never ask for the access code in chat and never put it on a command line. To measure a
-print: `printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf` until FINISH, then `calibrate
---log print.jsonl --add`. A calibrated time needs three qualifying prints of one printer model and material
-(`references/06-slicer-rules.md` section 11).
-
-The printer refused the code (`refused the MQTT login`, exit 3): no retry, because the printer also refuses while it
-boots or shuts down. Quote the error's `source:` and its next step, then hand back: "The printer refused the access
-code. Read the code off its touchscreen and run `shambu printer login --printer NAME` in your terminal (it prompts
-for the code)." In cloud mode: "Open Bambu Studio once so it fetches the current code, then run `shambu printer
-login --from-studio`."
 
 ## References (read when the row says so)
 

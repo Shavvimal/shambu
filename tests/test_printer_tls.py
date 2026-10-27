@@ -1608,16 +1608,16 @@ def test_scrub_ignores_an_empty_value():
 
 
 # ---------------------------------------------------------------------------- the default-route network
-ROUTE_GW_SECOND = ROUTE.replace("gateway: 10.0.0.1", "gateway: 192.168.7.1")
-IFCONFIG_ALIAS = IFCONFIG_24 + "\tinet 192.168.7.20 netmask 0xffffff00 broadcast 192.168.7.255\n"
+ROUTE_GW_SECOND = ROUTE.replace("gateway: 10.0.0.1", "gateway: 10.0.7.1")
+IFCONFIG_ALIAS = IFCONFIG_24 + "\tinet 10.0.7.20 netmask 0xffffff00 broadcast 10.0.7.255\n"
 IFCONFIG_TWO_ON_ONE = IFCONFIG_24 + "\tinet 10.0.0.6 netmask 0xffffff00 broadcast 10.0.0.255\n"
 IFCONFIG_UTUN = "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\tinet 10.0.0.5 --> 10.0.0.1 netmask 0xffffff00\n"
 
 
 def test_subnet_hosts_takes_the_address_whose_network_holds_the_gateway():
     hosts = printer.subnet_hosts(ROUTE_GW_SECOND, IFCONFIG_ALIAS)
-    assert len(hosts) == 253 and hosts[0] == "192.168.7.1" and "192.168.7.20" not in hosts
-    assert not any(h.startswith("10.") for h in hosts)
+    assert len(hosts) == 253 and hosts[0] == "10.0.7.1" and "10.0.7.20" not in hosts
+    assert not any(h.startswith("10.0.0.") for h in hosts)
     assert printer.subnet_hosts(ROUTE_GW_SECOND, IFCONFIG_24) == []  # no address's network holds the gateway
 
 
