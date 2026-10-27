@@ -547,3 +547,15 @@ def test_a_directory_or_another_users_printers_file_is_refused(tmp_path, monkeyp
     monkeypatch.setattr(conf.os, "getuid", lambda: os.stat(p).st_uid + 1)
     with pytest.raises(conf.DataFileError, match="not a private regular file"):
         conf.load_profiles(p)
+
+
+def test_serials_match_without_regard_to_case():
+    """A second login that types the serial in another case refreshes the one profile and keeps the stored case."""
+    ps = ProfileSet().upsert(Profile.from_dict(entry(name="x2d")))
+    lower = Profile.from_dict(entry(name="other", serial=SERIAL.lower(), ip="10.0.0.20"))
+    out = ps.upsert(lower)
+    assert len(out.printers) == 1
+    assert out.printers[0].serial == SERIAL and out.printers[0].name == "other" and out.printers[0].ip == "10.0.0.20"
+    assert ps.by_serial(SERIAL.lower()) is not None
+    with pytest.raises(ProfileError, match=REFUSAL):
+        validate_document(doc(entry(name="x2d"), entry(name="dup", serial=SERIAL.lower()), default="x2d"))

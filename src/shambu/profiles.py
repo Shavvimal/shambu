@@ -112,7 +112,7 @@ def validate_document(doc, secrets: Iterable[str] = ()) -> None:
         validate_profile(d, (*secrets, *ids))
     names = [d["name"] for d in doc["printers"]]
     serials = [d["serial"] for d in doc["printers"]]
-    if len(set(names)) != len(names) or len(set(serials)) != len(serials):
+    if len(set(names)) != len(names) or len({x.casefold() for x in serials}) != len(serials):
         raise ProfileError(REFUSAL)
     if doc["default"] is not None and (not isinstance(doc["default"], str) or doc["default"] not in names):
         raise ProfileError(REFUSAL)
@@ -166,8 +166,8 @@ class ProfileSet:
         return next((p for p in self.printers if p.name == name), None)
 
     def by_serial(self, serial: str) -> Profile | None:
-        """The profile for `serial`, or None."""
-        return next((p for p in self.printers if p.serial == serial), None)
+        """The profile for `serial` (compared without regard to letter case), or None."""
+        return next((p for p in self.printers if p.serial.casefold() == serial.casefold()), None)
 
     def selected(self, name: str | None = None) -> Profile | None:
         """The profile named `name`, or the default profile when `name` is None; None when there is none."""
@@ -176,18 +176,19 @@ class ProfileSet:
         return self.get(name)
 
     def upsert(self, p: Profile, default: bool = False, secrets: Iterable[str] = ()) -> ProfileSet:
-        """The set with `p` added, or replacing the profile with the same serial whatever its name (its `added` kept).
+        """The set with `p` added, or replacing the profile with the same serial (letter case ignored) whatever its name
+        (its `added` and its stored serial kept).
         ProfileError(CLASH) when another serial already has the name, ProfileError(REFUSAL) when `p` does not validate
         against `secrets`. The first profile becomes the default; `default=True` makes `p` the default."""
         validate_profile(p.to_dict(), secrets)
         old = self.by_serial(p.serial)
         clash = self.get(p.name)
-        if clash is not None and clash.serial != p.serial:
+        if clash is not None and clash.serial.casefold() != p.serial.casefold():
             raise ProfileError(CLASH)
         if old is None:
             printers = (*self.printers, p)
         else:
-            p = replace(p, added=old.added)
+            p = replace(p, added=old.added, serial=old.serial)  # the stored case is canonical
             printers = tuple(p if x.serial == p.serial else x for x in self.printers)
         new_default = self.default
         if old is not None and self.default == old.name:
