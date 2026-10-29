@@ -1753,3 +1753,30 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     except KeyboardInterrupt:
         return 130
+
+
+# ---------------------------------------------------------------------------- verify (registered at import, like the rest)
+@command(
+    "verify",
+    "Compare a project (a Bambu Studio save) with the spec it was built from: preset ids and override lists, every spec "
+    "setting, filaments, maps, bed type, print sequence, per-object settings and positions. No Studio run, no STL needed",
+)
+class Verify(Command):
+    def configure(self, p):
+        p.add_argument("file", help="the .3mf or .gcode.3mf to check, e.g. the project after a save in Bambu Studio")
+        p.add_argument(
+            "--against",
+            required=True,
+            metavar="SPEC",
+            help="the spec JSON the project was built from (or the build's shambu/spec.json); presets are composed from it, as the build does",
+        )
+        p.epilog = (
+            "One line per item that is not as expected: FAIL a value differs or Studio resets it on open, WARN a GUI edit "
+            "or other bookkeeping that changes no value, INFO a fact the spec does not decide. Exit 0 no FAIL, 1 any FAIL, "
+            "2 usage, 3 the file or the spec does not load."
+        )
+
+    def run(self, a, app, out):
+        rep = app.verify(a.file, a.against)
+        out.emit(rep.to_json(), [x.text() for x in rep.lines] + [rep.last_line()])
+        return 0 if rep.ok else 1
