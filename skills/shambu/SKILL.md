@@ -65,8 +65,8 @@ Change an existing project with `shambu patch` (object settings, process keys wi
 `--process-unset KEY`, bed, colours, map, pauses, names, print sequence, the edits under Commands; `--dry-run`
 first). Patching a sliced file drops its G-code: `shambu slice` again. `patch` does not re-check by-object spacing.
 Check a GUI-saved project against its spec with `shambu verify project.3mf --against plate.json` (exit 0 when no
-line is FAIL, 1 on any FAIL line, WARN-only GUI edits exit 0, 3 when the file or spec does not load; quote its FAIL
-lines).
+line is FAIL, 1 on any FAIL line or a spec that does not load, WARN-only GUI edits exit 0, 3 when the project file
+does not read; quote its FAIL lines).
 
 ## Hand-back (a gate: no reply about a check, build, sweep, patch or slice goes out without it)
 
@@ -85,9 +85,11 @@ Slice: Studio exit 0 | Studio exit <code>: "<quoted log line>" | not sliced (<wh
 Cause (only when something failed): the check line or Studio log line that states it, quoted | "not established"
 Sweep (when run): the table rows that decided the choice, and why.
 Still by hand in Studio: painted supports, brim ear points, variable layer height, <anything the spec cannot say>.
-Next: `shambu open project.3mf`; confirm `<base> (modified)` with <override values>, plate type, colours, (two filaments) filament 2 on the auxiliary nozzle.
+Next: `shambu open project.3mf`; confirm `<base>` (shown as modified when any override differs from the base) and check the <override values> in its tab: the values, not the suffix.
+      Confirm the plate type, the colours and (two filaments) each filament on its planned nozzle (the report's `Filament grouping` line).
       Slice plate (it opens unsliced). GUI estimate off by over 1 min or 1 g: File > Save project as (new name), `shambu verify <saved>.3mf --against SPEC`.
-      Preview (Overhang wall, Bridge, Support; first layer). Print only when the estimate matched or verify exits 0.
+      Do not Print until verify exits 0. If a FAIL is a change you want, put it in the spec and rebuild.
+      Preview (Overhang wall, Bridge, Support; first layer). Print only when the GUI estimate matched, or verify on the saved copy exited 0.
 Standing warnings:
 - The first print of any new fit is a coupon or one part, in the same orientation as the feature. A flat coupon cannot qualify a sideways bore.
 - Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores. Every bore that prints horizontal is flagged above.
@@ -152,7 +154,8 @@ qualifying prints of one printer model and material (`references/06-slicer-rules
 ```
 
 `process.name` is a label for the report, not the GUI's preset name: the project names the base preset, and the GUI
-shows it as `<base> (modified)`. A part takes `path`, `filament`, `count`, `recipes`, `set` (string values), `height_ranges`, `lay_on_face`
+shows it as `<base>`, marked modified when any override differs from the base (Studio selects it clean when every
+value equals the base). A part takes `path`, `filament`, `count`, `recipes`, `set` (string values), `height_ranges`, `lay_on_face`
 [nx, ny, nz] or `rotate` [x, y, z], or `"orientation": "auto"` (not with either); or `parts` (several files as
 one object). `at` [x, y] is the bed position of the turned part's bounding-box MIN corner (front-left), not its
 centre: to centre a part w x d on a bed W x D (doctor), write [(W - w) / 2, (D - d) / 2]. `brim_margin` (mm)
@@ -178,7 +181,7 @@ shambu patch project.3mf --replace-mesh OBJECT[/PART]=new.stl [--rotate-mesh X,Y
        --repair-nozzle-stats | --no-verify (skip the verify slice) | --dry-run | -o OUT.3mf
 shambu patch project.3mf --process-set wall_loops=4 [--process-set ...] | --process-unset KEY   # process keys, bookkeeping kept
 shambu verify project.3mf --against plate.json [--json]                # a GUI save against its spec: 0 no FAIL, 1 any FAIL, 3 no load
-shambu open project.3mf                                                # opens it in Studio for the user (WARN: behind an open window)
+shambu open project.3mf                                                # opens it in Studio for the user (WARN when Studio already ran: check the front window)
 shambu slice FILE.3mf [--plate N] [--no-check] [--tower X,Y[@PLATE]] [--settings-from plate.json]
 shambu studio [--out DIR] -- ARGS...                                   # logged raw Studio call: only with the user's yes
 shambu printer discover | printer filaments | printer status | printer watch [--every 300] [--log FILE --gcode3mf F.gcode.3mf [--wait-for-start]]
