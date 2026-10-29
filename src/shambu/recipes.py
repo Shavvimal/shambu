@@ -153,7 +153,6 @@ RECIPES: tuple[Recipe, ...] = (
             "tree_support_branch_diameter": "3",
             "tree_support_branch_diameter_angle": "7",
             "raft_first_layer_expansion": "5",
-            "independent_support_layer_height": "0",
             "thick_bridges": "0",
         },
         "PETG part with PLA interface or PLA part with PETG interface; they barely bond. The plate counts as two filaments even "
@@ -183,8 +182,8 @@ RECIPES: tuple[Recipe, ...] = (
         "Any plate whose parts carry `dual-material-interface`. Both keys are one value per plate in Studio (PrintConfig), "
         "so they belong in process.recipes.",
         "notes / research 08; docs/specs/2026-10-29-gui-preset-bookkeeping.md section 5.3",
-        "independent_support_layer_height is a global key (PrintConfig.hpp:1558, moved from PrintObjectConfig): the copy "
-        "in `dual-material-interface` matches Studio's per-object suggestion, the process value is the one the slicer reads.",
+        "independent_support_layer_height is a global key (PrintConfig.hpp:1558, moved from PrintObjectConfig): a "
+        "per-object copy does nothing, so only this process recipe sets it.",
     ),
     Recipe(
         "fuzzy-skin",

@@ -204,7 +204,6 @@ RECIPES = {
       "tree_support_branch_diameter": "3",
       "tree_support_branch_diameter_angle": "7",
       "raft_first_layer_expansion": "5",
-      "independent_support_layer_height": "0",
       "thick_bridges": "0"
     },
     "filament_map": {"mode": "Manual", "maps": "1 2"},
@@ -262,7 +261,7 @@ Notes on the recipes:
   the base unless `different_settings_to_system` names them (reference 03, "Preset bookkeeping Studio honours"). The
   object key set is the one Studio's suggestion wrote on the owner's `cap_print` object on 2026-10-29.
   `independent_support_layer_height` is a global key (`PrintConfig.hpp:1558`, moved from `PrintObjectConfig`): the
-  slicer reads the process value, so `two-filament-plate` carries it too. `support_interface_speed` stays out (a
+  slicer reads only the process value, so `two-filament-plate` carries it and `dual-material-interface` does not. `support_interface_speed` stays out (a
   per-nozzle array). `check` and `build` print a WARN when either recipe sits at the other scope; the keys still apply.
 - In `dual-material-interface`, the last three object keys and `independent_support_layer_height` come from the GUI's own
   suggestion text, found as strings in the binary ("0 top z distance, 0 interface spacing, 0 support/object xy distance,

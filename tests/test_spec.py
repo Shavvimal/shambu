@@ -228,7 +228,6 @@ DMI_KEYS = {
     "tree_support_branch_diameter": "3",
     "tree_support_branch_diameter_angle": "7",
     "raft_first_layer_expansion": "5",
-    "independent_support_layer_height": "0",
     "thick_bridges": "0",
 }
 
@@ -237,7 +236,8 @@ def test_dual_material_interface_is_per_object_and_two_filament_plate_is_per_pro
     """Spec 2026-10-29 section 5.3: the interface keys go where Studio's suggestion writes them and the GUI keeps them."""
     dmi, plate = R.by_name()["dual-material-interface"], R.by_name()["two-filament-plate"]
     assert dmi.scope == "object" and dmi.set == DMI_KEYS
-    assert "enable_prime_tower" not in dmi.set and "support_interface_speed" not in dmi.set
+    assert len(dmi.set) == 15 and "enable_prime_tower" not in dmi.set and "support_interface_speed" not in dmi.set
+    assert "independent_support_layer_height" not in dmi.set  # a PrintConfig key: per object it does nothing
     assert plate.scope == "process" and plate.set == {"enable_prime_tower": "1", "independent_support_layer_height": "0"}
     assert "dual-material-interface" in plate.description and "two-filament-plate" in dmi.description
 
