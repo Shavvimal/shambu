@@ -240,8 +240,8 @@ build, two watched prints, and the Studio source at tag v02.08.02.61. Details: r
    (`wipe_tower.width` 22), not the default, because a 218 mm tower that narrow without a rib wall is a stability
    risk. A one-filament plate with Smooth timelapse needs a tower too (PartPlate.cpp:2222-2223).
 
-9. **A process-level interface filament makes the plate two-filament.** `dual-material-interface` sets
-   `support_interface_filament 2` in the process. Studio counts only part filaments in its own log
+9. **A process-level interface filament makes the plate two-filament.** `dual-material-interface` set
+   `support_interface_filament 2` in the process until 0.6.0 (now per object; a per-object value counts the same way). Studio counts only part filaments in its own log
    (BambuStudio.cpp:1338-1343), and so did shambu: the seed build placed a cradle at x 9.2 and Studio exited -102
    (right-nozzle interface at x 14.3). `effective_filaments` counts the process keys, and `ExtruderReach` holds
    the interface extruder to x >= 20.5 plus the interface spread (brim margin plus 3 mm; measured 2.2 mm, n=1).
