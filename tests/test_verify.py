@@ -188,10 +188,14 @@ def test_secondary_filament_as_a_project_embedded_copy_is_accepted(capsys, tmp_p
     assert any(x.startswith("INFO filament 2 preset id") and "project-embedded copy of Test PLA" in x for x in lines)
     code, lines = verify(capsys, project(tmp_path, **{**over, "filament_flow_ratio": ["0.95", "0.95"]}), spec_file(tmp_path, filaments=fil))
     assert code == 1 and any(x.startswith("FAIL filament 2 filament_flow_ratio: expected 0.98, got 0.95") for x in lines)
-    # the copy's list is checked too: Studio resets an unlisted key against `inherits` on reopen (Preset.cpp:2258)
+    # the copy's list is checked too. The synthetic base chain does not define filament_flow_ratio, so a key Studio
+    # dropped while keeping the value equals Studio's own base (it lists only differing keys, PresetBundle.cpp:3306-3313):
+    # INFO, not FAIL. The FAIL for a key the chain does define is test_right_value_missing_from_the_list_fails_...
     missing = {**over, "different_settings_to_system": [LIST, "filament_flow_ratio", "", ""]}
     code, lines = verify(capsys, project(tmp_path, **missing), spec_file(tmp_path, filaments=fil))
-    assert code == 1 and any(x.startswith("FAIL filament 2 list filament_flow_ratio: expected listed, got not listed") for x in lines)
+    assert code == 0 and any(
+        x.startswith("INFO filament 2 list filament_flow_ratio") and "shambu's preset chain does not define" in x for x in lines
+    )
 
 
 def test_slot_1_must_carry_the_base_name(capsys, tmp_path):

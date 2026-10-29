@@ -356,7 +356,7 @@ def _list(rep: Report, what: str, slot: Slot, entry: str, value_of) -> set[str]:
             rep.lines.append(Line(FAIL, f"{what} list {k}", _norm(want), _norm(have), RESET_NOTE))
         elif base is not None and k in base and _same(want, base[k]):
             rep.lines.append(Line(INFO, f"{what} list {k}", None, None, "listed by shambu, equal to the base, dropped by Studio on save"))
-        else:
+        elif base is not None and k in base:
             rep.lines.append(
                 Line(
                     FAIL,
@@ -366,6 +366,17 @@ def _list(rep: Report, what: str, slot: Slot, entry: str, value_of) -> set[str]:
                     "the value is right in this file, but Studio resets it to the base on the next open (Preset.cpp:2258-2269)",
                 )
             )
+        else:
+            # Studio lists only the keys whose value differs from its own base (PresetBundle.cpp:3306-3313). A key it
+            # dropped while keeping the value therefore equals Studio's base and is not reset on the next open. shambu's
+            # resolved chain does not define this key (brim_type, thick_bridges ...), so the base check could not say so.
+            level = INFO if base is not None else WARN
+            note = (
+                "listed by shambu, dropped by Studio on save: equal to Studio's base, which shambu's preset chain does not define"
+                if base is not None
+                else "listed by shambu, not listed here; the base preset did not resolve, so shambu cannot tell whether Studio resets it"
+            )
+            rep.lines.append(Line(level, f"{what} list {k}", None, None, note))
     for k in sorted(got - slot.listed):
         if k in PROJECT_OPTIONS:
             rep.lines.append(
