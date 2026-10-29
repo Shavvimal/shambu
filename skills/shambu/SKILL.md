@@ -13,7 +13,7 @@ send a job. Request: $ARGUMENTS
 ## Before you start (standing rules)
 
 1. Before the first shambu command of a task (before the spec is written): `shambu --version` (it must print:
-   shambu 0.5.1), then `shambu doctor --json --expect-version 0.5.1`. Exit 3 with `"shambu": {"match": false}`
+   shambu 0.6.0), then `shambu doctor --json --expect-version 0.6.0`. Exit 3 with `"shambu": {"match": false}`
    (`MISMATCH` and a `Fix:` line) means another version is on PATH. A usage error on `--expect-version` means one
    older than 0.4.0. Either way: stop, give both versions and the fix (`/shambu:setup update`). Never use
    `uv run --project`, a checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`.
@@ -61,9 +61,11 @@ send a job. Request: $ARGUMENTS
       before `--keep-going` and list every FAIL it overrode.
 - [ ] 6. Hand back with the template below. It is a gate.
 
-Change an existing project with `shambu patch` (settings, bed, colours, map, pauses, names, print sequence, the
-edits under Commands; `--dry-run` first). Patching a sliced file drops its G-code: `shambu slice` again. `patch`
-does not re-check by-object spacing.
+Change an existing project with `shambu patch` (object settings, process keys with `--process-set KEY=VALUE` /
+`--process-unset KEY`, bed, colours, map, pauses, names, print sequence, the edits under Commands; `--dry-run`
+first). Patching a sliced file drops its G-code: `shambu slice` again. `patch` does not re-check by-object spacing.
+Check a GUI-saved project against its spec with `shambu verify project.3mf --against plate.json` (exit 0 match, 1
+differences: quote its FAIL lines).
 
 ## Hand-back (a gate: no reply about a check, build, sweep, patch or slice goes out without it)
 
@@ -71,7 +73,7 @@ Use it for every result: a failure, a "does not fit" answer, a sweep, a project 
 The template comes first; an explanation follows it, never replaces it.
 
 ```
-Project: <path>  (sliced | unsliced | export FAILED: <Studio exit and reason>)   Printer: <preset>   Process: <name> (<base>, recipes ...)
+Project: <path>  (sliced | unsliced | export FAILED: <Studio exit and reason>)   Printer: <preset>   Process: <base> (+N overrides: k1, k2; label "<spec name>")
 Filaments: from the printer at HH:MM: 1 = <preset> <colour> (<left/right external spool | AMS n tray m>), 2 = ...
            | WARNING printer not read (<reason>): from the GUI presets, UNVERIFIED; confirm the spools by eye before Print
 Plate <n>: Studio estimate <h> h <m> min[<calibration text as printed>], <g> g (the grams the report prints: support <g>, prime tower + flush <g>, <k> filament changes)  print sequence: by layer | by object
@@ -82,11 +84,14 @@ Slice: Studio exit 0 | Studio exit <code>: "<quoted log line>" | not sliced (<wh
 Cause (only when something failed): the check line or Studio log line that states it, quoted | "not established"
 Sweep (when run): the table rows that decided the choice, and why.
 Still by hand in Studio: painted supports, brim ear points, variable layer height, <anything the spec cannot say>.
-Next: open the project (`shambu open project.3mf`), confirm the plate type and colours, check Preview (Line Type: Overhang wall, Bridge, Support rows; the first layer), then Print.
+Next: `shambu open project.3mf`; confirm the process reads `<base> (modified)` with <override values>, the plate type, the colours and (two filaments) filament 2 on the auxiliary nozzle. Slice plate (Studio opens a project with objects unsliced; shambu's G-code is not loaded): the GUI estimate must land within 1 min and 1 g of shambu's, else `shambu verify project.3mf --against plate.json`. Then Preview (Line Type: Overhang wall, Bridge, Support rows; the first layer), then Print.
 Standing warnings:
 - The first print of any new fit is a coupon or one part, in the same orientation as the feature. A flat coupon cannot qualify a sideways bore.
 - Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores. Every bore that prints horizontal is flagged above.
 ```
+
+In the GUI, a filament 2..N with overrides comes back from a save as `<base>(<file>.3mf)` with its values kept;
+`shambu verify` accepts that form. Leave the filament grouping dialog alone unless it shows the wrong nozzle.
 
 Quote the report `<outdir>/<name>.report.md`; never paraphrase its numbers. Give only the grams it prints
 (prime tower + flush is one number); model grams only when the report has them.
@@ -143,7 +148,8 @@ qualifying prints of one printer model and material (`references/06-slicer-rules
 }
 ```
 
-A part takes `path`, `filament`, `count`, `recipes`, `set` (string values), `height_ranges`, `lay_on_face`
+`process.name` is a label for the report, not the GUI's preset name: the project names the base preset, and the GUI
+shows it as `<base> (modified)`. A part takes `path`, `filament`, `count`, `recipes`, `set` (string values), `height_ranges`, `lay_on_face`
 [nx, ny, nz] or `rotate` [x, y, z], or `"orientation": "auto"` (not with either); or `parts` (several files as
 one object). `at` [x, y] is the bed position of the turned part's bounding-box MIN corner (front-left), not its
 centre: to centre a part w x d on a bed W x D (doctor), write [(W - w) / 2, (D - d) / 2]. `brim_margin` (mm)
@@ -167,7 +173,9 @@ shambu patch project.3mf --bed-type "Textured PEI Plate" --map 1,2 --set "obj:en
 shambu patch project.3mf --replace-mesh OBJECT[/PART]=new.stl [--rotate-mesh X,Y,Z | --lay-on-face NX,NY,NZ] [--anchor frame|centre|min]
        --add-filament "PRESET[:#RRGGBB][@EXTRUDER]" | --move OBJECT=X,Y[@PLATE] (or +DX,+DY) [--strict] | --tower X,Y[@PLATE]
        --repair-nozzle-stats | --no-verify (skip the verify slice) | --dry-run | -o OUT.3mf
-shambu open project.3mf                                                # opens it in Studio for the user
+shambu patch project.3mf --process-set wall_loops=4 [--process-set ...] | --process-unset KEY   # process keys, bookkeeping kept
+shambu verify project.3mf --against plate.json [--json]                # a GUI save against its spec: 0 match, 1 differences, 3 unreadable
+shambu open project.3mf                                                # opens it in Studio for the user (WARN: behind an open window)
 shambu slice FILE.3mf [--plate N] [--no-check] [--tower X,Y[@PLATE]] [--settings-from plate.json]
 shambu studio [--out DIR] -- ARGS...                                   # logged raw Studio call: only with the user's yes
 shambu printer discover | printer filaments | printer status | printer watch [--every 300] [--log FILE --gcode3mf F.gcode.3mf [--wait-for-start]]
@@ -194,7 +202,7 @@ and log path; its output is unverified until `shambu inspect` reads it.
 | Tall, or long and narrow | `tall-outer-brim`; flat coupons, small parts `flat-no-brim`; a lifting corner: `dog-ears` (the user places the points) |
 | Overhangs | `tree-supports` per object; `snug-normal-supports` for a flat area straight above the plate; `bridge-short-spans` (spans to 10 mm); `minimal-supports`, `counterbore-bridging`, `petg-supports`, `more-support` |
 | Parts close together | `check` keeps the larger of two facing support spreads plus 1 mm, not their sum; a gap shorter than an estimated spread is a WARN. The slice decides: exit -101 is a real clash |
-| PETG part with PLA loaded too (or the reverse) | `dual-material-interface`: the other material as interface only, map 1,2. The process interface makes the plate two-filament: every supported part sits at x >= 20.5 plus its interface spread |
+| PETG part with PLA loaded too (or the reverse) | `dual-material-interface` on each supported part and `two-filament-plate` in `process.recipes`: the other material as interface only, map 1,2. The interface makes the plate two-filament: every supported part sits at x >= 20.5 plus its interface spread. A recipe at the wrong scope is a WARN |
 | Two filaments by layer (prime tower) | `wipe_tower` "auto" finds a spot both nozzles reach or FAILs naming the blocker. Size: the tallest part's (41 mm plus an 8 mm brim at 218 mm) with the rib wall, then 35 mm without it, narrower only if nothing fits. 22 mm without the rib wall is faster: offer it (a spot with `width` 22, or `prime_tower_width` in `process.set`), never default to it: a tall narrow tower can topple |
 | Two filaments, several single-colour objects | by object with `group_by_filament` (no tower); sweep `--by-object` to confirm; loses on many tiny parts; most volume on the left nozzle |
 | Orientation unclear | `"orientation": "auto"`, or `sweep --orientations PART [--source studio]`; load direction first, then supports and finish, then time |
@@ -215,7 +223,12 @@ It never runs Studio's arrange and never rotates a part to pack it.
 - Set supports, brims or infill for the whole plate when one part needs them: per object.
 - Guess an orientation for a part exported in an assembly frame: `shambu orient`, then `lay_on_face`.
 - Send keystrokes to Studio, press Print, or publish anything but one `pushall` to the printer.
-- Reuse a spec's filaments from an earlier day: Studio's swap on open resets the process to the stock preset.
+- Expect a process preset that exists only in the file to survive a GUI open: Studio resets every key not named in
+  `different_settings_to_system` to the base preset (shambu 0.6.0 writes the list; `shambu inspect` shows it).
+- Tell the user to send the file to the printer without opening it in Studio, or to print the embedded G-code
+  untouched: the GUI final pass is the requirement.
+- Expect the plate to open sliced in Studio: a project with objects always opens unsliced; the GUI slice is the
+  check against shambu's numbers.
 
 ## References (read when the row says so)
 
