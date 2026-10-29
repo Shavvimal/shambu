@@ -295,25 +295,28 @@ def test_handback_names_the_modified_base_and_every_override(tmp_path, stls, res
     )
     steps = text.split("## Owner steps in Bambu Studio")[1]
     assert "`shambu open" in steps
-    assert f"`{PROCESS} (modified)`" in steps
+    assert f"`{PROCESS}` (shown as modified when any override differs from the base)" in steps
+    assert "The values are what to check, not the suffix" in steps
     assert "wall_loops = 4" in steps and "sparse_infill_density = 25%" in steps
     assert "opens unsliced" in steps and "Plater.cpp:9578-9581" in steps
     assert "6 h 51 min, 212.4 g" in steps and "within 1 min and 1 g" in steps
     assert "shambu verify" in steps and "--against" in steps and "a setting changed on open" in steps
     assert "filament 2 on the auxiliary (right) nozzle" in steps and "Leave the Filament grouping dialog alone" in steps
-    assert "File > Save project as" in steps and "-checked.3mf" in steps and "Do not Print until it exits 0" in steps
+    assert "File > Save project as" in steps and "-checked.3mf" in steps and "Do not Print until it exits 0." in steps
+    assert "If a FAIL is a change you want, put it in the spec and rebuild." in steps
+    assert "every FAIL line is one you intended" not in steps  # contradicted the last step
     assert "type the key into the tab's search box" in steps
     assert (
         steps.split("## Standing warnings")[0]
         .rstrip()
-        .endswith("Print only when the GUI estimate matched, or `shambu verify` on the saved copy passed.")
+        .endswith("Print only when the GUI estimate matched, or `shambu verify` on the saved copy exited 0.")
     )
     assert f"process `{PROCESS}` + 2 override(s) (sparse_infill_density, wall_loops)" in text
 
 
 def test_handback_without_bookkeeping_falls_back_to_the_spec_set(tmp_path, stls, resolver, cli_export):
     text = _sliced_report(tmp_path, stls, resolver, cli_export)
-    assert f"`{PROCESS} (modified)`" in text and "wall_loops = 2" in text
+    assert f"`{PROCESS}` (shown as modified when any override differs from the base)" in text and "wall_loops = 2" in text
 
 
 def test_handback_never_promises_what_the_gui_does_not_do(tmp_path, stls, resolver, cli_export):

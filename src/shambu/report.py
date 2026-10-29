@@ -177,10 +177,12 @@ def _hm(seconds: float) -> str:
 
 def owner_steps(r: BuildResult) -> list[str]:
     """The numbered steps for the user's final pass in the GUI, written for what Studio 02.08 does on open
-    (spec 2026-10-29 section 5.5): the process combo reads `<base> (modified)` with the listed keys kept
-    (Preset.cpp:2258-2269 and :2330-2345 at v02.08.02.61), and a project with objects opens unsliced because Studio
-    loads the embedded G-code only when the model has no objects (Plater.cpp:9578-9581). The GUI slice is therefore
-    the check, and it must land on this report's estimate."""
+    (spec 2026-10-29 section 5.5): the process combo names `<base>` with the listed keys kept (Preset.cpp:2258-2269
+    and :2330-2345 at v02.08.02.61). It shows the base as modified only when a listed value differs from the base:
+    Studio selects the preset clean when every value equals it (Preset.cpp:2292-2305), and the exporter lists the
+    explicit keys even when they equal shambu's base, so the step checks the values, not the suffix. A project with
+    objects opens unsliced because Studio loads the embedded G-code only when the model has no objects
+    (Plater.cpp:9578-9581). The GUI slice is therefore the check, and it must land on this report's estimate."""
     pl, spec = r.plan, r.plan.spec
     base, keys = _process_slot(r)
     spec_path = r.inputs.get("spec")
@@ -189,7 +191,8 @@ def owner_steps(r: BuildResult) -> list[str]:
     if keys:
         vals = ", ".join(f"{k} = {pl.process.get(k, spec.process.set.get(k, '?'))}" for k in keys)
         steps.append(
-            f"The process combo shows `{base} (modified)`. Open its tab and confirm each value (type the key into the tab's search "
+            f"The process combo shows `{base}` (shown as modified when any override differs from the base). The values are what "
+            "to check, not the suffix: open its tab and confirm each value (type the key into the tab's search "
             f"box: the tab shows labels, not keys): {vals}."
         )
     else:
@@ -209,7 +212,7 @@ def owner_steps(r: BuildResult) -> list[str]:
     fallback = (
         f"save the project in Studio under a new name (File > Save project as, e.g. `{saved.name}`), then run "
         f'`shambu verify "{saved}" --against {against}`, which lists the settings that differ. Do not Print until it '
-        "exits 0 or every FAIL line is one you intended."
+        "exits 0. If a FAIL is a change you want, put it in the spec and rebuild."
     )
     est = r.estimates() if r.sliced else []
     if est:
@@ -229,7 +232,7 @@ def owner_steps(r: BuildResult) -> list[str]:
     steps.append(
         "In Preview, set the colour scheme to Line Type and look at the Overhang wall, Bridge and Support rows and at the first layer."
     )
-    steps.append("Print only when the GUI estimate matched, or `shambu verify` on the saved copy passed.")
+    steps.append("Print only when the GUI estimate matched, or `shambu verify` on the saved copy exited 0.")
     return [f"{i}. {t}" for i, t in enumerate(steps, 1)]
 
 

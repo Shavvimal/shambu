@@ -23,24 +23,31 @@ key that list does not name (post-mortem `docs/errors/2026-10-29-gui-open-drops-
 - Include order in preset resolution: the leaf's own keys now win over its `include` template, as in Studio
   (`PresetBundle.cpp:5084-5086`, `:5109`, `:5142-5144`, `:5158`). Three X2D filament values were the template's before:
   `filament_cooling_before_tower`, `retraction_distances_when_ec`, `slow_down_min_speed`.
-- The hand-back text: open with `shambu open`, confirm the process reads `<base> (modified)` with the override
-  values, Slice plate (Studio opens a project with objects unsliced), and the GUI estimate must land within 1 min and
-  1 g of shambu's. Otherwise the user saves the project in Studio under a new name and runs `shambu verify` on the
-  save, and prints only when the estimate matched or verify exits 0. "Re-slice in Studio after any change" is gone.
+- The hand-back text: open with `shambu open`, confirm the process names `<base>` and check the override values in
+  its tab (Studio marks the base modified only when an override differs from it, `Preset.cpp:2292-2305`), confirm
+  each filament on its planned nozzle, Slice plate (Studio opens a project with objects unsliced), and the GUI
+  estimate must land within 1 min and 1 g of shambu's. Otherwise the user saves the project in Studio under a new
+  name and runs `shambu verify` on the save: no Print until it exits 0, and a FAIL the user wants goes in the spec and
+  a rebuild. Print only when the estimate matched or verify on the saved copy exited 0. "Re-slice in Studio after any
+  change" is gone.
 
 ### Added
 - `shambu verify FILE --against SPEC [--json]`: compares a GUI-saved project with its spec: the spec's process keys
   (recipes included), the preset ids and lists, filament colours and set keys, map and mode at project and plate
   level, bed type, print sequence, and each object's spec-set settings, filament and position (`at`); one FAIL, WARN or
-  INFO line per difference. Exit 0 when no line is FAIL, 1 on any FAIL line (WARN-only GUI edits exit 0), 3 when the
-  file or spec does not load. A filament 2..N saved by the GUI as `<base>(<file>.3mf)` passes when its values match.
+  INFO line per difference. Exit 0 when no line is FAIL, 1 on any FAIL line or a spec that does not load (WARN-only
+  GUI edits exit 0), 3 when the project file does not read. A filament 2..N saved by the GUI as `<base>(<file>.3mf)`
+  passes when its values match. A spec on an installed user preset expects the exporter's bookkeeping: the system
+  base as the id and the user preset's overrides in the list and the file. Any `inherits_group` entry that names
+  another preset than the slot's system base is a FAIL, for every slot (`Preset.cpp:2258-2264`). "25%" equals "25"
+  only for the percent-only keys; for a FloatOrPercent key such as `max_travel_detour_distance` it is a difference.
 - `shambu patch FILE --process-set KEY=VALUE` and `--process-unset KEY`: change a process key and keep the override
   list right.
 - The `two-filament-plate` recipe (`[process]`: `enable_prime_tower 1`, `independent_support_layer_height 0`), paired
   with `dual-material-interface` on the parts.
 - `shambu inspect` prints `process <id> (+N overrides: ...)`.
-- `shambu open` prints a WARN when Studio was already running: the project opened in a new window behind the current
-  one.
+- `shambu open` prints "WARN: Bambu Studio was already running: check that the front window shows <file name>":
+  where the project opens depends on Studio's `single_instance` setting (`GUI_App.cpp:7711-7722`).
 - A WARN in `check` and `build` when a `[process]` recipe sits on a part or an `[object]` recipe in
   `process.recipes`. The keys still apply.
 - The derived infill keys: when the spec or a recipe sets `sparse_infill_density`, `skeleton_infill_density` and
