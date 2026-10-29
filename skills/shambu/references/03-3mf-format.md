@@ -31,6 +31,7 @@ Prototype: `$S/proto/bambu3mf.py` (read + patch), `$S/proto/gen.py` (generate fr
 | [6. Generating a project from STLs with no CLI](#6-generating-a-project-from-stls-with-no-cli) | Writing a project from STLs without the CLI |
 | [7. Gaps and next steps](#7-gaps-and-next-steps) | Open questions and the tests that would close them |
 | [8. Re-slicing a CLI export](#8-re-slicing-a-cli-export) | The per-extruder keys a later `--slice` needs, and the exit -100 chain |
+| [9. Preset bookkeeping Studio honours](#9-preset-bookkeeping-studio-honours) | What the GUI keeps of a project's process and filaments on open, and what shambu writes for it |
 | [Appendix: `project_settings.config` keys by source](#appendix-project_settingsconfig-keys-by-source) | Each `project_settings.config` key, grouped by preset source |
 | [Project edits](#project-edits-replace-a-mesh-add-a-filament-move-an-object-or-the-tower-shambu-04-editspy) | How `patch --replace-mesh`, `--add-filament`, `--move`, `--tower` and `shambu slice --no-check` change a project, with the Studio rules they follow |
 
@@ -332,7 +333,7 @@ Keys that matter for this task (fit test values):
 | `master_extruder_id` | `"1"` | |
 | `extruder_printable_area` | `["0x0,256x0,256x256,0x256", "20.5x0,256x0,256x256,20.5x256"]` | extruder 2 cannot reach x < 20.5 |
 | `extruder_printable_height` | `["261","256"]` | |
-| `inherits_group`, `different_settings_to_system` | 4 × `""` | user-preset bookkeeping |
+| `inherits_group`, `different_settings_to_system` | 4 × `""` (CLI export); shambu 0.6.0 fills the slots with overrides | preset bookkeeping `[process, filament 1..N, printer]`: Studio resets every key not on the list (section 9) |
 | `from`, `name`, `version` | `"project"`, `"project_settings"`, `"02.08.02.61"` | |
 | `machine_pause_gcode` | `"M400 U1"` | used for a pause entry |
 
@@ -662,6 +663,84 @@ with an empty stat, a `#0` count, or variant and self-index lists of different l
 Live check, the seed build moved to x >= 29: the repaired unsliced export re-sliced through shambu's own
 `--load-settings` command and through a bare `--slice 1` both exit 0 (2 h 12 min) with no `could not found` line.
 The same file with `extruder_nozzle_stats []` exits -100 "No valid nozzle found".
+
+## 9. Preset bookkeeping Studio honours
+
+Read from the Bambu Studio source at tag `v02.08.02.61` (commit `926a7192`) on 2026-10-29, after a shambu project
+lost its process on a GUI open (`docs/errors/2026-10-29-gui-open-drops-process.md`, spec
+`docs/specs/2026-10-29-gui-preset-bookkeeping.md` section 1). Paths are relative to `src/`. shambu 0.6.0 encodes
+these rules.
+
+**Index layout.** `inherits_group` and `different_settings_to_system` have `num_filaments + 2` entries:
+`[process, filament 1..N, printer]` (`libslic3r/PresetBundle.cpp:3775-3776`, `:3867`, `:3885`, `:3985`).
+
+**What the GUI does on open.**
+
+1. `Plater::priv::load_files` (`slic3r/GUI/Plater.cpp:8398`, `:8799`) reads the archive and any project-embedded
+   presets, then calls `load_config_file_config(name, is_external=true, ...)` (`libslic3r/PresetBundle.cpp:3729`).
+2. It pads both vectors to N + 2 entries (`PresetBundle.cpp:3775-3776`).
+3. For the process it splits `different_settings_to_system[0]` on `;`, adds the four ignore keys (`inherits`,
+   `print_settings_id`, `filament_settings_id`, `printer_settings_id`, `:3250-3253`) and calls `load_external_preset`
+   with `LoadAndSelect::Always` (`:3866-3879`). The empty-list guard is commented out (`:3870`), so the set is never
+   empty.
+4. `load_external_preset` (`libslic3r/Preset.cpp:2214`, the reset at `:2258-2269`) finds the base by `inherits`, or by
+   `print_settings_id` when that names a system preset, and calls `update_non_diff_values_to_base_config`
+   (`libslic3r/PrintConfig.cpp:9218`). That call sets EVERY key not named in the list back to the base value. Only
+   the listed keys keep their values from the file.
+5. Selection (`Preset.cpp:2292`, `:2307-2323`, `:2330-2345`, `:2364-2418`): a known name with the same values is
+   selected clean. An unknown name whose `inherits` has the same values selects that preset clean. A known preset
+   with other values is selected and shows as modified. Otherwise Studio creates `"<name>(<file>.3mf)"` with no
+   parent; a GUI save of it writes an empty list, and each reopen adds a suffix.
+6. On save, `PresetBundle::full_fff_config` (`PresetBundle.cpp:3304-3313`, `:3523-3545`) writes
+   `print_settings_id` = the selected preset, `inherits_group[0]` = its `inherits` (`""` for a system preset) and
+   `different_settings_to_system[0]` = the keys that differ from the parent, sorted and `;`-joined
+   (`Preset.cpp:3162-3186`, `libslic3r/Config.cpp:89`). A listed key whose value equals the parent's drops off the
+   list on save. The GUI couples `skeleton_infill_density` and `skin_infill_density` to `sparse_infill_density`
+   (`slic3r/GUI/Tab.cpp:2105-2111`).
+7. The embedded G-code loads as a slice result only when the model has NO objects (`Plater.cpp:9578-9581`). Studio's
+   own `.gcode.3mf` export skips the geometry (`:22612`). A project with objects always opens unsliced, whatever its
+   config says.
+8. Project-embedded presets (`Metadata/process_settings_<n>.config`, `libslic3r/Format/bbs_3mf.cpp:186-189`) need
+   `print_settings_id` and an `inherits` that names an installed preset (`Preset.cpp:1671-1752`, else "can not find
+   parent for config"). They pass through the same step 4 reset, so they still need the list.
+9. `filament_map_mode`: the plate metadata wins over the project value (`slic3r/GUI/PartPlate.cpp:300-311`). A new
+   plate starts as `Auto For Flush` (`PartPlate.cpp:172`) and takes the plate metadata when present
+   (`bbs_3mf.cpp:4657-4676`). A `printer_model` change on open resets the project value
+   (`Plater.cpp:24529-24533`).
+
+**Filament slots 2..N load differently.** Slots 2..N use `LoadAndSelect::OnlyIfModified` or `Never`
+(`PresetBundle.cpp:3855`, `:3931`, `:4003-4013`), not `Always` as the process, the printer and slot 1 do. A secondary
+filament with overrides therefore comes back from a GUI save as a project-embedded copy named `<base>(<file>.3mf)`,
+with `inherits_group[i]` = the base and the values kept (`Preset.cpp:2332`, `:2354-2365`, `:2401-2439`). shambu's
+export still writes the base id. `shambu verify` accepts the embedded form for slots 2..N and compares the values.
+
+**What shambu writes (0.6.0).** Every export carries, per slot with overrides: the `*_settings_id` = the base system
+preset, `inherits_group[slot]` = `""`, and `different_settings_to_system[slot]` = sorted(the explicit overrides
+together with every key that differs from the resolved base), merged with any key the CLI listed. The explicit
+overrides go on the list even when shambu's resolved base already holds that value. Reason: Studio applies only the
+include keys that differ from its collection default (`PresetBundle.cpp:5142-5144`), so shambu's resolved base can
+differ from Studio's for a key nobody overrode. An equal key on the list is harmless (step 6 drops it on save). A
+missing one is reset. The spec's `process.name` stays a report label, never the preset id. `shambu inspect` prints
+`process <id> (+N overrides: ...)`. `shambu patch --process-set KEY=VALUE` / `--process-unset KEY` change a process
+key and keep the list right.
+
+**The CLI is not the GUI.** The Studio CLI copies `different_settings_to_system[0]` from an input process JSON only
+for a non-3MF input model (`BambuStudio.cpp:2382-2386`, `:3352-3360`), so shambu sets the list with a patch after the
+export. The CLI never resets values on shambu's path, which supplies a new process JSON (`update_all` true,
+`BambuStudio.cpp:3388`); the path that updates an existing preset passes false (`:3375`). It copies every input key,
+but can change and list a tower key (`:4182-4208`), hence shambu merges its list with the CLI's. The headless slice
+always had the spec's values.
+
+**Short vectors are padded, not reset.** `filament_map`, `filament_nozzle_map` and `filament_volume_map` with fewer
+entries than filaments are padded on load (`Plater.cpp:8944-8958`); `extruder_ams_count` is parsed and erased
+(`PresetBundle.cpp:3827-3831`). A short vector never triggers the reset (F5 of the 29 October post-mortem is not a
+fault).
+
+**Include order.** Studio resolves a system preset as: the flattened parent (looked up at
+`PresetBundle.cpp:5084-5086`, copied at `:5109`), then the `include` template keys that differ from the collection
+default (`apply_only`, `:5142-5144`), then the leaf's own keys (`:5158`). The leaf wins over the template, the
+template over the ancestors. shambu's `presets.resolve()` follows that order from 0.6.0; it applies every template key
+(it has no default table).
 
 ## Appendix: `project_settings.config` keys by source
 

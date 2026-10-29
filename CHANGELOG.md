@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-29
+
+A shambu project now opens in Bambu Studio with the process it was sliced with. On 2026-10-29 the owner opened a
+shambu project in Studio for the final pass, the process came back as the stock `0.20mm Standard @BBL X2D`, and the
+GUI re-sliced at 2 walls and 15 % grid instead of the spec's 4 walls and 25 % gyroid. shambu 0.5.1 exported the
+process as a user preset Studio did not know, with an empty `different_settings_to_system`, and Studio resets every
+key that list does not name (post-mortem `docs/errors/2026-10-29-gui-open-drops-process.md`, spec
+`docs/specs/2026-10-29-gui-preset-bookkeeping.md`).
+
+### Fixed
+- The preset bookkeeping in every export: `print_settings_id` (and each `filament_settings_id`, the
+  `printer_settings_id`) names the base system preset, and `different_settings_to_system[slot]` lists the overrides:
+  sorted(the explicit overrides together with every key that differs from the resolved base), merged with any key the
+  CLI listed. Both the sliced and the unsliced export carry it, and `slice --settings-from` writes the process and
+  printer bookkeeping too. The GUI shows `<base> (modified)` with the values in place, and a GUI save keeps them (read
+  from the Studio source at v02.08.02.61; the live open check is spec section 6). The spec's `process.name` stays the report label.
+- Include order in preset resolution: the leaf's own keys now win over its `include` template, as in Studio
+  (`PresetBundle.cpp:5084-5086`, `:5109`, `:5142-5144`, `:5158`). Three X2D filament values were the template's before:
+  `filament_cooling_before_tower`, `retraction_distances_when_ec`, `slow_down_min_speed`.
+- The hand-back text: open with `shambu open`, confirm the process reads `<base> (modified)` with the override
+  values, Slice plate (Studio opens a project with objects unsliced), and the GUI estimate must land within 1 min and
+  1 g of shambu's. Otherwise the user saves the project in Studio under a new name and runs `shambu verify` on the
+  save, and prints only when the estimate matched or verify exits 0. "Re-slice in Studio after any change" is gone.
+
+### Added
+- `shambu verify FILE --against SPEC [--json]`: compares a GUI-saved project with its spec: the spec's process keys
+  (recipes included), the preset ids and lists, filament colours and set keys, map and mode at project and plate
+  level, bed type, print sequence, and each object's spec-set settings, filament and position (`at`); one FAIL, WARN or
+  INFO line per difference. Exit 0 when no line is FAIL, 1 on any FAIL line (WARN-only GUI edits exit 0), 3 when the
+  file or spec does not load. A filament 2..N saved by the GUI as `<base>(<file>.3mf)` passes when its values match.
+- `shambu patch FILE --process-set KEY=VALUE` and `--process-unset KEY`: change a process key and keep the override
+  list right.
+- The `two-filament-plate` recipe (`[process]`: `enable_prime_tower 1`, `independent_support_layer_height 0`), paired
+  with `dual-material-interface` on the parts.
+- `shambu inspect` prints `process <id> (+N overrides: ...)`.
+- `shambu open` prints a WARN when Studio was already running: the project opened in a new window behind the current
+  one.
+- A WARN in `check` and `build` when a `[process]` recipe sits on a part or an `[object]` recipe in
+  `process.recipes`. The keys still apply.
+- The derived infill keys: when the spec or a recipe sets `sparse_infill_density`, `skeleton_infill_density` and
+  `skin_infill_density` follow it, as the GUI does (`Tab.cpp:2105-2111`).
+
+### Changed
+- `dual-material-interface` is per object (`[object]`), where Studio's own suggestion dialog writes its interface
+  keys; the GUI keeps per-object settings across an open. `enable_prime_tower` moved to `two-filament-plate`.
+
 ## [0.5.1] - 2026-10-27
 
 ### Changed

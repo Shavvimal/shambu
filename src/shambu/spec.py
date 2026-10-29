@@ -46,6 +46,7 @@ Unknown keys are dropped with a warning (`shambu spec` lists them), so a typo su
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,43 @@ def spec_warnings(d: dict) -> list[str]:
             for r in part.get("height_ranges") or []:
                 out += unknown_keys(r, "height_range", f"plate {pi} part {si} height range")
     return out
+
+
+def scope_warnings(process_recipes: Sequence[str], plates: Sequence[PlateSpec]) -> list[str]:
+    """A WARN per recipe listed at the other scope (spec 2026-10-29 section 5.3): the keys still apply, so this never
+    errors. A `[process]` recipe on a part is written per object, where the slicer ignores its global keys
+    (`recipes.GLOBAL_KEYS`) and its object and region keys reach that object only; an `[object]` recipe in
+    process.recipes writes its keys for every object. Names unknown to `recipes.RECIPES` are left to the recipe check."""
+    from .recipes import GLOBAL_KEYS, by_name
+
+    known = by_name()
+    out = []
+    for name in process_recipes:
+        r = known.get(name)
+        if r is not None and r.scope == "object":
+            out.append(f"recipe {name} is [object] scope; in process.recipes its keys apply to every object; list it on the parts instead")
+    for pl in plates:
+        for part in pl.parts:
+            for name in part.recipes:
+                r = known.get(name)
+                if r is None or r.scope != "process":
+                    continue
+                try:
+                    where = part.key()
+                except BuildError:
+                    where = "?"
+                plate_wide = [k for k in r.set if k in GLOBAL_KEYS]
+                if plate_wide:
+                    out.append(
+                        f"recipe {name} is [process] scope; on part {where} it is written per object, where its plate-wide keys "
+                        f"({', '.join(plate_wide)}) are ignored by the slicer; list it in process.recipes"
+                    )
+                else:
+                    out.append(
+                        f"recipe {name} is [process] scope; on part {where} it is written per object, so its keys apply to that "
+                        "object only; list it in process.recipes"
+                    )
+    return list(dict.fromkeys(out))
 
 
 def _strs(d: dict | None) -> dict[str, str]:
@@ -429,7 +467,7 @@ class Spec:
             tuple(int(x) for x in d["filament_map"]) if d.get("filament_map") else None,
             float(d["aux_x_limit"]) if d.get("aux_x_limit") is not None else None,
             LayoutSpec(float(lay.get("gap", 5.0)), float(lay.get("edge", 2.0))),
-            tuple(spec_warnings(d)),
+            tuple(spec_warnings(d) + scope_warnings(tuple(pr.get("recipes", [])), plates)),
         )
 
     def to_json(self) -> dict:
