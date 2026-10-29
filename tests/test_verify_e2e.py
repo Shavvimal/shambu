@@ -54,10 +54,11 @@ def spec_json(tmp_path: Path) -> dict:
     }
 
 
-def build(tmp_path: Path, resolver, *, sliced: bool = False) -> tuple[BuildResult, Path]:
+def build(tmp_path: Path, resolver, *, sliced: bool = False, process_base: str = PROCESS) -> tuple[BuildResult, Path]:
     """Build the spec through the fake export; returns the result and the spec file `shambu verify` reads."""
     (tmp_path / "stl").mkdir()
     d = spec_json(tmp_path)
+    d["process"]["base"] = process_base
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(d), encoding="utf-8")
     fixture = make_geo_3mf(tmp_path / "fixture.3mf", sliced=sliced)
@@ -120,3 +121,17 @@ def test_gui_reset_of_a_process_key_fails_naming_it(capsys, tmp_path, resolver):
     fails = [x for x in lines if x.startswith("FAIL")]
     assert any(x.startswith("FAIL process wall_loops: expected 4, got 2") for x in fails), fails
     assert all("wall_loops" in x for x in fails), fails
+
+
+def test_export_of_a_user_process_preset_verifies(capsys, tmp_path, resolver, profiles):
+    """A spec on an installed user preset: the export names its system base and lists the user preset's override
+    (`build._bookkeeping`), and verify expects exactly that, so the pristine export passes."""
+    (profiles / "process" / "My walls.json").write_text(
+        json.dumps({"name": "My walls", "from": "User", "inherits": PROCESS, "brim_width": "8"}), encoding="utf-8"
+    )
+    r, spec_path = build(tmp_path, resolver, process_base="My walls")
+    ps = Project(str(r.project)).project_settings
+    assert ps["print_settings_id"] == PROCESS and "brim_width" in ps["different_settings_to_system"][0].split(";")
+    code, lines = verify(capsys, r.project, spec_path)
+    assert code == 0, lines
+    assert not [x for x in lines if x.startswith(("FAIL", "WARN"))], lines

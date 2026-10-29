@@ -134,6 +134,60 @@ def test_gui_edit_is_a_warn_with_its_value(capsys, tmp_path):
 def test_inherits_group_naming_the_base_is_a_warn(capsys, tmp_path):
     code, lines = verify(capsys, project(tmp_path, inherits_group=[PROCESS, "", "", ""]), spec_file(tmp_path))
     assert code == 0 and any(x.startswith("WARN process inherits_group[0]") for x in lines)
+    code, lines = verify(capsys, project(tmp_path, inherits_group=["", "Test PLA", "", MACHINE]), spec_file(tmp_path))
+    assert code == 0 and any(x.startswith("WARN filament 1 inherits_group[1]") for x in lines)
+    assert any(x.startswith("WARN printer inherits_group[3]") for x in lines)
+
+
+@pytest.mark.parametrize(
+    ("index", "parent", "item"),
+    [
+        (0, "0.20mm Wrong", "process inherits_group[0]"),
+        (1, "Other PLA", "filament 1 inherits_group[1]"),
+        (2, "Other PLA", "filament 2 inherits_group[2]"),
+        (3, "Other printer", "printer inherits_group[3]"),
+    ],
+)
+def test_inherits_group_naming_another_parent_fails_for_every_slot(capsys, tmp_path, index, parent, item):
+    """Studio resets the unlisted keys of a slot against its `inherits_group` entry (Preset.cpp:2258-2264): a correct id
+    and correct values do not help when that entry names another preset."""
+    inherits = ["", "", "", ""]
+    inherits[index] = parent
+    code, lines = verify(capsys, project(tmp_path, inherits_group=inherits), spec_file(tmp_path))
+    assert code == 1, lines
+    fails = [x for x in lines if x.startswith("FAIL")]
+    assert len(fails) == 1, lines
+    assert fails[0].startswith(f'FAIL {item}: expected "", got {parent} (Studio resets the unlisted keys against {parent}')
+
+
+def user_process(profiles, name="My walls", **values):
+    (profiles / "process" / f"{name}.json").write_text(
+        json.dumps({"name": name, "from": "User", "inherits": PROCESS, **values}), encoding="utf-8"
+    )
+
+
+def test_user_preset_base_expects_its_system_base_and_its_overrides(capsys, tmp_path, profiles):
+    """The exporter names the system base and lists the user preset's own overrides (`build._bookkeeping`); verify
+    expects the same, so a pristine export of a spec on "My walls" passes."""
+    user_process(profiles, brim_width="8")
+    spec = spec_file(tmp_path, process={"base": "My walls", "set": {"wall_loops": "4", "sparse_infill_density": "25%"}})
+    lst = "brim_width;" + LIST
+    code, lines = verify(capsys, project(tmp_path, different_settings_to_system=[lst, "", "", ""], brim_width="8"), spec)
+    assert code == 0, lines
+    assert not [x for x in lines if x.startswith(("FAIL", "WARN"))], lines
+    # the user preset's override is expected in the file and in the list
+    code, lines = verify(capsys, project(tmp_path, different_settings_to_system=[lst, "", "", ""], brim_width="5"), spec)
+    assert code == 1 and any(x.startswith("FAIL process brim_width: expected 8, got 5") for x in lines), lines
+    code, lines = verify(capsys, project(tmp_path, brim_width="8"), spec)
+    assert code == 1 and any(x.startswith("FAIL process list brim_width: expected listed, got not listed") for x in lines), lines
+    # the id is the system base, never the user preset's name
+    f = project(tmp_path, print_settings_id="My walls", different_settings_to_system=[lst, "", "", ""], brim_width="8")
+    code, lines = verify(capsys, f, spec)
+    assert code == 1
+    assert (
+        f"FAIL process preset id: expected {PROCESS}, got My walls (Studio selects the preset by this name; {PROCESS} is the "
+        "system base of the spec's My walls)"
+    ) in lines
 
 
 def test_wrong_object_setting_is_a_fail(capsys, tmp_path):
@@ -323,28 +377,47 @@ def test_vector_count_disagreement_is_a_warn(capsys, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("want", "got", "same"),
+    ("want", "got", "key", "same"),
     [
-        ("0.20", "0.2", True),
-        ("35.0", "35", True),
-        ("25%", "25", True),
-        ("25%", "25%", True),
-        ("25%", "30", False),
-        (True, "1", True),
-        ("false", "0", True),
-        ("4", ["4"], True),
-        ("50,50", ["50", "50.0"], True),
-        (["0.2", "0.4"], ["0.20", "0.4"], True),
-        (["0.2", "0.4"], ["0.2", "0.5"], False),
-        ("220", ["220", "220", "220"], True),
-        ("gyroid", "grid", False),
-        ("4", None, False),
+        ("0.20", "0.2", "", True),
+        ("35.0", "35", "", True),
+        ("25%", "25", "sparse_infill_density", True),  # coPercent (PrintConfig.cpp:3085): the sign is insignificant
+        ("25", "25%", "top_surface_density", True),
+        ("25%", "25%", "", True),
+        ("25.0%", "25%", "max_travel_detour_distance", True),
+        ("25%", "30", "sparse_infill_density", False),
+        ("50%", "50", "max_travel_detour_distance", False),  # FloatOrPercent (PrintConfig.cpp:1178-1188): ratio vs mm
+        ("50", "50%", "max_travel_detour_distance", False),
+        ("25%", "25", "", False),  # an unknown key keeps the sign
+        (True, "1", "", True),
+        ("false", "0", "", True),
+        ("4", ["4"], "", True),
+        ("50,50", ["50", "50.0"], "", True),
+        (["0.2", "0.4"], ["0.20", "0.4"], "", True),
+        (["0.2", "0.4"], ["0.2", "0.5"], "", False),
+        ("220", ["220", "220", "220"], "", True),
+        ("gyroid", "grid", "", False),
+        ("4", None, "", False),
     ],
 )
-def test_value_normalisation(want, got, same):
+def test_value_normalisation(want, got, key, same):
     from shambu import verify as V
 
-    assert V._same(want, got) is same
+    assert V._same(want, got, key) is same
+
+
+def test_percent_only_key_accepts_a_bare_number_and_a_float_or_percent_key_fails(capsys, tmp_path):
+    code, lines = verify(capsys, project(tmp_path, sparse_infill_density="25"), spec_file(tmp_path))
+    assert code == 0, lines
+    spec = spec_file(
+        tmp_path,
+        process={"base": PROCESS, "set": {"wall_loops": "4", "sparse_infill_density": "25%", "max_travel_detour_distance": "50%"}},
+    )
+    lst = LIST.replace("skeleton", "max_travel_detour_distance;skeleton")
+    f = project(tmp_path, different_settings_to_system=[lst, "", "", ""], max_travel_detour_distance="50")
+    code, lines = verify(capsys, f, spec)
+    assert code == 1
+    assert "FAIL process max_travel_detour_distance: expected 50%, got 50" in lines
 
 
 def test_tower_key_the_plan_moves_is_info(capsys, tmp_path):
@@ -488,3 +561,15 @@ def test_filament_preset_missing_from_the_library_is_a_warn(capsys, tmp_path):
     code, lines = verify(capsys, project(tmp_path), spec_file(tmp_path, filaments=fil))
     assert code == 0
     assert "WARN filament 2 preset No Such PLA: got Test PLA (not in the Studio library: values not compared)" in lines
+
+
+def test_user_filament_preset_expects_its_system_base_and_its_overrides(capsys, tmp_path, profiles):
+    (profiles / "filament" / "My PLA.json").write_text(
+        json.dumps({"name": "My PLA", "from": "User", "inherits": "Test PLA", "filament_flow_ratio": ["0.9"]}), encoding="utf-8"
+    )
+    fil = [{"preset": "My PLA", "colour": "#00AE42"}, {"preset": "Test PLA", "colour": "#FFFFFF"}]
+    over = {"different_settings_to_system": [LIST, "filament_flow_ratio", "", ""], "filament_flow_ratio": ["0.9", "0.98"]}
+    code, lines = verify(capsys, project(tmp_path, **over), spec_file(tmp_path, filaments=fil))
+    assert code == 0, lines
+    code, lines = verify(capsys, project(tmp_path, **{**over, "filament_flow_ratio": ["0.98", "0.98"]}), spec_file(tmp_path, filaments=fil))
+    assert code == 1 and any(x.startswith("FAIL filament 1 filament_flow_ratio: expected 0.9, got 0.98") for x in lines), lines

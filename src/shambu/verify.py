@@ -17,8 +17,15 @@ not as expected:
   from the printer, list keys Studio dropped because they equal the base, objects the spec does not name.
 
 Exit 1 is for a FAIL only: the exit code answers "is the spec honoured", a WARN answers "what did the user change".
-Values compare in Studio's string form after a light normalisation (`_scalar_same`): "0.20" equals "0.2", "25%"
-equals "25" when only one side carries the sign, true/false equal 1/0, and vectors compare entry by entry.
+Values compare in Studio's string form after a light normalisation (`_scalar_same`): "0.20" equals "0.2", true/false
+equal 1/0, and vectors compare entry by entry. "25%" equals "25" only for a percent-only key (`PERCENT_ONLY`, the
+coPercent and coPercents options): a FloatOrPercent key such as `max_travel_detour_distance` reads "50" as mm and
+"50%" as a ratio (PrintConfig.cpp:1178-1188), so there the sign is a difference.
+
+The expected preset ids and lists are the exporter's (`build.system_base`, `build.slot_keys`, as `build._bookkeeping`
+writes them): a spec whose base is an installed user preset expects the first system preset up its `inherits` chain
+as the id, and the user preset's own overrides in the list and in the file. A non-empty `inherits_group` entry is the
+slot's reset target (Preset.cpp:2258-2264): any name other than the slot's system base is a FAIL.
 
 Studio rules encoded (v02.08.02.61): the slot layout `[0]` process, `[1..N]` filaments, `[N+1]` printer of
 `inherits_group` and `different_settings_to_system` (PresetBundle.cpp:3775-3776, :3867, :3885, :3985); the filament
@@ -48,7 +55,7 @@ from dataclasses import asdict, dataclass, field
 
 from . import edits
 from . import presets as P
-from .build import SUPPORT_PIN_KEYS, TOWER_KEYS, effective_filaments, pin_support_filaments
+from .build import SUPPORT_PIN_KEYS, TOWER_KEYS, effective_filaments, pin_support_filaments, slot_keys, system_base
 from .errors import BuildError, ProjectError
 from .spec import PartSpec, Spec
 from .threemf import Project
@@ -73,6 +80,35 @@ PROJECT_OPTIONS = frozenset(
     }
 )
 POSITION_TOLERANCE_MM = 0.05
+# The percent-only options (coPercent, coPercents in PrintConfig.cpp at v02.08.02.61): Studio stores "25%" and reads
+# "25" as the same percentage, so the sign is insignificant. Every other key keeps it: a FloatOrPercent option reads
+# "50" as an absolute value and "50%" as a ratio (max_travel_detour_distance, PrintConfig.cpp:1178-1188).
+PERCENT_ONLY = frozenset(
+    {
+        "accel_to_decel_factor",  # :3287
+        "bottom_surface_density",  # :2128
+        "filament_shrink",  # :2683
+        "infill_wall_overlap",  # :3953
+        "ironing_flow",  # :4097
+        "min_bead_width",  # :6429
+        "min_feature_size",  # :6417
+        "monotonic_travel_into_wall",  # :2109
+        "prime_tower_infill_gap",  # :6294
+        "raft_first_layer_density",  # :4672
+        "retract_before_wipe",  # :4720
+        "seam_gap",  # :5066
+        "skeleton_infill_density",  # :3789
+        "skin_infill_density",  # :3801
+        "sparse_infill_density",  # :3085
+        "support_ironing_flow",  # :5624
+        "support_small_pillar_diameter_percent",  # :6949
+        "top_area_threshold",  # :1537
+        "top_surface_density",  # :2097
+        "wall_transition_filter_deviation",  # :6380
+        "wall_transition_length",  # :6369
+        "wipe_speed",  # :5164
+    }
+)
 # Tab.cpp:2106-2120 at v02.08.02.61: an edit of the first key sets the others to the same value in the GUI
 DERIVED_KEYS = {
     "sparse_infill_density": ("skeleton_infill_density", "skin_infill_density"),
@@ -140,9 +176,10 @@ class Report:
 # ---------------------------------------------------------------------------- expected presets
 @dataclass(frozen=True)
 class Slot:
-    """One Studio preset slot as the spec expects it: the base system preset, the composed preset (None for a
-    filament loaded from the printer or one the library lacks), the base preset's resolved values, the keys the spec
-    sets explicitly, the expected list keys, and why it cannot be composed (`missing`)."""
+    """One Studio preset slot as the spec expects it: the system base (`build.system_base` of the spec's preset), the
+    composed preset (None for a filament loaded from the printer or one the library lacks), the system base's resolved
+    values, the keys whose value the file must hold (the spec's keys and every expected list key), the expected list
+    keys, why it cannot be composed (`missing`), and the preset the spec names (`preset`, a user preset or the base)."""
 
     kind: str
     base: str
@@ -151,6 +188,7 @@ class Slot:
     explicit: tuple[str, ...] = ()
     listed: frozenset[str] = frozenset()
     missing: str = ""
+    preset: str = ""
 
 
 def with_derived(settings: Mapping[str, str]) -> dict[str, str]:
@@ -163,32 +201,51 @@ def with_derived(settings: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+MACHINE_GCODE = ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode")  # compared by length (`_machine`)
+
+
 def expected_slots(spec: Spec, resolver: P.PresetResolver) -> list[Slot]:
     """The process, each filament and the printer as Studio's slots, composed from the spec as `Pipeline.plan`
-    composes them (`for_cli` with the spec's base, `set` and `name`). The expected list of a slot is its explicit keys
-    plus every key that differs from the base (`diff_keys`); tower keys come from planning, not from the spec, so they
-    are expected only when the spec sets them. A process or printer preset the library lacks is PresetError (the
-    environment error); a filament preset the library lacks gives a slot with `missing` set, so the rest still runs."""
+    composes them (`for_cli` with the spec's preset, `set` and `name`). The id and the list are the exporter's
+    (`build._bookkeeping`): the id is `build.system_base` of the spec's preset, and the list is `build.slot_keys`
+    against that base with the same explicit keys (the process `set` with the GUI-derived keys, the filament `set`,
+    none for the printer), so a user preset's own overrides are listed and expected in the file. Tower keys come from
+    planning, not from the spec, so they are expected only when the spec sets them. A process or printer preset the
+    library lacks is PresetError (the environment error); a filament preset the library lacks gives a slot with
+    `missing` set, so the rest still runs."""
     pset = with_derived(spec.process.set)
+    pbase = system_base(resolver, "process", spec.process.base)
     process = resolver.for_cli("process", spec.process.base, pset, spec.process.name)
-    plisted = (set(pset) | set(resolver.diff_keys("process", spec.process.base, process))) - (set(TOWER_KEYS) - set(spec.process.set))
+    plisted = set(slot_keys(resolver, "process", pbase, process, pset)) - (set(TOWER_KEYS) - set(spec.process.set))
     slots = [
-        Slot("process", spec.process.base, process, resolver.resolve("process", spec.process.base), tuple(sorted(pset)), frozenset(plisted))
+        Slot(
+            "process",
+            pbase,
+            process,
+            resolver.resolve("process", pbase),
+            tuple(sorted(set(pset) | plisted)),
+            frozenset(plisted),
+            preset=spec.process.base,
+        )
     ]
     for f in spec.filaments:
         if f.loaded:
-            slots.append(Slot("filament", f.preset, None))
+            slots.append(Slot("filament", f.preset, None, preset=f.preset))
             continue
         try:
+            fbase = system_base(resolver, "filament", f.preset)
             comp = resolver.for_cli("filament", f.preset, f.set, f.name)
-            base = resolver.resolve("filament", f.preset)
-            listed = frozenset(set(f.set) | set(resolver.diff_keys("filament", f.preset, comp)))
+            base = resolver.resolve("filament", fbase)
+            listed = frozenset(slot_keys(resolver, "filament", fbase, comp, f.set))
         except P.PresetError as e:
-            slots.append(Slot("filament", f.preset, None, missing=str(e)))
+            slots.append(Slot("filament", f.preset, None, missing=str(e), preset=f.preset))
             continue
-        slots.append(Slot("filament", f.preset, comp, base, tuple(sorted(f.set)), listed))
+        slots.append(Slot("filament", fbase, comp, base, tuple(sorted(set(f.set) | listed)), listed, preset=f.preset))
+    mbase = system_base(resolver, "machine", spec.printer)
     machine = resolver.for_cli("machine", spec.printer)
-    slots.append(Slot("machine", spec.printer, machine, None, (), frozenset(resolver.diff_keys("machine", spec.printer, machine))))
+    mlisted = frozenset(slot_keys(resolver, "machine", mbase, machine))
+    mvalues = tuple(sorted(mlisted - set(MACHINE_GCODE)))
+    slots.append(Slot("machine", mbase, machine, resolver.resolve("machine", mbase), mvalues, mlisted, preset=spec.printer))
     return slots
 
 
@@ -235,39 +292,43 @@ def _scalar(v) -> str:
     return {"true": "1", "false": "0"}.get(t.lower(), t)
 
 
-def _scalar_same(a, b) -> bool:
-    """One value against one value: equal strings, or equal after dropping a "%" only one side has, or equal numbers
-    ("0.20" and "0.2", "35.0" and "35"), with true/false as 1/0."""
+def _scalar_same(a, b, key: str = "") -> bool:
+    """One value against one value: equal strings, or equal numbers ("0.20" and "0.2", "35.0" and "35"), with
+    true/false as 1/0. For a percent-only `key` (PERCENT_ONLY) a "%" only one side has is dropped first; for every
+    other key "50%" and "50" differ (a FloatOrPercent option reads them as a ratio and an absolute value)."""
     x, y = _scalar(a), _scalar(b)
     if x == y:
         return True
-    if x.endswith("%") != y.endswith("%"):
+    if key in PERCENT_ONLY and x.endswith("%") != y.endswith("%"):
         x, y = x.rstrip("%"), y.rstrip("%")
+    if x.endswith("%") != y.endswith("%"):
+        return False
+    x, y = x.rstrip("%"), y.rstrip("%")
     try:
         return float(x) == float(y)
     except ValueError:
         return x == y
 
 
-def _same(expected, got) -> bool:
-    """Studio's value on both sides (`_scalar_same` per entry). Vectors compare entry by entry, a comma-joined string
-    against a vector of the same length likewise, and a one-entry expectation matches a vector whose entries all
-    equal it (a value per nozzle or per variant)."""
+def _same(expected, got, key: str = "") -> bool:
+    """Studio's value of `key` on both sides (`_scalar_same` per entry). Vectors compare entry by entry, a
+    comma-joined string against a vector of the same length likewise, and a one-entry expectation matches a vector
+    whose entries all equal it (a value per nozzle or per variant)."""
     if expected is None or got is None:
         return expected is None and got is None
     el = [str(x) for x in expected] if isinstance(expected, (list, tuple)) else None
     gl = [str(x) for x in got] if isinstance(got, (list, tuple)) else None
     if el is None and gl is None:
-        return _scalar_same(expected, got)
+        return _scalar_same(expected, got, key)
     if gl is None:
         gl = str(got).split(",") if el is not None and len(el) > 1 else [str(got)]
     if el is None:
         el = str(expected).split(",") if len(gl) > 1 and "," in str(expected) else [str(expected)]
     if len(el) == 1 and len(gl) > 1:
-        return all(_scalar_same(el[0], g) for g in gl)
+        return all(_scalar_same(el[0], g, key) for g in gl)
     if len(gl) == 1 and len(el) > 1:
-        return all(_scalar_same(e, gl[0]) for e in el)
-    return len(el) == len(gl) and all(_scalar_same(e, g) for e, g in zip(el, gl, strict=True))
+        return all(_scalar_same(e, gl[0], key) for e in el)
+    return len(el) == len(gl) and all(_scalar_same(e, g, key) for e, g in zip(el, gl, strict=True))
 
 
 # ---------------------------------------------------------------------------- the comparison
@@ -308,7 +369,7 @@ def compare(
     for i, slot in enumerate(slots[1:-1]):
         if i < n_fil:  # a slot the file lacks is the filament count FAIL above
             _filament(rep, i, n_fil, slot, ps, fids[i], inherits[i + 1], lists[i + 1], spec)
-    _machine(rep, slots[-1], ps, lists[n_fil + 1])
+    _machine(rep, slots[-1], ps, inherits[n_fil + 1], n_fil + 1, lists[n_fil + 1])
     _maps(rep, spec, slots[-1].composed or {}, ps, summary)
     process = slots[0].composed or {}
     _plates(rep, spec, ps, summary, str(process.get("print_sequence") or "by layer"))
@@ -349,11 +410,11 @@ def _list(rep: Report, what: str, slot: Slot, entry: str, value_of) -> set[str]:
             # the value line decides; the tower plan writes these after the spec (build.py tower planning)
             rep.lines.append(Line(INFO, f"{what} list {k}", "listed", "not listed", "tower key: the tower plan sets it"))
             continue
-        if not _same(want, have):
+        if not _same(want, have, k):
             if k in slot.explicit:
                 continue
             rep.lines.append(Line(FAIL, f"{what} list {k}", _norm(want), _norm(have), RESET_NOTE))
-        elif base is not None and k in base and _same(want, base[k]):
+        elif base is not None and k in base and _same(want, base[k], k):
             rep.lines.append(Line(INFO, f"{what} list {k}", None, None, "listed by shambu, equal to the base, dropped by Studio on save"))
         elif base is not None and k in base:
             rep.lines.append(
@@ -393,19 +454,32 @@ def _tower_override(spec: Spec) -> bool:
     return any(pl.wipe_tower.mode != "auto" for pl in spec.plates)
 
 
-def _process(rep: Report, slot: Slot, ps: Mapping, inherits: str, entry: str, spec: Spec) -> None:
-    pid = str(ps.get("print_settings_id") or "")
-    _add(rep, pid == slot.base, Line(FAIL, "process preset id", slot.base, pid, "Studio selects the preset by this name"))
-    if inherits:
-        level = WARN if inherits == slot.base else FAIL
-        note = (
-            "names the base itself; Studio resets against the same preset"
-            if level == WARN
-            else "Studio resets the listed keys against this preset"
-        )
-        _add(rep, False, Line(level, "process inherits_group[0]", '""', inherits, note))
+def _id(rep: Report, what: str, slot: Slot, got: str) -> None:
+    note = "Studio selects the preset by this name"
+    if slot.preset and slot.preset != slot.base:
+        note += f"; {slot.base} is the system base of the spec's {slot.preset}"
+    _add(rep, got == slot.base, Line(FAIL, f"{what} preset id", slot.base, got, note))
+
+
+def _inherits(rep: Report, what: str, slot: Slot, inherits: str, index: int, copy: bool = False) -> None:
+    """A non-empty `inherits_group` entry is the slot's reset target: on open Studio resets every unlisted key against
+    the preset it names (Preset.cpp:2258-2264). Any name but the slot's system base is a FAIL. The base itself is a
+    WARN (the same target, but not what shambu writes), or nothing for a project-embedded filament copy (`copy`),
+    whose INFO id line already accepts it."""
+    rep.checked += 1
+    if not inherits or (copy and inherits == slot.base):
+        return
+    item = f"{what} inherits_group[{index}]"
+    if inherits == slot.base:
+        rep.lines.append(Line(WARN, item, '""', inherits, "names the base itself; Studio resets against the same preset"))
     else:
-        rep.checked += 1
+        note = f"Studio resets the unlisted keys against {inherits} when it has that preset, not the system base {slot.base} (Preset.cpp:2258-2264)"
+        rep.lines.append(Line(FAIL, item, '""', inherits, note))
+
+
+def _process(rep: Report, slot: Slot, ps: Mapping, inherits: str, entry: str, spec: Spec) -> None:
+    _id(rep, "process", slot, str(ps.get("print_settings_id") or ""))
+    _inherits(rep, "process", slot, inherits, 0)
     listed = _list(rep, "process", slot, entry, ps.get)
     composed = slot.composed or {}
     tower_planned = _tower_override(spec)
@@ -413,11 +487,11 @@ def _process(rep: Report, slot: Slot, ps: Mapping, inherits: str, entry: str, sp
         want, have = composed.get(k), ps.get(k)
         if k in ps and (k in PLAN_MOVES or (k in TOWER_KEYS and tower_planned)):
             rep.checked += 1
-            if not _same(want, have):
+            if not _same(want, have, k):
                 rep.lines.append(Line(INFO, f"process {k}", _norm(want), _norm(have), TOWER_NOTE))
             continue
         note = "missing from the file" if k not in ps else ("" if k in listed else RESET_NOTE)
-        _add(rep, k in ps and _same(want, have), Line(FAIL, f"process {k}", _norm(want), None if k not in ps else _norm(have), note))
+        _add(rep, k in ps and _same(want, have, k), Line(FAIL, f"process {k}", _norm(want), None if k not in ps else _norm(have), note))
     for k in TOWER_KEYS:
         if k not in slot.explicit and k in ps:
             rep.lines.append(Line(INFO, f"process {k}", None, _norm(ps[k]), "tower key from planning, not from the spec"))
@@ -433,20 +507,24 @@ def _filament(rep: Report, i: int, n: int, slot: Slot, ps: Mapping, fid: str, in
             rep.lines.append(Line(INFO, f"{what} preset id", None, fid, "not checked: loaded from the printer"))
         _colour(rep, what, fspec.colour, ps, i, n)
         return
-    if i > 0 and fid != slot.base and inherits == slot.base and fid.startswith(slot.base):
+    copy = i > 0 and fid != slot.base and inherits == slot.base and fid.startswith(slot.base)
+    if copy:
         # Slots 2..N load OnlyIfModified or Never (PresetBundle.cpp:4003-4013): Studio keeps a project-embedded copy.
         # On reopen it resets unlisted keys against `inherits` (Preset.cpp:2258) and recomputes the list against the
         # parent on save (PresetBundle.cpp:3402-3421), so the list and the values are checked as for the base.
         rep.checked += 1
         rep.lines.append(Line(INFO, f"{what} preset id", slot.base, fid, f"project-embedded copy of {slot.base}"))
     else:
-        _add(rep, fid == slot.base, Line(FAIL, f"{what} preset id", slot.base, fid, "Studio selects the preset by this name"))
+        _id(rep, what, slot, fid)
+    _inherits(rep, what, slot, inherits, i + 1, copy)
     listed = _list(rep, what, slot, entry, lambda k: slot_value(ps, k, i, n))
     for k in slot.explicit:
         want, have = slot.composed.get(k), slot_value(ps, k, i, n)
         note = "missing from the file" if have is None else ("" if k in listed else RESET_NOTE)
         _add(
-            rep, have is not None and _same(want, have), Line(FAIL, f"{what} {k}", _norm(want), None if have is None else _norm(have), note)
+            rep,
+            have is not None and _same(want, have, k),
+            Line(FAIL, f"{what} {k}", _norm(want), None if have is None else _norm(have), note),
         )
     _colour(rep, what, fspec.colour, ps, i, n)
 
@@ -459,11 +537,16 @@ def _colour(rep: Report, what: str, want: str | None, ps: Mapping, i: int, n: in
         rep.lines.append(Line(INFO, f"{what} colour", None, have, "the spec gives no colour"))
 
 
-def _machine(rep: Report, slot: Slot, ps: Mapping, entry: str) -> None:
-    mid = str(ps.get("printer_settings_id") or "")
-    _add(rep, mid == slot.base, Line(FAIL, "printer preset id", slot.base, mid, "Studio selects the preset by this name"))
-    _list(rep, "printer", slot, entry, ps.get)
-    for k in ("machine_start_gcode", "machine_end_gcode", "change_filament_gcode"):
+def _machine(rep: Report, slot: Slot, ps: Mapping, inherits: str, index: int, entry: str) -> None:
+    _id(rep, "printer", slot, str(ps.get("printer_settings_id") or ""))
+    _inherits(rep, "printer", slot, inherits, index)
+    listed = _list(rep, "printer", slot, entry, ps.get)
+    composed = slot.composed or {}
+    for k in slot.explicit:  # a user printer preset's overrides (the G-code keys follow, by length)
+        want, have = composed.get(k), ps.get(k)
+        note = "missing from the file" if k not in ps else ("" if k in listed else RESET_NOTE)
+        _add(rep, k in ps and _same(want, have, k), Line(FAIL, f"printer {k}", _norm(want), None if k not in ps else _norm(have), note))
+    for k in MACHINE_GCODE:
         want, have = str((slot.composed or {}).get(k, "")), str(ps.get(k, ""))
         _add(
             rep,
@@ -640,7 +723,7 @@ def _object_settings(rep: Report, item: str, part: PartSpec, obj: Mapping, n_fil
         note = "not set on the object: the process value applies" if got is None else ""
         if k in SUPPORT_PIN_KEYS and k not in part.set:
             note = (note + "; " if note else "") + "the build pins it to the part's filament"
-        _add(rep, got is not None and _same(v, got), Line(FAIL, f"{item} {k}", v, got, note))
+        _add(rep, got is not None and _same(v, got, k), Line(FAIL, f"{item} {k}", v, got, note))
     if not part.parts:  # a single file: the object prints with its filament or set.extruder (merged objects: per part)
         want_ext = str(part.set.get("extruder", part.filament))
         got_ext = obj.get("extruder")
