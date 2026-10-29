@@ -161,8 +161,8 @@ and `wall_loops 4`.
 ### 5.2 Mirror the GUI's derived keys
 
 When the composed process sets `sparse_infill_density` and the spec or recipe does not set `skeleton_infill_density`
-or `skin_infill_density`, set both to the same value (Tab.cpp:2105-2111). Same for `sparse_infill_line_width` →
-`skin_infill_line_width`, `skeleton_infill_line_width` (`:2113-2117`). Done in `build.py` where the process is
+or `skin_infill_density`, set both to the same value (Tab.cpp:2106-2111). Same for `sparse_infill_line_width` →
+`skin_infill_line_width`, `skeleton_infill_line_width` (`:2114-2119`). Done in `build.py` where the process is
 composed, so the diff list includes them, as the GUI's does.
 
 ### 5.3 Object-scoped interface recipe (F2)
