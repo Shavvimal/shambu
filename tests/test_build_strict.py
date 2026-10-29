@@ -11,7 +11,9 @@ import pytest
 from conftest import MACHINE, PROCESS, PROCESS_NAME, FakeStudio, make_3mf, mesh
 from shambu import assemble as A
 from shambu import layout as L
-from shambu.build import Pipeline, _rename_steps, effective_filaments
+from shambu.build import Pipeline, _rename_steps, effective_filaments, system_base
+from shambu.errors import BuildError
+from shambu.loaded import FilamentResolution
 from shambu.patches import RenameObject, SetFilamentMap, SetPresetBookkeeping
 from shambu.spec import Spec
 from shambu.studio import MeshInfo, RunResult
@@ -242,16 +244,10 @@ def test_verify_compares_machine_gcode_with_the_preset(tmp_path, stls, resolver)
 
 
 def test_verify_compares_filament_presets(tmp_path, stls, resolver):
-    class NoPatch(Pipeline):  # the bookkeeping patch would write the system bases over the CLI's names
-        def patch(self, plan, project, sliced=False):
-            return []
-
-    fx = make_3mf(tmp_path / "f.3mf", object_names=("body", "label"), filament_settings_id=["Other", "Test PLA"], **CHANGE_FILAMENT)
-    r = build_with(tmp_path, stls, resolver, fx, pipeline_cls=NoPatch)
-    assert any(
-        "filament presets in file are ['Other', 'Test PLA'], expected the system bases ['Test PLA', 'Test PLA']" in p
-        for p in r.verify_problems
-    )
+    fx = make_3mf(tmp_path / "f.3mf", object_names=("body_1", "assemble_1"), filament_settings_id=["Other", "Test PLA"], **CHANGE_FILAMENT)
+    r = build_with(tmp_path, stls, resolver, fx)  # the ordinary pipeline: the export's names are read before the patch
+    assert "filament presets in file are ['Other', 'Test PLA'], expected ['Test PLA', 'Test PLA'] (the CLI export)" in r.verify_problems
+    assert Project(str(r.project)).project_settings["filament_settings_id"] == ["Test PLA", "Test PLA"]  # patched after the read
 
 
 def test_verify_requires_plate_bed_type(tmp_path, stls, resolver):
@@ -1164,7 +1160,10 @@ def test_no_probe_through_the_cli(tmp_path, resolver, capsys, monkeypatch):
 
 # ---------------------------------------------------------------------------- preset bookkeeping (spec 2026-10-29 5.1, 5.2)
 def test_bookkeeping_has_one_entry_per_studio_slot_in_order(tmp_path, stls, resolver):
-    plan = plan_of(tmp_path, resolver, two_part_plates(stls))
+    sp = spec(tmp_path, two_part_plates(stls))
+    resolution = FilamentResolution(sp, [], "filaments from the spec")
+    plan = Pipeline(FakeStudio(), resolver).plan(sp, resolution)
+    assert plan.filament_resolution is resolution  # by keyword: never shifted into the bookkeeping field
     assert [(kind, base) for kind, base, _ in plan.bookkeeping] == [
         ("process", PROCESS),
         ("filament", "Test PLA"),
@@ -1174,7 +1173,33 @@ def test_bookkeeping_has_one_entry_per_studio_slot_in_order(tmp_path, stls, reso
     proc_keys = plan.bookkeeping[0][2]
     assert "wall_loops" in proc_keys  # explicit, though equal to the resolved base: Studio's base may differ
     assert proc_keys == sorted(proc_keys) and plan.bookkeeping[3][2] == []
-    assert plan.filament_resolution is None  # the keyword argument: not shifted into another Plan field
+
+
+def test_system_base_follows_a_user_chain(profiles, resolver):
+    for name, parent in (("My walls", PROCESS), ("My walls v2", "My walls")):
+        (profiles / "process" / f"{name}.json").write_text(
+            json.dumps({"name": name, "from": "User", "inherits": parent, "wall_loops": "4"})
+        )
+    assert system_base(resolver, "process", "My walls v2") == PROCESS
+    assert system_base(resolver, "process", PROCESS) == PROCESS  # a system preset is its own base
+
+
+def test_system_base_reports_a_loop(profiles, resolver):
+    for name, parent in (("Loop A", "Loop B"), ("Loop B", "Loop A")):
+        (profiles / "process" / f"{name}.json").write_text(json.dumps({"name": name, "from": "user", "inherits": parent}))
+    with pytest.raises(BuildError, match="inherits loop: Loop A -> Loop B -> Loop A"):
+        system_base(resolver, "process", "Loop A")
+
+
+def test_patch_skips_the_bookkeeping_on_a_filament_count_mismatch(tmp_path, stls, resolver):
+    # sliced: no colour patch runs first, so the export's own counts decide (an unsliced build's colour patch refuses first)
+    fx = make_3mf(
+        tmp_path / "f.gcode.3mf", sliced=True, object_names=("body_1", "assemble_1"), filament_settings_id=["Test PLA"], **CHANGE_FILAMENT
+    )
+    r = Pipeline(FakeStudio(fx), resolver).build(spec(tmp_path, two_part_plates(stls)), do_slice=True, keep_going=True)
+    assert not any(d.startswith("preset slot") for d in r.patches)
+    assert Project(str(r.project)).project_settings["print_settings_id"] == PROCESS_NAME  # left as the CLI wrote it
+    assert "1 filaments in file, expected 2" in r.verify_problems
 
 
 def test_bookkeeping_lists_the_tower_keys_and_filament_sets(tmp_path, stls, resolver):
@@ -1248,7 +1273,13 @@ def test_verify_compares_each_listed_value(tmp_path, stls, resolver):
 
 
 def test_sliced_build_keeps_the_gcode_after_the_bookkeeping(tmp_path, stls, resolver):
-    fx = make_3mf(tmp_path / "f.gcode.3mf", sliced=True, object_names=("body_1", "assemble_1"), **CHANGE_FILAMENT)
+    fx = make_3mf(
+        tmp_path / "f.gcode.3mf",
+        sliced=True,
+        object_names=("body_1", "assemble_1"),
+        filament_colour=["#000000", "#FFFFFF"],
+        **CHANGE_FILAMENT,
+    )
     plan = Pipeline(FakeStudio(fx), resolver).plan(spec(tmp_path, two_part_plates(stls)))
     ps = Pipeline(FakeStudio(fx), resolver).patch_set(plan, sliced=True)
     assert [x.slot for x in ps.patches if isinstance(x, SetPresetBookkeeping)] == [0, 1, 2, 3]
