@@ -6,10 +6,11 @@ PatchSet, so a new kind of patch is one new class here and one flag in the CLI.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
-from .threemf import DEFAULT_TOUCHES, Project
+from .threemf import DEFAULT_TOUCHES, PROJECT_SETTINGS, Project
 
 
 class Patch(Protocol):
@@ -219,6 +220,63 @@ class RenameObject(PatchBase):
 
     def describe(self) -> str:
         return f"object '{self.old}' renamed '{self.new}'"
+
+
+@dataclass(frozen=True)
+class SetPresetBookkeeping(PatchBase):
+    """One Studio preset slot (0 process, 1..N filaments, N+1 printer) named by its system preset `base`, with the keys
+    Studio must keep on open, merged with those the slot already lists (`Project.set_preset_bookkeeping`). Keeps a
+    slice: these keys never change the G-code, so only project_settings.config changes (the plate G-code and its MD5
+    stay byte for byte; the MD5 covers the G-code only, bbs_3mf.cpp:6776-6800)."""
+
+    slot: int
+    base: str
+    keys: tuple[str, ...] = ()
+    touches: frozenset[str] = field(default=frozenset({PROJECT_SETTINGS}), init=False, repr=False, compare=False)
+
+    def apply(self, p: Project) -> None:
+        p.set_preset_bookkeeping(self.slot, self.base, self.keys)
+
+    def describe(self) -> str:
+        n = len(self.keys)
+        listed = f" ({';'.join(sorted(self.keys))})" if self.keys else ""
+        return f"preset slot {self.slot}: {self.base} + {n} override{'' if n == 1 else 's'}{listed}"
+
+
+BaseValues = Mapping[str, Any] | None  # the resolved base process preset, or None when it is not in the Studio library
+
+
+@dataclass(frozen=True)
+class SetProcessSetting(PatchBase):
+    """A process key in `project_settings.config`, listed in the process slot's diff list (`Project.set_process_setting`).
+    `base_values`: the resolved base preset, which the caller resolves (this module does no preset I/O)."""
+
+    key: str
+    value: str
+    base_values: BaseValues = field(default=None, hash=False, compare=False, repr=False)
+
+    def apply(self, p: Project) -> None:
+        p.set_process_setting(self.key, self.value, self.base_values)
+
+    def describe(self) -> str:
+        return f"process: {self.key} = {self.value} (different_settings_to_system[0] updated)"
+
+
+@dataclass(frozen=True)
+class UnsetProcessSetting(PatchBase):
+    """A process key back to its base preset's value, removed from the process slot's diff list. The caller resolves
+    `base_value` and `base_values` (this module does no preset I/O)."""
+
+    key: str
+    base_value: str | tuple[str, ...]
+    base_values: BaseValues = field(default=None, hash=False, compare=False, repr=False)
+
+    def apply(self, p: Project) -> None:
+        p.clear_process_setting(self.key, self.base_value, self.base_values)
+
+    def describe(self) -> str:
+        v = ",".join(self.base_value) if isinstance(self.base_value, tuple) else self.base_value
+        return f"process: {self.key} restored to the base value {v} (removed from different_settings_to_system[0])"
 
 
 @dataclass
