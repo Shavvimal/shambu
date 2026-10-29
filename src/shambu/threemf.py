@@ -845,12 +845,18 @@ class Project:
         """Set one process key in `project_settings.config` and list it in the process slot's
         `different_settings_to_system` entry, so Studio keeps it on open (Preset.cpp:2258-2269). Refuses a key the
         file does not hold (Studio writes its full config, so an absent key is unknown to Studio) and a bookkeeping
-        key. A list value stays a list; anything else is stored as a string. `base_values`: the resolved base preset
+        key. A list value stays a list; a string for a key the file holds as a list is split on ","; anything else is
+        stored as a string. `base_values`: the resolved base preset
         (the caller resolves it); the list is then recomputed (`_relist_process`), so a key set back to its base
         value is not listed. Drops the slice: the value changes the G-code."""
         self._process_key(key)
         ps = self.project_settings
-        ps[key] = [str(x) for x in value] if isinstance(value, (list, tuple)) else str(value)
+        if isinstance(value, (list, tuple)):
+            ps[key] = [str(x) for x in value]
+        elif isinstance(ps[key], list):  # a vector key stays a vector: "a,b" is two entries, as Studio serialises it
+            ps[key] = str(value).split(",")
+        else:
+            ps[key] = str(value)
         self._relist_process(key, None, base_values)
         self._touch_ps()
 
