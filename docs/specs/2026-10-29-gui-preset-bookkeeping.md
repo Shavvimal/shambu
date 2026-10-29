@@ -173,10 +173,11 @@ composed, so the diff list includes them, as the GUI's does.
   `support_on_build_plate_only 0`, `support_interface_filament 2`, `support_filament 0`,
   `support_interface_not_for_body 1`, `support_top_z_distance 0`, `support_interface_spacing 0`,
   `support_interface_pattern rectilinear_interlaced`, `tree_support_branch_diameter 3`,
-  `tree_support_branch_diameter_angle 7`, `raft_first_layer_expansion 5`, `independent_support_layer_height 0`,
-  `thick_bridges 0`. `support_interface_speed` stays out (per-nozzle array, caveat at `recipes.py:172`).
-- The plate-wide part (`enable_prime_tower 1`) moves to a new `[process]` recipe `two-filament-plate` that the spec's
-  `process.recipes` lists; the skill text pairs them.
+  `tree_support_branch_diameter_angle 7`, `raft_first_layer_expansion 5`, `thick_bridges 0` (15 keys).
+  `support_interface_speed` stays out (per-nozzle array, caveat at `recipes.py:172`).
+- The plate-wide part moves to a new `[process]` recipe `two-filament-plate` (`enable_prime_tower 1`,
+  `independent_support_layer_height 0`: both are global `PrintConfig` keys, `PrintConfig.hpp:1558`, so a per-object
+  copy does nothing) that the spec's `process.recipes` lists; the skill text pairs them.
 - `build.py:943-950` auto-pin: a part with `support_interface_filament` set by a recipe keeps it (today the pin only
   fires on `"0"`, so no change in logic, but a test proves it).
 - Scope is enforced softly: a `[process]` recipe listed on a part, or an `[object]` recipe listed on the process, is a
