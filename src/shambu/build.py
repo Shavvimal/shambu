@@ -212,6 +212,11 @@ class Plan:
     assemble: A.AssembleList
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # The preset bookkeeping Studio honours on open (spec 2026-10-29 section 5.1), one entry per Studio slot in its
+    # order: process, filament 1..N, printer. Each is (kind, base system preset name, sorted keys whose value differs
+    # from that base). An empty key list means the slot is the unmodified system preset. Filled by `plan()`, written
+    # into the export by `SetPresetBookkeeping`, read by the report and the verifier.
+    bookkeeping: list[tuple[str, str, list[str]]] = field(default_factory=list)
     filament_resolution: FilamentResolution | None = None  # how each filament was chosen: the printer, the GUI or the spec
 
     @property
