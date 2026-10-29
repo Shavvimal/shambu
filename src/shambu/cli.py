@@ -1316,14 +1316,15 @@ class Open(Command):
         return 0
 
 
-OPEN_BEHIND = "WARN: Bambu Studio was already running: the project opened in a new window behind the current one"
+OPEN_ALREADY_RUNNING = "WARN: Bambu Studio was already running: check that the front window shows {name}"
 
 
 def warn_open_behind(opened: OpenResult) -> None:
-    """The one WARN line on stderr (stdout keeps the one document) when Studio ran before `open`: the new window opens
-    behind the current one, and on 29 October the user read the old window's grams as the new file's."""
+    """The one WARN line on stderr (stdout keeps the one document) when Studio ran before `open`: the project can open
+    in a window behind the current one (a running process proves no window order), and on 29 October the user read
+    the old window's grams as the new file's."""
     if opened.already_running:
-        print(OPEN_BEHIND, file=sys.stderr)
+        print(OPEN_ALREADY_RUNNING.format(name=Path(opened.path).name), file=sys.stderr)
 
 
 @command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw | login | list | forget")
@@ -1771,12 +1772,17 @@ class Verify(Command):
             help="the spec JSON the project was built from (or the build's shambu/spec.json); presets are composed from it, as the build does",
         )
         p.epilog = (
-            "One line per item that is not as expected: FAIL a value differs or Studio resets it on open, WARN a GUI edit "
-            "or other bookkeeping that changes no value, INFO a fact the spec does not decide. Exit 0 no FAIL, 1 any FAIL, "
-            "2 usage, 3 the file or the spec does not load."
+            "Save the project in Studio first (File > Save project as): changes made on open live in memory until then. "
+            "One line per item that is not as expected: FAIL a value differs or Studio resets it on open, WARN a key the "
+            "spec does not set changed in the GUI (with its file value) or other bookkeeping, INFO a fact the spec does "
+            "not decide. Exit 0 no FAIL, 1 any FAIL or a spec that does not load, 2 usage, 3 a project file that does "
+            "not read or a preset the Studio library lacks."
         )
 
     def run(self, a, app, out):
-        rep = app.verify(a.file, a.against)
+        spec = load_spec_or_error(a.against, out)
+        if isinstance(spec, int):
+            return spec
+        rep = app.verify(a.file, spec, a.against)
         out.emit(rep.to_json(), [x.text() for x in rep.lines] + [rep.last_line()])
         return 0 if rep.ok else 1

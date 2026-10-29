@@ -1941,7 +1941,7 @@ def test_open_warns_once_when_studio_already_runs(capsys, tmp_path, monkeypatch,
     assert calls == [["open", "-a", "BambuStudio", str(f.resolve())]]  # no --new, no AppleScript
     assert err.count("Bambu Studio was already running") == (1 if warned else 0)
     if warned:
-        assert "WARN: Bambu Studio was already running: the project opened in a new window behind the current one" in err
+        assert "WARN: Bambu Studio was already running: check that the front window shows p.3mf" in err
 
 
 def test_build_open_warns_when_studio_already_runs(capsys, tmp_path, monkeypatch, resolver):

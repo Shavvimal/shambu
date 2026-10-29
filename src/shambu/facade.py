@@ -29,7 +29,7 @@ from . import vault as vault_mod
 from . import verify as verify_mod
 from .build import BuildResult, Listener, Pipeline, load_spec
 from .edits import AddFilament, EditSet
-from .errors import BambuError, BuildError, ConfError, PrinterError, StudioError
+from .errors import BambuError, ConfError, PrinterError, StudioError
 from .loaded import FilamentResolution, reconcile
 from .patches import PatchSet
 from .printer import (
@@ -400,16 +400,12 @@ class Bambu:
             o["position"] = pos.get(o["name"])
         return s
 
-    def verify(self, path: str | Path, spec_path: str | Path) -> verify_mod.Report:
+    def verify(self, path: str | Path, spec: Spec, spec_path: str | Path = "") -> verify_mod.Report:
         """Compare a project (a GUI save, typically) with the spec it was built from (`verify.check_project`). Needs the
-        preset library, not the Studio binary or the STL files. A file that is not a project is ProjectError; a spec
-        that does not load is BuildError; a preset the library lacks is PresetError (all exit 3 at the CLI)."""
-        try:
-            spec = load_spec(spec_path)
-        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
-            raise BuildError(f"{spec_path}: bad spec ({type(e).__name__}: {e})") from e
-        project = Project(str(path))
-        return verify_mod.check_project(project, spec, self.presets(), str(spec_path))
+        preset library, not the Studio binary or the STL files. A file that is not a project or whose metadata does not
+        parse is ProjectError; a process or printer preset the library lacks is PresetError (both exit 3 at the CLI).
+        The CLI loads the spec first, so a bad spec is exit 1 as for every other command."""
+        return verify_mod.check_project(str(path), spec, self.presets(), str(spec_path))
 
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)
