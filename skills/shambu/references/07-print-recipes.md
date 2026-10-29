@@ -83,7 +83,7 @@ Scope words: **process** (whole plate), **per-object**, **height range**, **modi
 | 18 | Support threshold angle | notes | per-object | `"support_threshold_angle": "30"` (preset). Overhangs flatter than this angle from horizontal get support | Keep 30. 45 deg overhangs are safe (notes) | Raising it adds support on 45-60 deg faces that print fine |
 | 19 | Supports only in a few places (paint) | notes (jaw finger block), notes | per-object + modifier or user-in-GUI | `"enable_support": "1"`, `"support_type": "tree(manual)"` or `"normal(manual)"`, plus `support_enforcer` volumes or painted triangles (`paint_supports`) | Jaw finger: one 10 mm block | Manual types make only enforced support. Enforcer volumes are a 3MF write (report 03: whole-triangle painting is feasible) |
 | 20 | Interface layers and top Z distance (single material) | not in notes | per-object | `"support_interface_top_layers": "2"`, `"support_interface_bottom_layers": "2"`, `"support_top_z_distance": "0.2"`, `"support_bottom_z_distance": "0.2"` (all preset) | Default | Datum faces on support are rough. Plan to file them (notes) |
-| 21 | Different-material support interface | notes | per-object (support keys) + plate (filament map) + process (prime tower) | `"enable_support": "1"`, `"support_type": "tree(auto)"`, `"support_filament": "0"` (Default = part filament; or the part's slot, e.g. `"1"`), `"support_interface_filament": "2"`, `"support_top_z_distance": "0"`, `"support_interface_not_for_body": "1"`, `"enable_prime_tower": "1"`; plate `filament_map_mode` `"Manual"`, `filament_maps` `"1 2"` | PETG part with PLA interface, or PLA part with PETG interface | Needs one material per nozzle. Interface nozzle (right) cannot reach X < 20.5 mm (section 4): every supported part must sit at x >= 20.5 plus its interface spread (brim margin plus 3 mm; measured 2.2 mm past the box, n=1; the seed build exited -102 at x 14.3). The plate counts as two filaments even though only the supports use filament 2, so Studio builds a prime tower sized by the tallest part: with the rib wall, 41 mm square plus an 8 mm brim for a 218 mm part (35 mm plus 2.6 mm for a 32 mm part). Give the plate a `wipe_tower` spot both extruders reach (x >= 20.5), or let `"auto"` find one; auto tries Studio's size with the rib wall first, then 35, 30, 25, 22 and 20 mm without it (06-slicer-rules.md section 10). On plate 14 a 22 mm tower without the rib wall saved 1 h 43 min and 32 g against the 35 mm one (n=1): an option through `wipe_tower.width`, never the default. Measured on plate 14 (n=1): the tower adds 27 min and 71 g over no tower (19.25 h against 18.8 h). Re-slicing an unsliced export with `--slice 1` exits -100 "No valid nozzle found" unless RepairNozzleStats ran (`shambu build` applies it; `shambu patch --repair-nozzle-stats` for an older file; 03-3mf-format.md section 8). Right nozzle speeds are lower (outer wall 50 vs 200 mm/s). Bed follows `bed_temperature_formula` `"by_highest_temp"`: PETG 70 deg C applies to a PLA part too. The GUI suggests more (section 2, recipe 8) |
+| 21 | Different-material support interface | notes | per-object (support keys, shambu `dual-material-interface`) + plate (filament map) + process (prime tower, shambu `two-filament-plate`) | `"enable_support": "1"`, `"support_type": "tree(auto)"`, `"support_filament": "0"` (Default = part filament; or the part's slot, e.g. `"1"`), `"support_interface_filament": "2"`, `"support_top_z_distance": "0"`, `"support_interface_not_for_body": "1"`, `"enable_prime_tower": "1"`; plate `filament_map_mode` `"Manual"`, `filament_maps` `"1 2"` | PETG part with PLA interface, or PLA part with PETG interface | Needs one material per nozzle. Interface nozzle (right) cannot reach X < 20.5 mm (section 4): every supported part must sit at x >= 20.5 plus its interface spread (brim margin plus 3 mm; measured 2.2 mm past the box, n=1; the seed build exited -102 at x 14.3). The plate counts as two filaments even though only the supports use filament 2, so Studio builds a prime tower sized by the tallest part: with the rib wall, 41 mm square plus an 8 mm brim for a 218 mm part (35 mm plus 2.6 mm for a 32 mm part). Give the plate a `wipe_tower` spot both extruders reach (x >= 20.5), or let `"auto"` find one; auto tries Studio's size with the rib wall first, then 35, 30, 25, 22 and 20 mm without it (06-slicer-rules.md section 10). On plate 14 a 22 mm tower without the rib wall saved 1 h 43 min and 32 g against the 35 mm one (n=1): an option through `wipe_tower.width`, never the default. Measured on plate 14 (n=1): the tower adds 27 min and 71 g over no tower (19.25 h against 18.8 h). Re-slicing an unsliced export with `--slice 1` exits -100 "No valid nozzle found" unless RepairNozzleStats ran (`shambu build` applies it; `shambu patch --repair-nozzle-stats` for an older file; 03-3mf-format.md section 8). Right nozzle speeds are lower (outer wall 50 vs 200 mm/s). Bed follows `bed_temperature_formula` `"by_highest_temp"`: PETG 70 deg C applies to a PLA part too. The GUI suggests more (section 2, recipe 8) |
 | 22 | Prime tower | notes | process (global) | `"enable_prime_tower": "1"` (preset), `"prime_tower_width": "35"` | Any plate with two filaments | Forces equal layering on multi-object plates. On a by-object plate with more than one object Studio drops the tower itself (reference 08) |
 | 23 | Fuzzy skin, outer wall only, tiny | notes | per-object, modifier, or paint | `"fuzzy_skin": "external"`, `"fuzzy_skin_thickness": "0.15"`, `"fuzzy_skin_point_distance": "0.4"`, `"fuzzy_skin_first_layer": "0"` | Decorative parts to hide layer lines | 0.15 / 0.4 are my starting values. The notes only say "tiny". Preset is 0.3 / 0.8. Not for functional parts (notes): it grows the outside by up to the thickness. Thickness must stay below the outer wall width |
 | 24 | X-Y hole compensation | notes | per-object | `"xy_hole_compensation": "0.02"` (notes range 0.01-0.03; preset `"0"`) | Only a part whose holes are all vertical and none sets a shared dimension | It offsets holes in each layer's XY slice, so it only reaches vertical holes. Horizontal bridged bores (0.2-0.3 mm under) get nothing. Do NOT use on gripper parts: notes chose CAD clearance + coupons because the error depends on orientation and bore length |
@@ -188,24 +188,38 @@ RECIPES = {
   "dual-material-interface": {
     "name": "dual-material-interface",
     "description": "Tree supports in the part material, interface in the other material (PLA on PETG or PETG on PLA), top Z 0.",
-    "process_set": {
-      "enable_prime_tower": "1",
-      "independent_support_layer_height": "0"
-    },
+    "process_set": {},
     "object_set": {
       "enable_support": "1",
       "support_type": "tree(auto)",
+      "support_style": "tree_hybrid",
+      "support_threshold_angle": "35",
+      "support_on_build_plate_only": "0",
       "support_filament": "0",
       "support_interface_filament": "2",
       "support_interface_not_for_body": "1",
       "support_top_z_distance": "0",
       "support_interface_spacing": "0",
-      "support_interface_pattern": "rectilinear_interlaced"
+      "support_interface_pattern": "rectilinear_interlaced",
+      "tree_support_branch_diameter": "3",
+      "tree_support_branch_diameter_angle": "7",
+      "raft_first_layer_expansion": "5",
+      "independent_support_layer_height": "0",
+      "thick_bridges": "0"
     },
     "filament_map": {"mode": "Manual", "maps": "1 2"},
     "filament_hint": "slot 1 = part material on the left nozzle, slot 2 = the other material on the right nozzle",
     "requires": ["supported features at X >= 20.5 mm (right nozzle area)", "check the bed temperature: by_highest_temp"],
     "when": "Supported faces that must come off clean. Expect a prime tower and a slower print."
+  },
+  "two-filament-plate": {
+    "name": "two-filament-plate",
+    "description": "The plate-wide half of the interface: prime tower on, independent support layer height off.",
+    "process_set": {
+      "enable_prime_tower": "1",
+      "independent_support_layer_height": "0"
+    },
+    "when": "Any plate whose parts carry dual-material-interface. List it in process.recipes."
   },
   "fuzzy-skin-external": {
     "name": "fuzzy-skin-external",
@@ -241,6 +255,15 @@ RECIPES = {
 
 Notes on the recipes:
 - `"__solid_parts__"` is a placeholder for the library's object selector.
+- shambu 0.6.0 splits the interface in two (spec `docs/specs/2026-10-29-gui-preset-bookkeeping.md` section 5.3):
+  `dual-material-interface` is `[object]` scope and goes on each supported part, `two-filament-plate` is `[process]`
+  scope and goes in `process.recipes`. Reason: Studio's own suggestion dialog writes the support keys per object, and
+  the GUI keeps per-object settings across an open. Process values of a preset Studio cannot find by name are reset to
+  the base unless `different_settings_to_system` names them (reference 03, "Preset bookkeeping Studio honours"). The
+  object key set is the one Studio's suggestion wrote on the owner's `cap_print` object on 2026-10-29.
+  `independent_support_layer_height` is a global key (`PrintConfig.hpp:1558`, moved from `PrintObjectConfig`): the
+  slicer reads the process value, so `two-filament-plate` carries it too. `support_interface_speed` stays out (a
+  per-nozzle array). `check` and `build` print a WARN when either recipe sits at the other scope; the keys still apply.
 - In `dual-material-interface`, the last three object keys and `independent_support_layer_height` come from the GUI's own
   suggestion text, found as strings in the binary ("0 top z distance, 0 interface spacing, 0 support/object xy distance,
   interlaced rectilinear pattern, disable independent support layer height ..."). That suggestion is for soluble and
