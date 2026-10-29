@@ -15,7 +15,8 @@ Rules the code follows:
 - layer_config_ranges.xml keys objects by the 1-based order of their first <build><item>,
   not by object id.
 - A change to settings makes an existing slice stale, so a patch on a sliced project drops
-  the G-code entries and the plate slice data (invalidate_slices()). Renames do not.
+  the G-code entries and the plate slice data (invalidate_slices()). Renames and the preset bookkeeping
+  (`*_settings_id`, `inherits_group`, `different_settings_to_system`) do not: they never change the G-code.
 - Every height range carries `layer_height`: the slicer reads it without a null check and
   segfaults in layer_height_profile_from_ranges when it is absent.
 - save() writes a temporary file next to the destination, checks it, then renames it over the
