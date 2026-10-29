@@ -31,8 +31,9 @@ couples the skin and skeleton infill keys to `sparse_infill_density` and `sparse
 (Tab.cpp:2106-2120); a plate without `filament_map_mode` metadata is Auto For Flush (PartPlate.cpp:172, metadata
 applied over it on load) and an empty plate `filament_maps` falls back to the project map (PartPlate.cpp:289); a
 filament's variant block is the run of entries whose `filament_self_index` names it (PresetBundle.cpp:3792-3822,
-:3960). The object settings mirror the auto-pin of `Pipeline.plan` (build.py: on a project with two or more
-filaments a supported part's "0" support and interface filaments become its own filament).
+:3960). The object settings include the auto-pin by the helper `Pipeline.plan` uses (`build.pin_support_filaments`:
+on a project with two or more filaments a supported part's "0" support and interface filaments become its own
+filament).
 
 What this module does not do: it runs no subprocess and prints nothing (cli.py does), it does not slice or compare
 G-code, it does not check height ranges, sub-part filaments or the tower position (`shambu inspect` shows them), it
@@ -46,9 +47,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 
 from . import edits
-from . import layout as L
 from . import presets as P
-from .build import TOWER_KEYS, effective_filaments
+from .build import SUPPORT_PIN_KEYS, TOWER_KEYS, effective_filaments, pin_support_filaments
 from .errors import BuildError, ProjectError
 from .spec import PartSpec, Spec
 from .threemf import Project
@@ -72,7 +72,6 @@ PROJECT_OPTIONS = frozenset(
         "filament_nozzle_map",
     }
 )
-PIN_KEYS = ("support_filament", "support_interface_filament")
 POSITION_TOLERANCE_MM = 0.05
 # Tab.cpp:2106-2120 at v02.08.02.61: an edit of the first key sets the others to the same value in the GUI
 DERIVED_KEYS = {
@@ -559,17 +558,13 @@ def _wanted(spec: Spec) -> list[_Want]:
 
 
 def expected_object_settings(part: PartSpec, n_filaments: int, process: Mapping) -> dict[str, str]:
-    """The per-object settings the build writes for `part`: its `set` (recipes included) plus the auto-pin.
-    Mirrors build.Pipeline.plan's auto-pin (build.py, the `pinned` loop); unify after merge: on a project with two or
-    more filaments, a part that needs support gets its own filament for a support or interface filament that is "0"
-    or empty (explicitly or through the process), so Studio's default never prints it with the other nozzle."""
-    out = {k: str(v) for k, v in part.set.items() if k != "extruder"}
-    if n_filaments > 1 and L.needs_support({**process, **part.set}):
-        main = _main_filament(part, process)
-        for k in PIN_KEYS:
-            if str(part.set.get(k, process.get(k, "0"))) in ("0", ""):
-                out[k] = str(main)
-    return out
+    """The per-object settings the build writes for `part`: its `set` (recipes included) plus the auto-pin, by the
+    rule `Pipeline.plan` uses (`build.pin_support_filaments`): on a project with two or more filaments, a part that
+    needs support gets its own filament for a support or interface filament that is "0" or empty (explicitly or
+    through the process), so Studio's default never prints it with the other nozzle. `extruder` is left out (the
+    object's filament is compared on its own)."""
+    pinned = pin_support_filaments(part.set, process, _main_filament(part, process), n_filaments)
+    return {k: str(v) for k, v in pinned.items() if k != "extruder"}
 
 
 def _main_filament(part: PartSpec, process: Mapping) -> int:
@@ -643,7 +638,7 @@ def _object_settings(rep: Report, item: str, part: PartSpec, obj: Mapping, n_fil
     for k, v in want.items():
         got = have.get(k)
         note = "not set on the object: the process value applies" if got is None else ""
-        if k in PIN_KEYS and k not in part.set:
+        if k in SUPPORT_PIN_KEYS and k not in part.set:
             note = (note + "; " if note else "") + "the build pins it to the part's filament"
         _add(rep, got is not None and _same(v, got), Line(FAIL, f"{item} {k}", v, got, note))
     if not part.parts:  # a single file: the object prints with its filament or set.extruder (merged objects: per part)

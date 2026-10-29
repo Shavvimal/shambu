@@ -380,12 +380,15 @@ def test_enable_prime_tower_differs_is_info_only_with_a_plate_tower_override(cap
         (1, {"enable_support": "1", "support_filament": "0"}, {}, {"support_filament": "0"}),  # one filament: no pin
     ],
 )
-def test_expected_object_settings_mirror_the_auto_pin(n_fil, part_set, process_set, pinned):
+def test_expected_object_settings_use_the_build_auto_pin(n_fil, part_set, process_set, pinned):
     from shambu import verify as V
+    from shambu.build import SUPPORT_PIN_KEYS, pin_support_filaments
     from shambu.spec import PartSpec
 
     got = V.expected_object_settings(PartSpec(path=Path("/nowhere/body.stl"), set=part_set), n_fil, process_set)
-    assert {k: got[k] for k in V.PIN_KEYS if k in got} == pinned
+    assert {k: got[k] for k in SUPPORT_PIN_KEYS if k in got} == pinned
+    built = pin_support_filaments(part_set, process_set, 1, n_fil)  # the rule Pipeline.plan applies
+    assert {k: built[k] for k in SUPPORT_PIN_KEYS if k in built} == pinned
 
 
 def test_pinned_support_filament_missing_from_the_object_fails(capsys, tmp_path):

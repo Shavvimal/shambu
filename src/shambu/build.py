@@ -186,6 +186,24 @@ def effective_filaments(
     return L.filament_slots(base, part_spec.set, ranges, process, _slot, skip=skip)
 
 
+SUPPORT_PIN_KEYS = ("support_filament", "support_interface_filament")
+
+
+def pin_support_filaments(settings: Mapping[str, str], process: Mapping, filament: int, n_filaments: int) -> dict[str, str]:
+    """The per-object `settings` with the support auto-pin applied, as `Pipeline.plan` writes them (a new dict, no
+    I/O). On a project with two or more filaments, a part that needs support (`layout.needs_support` of the process
+    with the part's settings over it) gets its own `filament` for each of SUPPORT_PIN_KEYS that is "0" or empty, in
+    `settings` or else in the process. Studio prints "default" (0) support with whichever filament is loaded; on a
+    two-filament plate that put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102, reference
+    08 3.3b). `verify.expected_object_settings` uses the same rule, so the verifier expects what the build wrote."""
+    out = dict(settings)
+    if n_filaments > 1 and L.needs_support({**process, **settings}):
+        for key in SUPPORT_PIN_KEYS:
+            if str(settings.get(key, process.get(key, "0"))) in ("0", ""):
+                out[key] = str(filament)
+    return out
+
+
 def interface_uses(part_spec: PartSpec, process: Mapping, spread: float, files: FileRefs | None = None) -> dict[int, tuple[float, str]]:
     """The slot that prints only this supported part's support interface, {slot: (spread, source)} for
     `Placed.interface` (`layout.interface_only`). Raises BuildError for a value that is not a slot number."""
@@ -1024,14 +1042,9 @@ class Pipeline:
             pinned: list[str] = []
             for group in groups.values():
                 first = group[0]
-                settings = dict(first.spec.set)
-                if len(filaments) > 1 and L.needs_support({**process, **settings}):
-                    # Studio prints "default" (0) support with whichever filament is loaded; on a two-filament plate that
-                    # put a filament-1 part's support base on the right nozzle at x < 20.5 (exit -102, reference 08 3.3b).
-                    for key in ("support_filament", "support_interface_filament"):
-                        if str(settings.get(key, process.get(key, "0"))) in ("0", ""):
-                            settings[key] = str(first.placed.filament)
-                            pinned.append(f"{first.key}:{key}")
+                # The support auto-pin (Studio's default 0 support filament can reach the wrong nozzle, exit -102)
+                settings = pin_support_filaments(first.spec.set, process, first.placed.filament, len(filaments))
+                pinned += [f"{first.key}:{key}" for key in SUPPORT_PIN_KEYS if settings.get(key) != first.spec.set.get(key)]
                 # The CLI translates copy 1 by pos[0], then CLONES that translated object for copies 2..n and translates
                 # each by its own pos[i] (reference 01 section 2.4, live-verified 2026-10-13): their pos is relative to
                 # copy 1's world position, so pos[i] = T_i - T_0.
