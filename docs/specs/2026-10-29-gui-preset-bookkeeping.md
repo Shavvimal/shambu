@@ -201,7 +201,9 @@ against the `inherits_group[0]` parent. Exit 1 when the key is unknown to the re
   plate type and the filament colours and, for two filaments, that the grouping shows filament 2 on the auxiliary
   nozzle; (4) Slice plate: Studio does not load shambu's embedded G-code for a project with objects, so the plate
   opens unsliced; the GUI estimate must match `<h> h <min> min, <g> g` from this report within a minute and a gram,
-  otherwise stop and run `shambu verify FILE --against SPEC`; (5) Preview checks as today; (6) Print. The line
+  otherwise stop, save the project in Studio under a new name and run `shambu verify <saved>.3mf --against SPEC`
+  (what Studio holds in memory is not on disk until saved; verifying the export proves nothing about the GUI state);
+  (5) Preview checks as today; (6) Print only when the estimate matched or verify exits 0. The line
   "Re-slice in Studio after any change" goes. No SD-card or Device-tab bypass anywhere.
 - `skills/shambu/SKILL.md`: the hand-back template's `Process:` line names the base and the override count; the
   `Next:` line carries steps 2 and 4; the Never list gets "Tell the user to send the file to the printer without
@@ -216,8 +218,8 @@ against the `inherits_group[0]` parent. Exit 1 when the key is unknown to the re
 the file, and reports per line: process preset id and diff list (expected vs file), every spec and recipe process
 key (value expected vs in file), each filament preset id and colour, `filament_map` and mode at project and plate
 level, bed type, print sequence, every object's per-object settings against its part's recipes and `set`, and each
-object's position against `at` when the spec gives one (tolerance 0.05 mm). Exit 0 when no FAIL line, 1 on any FAIL, 3 on a file or spec that
-does not load. A key the spec does not set but the GUI changed is a WARN with its file value and does not change the
+object's position against `at` when the spec gives one (tolerance 0.05 mm). Exit 0 when no FAIL line, 1 on any FAIL or a spec that does not
+load (as every other verb through `load_spec_or_error`), 3 on a project file that does not read. A key the spec does not set but the GUI changed is a WARN with its file value and does not change the
 exit code: the exit code answers "is the spec honoured", the WARN lines answer "what did the user change" (decided in
 review, 2026-10-29). It reuses `Pipeline.plan()` up to the presets and the existing
 `Project.summary()`; no new parsing. Positions use the existing `summary()["objects"][i]["position"]`.
@@ -328,3 +330,30 @@ Verdict was "reject" on three blockers. Each finding, and what changed:
 9. **Should, rubric (G).** Accepted: the open warning is returned by the facade and printed by the CLI; exit codes as
    rubric 19.
 10. **Nit, deferrals (H).** Agreed; the embedded named process preset stays an experiment (section 6).
+
+## 10. Code review round 1 (Codex per worktree, rubric reviewers), decisions
+
+- **Bookkeeping worktree**, four blockers accepted: `_relist_process` keeps listed keys and adds a newly set key absent
+  from the base; `_process_base` takes `inherits_group[0]` before `print_settings_id` (Studio's reset target,
+  `Preset.cpp:2258-2269`); `slice --settings-from` unions the input file's listed keys (the CLI keeps their values but
+  clears the list, `BambuStudio.cpp:3352-3360`); the filament count follows `filament_colour`
+  (`PresetBundle.cpp:3751-3755`) and a disagreement with `filament_settings_id` refuses the patch. Also: the export's
+  original preset ids are checked against the composed names before the bookkeeping patch rewrites them;
+  `--process-set` refuses filament and printer keys; `PatchSet.apply` forwards the union of the patches' touches.
+- **Verify worktree**, six blockers accepted: the auto-pin of `support_filament`/`support_interface_filament`
+  (build.py:943-950) is mirrored in the expected object settings; the object's filament is compared; a missing object
+  is FAIL unless its plate groups by filament and a `group-f<n>` object exists; plate membership is checked for every
+  object; embedded filament copies still get their list and values checked; a plate without `filament_map_mode`
+  metadata is Auto For Flush in Studio (`PartPlate.cpp:172`) and fails a Manual expectation, while an empty plate map
+  falls back to the project map (`PartPlate.cpp:289`); the hand-back makes the user save the GUI project before
+  verifying it. Should-fixes accepted: filament base values for list classification; tower keys INFO when the spec has
+  plate-level tower overrides; variant blocks by `filament_self_index`; project options (`s_project_options`) are not
+  "GUI edits"; a bad spec is exit 1; malformed metadata becomes `ProjectError`; the open WARN asks the user to check the
+  front window instead of asserting a window order (`GUI_App.cpp:7711-7722` makes it conditional); a swallowed
+  `PresetError` becomes a WARN line.
+- **Recipes and docs worktree**: the scope WARN says a `[process]` recipe's global keys are ignored per object
+  (`PrintConfig.hpp:1517`, `:1558`), the skill and README make the user save before verifying, "the CLI never resets"
+  is restricted to shambu's new-process path (`BambuStudio.cpp:3388`), the dropped-key correction names the
+  `support_interface_filament` loss, the verifier's CHANGELOG line is narrowed to what its tests show, and four cites
+  were tightened (`:3985`, `:5084-5086` + `:5109`, `:5142-5144`, `Plater.cpp:8944-8958`).
+- Dismissed: "GUI edits exit 1" (kept WARN, exit 0: the exit code answers whether the spec is honoured).
