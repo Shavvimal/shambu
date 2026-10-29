@@ -357,3 +357,27 @@ Verdict was "reject" on three blockers. Each finding, and what changed:
   `support_interface_filament` loss, the verifier's CHANGELOG line is narrowed to what its tests show, and four cites
   were tightened (`:3985`, `:5084-5086` + `:5109`, `:5142-5144`, `Plater.cpp:8944-8958`).
 - Dismissed: "GUI edits exit 1" (kept WARN, exit 0: the exit code answers whether the spec is honoured).
+
+## 11. Final Codex pass on the merged branch (two threads, by module), decisions
+
+Core path: (1) `slice --settings-from` rewrote the preset ids without checking the export's original ids and values
+the way `Pipeline.patch` does through `export_names`; accepted, the export now has to carry the composed process and
+printer and the spec's explicit values before the bookkeeping patch, else it stays in the run folder. (2) Two colours
+and no `filament_settings_id`: slot 1 first raised a count error; accepted, the ids are padded to Studio's count first.
+
+Verifier and text: (1) the expected ids came from the spec's preset name while the exporter uses `system_base`; a spec
+on an installed user preset failed a pristine export; accepted, the verifier builds its expectations with
+`build.system_base` and `build.slot_keys`. (2) `inherits_group[slot]` is Studio's reset target for every slot; the
+verifier now fails any parent other than the base for process, filaments and printer. (3) "%" is insignificant only
+for percent-only options (`_density` keys and the `coPercent` set), because FloatOrPercent options such as
+`max_travel_detour_distance` mean different things with and without it (`PrintConfig.cpp:1178-1188`). (4) The
+hand-back's "every FAIL line you intended" exception is gone: a wanted change goes into the spec and is rebuilt.
+(5) The skill template derives the nozzle of each filament from the plan, not "filament 2 on the auxiliary". (6) The
+"(modified)" suffix is qualified: Studio selects the preset clean when every value equals the base
+(`Preset.cpp:2292-2305`); the values are the check. (7) Exit code and open-warning text aligned in CHANGELOG, skill
+and README.
+
+Confirmed by the same pass: the live export of the merged code (16 listed process keys, system filament and printer
+ids, `inherits_group` all empty) opens as the base preset marked modified with every listed value kept
+(`Preset.cpp:2258-2269`, `:2330-2345`); `support_interface_filament` is per object and outside the reset. This is
+a source-and-file confirmation; the GUI round trip itself is the owner's check in section 6.
