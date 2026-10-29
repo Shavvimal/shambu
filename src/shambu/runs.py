@@ -28,10 +28,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import presets as P
-from .build import DEFAULT_COLOURS, _estimate, sliced_problems, summarise, two_pass_slice, verify_tower
+from .build import (
+    DEFAULT_COLOURS,
+    _estimate,
+    sliced_problems,
+    slot_keys,
+    summarise,
+    system_base,
+    two_pass_slice,
+    verify_tower,
+    with_gui_derived,
+)
 from .edits import AddFilament, EditError, EditSet, FilamentSlot, SetTower, check_preset, slot_from_export, slot_from_preset, slot_presets
-from .errors import BambuError, FileError, StudioError
-from .patches import PatchSet, RepairNozzleStats
+from .errors import BambuError, FileError, ProjectError, StudioError
+from .patches import PatchSet, RepairNozzleStats, SetPresetBookkeeping
 from .spec import Spec
 from .studio import NO_PAIR, CliCommand, RunResult, StudioCLI, conflict_phrase, conflicts_in_log
 from .threemf import Project
@@ -246,11 +256,26 @@ def slice_project(
         if inp != src:
             inp.unlink(missing_ok=True)
         inp = rep
+    bookkeeping: list[tuple[str, list[str]]] = []  # (base, keys) for the process and the printer slot
     if settings_from is not None:
         machine = resolver.for_cli("machine", settings_from.printer)
-        process = resolver.for_cli("process", settings_from.process.base, settings_from.process.set, settings_from.process.name)
+        overrides = with_gui_derived(settings_from.process.set)
+        process = resolver.for_cli("process", settings_from.process.base, overrides, settings_from.process.name)
         loads = [P.write(machine, work / "machine.json"), P.write(process, work / "process.json")]
         notes.append(f"settings: machine {machine['name']}, process {process['name']}; the project's filaments kept")
+        # The CLI writes print_settings_id from the JSON's name and copies no diff list from a 3MF input
+        # (BambuStudio.cpp:2382-2386, :3352-3360): the export names the system bases and lists the keys (spec
+        # 2026-10-29 section 5.1), else Studio resets the process to its base on open (Preset.cpp:2258-2269).
+        # The input's own lists stay listed: the CLI applies only the supplied preset's keys over the input's config
+        # (update_full_config, BambuStudio.cpp:3132-3137, :3352-3360), so a GUI-listed key the preset does not define
+        # keeps the input's value in the slice and must stay listed, or the GUI resets it on open.
+        book_in = project.preset_bookkeeping()
+        proc_base = system_base(resolver, "process", settings_from.process.base)
+        machine_base = system_base(resolver, "machine", settings_from.printer)
+        bookkeeping = [
+            (proc_base, sorted({*slot_keys(resolver, "process", proc_base, process, overrides), *book_in[0]["keys"]})),
+            (machine_base, sorted({*slot_keys(resolver, "machine", machine_base, machine), *book_in[-1]["keys"]})),
+        ]
 
     def make(nc: bool, pl: int, outdir: Path) -> CliCommand:
         cmd = CliCommand(inputs=[str(inp)])
@@ -276,6 +301,17 @@ def slice_project(
     if inp != src:
         inp.unlink(missing_ok=True)
     estimates: list[dict] = []
+    if rr.ok and bookkeeping:  # names and lists only: the G-code and its MD5 stay as Studio wrote them
+        (proc_base, proc_keys), (machine_base, machine_keys) = bookkeeping
+        try:
+            n = Project(str(tmp_dest)).studio_filament_count()
+        except ProjectError as e:  # an ambiguous slot count: writing slots by a guess could name the wrong preset
+            notes.append(f"WARN: preset bookkeeping not written ({e}); Studio resets the process to its base on open")
+        else:
+            PatchSet(
+                [SetPresetBookkeeping(0, proc_base, tuple(proc_keys)), SetPresetBookkeeping(n + 1, machine_base, tuple(machine_keys))]
+            ).apply(str(tmp_dest))
+            notes.append(f"preset bookkeeping: process {proc_base} + {len(proc_keys)} overrides")
     if rr.ok:
         try:  # read the export back before it replaces anything
             s = summarise(tmp_dest, rr)

@@ -4,6 +4,7 @@ import os
 import shutil
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -672,3 +673,227 @@ def test_repair_covers_every_extruder_when_volume_types_are_short(tmp_path):
     X.PatchSet().add(X.RepairNozzleStats()).apply(str(f))
     assert Project(str(f)).project_settings["extruder_nozzle_stats"] == ["High Flow#1", "High Flow#2"]
     assert not [m for m in Project(str(f)).reslice_problems() if "nozzle_stats" in m]
+
+
+# ---------------------------------------------------------------------------- preset bookkeeping (spec 2026-10-29 5.1, 5.4)
+TWO_COLOURS = ["#00AE42", "#FFFFFF"]  # Studio counts filament_colour (PresetBundle.cpp:3750-3755): one per id
+
+
+def two(path, **over) -> Path:
+    return make_3mf(path, **{"filament_colour": TWO_COLOURS, **over})
+
+
+def settings(path) -> dict:
+    return Project(str(path)).project_settings
+
+
+def test_set_preset_bookkeeping_creates_both_vectors_at_n_plus_2(tmp_path):
+    f = two(tmp_path / "f.3mf")
+    apply(f, X.SetPresetBookkeeping(0, "0.20mm Test", ("wall_loops", "brim_type")))
+    ps = settings(f)
+    assert ps["print_settings_id"] == "0.20mm Test"
+    assert ps["inherits_group"] == ["", "", "", ""]  # 2 filaments + process + printer
+    assert ps["different_settings_to_system"] == ["brim_type;wall_loops", "", "", ""]  # sorted, ;-joined
+
+
+def test_set_preset_bookkeeping_writes_each_slot(tmp_path):
+    f = two(tmp_path / "f.3mf")
+    apply(
+        f,
+        X.SetPresetBookkeeping(0, "P base", ("wall_loops",)),
+        X.SetPresetBookkeeping(1, "F1 base", ()),
+        X.SetPresetBookkeeping(2, "F2 base", ("nozzle_temperature",)),
+        X.SetPresetBookkeeping(3, "M base", ("z_hop",)),
+    )
+    ps = settings(f)
+    assert (ps["print_settings_id"], ps["filament_settings_id"], ps["printer_settings_id"]) == ("P base", ["F1 base", "F2 base"], "M base")
+    assert ps["different_settings_to_system"] == ["wall_loops", "", "nozzle_temperature", "z_hop"]
+    book = Project(str(f)).summary()["preset_bookkeeping"]
+    assert [(b["slot"], b["kind"], b["id"], b["inherits"], b["keys"]) for b in book] == [
+        (0, "process", "P base", "", ["wall_loops"]),
+        (1, "filament", "F1 base", "", []),
+        (2, "filament", "F2 base", "", ["nozzle_temperature"]),
+        (3, "machine", "M base", "", ["z_hop"]),
+    ]
+
+
+def test_set_preset_bookkeeping_pads_and_never_cuts(tmp_path):
+    f = two(
+        tmp_path / "f.3mf",
+        inherits_group=["Base P", "Base F"],  # short: padded to N+2
+        different_settings_to_system=["", "filament_flow_ratio", "", "", "extra"],  # long: kept as it is
+    )
+    apply(f, X.SetPresetBookkeeping(0, "Base P", ("wall_loops",)))
+    ps = settings(f)
+    assert ps["inherits_group"] == ["", "Base F", "", ""]
+    assert ps["different_settings_to_system"] == ["wall_loops", "filament_flow_ratio", "", "", "extra"]
+
+
+def test_set_preset_bookkeeping_merges_the_keys_the_slot_lists(tmp_path):
+    f = two(tmp_path / "f.3mf", different_settings_to_system=["enable_prime_tower", "", "", ""])  # the CLI listed one
+    apply(f, X.SetPresetBookkeeping(0, "0.20mm Test", ("wall_loops",)))
+    assert settings(f)["different_settings_to_system"][0] == "enable_prime_tower;wall_loops"
+
+
+def test_set_preset_bookkeeping_keeps_the_slice_and_the_gcode_bytes(tmp_path):
+    f = two(tmp_path / "f.gcode.3mf", sliced=True)
+
+    def gcode_bytes(path):
+        with zipfile.ZipFile(path) as z:
+            return {n: z.read(n) for n in z.namelist() if n.startswith("Metadata/plate_") and ".gcode" in n}
+
+    before = gcode_bytes(f)
+    assert set(before) == {"Metadata/plate_1.gcode", "Metadata/plate_1.gcode.md5"}
+    s = apply(f, X.SetPresetBookkeeping(0, "0.20mm Test", ("wall_loops",)), X.SetPresetBookkeeping(3, MACHINE, ()))
+    assert s["sliced"] is True
+    assert gcode_bytes(f) == before
+    assert s["plates"][0]["gcode_file"] == "Metadata/plate_1.gcode"
+
+
+def test_set_preset_bookkeeping_is_idempotent(tmp_path):
+    f = two(tmp_path / "f.3mf")
+    patch = X.SetPresetBookkeeping(0, "0.20mm Test", ("wall_loops",))
+    apply(f, patch)
+    once = f.read_bytes()
+    apply(f, patch)
+    assert f.read_bytes() == once
+
+
+def test_set_preset_bookkeeping_touches_only_project_settings(tmp_path):
+    f = two(tmp_path / "f.gcode.3mf", sliced=True)
+    patch = X.SetPresetBookkeeping(0, "0.20mm Test", ("wall_loops",))
+    assert patch.touches == frozenset({PROJECT_SETTINGS})
+    p = Project(str(f))
+    patch.apply(p)
+    p.materialise()
+    assert p.changed_entries() == [PROJECT_SETTINGS]
+    out = tmp_path / "out.3mf"
+    p.save(str(out), touches=patch.touches)  # the touches check passes: nothing else changed
+    with zipfile.ZipFile(f) as a, zipfile.ZipFile(out) as b:
+        assert b.testzip() is None and a.namelist() == b.namelist()
+        assert [n for n in a.namelist() if a.read(n) != b.read(n)] == [PROJECT_SETTINGS]
+
+
+@dataclass(frozen=True)
+class _NarrowButRenames(X.PatchBase):
+    """Declares project_settings only, then changes model_settings: the save must refuse it."""
+
+    touches: frozenset = frozenset({PROJECT_SETTINGS})
+
+    def apply(self, p):
+        p.rename_plate(1, "sneaky")
+
+    def describe(self):
+        return "narrow"
+
+
+def test_patchset_apply_enforces_narrow_touches(tmp_path):
+    f = two(tmp_path / "f.3mf")
+    raw = f.read_bytes()
+    with pytest.raises(ProjectError, match="did not declare"):
+        X.PatchSet([_NarrowButRenames()]).apply(str(f))
+    assert f.read_bytes() == raw
+    apply(f, _NarrowButRenames(), X.RenamePlate(1, "x"))  # a default-touches patch widens the set to Metadata/*
+
+
+@pytest.mark.parametrize("slot", [-1, 4])
+def test_set_preset_bookkeeping_refuses_a_bad_slot(tmp_path, slot):
+    with pytest.raises(ProjectError, match=r"preset slot must be in 0\.\.3"):
+        Project(str(two(tmp_path / "f.3mf"))).set_preset_bookkeeping(slot, "x", ())
+
+
+def test_studio_counts_the_colours_when_the_ids_are_missing(tmp_path):
+    f = two(tmp_path / "f.3mf", filament_settings_id=[])
+    apply(f, X.SetPresetBookkeeping(2, "F2 base", ("nozzle_temperature",)), X.SetPresetBookkeeping(3, MACHINE, ()))
+    ps = settings(f)
+    assert ps["filament_settings_id"] == ["", "F2 base"] and ps["different_settings_to_system"] == ["", "", "nozzle_temperature", ""]
+
+
+def test_two_ids_and_one_colour_are_refused(project_file):  # the fixture: 2 ids, 1 colour
+    with pytest.raises(ProjectError, match="1 filament_colour entries but 2 filament_settings_id entries"):
+        Project(str(project_file)).set_preset_bookkeeping(0, "x", ())
+    with pytest.raises(ProjectError, match="ambiguous"):
+        Project(str(project_file)).set_process_setting("wall_loops", "4")
+
+
+@pytest.mark.parametrize(("ids", "colours"), [(["A"], ["#000000"]), (["A", "B", "C"], ["#000000", "#111111", "#222222"])])
+def test_bookkeeping_slots_for_one_and_three_filaments(tmp_path, ids, colours):
+    f = make_3mf(tmp_path / "f.3mf", filament_settings_id=ids, filament_colour=colours)
+    n = len(ids)
+    apply(f, X.SetPresetBookkeeping(n + 1, "M base", ("z_hop",)))
+    ps = settings(f)
+    assert ps["printer_settings_id"] == "M base" and ps["different_settings_to_system"] == [""] * (n + 1) + ["z_hop"]
+    assert [b["kind"] for b in Project(str(f)).preset_bookkeeping()] == ["process"] + ["filament"] * n + ["machine"]
+
+
+def test_preset_bookkeeping_tolerates_missing_vectors(tmp_path):
+    book = Project(str(two(tmp_path / "f.3mf"))).preset_bookkeeping()
+    assert [(b["kind"], b["id"], b["inherits"], b["keys"]) for b in book] == [
+        ("process", PROCESS_NAME, "", []),
+        ("filament", "Test PLA", "", []),
+        ("filament", "Test PLA", "", []),
+        ("machine", MACHINE, "", []),
+    ]
+
+
+def test_preset_bookkeeping_reads_an_ambiguous_file_as_studio_does(project_file):
+    book = Project(str(project_file)).preset_bookkeeping()  # 1 colour: Studio sees one filament slot
+    assert [b["kind"] for b in book] == ["process", "filament", "machine"]
+
+
+def test_set_process_setting_lists_the_key_and_invalidates(tmp_path):
+    f = two(tmp_path / "f.gcode.3mf", sliced=True)
+    s = apply(f, X.SetProcessSetting("wall_loops", "4"))
+    ps = settings(f)
+    assert ps["wall_loops"] == "4" and ps["different_settings_to_system"] == ["wall_loops", "", "", ""]
+    assert s["sliced"] is False
+
+
+def test_set_process_setting_splits_a_numeric_vector_only(tmp_path):
+    f = two(tmp_path / "f.3mf", support_interface_speed=["80", "80"], post_process=["a.py --x=1"])
+    apply(f, X.SetProcessSetting("support_interface_speed", "60,70"), X.SetProcessSetting("post_process", "b.py --x=1,2"))
+    ps = settings(f)
+    assert ps["support_interface_speed"] == ["60", "70"]
+    assert ps["post_process"] == ["b.py --x=1,2"]  # a string vector: the commas stay inside the one entry
+
+
+BASE = {"wall_loops": "2", "sparse_infill_density": "15%", "layer_height": "0.2", "name": "0.20mm Test"}
+
+
+def test_set_process_setting_lists_a_key_the_base_does_not_define(tmp_path):
+    f = two(tmp_path / "f.3mf", brim_type="auto_brim")
+    apply(f, X.SetProcessSetting("brim_type", "no_brim", BASE))  # not in the resolved chain: still listed
+    assert settings(f)["different_settings_to_system"][0] == "brim_type"
+
+
+def test_set_process_setting_keeps_a_listed_key_equal_to_the_base(tmp_path):
+    f = two(tmp_path / "f.3mf", sparse_infill_density="15%", different_settings_to_system=["wall_loops", "", "", ""])  # wall_loops 2 = BASE
+    apply(f, X.SetProcessSetting("sparse_infill_density", "25%", BASE))
+    assert settings(f)["different_settings_to_system"][0] == "sparse_infill_density;wall_loops"
+
+
+def test_set_process_setting_with_the_base_adds_every_differing_key(tmp_path):
+    f = two(tmp_path / "f.3mf", sparse_infill_density="25%")
+    apply(f, X.SetProcessSetting("wall_loops", "2", BASE))
+    assert settings(f)["different_settings_to_system"][0] == "sparse_infill_density;wall_loops"
+
+
+def test_clear_process_setting_drops_only_its_key(tmp_path):
+    f = two(tmp_path / "f.gcode.3mf", sliced=True, wall_loops="4", different_settings_to_system=["brim_type;wall_loops", "", "", ""])
+    s = apply(f, X.UnsetProcessSetting("wall_loops", "2", BASE))
+    ps = settings(f)
+    assert ps["wall_loops"] == "2" and ps["different_settings_to_system"][0] == "brim_type" and s["sliced"] is False
+
+
+def test_clear_process_setting_without_the_base(tmp_path):
+    f = two(tmp_path / "f.3mf")
+    apply(f, X.SetProcessSetting("wall_loops", "4"))
+    apply(f, X.UnsetProcessSetting("wall_loops", "2"))
+    ps = settings(f)
+    assert ps["wall_loops"] == "2" and ps["different_settings_to_system"][0] == ""
+
+
+@pytest.mark.parametrize("key", ["no_such_key", "print_settings_id", "different_settings_to_system", "inherits_group"])
+def test_set_process_setting_refuses_unknown_and_bookkeeping_keys(tmp_path, key):
+    with pytest.raises(ProjectError):
+        Project(str(two(tmp_path / "f.3mf"))).set_process_setting(key, "1")

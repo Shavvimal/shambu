@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -11,8 +11,10 @@ import pytest
 from conftest import MACHINE, PROCESS, PROCESS_NAME, FakeStudio, make_3mf, mesh
 from shambu import assemble as A
 from shambu import layout as L
-from shambu.build import Pipeline, _rename_steps, effective_filaments
-from shambu.patches import RenameObject, SetFilamentMap
+from shambu.build import Pipeline, _rename_steps, effective_filaments, system_base
+from shambu.errors import BuildError
+from shambu.loaded import FilamentResolution
+from shambu.patches import RenameObject, SetFilamentMap, SetPresetBookkeeping
 from shambu.spec import Spec
 from shambu.studio import MeshInfo, RunResult
 from shambu.threemf import Project
@@ -243,8 +245,9 @@ def test_verify_compares_machine_gcode_with_the_preset(tmp_path, stls, resolver)
 
 def test_verify_compares_filament_presets(tmp_path, stls, resolver):
     fx = make_3mf(tmp_path / "f.3mf", object_names=("body_1", "assemble_1"), filament_settings_id=["Other", "Test PLA"], **CHANGE_FILAMENT)
-    r = build_with(tmp_path, stls, resolver, fx)
-    assert any("filament presets in file" in p for p in r.verify_problems)
+    r = build_with(tmp_path, stls, resolver, fx)  # the ordinary pipeline: the export's names are read before the patch
+    assert "filament presets in file are ['Other', 'Test PLA'], expected ['Test PLA', 'Test PLA'] (the CLI export)" in r.verify_problems
+    assert Project(str(r.project)).project_settings["filament_settings_id"] == ["Test PLA", "Test PLA"]  # patched after the read
 
 
 def test_verify_requires_plate_bed_type(tmp_path, stls, resolver):
@@ -1153,3 +1156,132 @@ def test_no_probe_through_the_cli(tmp_path, resolver, capsys, monkeypatch):
         cli.main(["check", "--no-printer", *flag, str(p)])
         out = capsys.readouterr().out
         assert (studio.probes > 0) is want and ("Spreads measured" in out) is want
+
+
+# ---------------------------------------------------------------------------- preset bookkeeping (spec 2026-10-29 5.1, 5.2)
+def test_bookkeeping_has_one_entry_per_studio_slot_in_order(tmp_path, stls, resolver):
+    sp = spec(tmp_path, two_part_plates(stls))
+    resolution = FilamentResolution(sp, [], "filaments from the spec")
+    plan = Pipeline(FakeStudio(), resolver).plan(sp, resolution)
+    assert plan.filament_resolution is resolution  # by keyword: never shifted into the bookkeeping field
+    assert [(kind, base) for kind, base, _ in plan.bookkeeping] == [
+        ("process", PROCESS),
+        ("filament", "Test PLA"),
+        ("filament", "Test PLA"),
+        ("machine", MACHINE),
+    ]
+    proc_keys = plan.bookkeeping[0][2]
+    assert "wall_loops" in proc_keys  # explicit, though equal to the resolved base: Studio's base may differ
+    assert proc_keys == sorted(proc_keys) and plan.bookkeeping[3][2] == []
+
+
+def test_system_base_follows_a_user_chain(profiles, resolver):
+    for name, parent in (("My walls", PROCESS), ("My walls v2", "My walls")):
+        (profiles / "process" / f"{name}.json").write_text(
+            json.dumps({"name": name, "from": "User", "inherits": parent, "wall_loops": "4"})
+        )
+    assert system_base(resolver, "process", "My walls v2") == PROCESS
+    assert system_base(resolver, "process", PROCESS) == PROCESS  # a system preset is its own base
+
+
+def test_system_base_reports_a_loop(profiles, resolver):
+    for name, parent in (("Loop A", "Loop B"), ("Loop B", "Loop A")):
+        (profiles / "process" / f"{name}.json").write_text(json.dumps({"name": name, "from": "user", "inherits": parent}))
+    with pytest.raises(BuildError, match="inherits loop: Loop A -> Loop B -> Loop A"):
+        system_base(resolver, "process", "Loop A")
+
+
+def test_patch_skips_the_bookkeeping_on_a_filament_count_mismatch(tmp_path, stls, resolver):
+    # sliced: no colour patch runs first, so the export's own counts decide (an unsliced build's colour patch refuses first)
+    fx = make_3mf(
+        tmp_path / "f.gcode.3mf", sliced=True, object_names=("body_1", "assemble_1"), filament_settings_id=["Test PLA"], **CHANGE_FILAMENT
+    )
+    r = Pipeline(FakeStudio(fx), resolver).build(spec(tmp_path, two_part_plates(stls)), do_slice=True, keep_going=True)
+    assert not any(d.startswith("preset slot") for d in r.patches)
+    assert Project(str(r.project)).project_settings["print_settings_id"] == PROCESS_NAME  # left as the CLI wrote it
+    assert "1 filaments in file, expected 2" in r.verify_problems
+
+
+def test_bookkeeping_lists_the_tower_keys_and_filament_sets(tmp_path, stls, resolver):
+    fils = [{"preset": "Test PLA", "colour": "#000000", "set": {"nozzle_temperature": ["215"]}}, TWO[1]]
+    plan = plan_of(tmp_path, resolver, two_part_plates(stls), filaments=fils)
+    assert {"enable_prime_tower", "prime_tower_width"} <= set(plan.bookkeeping[0][2])
+    assert plan.bookkeeping[1] == ("filament", "Test PLA", ["nozzle_temperature"])
+    assert plan.bookkeeping[2] == ("filament", "Test PLA", [])  # filament_colour never counts
+
+
+def test_derived_infill_keys_follow_an_explicit_density(tmp_path, stls, resolver):
+    proc = {"base": PROCESS, "name": PROCESS_NAME, "set": {"sparse_infill_density": "25%", "sparse_infill_line_width": "0.5"}}
+    plan = plan_of(tmp_path, resolver, two_part_plates(stls), process=proc)
+    for k in ("skeleton_infill_density", "skin_infill_density"):
+        assert plan.process[k] == "25%" and k in plan.bookkeeping[0][2]
+    for k in ("skin_infill_line_width", "skeleton_infill_line_width"):
+        assert plan.process[k] == "0.5" and k in plan.bookkeeping[0][2]
+
+
+def test_derived_infill_keys_keep_an_explicit_value_and_ignore_the_base(tmp_path, stls, resolver):
+    proc = {"base": PROCESS, "name": PROCESS_NAME, "set": {"sparse_infill_density": "25%", "skin_infill_density": "10%"}}
+    plan = plan_of(tmp_path, resolver, two_part_plates(stls), process=proc)
+    assert (plan.process["skin_infill_density"], plan.process["skeleton_infill_density"]) == ("10%", "25%")
+    plain = plan_of(tmp_path, resolver, two_part_plates(stls))  # the base has 15 %: no coupling without an override
+    assert "skin_infill_density" not in plain.process
+
+
+def test_export_with_the_user_name_is_patched_to_base_and_list(tmp_path, stls, resolver):
+    fx = make_3mf(
+        tmp_path / "f.3mf",
+        object_names=("body_1", "assemble_1"),
+        inherits_group=[PROCESS, "", "", ""],  # what the CLI writes for a user process preset
+        different_settings_to_system=["", "", "", ""],
+        **CHANGE_FILAMENT,
+    )
+    assert Project(str(fx)).project_settings["print_settings_id"] == PROCESS_NAME
+    r = build_with(tmp_path, stls, resolver, fx)
+    assert r.verify_problems == [], r.verify_problems
+    ps = Project(str(r.project)).project_settings
+    assert ps["print_settings_id"] == PROCESS and ps["inherits_group"] == ["", "", "", ""]
+    assert ps["different_settings_to_system"][0] == ";".join(r.plan.bookkeeping[0][2])
+    assert ps["filament_settings_id"] == ["Test PLA", "Test PLA"] and ps["printer_settings_id"] == MACHINE
+
+
+def test_verify_names_a_key_missing_from_the_list(tmp_path, stls, resolver):
+    class DropsWallLoops(Pipeline):
+        def patch_set(self, plan, sliced=False):
+            ps = super().patch_set(plan, sliced)
+            ps.patches = [
+                replace(x, keys=tuple(k for k in x.keys if k != "wall_loops")) if isinstance(x, SetPresetBookkeeping) else x
+                for x in ps.patches
+            ]
+            return ps
+
+    fx = make_3mf(tmp_path / "f.3mf", object_names=("body_1", "assemble_1"), **CHANGE_FILAMENT)
+    r = build_with(tmp_path, stls, resolver, fx, pipeline_cls=DropsWallLoops)
+    (p,) = [p for p in r.verify_problems if "different_settings_to_system[0]" in p]
+    assert p.startswith(f"different_settings_to_system[0] lacks wall_loops: Studio resets them to {PROCESS} on open")
+
+
+def test_verify_compares_each_listed_value(tmp_path, stls, resolver):
+    proc = {"base": PROCESS, "name": PROCESS_NAME, "set": {"wall_loops": "2", "sparse_infill_density": "25%"}}
+    fx = make_3mf(
+        tmp_path / "f.3mf", object_names=("body_1", "assemble_1"), sparse_infill_density="25%", skin_infill_density="15%", **CHANGE_FILAMENT
+    )
+    r = build_with(tmp_path, stls, resolver, fx, process=proc)
+    assert any(p.startswith("process setting skin_infill_density is '15%' in the file, plan says '25%'") for p in r.verify_problems)
+    assert any(
+        p.startswith("process setting skeleton_infill_density is listed") and "missing from the file" in p for p in r.verify_problems
+    )
+
+
+def test_sliced_build_keeps_the_gcode_after_the_bookkeeping(tmp_path, stls, resolver):
+    fx = make_3mf(
+        tmp_path / "f.gcode.3mf",
+        sliced=True,
+        object_names=("body_1", "assemble_1"),
+        filament_colour=["#000000", "#FFFFFF"],
+        **CHANGE_FILAMENT,
+    )
+    plan = Pipeline(FakeStudio(fx), resolver).plan(spec(tmp_path, two_part_plates(stls)))
+    ps = Pipeline(FakeStudio(fx), resolver).patch_set(plan, sliced=True)
+    assert [x.slot for x in ps.patches if isinstance(x, SetPresetBookkeeping)] == [0, 1, 2, 3]
+    ps.apply(str(fx))
+    assert Project(str(fx)).is_sliced()
