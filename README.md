@@ -111,7 +111,10 @@ A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate ta
 **3. Inspect, patch, edit or re-slice an existing project.**
 
 ```
-shambu inspect project.3mf
+shambu inspect project.3mf                           # process <base> (+N overrides: ...), filaments, objects
+shambu verify project.3mf --against plate.json       # a GUI-saved project against its spec: exit 0 match, 1 differences
+shambu patch project.3mf --process-set wall_loops=4 --process-set sparse_infill_density=25%   # process keys, override list kept
+shambu patch project.3mf --process-unset wall_loops  # back to the base preset's value
 shambu patch project.3mf --bed-type "Textured PEI Plate" --colours "#1A1A1A,#F0F0F0" --map 1,2 \
     --set "carrier_1:enable_support=1" --pause 1:10.2 --rename-plate "1:carrier D.6" --print-sequence "1:by object"
 shambu patch project.3mf --replace-mesh housing=housing-v2.stl --dry-run   # swap a mesh, keep name, settings, place
@@ -127,6 +130,15 @@ verifies it with a slice (a preset with no colour takes the next unused default 
 and `--tower` report the same pair rule as `check`. `shambu slice --no-check` adds an unchecked pass only after a
 -101 or a warning -100, as the GUI would, and the report lists what it skipped. `shambu studio -- ARGS` is the
 logged last resort for anything else.
+
+**Opening a project in Studio.** `shambu open project.3mf` (or `build --open`) hands the project to the GUI for the
+final pass. The process combo shows the base preset marked modified, for example `0.20mm Standard @BBL X2D
+(modified)`, with every spec and recipe value in place: shambu names the base preset in the project and lists the
+overrides in `different_settings_to_system`, the list Studio keeps on open. The spec's `process.name` is a label for
+the report, not the GUI's preset name. The plate opens unsliced: Studio never loads the embedded G-code of a project
+with objects. Press Slice plate. The GUI estimate must match the report within a minute and a gram; if it does not,
+run `shambu verify project.3mf --against plate.json` and read its FAIL lines. When Studio is already running, the
+project opens in a new window behind the current one (`open` prints a WARN).
 
 **4. Read the printer (read-only) and measure prints.**
 
