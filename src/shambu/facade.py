@@ -139,6 +139,15 @@ def install_command(version: str) -> str:
 
 
 @dataclass(frozen=True)
+class OpenResult:
+    """What `open_in_studio` did: the path it opened and whether Studio was running before (None: pgrep failed or the
+    Studio binary is absent, so it is unknown)."""
+
+    path: str
+    already_running: bool | None
+
+
+@dataclass(frozen=True)
 class LoginResult:
     """What `Bambu.login` stored: the profile name, the masked serial, the mode, the time of the verified read, whether
     the profile is the default and whether the code went into the credentials file."""
@@ -414,16 +423,23 @@ class Bambu:
     def studio_raw(self, raw: list[str], out_dir: str | Path = ".", timeout: int = 1200) -> dict:
         return runs.studio_raw(self.studio_cli(), raw, Path.cwd(), Path(out_dir), timeout)
 
-    def open_in_studio(self, path: str | Path) -> None:
-        """Opens the project for the user. With single_instance off this starts a second Studio process. StudioError
-        when `open` fails or is missing (exit 3 at the CLI, not a traceback)."""
+    def open_in_studio(self, path: str | Path) -> OpenResult:
+        """Opens the project for the user and says whether Studio was already running before the call (`running_pids`
+        read first: [] none, None unknown). Studio keeps one process (`single_instance`), so a project opened into a
+        running Studio lands in a new window behind the current one; the CLI warns about that. No AppleScript and no
+        `open --new` (rubric item 16; a second instance is refused). StudioError when `open` fails or is missing
+        (exit 3 at the CLI, not a traceback)."""
+        studio = self.studio_or_none()
+        pids = studio.running_pids() if studio is not None else None
+        resolved = Path(path).resolve()
         try:
-            subprocess.run(["open", "-a", "BambuStudio", str(Path(path).resolve())], check=True, capture_output=True)
+            subprocess.run(["open", "-a", "BambuStudio", str(resolved)], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             err = (e.stderr or b"").decode("utf-8", "replace").strip()[:200]
             raise StudioError(f"`open -a BambuStudio` exited {e.returncode}" + (f": {err}" if err else "")) from e
         except OSError as e:
             raise StudioError(f"`open -a BambuStudio` could not run ({e.strerror or e})") from e
+        return OpenResult(str(resolved), None if pids is None else bool(pids))
 
     # ---- printer (read-only)
     def printer(

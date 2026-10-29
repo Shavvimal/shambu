@@ -1907,3 +1907,51 @@ def test_login_by_ip_keeps_the_credential_key_of_an_existing_lower_case_profile(
     (p,) = stored()["printers"]
     assert p["serial"] == P_SERIAL.lower()
     assert offline.vault.items == {P_SERIAL.lower(): P_CODE}
+
+
+# ---------------------------------------------------------------------------- open focus (spec 2026-10-29 section 5.7)
+def _fake_open(monkeypatch, pids):
+    from shambu import facade
+
+    calls = []
+    order = []
+
+    class Studio(FakeStudio):
+        def running_pids(self):
+            order.append("pgrep")
+            return pids
+
+    def fake_run(argv, **kw):
+        order.append("open")
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(facade.subprocess, "run", fake_run)
+    return Studio(), calls, order
+
+
+@pytest.mark.parametrize(("pids", "warned", "running"), [([4242], True, True), ([], False, False), (None, False, None)])
+def test_open_warns_once_when_studio_already_runs(capsys, tmp_path, monkeypatch, resolver, pids, warned, running):
+    studio, calls, order = _fake_open(monkeypatch, pids)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    f = make_3mf(tmp_path / "p.3mf")
+    code, out, err = run(capsys, "--json", "open", str(f))
+    assert code == 0 and one_json(out)["already_running"] is running
+    assert order == ["pgrep", "open"]  # the process table is read before `open` starts anything
+    assert calls == [["open", "-a", "BambuStudio", str(f.resolve())]]  # no --new, no AppleScript
+    assert err.count("Bambu Studio was already running") == (1 if warned else 0)
+    if warned:
+        assert "WARN: Bambu Studio was already running: the project opened in a new window behind the current one" in err
+
+
+def test_build_open_warns_when_studio_already_runs(capsys, tmp_path, monkeypatch, resolver):
+    from types import SimpleNamespace
+
+    studio, _, _ = _fake_open(monkeypatch, [7])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    fake = SimpleNamespace(to_json=lambda: {"ok": True}, report="# r\n", run=SimpleNamespace(ok=True), ok=True, project=tmp_path / "p.3mf")
+    monkeypatch.setattr(Bambu, "build", lambda self, spec, **kw: fake)
+    code, out, err = run(capsys, "--json", "build", str(write_spec(tmp_path)), "--open")
+    doc = one_json(out)
+    assert code == 0 and doc["open_already_running"] is True
+    assert err.count("WARN: Bambu Studio was already running") == 1

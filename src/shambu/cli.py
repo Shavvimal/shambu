@@ -34,7 +34,7 @@ from .edits import (
     SetTower,
 )
 from .errors import BambuError, BuildError, ConfError, PrinterError, ProjectError, StudioError
-from .facade import Bambu
+from .facade import Bambu, OpenResult
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
     AddCustomGcode,
@@ -958,11 +958,13 @@ class Build(Command):
         doc, lines = r.to_json(), r.report.splitlines()
         if a.open and r.run and r.run.ok:
             try:  # before the output, so a failed open lands in the one JSON document
-                app.open_in_studio(r.project)
+                opened = app.open_in_studio(r.project)
             except StudioError as e:
                 doc["open_error"] = f"StudioError: {e}"
                 out.emit(doc, [*lines, f"StudioError: {e}"])
                 return 3
+            doc["open_already_running"] = opened.already_running
+            warn_open_behind(opened)
         out.emit(doc, lines)
         return 0 if r.ok else 1
 
@@ -1308,9 +1310,20 @@ class Open(Command):
         p.add_argument("file")
 
     def run(self, a, app, out):
-        app.open_in_studio(a.file)
-        out.emit({"opened": a.file}, [f"opened {a.file} in Bambu Studio"])
+        opened = app.open_in_studio(a.file)
+        warn_open_behind(opened)
+        out.emit({"opened": a.file, "already_running": opened.already_running}, [f"opened {a.file} in Bambu Studio"])
         return 0
+
+
+OPEN_BEHIND = "WARN: Bambu Studio was already running: the project opened in a new window behind the current one"
+
+
+def warn_open_behind(opened: OpenResult) -> None:
+    """The one WARN line on stderr (stdout keeps the one document) when Studio ran before `open`: the new window opens
+    behind the current one, and on 29 October the user read the old window's grams as the new file's."""
+    if opened.already_running:
+        print(OPEN_BEHIND, file=sys.stderr)
 
 
 @command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw | login | list | forget")
