@@ -213,6 +213,75 @@ def test_recipes_describe_filters_scope():
     assert R.recipe_settings()["solid-part"]["sparse_infill_density"] == "100%"
 
 
+DMI_KEYS = {
+    "enable_support": "1",
+    "support_type": "tree(auto)",
+    "support_style": "tree_hybrid",
+    "support_threshold_angle": "35",
+    "support_on_build_plate_only": "0",
+    "support_interface_filament": "2",
+    "support_filament": "0",
+    "support_interface_not_for_body": "1",
+    "support_top_z_distance": "0",
+    "support_interface_spacing": "0",
+    "support_interface_pattern": "rectilinear_interlaced",
+    "tree_support_branch_diameter": "3",
+    "tree_support_branch_diameter_angle": "7",
+    "raft_first_layer_expansion": "5",
+    "independent_support_layer_height": "0",
+    "thick_bridges": "0",
+}
+
+
+def test_dual_material_interface_is_per_object_and_two_filament_plate_is_per_process():
+    """Spec 2026-10-29 section 5.3: the interface keys go where Studio's suggestion writes them and the GUI keeps them."""
+    dmi, plate = R.by_name()["dual-material-interface"], R.by_name()["two-filament-plate"]
+    assert dmi.scope == "object" and dmi.set == DMI_KEYS
+    assert "enable_prime_tower" not in dmi.set and "support_interface_speed" not in dmi.set
+    assert plate.scope == "process" and plate.set == {"enable_prime_tower": "1", "independent_support_layer_height": "0"}
+    assert "dual-material-interface" in plate.description and "two-filament-plate" in dmi.description
+
+
+def test_paired_interface_recipes_parse_without_a_scope_warning(tmp_path):
+    d = spec_json(tmp_path)
+    d["process"]["recipes"] = ["petg-functional", "two-filament-plate"]
+    d["plates"][0]["parts"][0]["recipes"] = ["dual-material-interface"]
+    s = Spec.from_json(d)
+    assert s.warnings == ()
+    assert s.process.set["enable_prime_tower"] == "1"
+    assert s.plates[0].parts[0].set["support_interface_filament"] == "2"
+
+
+def test_process_recipe_on_a_part_warns_and_still_applies(tmp_path):
+    d = spec_json(tmp_path)
+    d["plates"][0]["parts"][0]["recipes"] = ["two-filament-plate"]
+    s = Spec.from_json(d)
+    assert s.warnings == (
+        "recipe two-filament-plate is [process] scope; on part a its plate-wide keys "
+        "(enable_prime_tower, independent_support_layer_height) apply to that object only",
+    )
+    assert s.plates[0].parts[0].set["enable_prime_tower"] == "1"  # soft: the keys stay
+
+
+def test_object_recipe_in_process_recipes_warns_and_still_applies(tmp_path):
+    d = spec_json(tmp_path)
+    d["process"]["recipes"] = ["dual-material-interface"]
+    s = Spec.from_json(d)
+    assert s.warnings == (
+        "recipe dual-material-interface is [object] scope; in process.recipes its keys apply to every object; list it on the parts instead",
+    )
+    assert s.process.set["support_interface_filament"] == "2"
+
+
+def test_scope_warning_names_a_merged_part_and_comes_after_unknown_keys(tmp_path):
+    d = spec_json(tmp_path)
+    d["plates"][0]["parts"][1]["recipes"] = ["pla-light"]
+    d["plates"][0]["parts"][1]["brim_margn"] = 2
+    w = Spec.from_json(d).warnings
+    assert len(w) == 2 and w[0].startswith("plate 1 part 2: unknown key 'brim_margn'")
+    assert w[1].startswith("recipe pla-light is [process] scope; on part label its plate-wide keys (wall_loops, ")
+
+
 # ---------------------------------------------------------------------------- wipe_tower and unknown keys
 X2D_FACTS = {
     "bed": {"x": (0.0, 256.0), "y": (0.0, 256.0)},
