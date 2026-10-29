@@ -127,14 +127,28 @@ to the Generic preset of its material. Single-nozzle firmware reports one extern
 loaded slot as `ams.tray_now` (254 = external, 255 = none, else ams * 4 + slot).
 
 Why this matters (`docs/errors/2026-10-16-loaded-filament-not-used.md`): a spec written for one spool passed
-every check after the spool changed, Studio offered a swap on open, and the swap reset the process to the stock
-preset without a word (5 h 08 against 6 h 34 for the same part). `check` and `build` now read the trays before
+every check after the spool changed, Studio offered a swap on open, and the process came back as the stock
+preset without a word (5 h 08 against 6 h 34 for the same part). Corrected 2026-10-29: the swap did not cause the
+reset. The empty `different_settings_to_system` list did: Studio resets every process key the list does not name
+on any GUI open (next paragraph). `check` and `build` now read the trays before
 resolving the spec: `"preset": "loaded"` takes the spool (an unloaded nozzle is a problem that names the fitted
 spool, never a guess), a pinned preset that differs or cannot be compared is a FAIL unless
 `--allow-filament-mismatch` (which keeps the colour rule), a pinned colour gives way to the spool colour unless the
 spec has a `colour_note`, the nozzle compared follows `filament_map` and the machine preset's extruder count, and
 with the printer unreachable the GUI presets stand in after a WARNING on the first lines of the report, with the
 project's filaments marked unverified.
+
+GUI open drops the process (29 October 2026, `docs/errors/2026-10-29-gui-open-drops-process.md`, spec
+`docs/specs/2026-10-29-gui-preset-bookkeeping.md`): shambu 0.5.1 exported the process as a user preset named after
+`spec.process.name` with `different_settings_to_system` = `["", ...]`. On open, Studio's `load_external_preset`
+(`Preset.cpp:2258-2269`) resets every key the list does not name to the base preset
+(`update_non_diff_values_to_base_config`, `PrintConfig.cpp:9218`), so the GUI showed `0.20mm Standard @BBL X2D` with
+2 walls and 15 % grid, and its re-slice printed that. Per-object settings never pass through presets and survived.
+The fix (0.6.0): every export names the base system preset in `print_settings_id` (and each filament and printer
+slot) and lists the overrides in `different_settings_to_system`; the interface recipe moved to object scope; `shambu
+patch --process-set` and `shambu verify --against` exist. A project with objects still opens unsliced
+(`Plater.cpp:9578-9581`), so the GUI slice is the check against shambu's estimate. The rules with line cites:
+reference 03 section 9.
 
 Pitfalls: Studio holds UDP 2021 (SSDP) while it runs, so discovery probes 8883 instead (`printer discover
 --ssdp 10` listens with SO_REUSEPORT when needed). Newer firmware may need LAN-only mode for third-party MQTT;
