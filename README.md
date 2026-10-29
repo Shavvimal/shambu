@@ -5,6 +5,15 @@
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 
+**Why this exists.** Bambu Studio is a one-plate-at-a-time tool: you arrange, pick a profile, slice, read the
+estimate, and try again. Every variant costs a human a few minutes, so nobody explores more than a handful. shambu
+turns that loop into a command an agent can run many times over, in parallel: the same parts in six orientations,
+by object and by layer, with and without a prime tower, on one plate or two, each slice read back as grams and
+minutes (`shambu sweep` does exactly this). Because it ships as a Claude Code skill, several agents can prepare
+several plates at once, each with its own placement and reach checks, and iterate on the result in a way a person
+in the GUI cannot. Studio stays the place where you look at the plate and press Print; the search for the best plate
+happens before that, at machine speed, with every rule the slicer enforces checked first.
+
 STLs in, a checked Bambu Studio project out. `shambu` drives Bambu Studio's own command line to turn a short
 JSON spec into a `.3mf` project (or a sliced `.gcode.3mf` with time and filament estimates) with the parts placed,
 the process settings applied, the right filament on each part and the plate type set. It also inspects and

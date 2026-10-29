@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- README opens with why the tool exists: agents can sweep orientations, print sequences and tower options in
+  parallel and iterate on plates in a way a person in the Studio GUI cannot; Studio stays the final pass.
+
 ## [0.6.0] - 2026-10-29
 
 A shambu project now opens in Bambu Studio with the process it was sliced with. On 2026-10-29 the owner opened a
