@@ -672,7 +672,7 @@ lost its process on a GUI open (`docs/errors/2026-10-29-gui-open-drops-process.m
 these rules.
 
 **Index layout.** `inherits_group` and `different_settings_to_system` have `num_filaments + 2` entries:
-`[process, filament 1..N, printer]` (`libslic3r/PresetBundle.cpp:3775-3776`, `:3867`, `:3885`, `:3990`).
+`[process, filament 1..N, printer]` (`libslic3r/PresetBundle.cpp:3775-3776`, `:3867`, `:3885`, `:3985`).
 
 **What the GUI does on open.**
 
@@ -726,7 +726,7 @@ key and keep the list right.
 
 **The CLI is not the GUI.** The Studio CLI copies `different_settings_to_system[0]` from an input process JSON only
 for a non-3MF input model (`BambuStudio.cpp:2382-2386`, `:3352-3360`), so shambu sets the list with a patch after the
-export. The CLI never resets values (`update_all` true, `BambuStudio.cpp:3135-3137`): the headless slice always had
+export. The CLI never resets values (`update_all` true, `BambuStudio.cpp:3135-3137`) (it copies every input key, but can change and list a tower key, `BambuStudio.cpp:3388`, `:4182-4208`; hence shambu merges its list with the CLI's): the headless slice always had
 the spec's values.
 
 **Short vectors are padded, not reset.** `filament_map`, `filament_nozzle_map` and `filament_volume_map` with fewer
@@ -734,7 +734,7 @@ entries than filaments are padded on load (`Plater.cpp:~8935-8948`); `extruder_a
 (`PresetBundle.cpp:3827-3831`). A short vector never triggers the reset (F5 of the 29 October post-mortem is not a
 fault).
 
-**Include order.** Studio resolves a system preset as: the flattened parent (`PresetBundle.cpp:5108`), then the
+**Include order.** Studio resolves a system preset as: the flattened parent (`PresetBundle.cpp:5108-5109`), then the
 `include` template keys that differ from the collection default (`:5141-5143`), then the leaf's own keys
 (`:5158`). The leaf wins over the template, the template over the ancestors. shambu's `presets.resolve()` follows
 that order from 0.6.0; it applies every template key (it has no default table).

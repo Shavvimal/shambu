@@ -112,7 +112,7 @@ A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate ta
 
 ```
 shambu inspect project.3mf                           # process <base> (+N overrides: ...), filaments, objects
-shambu verify project.3mf --against plate.json       # a GUI-saved project against its spec: exit 0 match, 1 differences
+shambu verify project.3mf --against plate.json       # a GUI save against its spec: exit 0 no FAIL, 1 any FAIL, 3 no load
 shambu patch project.3mf --process-set wall_loops=4 --process-set sparse_infill_density=25%   # process keys, override list kept
 shambu patch project.3mf --process-unset wall_loops  # back to the base preset's value
 shambu patch project.3mf --bed-type "Textured PEI Plate" --colours "#1A1A1A,#F0F0F0" --map 1,2 \

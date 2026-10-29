@@ -134,8 +134,10 @@ RECIPES: tuple[Recipe, ...] = (
         "dual-material-interface",
         "object",
         "Support interface in the other material on nozzle 2: Bambu's own X2D values for PLA/PETG pairs, per object. "
-        "Studio's own suggestion dialog writes these keys per object, and the GUI keeps per-object settings across an "
-        "open, while it resets the process values of a preset it cannot find by name "
+        "The interface keys are the ones Studio's own suggestion dialog writes per object (interface filament 2, top z 0, "
+        "spacing 0, rectilinear_interlaced, threshold 35, branch 3 / 7 degrees, raft expansion 5, tree_hybrid), plus "
+        "shambu's tree(auto), build-plate-only off, support_filament 0, support_interface_not_for_body 1 and "
+        "thick_bridges 0. The GUI keeps per-object settings across an open, while it resets the process values of a preset it cannot find by name "
         "(docs/specs/2026-10-29-gui-preset-bookkeeping.md, sections 1 and 5.3). Pair it with `two-filament-plate` in "
         "process.recipes.",
         {

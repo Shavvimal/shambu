@@ -17,10 +17,11 @@ key that list does not name (post-mortem `docs/errors/2026-10-29-gui-open-drops-
 - The preset bookkeeping in every export: `print_settings_id` (and each `filament_settings_id`, the
   `printer_settings_id`) names the base system preset, and `different_settings_to_system[slot]` lists the overrides:
   sorted(the explicit overrides together with every key that differs from the resolved base), merged with any key the
-  CLI listed. Both the sliced and the unsliced export carry it. The GUI shows `<base> (modified)` with the values in
-  place, and a GUI save keeps them. The spec's `process.name` stays the report label.
+  CLI listed. Both the sliced and the unsliced export carry it, and `slice --settings-from` writes the process and
+  printer bookkeeping too. The GUI shows `<base> (modified)` with the values in place, and a GUI save keeps them (read
+  from the Studio source at v02.08.02.61; the live open check is spec section 6). The spec's `process.name` stays the report label.
 - Include order in preset resolution: the leaf's own keys now win over its `include` template, as in Studio
-  (`PresetBundle.cpp:5108`, `:5141-5143`, `:5158`). Three X2D filament values were the template's before:
+  (`PresetBundle.cpp:5108-5109`, `:5141-5143`, `:5158`). Three X2D filament values were the template's before:
   `filament_cooling_before_tower`, `retraction_distances_when_ec`, `slow_down_min_speed`.
 - The hand-back text: open with `shambu open`, confirm the process reads `<base> (modified)` with the override
   values, Slice plate (Studio opens a project with objects unsliced), and the GUI estimate must land within 1 min and
@@ -28,8 +29,7 @@ key that list does not name (post-mortem `docs/errors/2026-10-29-gui-open-drops-
 
 ### Added
 - `shambu verify FILE --against SPEC [--json]`: checks a GUI-saved project against its spec (process id and
-  override list, every process key, filaments, map, bed, sequence, per-object settings, positions). Exit 0 match, 1
-  differences, 3 unreadable; lines prefixed FAIL, WARN, INFO. A filament 2..N saved by the GUI as `<base>(<file>.3mf)`
+  override list, every process key, filaments, map, bed, sequence, per-object settings, positions). Exit 0 when no line is FAIL, 1 on any FAIL line (WARN-only GUI edits exit 0), 3 when the file or spec does not load; lines prefixed FAIL, WARN, INFO. A filament 2..N saved by the GUI as `<base>(<file>.3mf)`
   passes when its values match.
 - `shambu patch FILE --process-set KEY=VALUE` and `--process-unset KEY`: change a process key and keep the override
   list right.
@@ -40,12 +40,12 @@ key that list does not name (post-mortem `docs/errors/2026-10-29-gui-open-drops-
   one.
 - A WARN in `check` and `build` when a `[process]` recipe sits on a part or an `[object]` recipe in
   `process.recipes`. The keys still apply.
-- The derived infill keys: `skeleton_infill_density` and `skin_infill_density` follow `sparse_infill_density`, as the
-  GUI does (`Tab.cpp:2105-2111`).
+- The derived infill keys: when the spec or a recipe sets `sparse_infill_density`, `skeleton_infill_density` and
+  `skin_infill_density` follow it, as the GUI does (`Tab.cpp:2105-2111`).
 
 ### Changed
-- `dual-material-interface` is per object (`[object]`), with the keys Studio's own suggestion dialog writes per
-  object; the GUI keeps per-object settings across an open. `enable_prime_tower` moved to `two-filament-plate`.
+- `dual-material-interface` is per object (`[object]`), where Studio's own suggestion dialog writes its interface
+  keys; the GUI keeps per-object settings across an open. `enable_prime_tower` moved to `two-filament-plate`.
 
 ## [0.5.1] - 2026-10-27
 

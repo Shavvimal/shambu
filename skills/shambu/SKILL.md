@@ -64,8 +64,9 @@ send a job. Request: $ARGUMENTS
 Change an existing project with `shambu patch` (object settings, process keys with `--process-set KEY=VALUE` /
 `--process-unset KEY`, bed, colours, map, pauses, names, print sequence, the edits under Commands; `--dry-run`
 first). Patching a sliced file drops its G-code: `shambu slice` again. `patch` does not re-check by-object spacing.
-Check a GUI-saved project against its spec with `shambu verify project.3mf --against plate.json` (exit 0 match, 1
-differences: quote its FAIL lines).
+Check a GUI-saved project against its spec with `shambu verify project.3mf --against plate.json` (exit 0 when no
+line is FAIL, 1 on any FAIL line, WARN-only GUI edits exit 0, 3 when the file or spec does not load; quote its FAIL
+lines).
 
 ## Hand-back (a gate: no reply about a check, build, sweep, patch or slice goes out without it)
 
@@ -84,7 +85,8 @@ Slice: Studio exit 0 | Studio exit <code>: "<quoted log line>" | not sliced (<wh
 Cause (only when something failed): the check line or Studio log line that states it, quoted | "not established"
 Sweep (when run): the table rows that decided the choice, and why.
 Still by hand in Studio: painted supports, brim ear points, variable layer height, <anything the spec cannot say>.
-Next: `shambu open project.3mf`; confirm the process reads `<base> (modified)` with <override values>, the plate type, the colours and (two filaments) filament 2 on the auxiliary nozzle. Slice plate (Studio opens a project with objects unsliced; shambu's G-code is not loaded): the GUI estimate must land within 1 min and 1 g of shambu's, else `shambu verify project.3mf --against plate.json`. Then Preview (Line Type: Overhang wall, Bridge, Support rows; the first layer), then Print.
+Next: `shambu open project.3mf`; confirm `<base> (modified)` with <override values>, plate type, colours, (two filaments) filament 2 on the auxiliary nozzle.
+      Slice plate (it opens unsliced): GUI estimate within 1 min and 1 g of shambu's, else `shambu verify FILE --against SPEC`. Preview (Overhang wall, Bridge, Support; first layer), Print.
 Standing warnings:
 - The first print of any new fit is a coupon or one part, in the same orientation as the feature. A flat coupon cannot qualify a sideways bore.
 - Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores. Every bore that prints horizontal is flagged above.
@@ -174,7 +176,7 @@ shambu patch project.3mf --replace-mesh OBJECT[/PART]=new.stl [--rotate-mesh X,Y
        --add-filament "PRESET[:#RRGGBB][@EXTRUDER]" | --move OBJECT=X,Y[@PLATE] (or +DX,+DY) [--strict] | --tower X,Y[@PLATE]
        --repair-nozzle-stats | --no-verify (skip the verify slice) | --dry-run | -o OUT.3mf
 shambu patch project.3mf --process-set wall_loops=4 [--process-set ...] | --process-unset KEY   # process keys, bookkeeping kept
-shambu verify project.3mf --against plate.json [--json]                # a GUI save against its spec: 0 match, 1 differences, 3 unreadable
+shambu verify project.3mf --against plate.json [--json]                # a GUI save against its spec: 0 no FAIL, 1 any FAIL, 3 no load
 shambu open project.3mf                                                # opens it in Studio for the user (WARN: behind an open window)
 shambu slice FILE.3mf [--plate N] [--no-check] [--tower X,Y[@PLATE]] [--settings-from plate.json]
 shambu studio [--out DIR] -- ARGS...                                   # logged raw Studio call: only with the user's yes
@@ -227,8 +229,6 @@ It never runs Studio's arrange and never rotates a part to pack it.
   `different_settings_to_system` to the base preset (shambu 0.6.0 writes the list; `shambu inspect` shows it).
 - Tell the user to send the file to the printer without opening it in Studio, or to print the embedded G-code
   untouched: the GUI final pass is the requirement.
-- Expect the plate to open sliced in Studio: a project with objects always opens unsliced; the GUI slice is the
-  check against shambu's numbers.
 
 ## References (read when the row says so)
 

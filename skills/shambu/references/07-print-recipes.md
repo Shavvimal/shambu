@@ -259,16 +259,20 @@ Notes on the recipes:
   scope and goes in `process.recipes`. Reason: Studio's own suggestion dialog writes the support keys per object, and
   the GUI keeps per-object settings across an open. Process values of a preset Studio cannot find by name are reset to
   the base unless `different_settings_to_system` names them (reference 03, "Preset bookkeeping Studio honours"). The
-  object key set is the one Studio's suggestion wrote on the owner's `cap_print` object on 2026-10-29.
+  object key set is the suggestion's interface keys (`support_interface_filament 2`, `support_top_z_distance 0`,
+  `support_interface_spacing 0`, `rectilinear_interlaced`, `support_threshold_angle 35`, branch diameter 3 and angle
+  7 degrees, `raft_first_layer_expansion 5`, `tree_hybrid`, as seen on the owner's `cap_print` object on 2026-10-29)
+  plus shambu's own `tree(auto)`, `support_on_build_plate_only 0`, `support_filament 0`,
+  `support_interface_not_for_body 1` and `thick_bridges 0`.
   `independent_support_layer_height` is a global key (`PrintConfig.hpp:1558`, moved from `PrintObjectConfig`): the
-  slicer reads only the process value, so `two-filament-plate` carries it and `dual-material-interface` does not. `support_interface_speed` stays out (a
-  per-nozzle array). `check` and `build` print a WARN when either recipe sits at the other scope; the keys still apply.
-- In `dual-material-interface`, the last three object keys and `independent_support_layer_height` come from the GUI's own
-  suggestion text, found as strings in the binary ("0 top z distance, 0 interface spacing, 0 support/object xy distance,
-  interlaced rectilinear pattern, disable independent support layer height ..."). That suggestion is for soluble and
-  PLA-under-TPU supports. It also sets `support_object_xy_distance` to 0 and puts the interface material in the base too.
-  The notes keep the base in the part material, so the recipe keeps `support_object_xy_distance` at the preset 0.35 and
-  `support_filament` at `"0"`. Treat these three extra keys as unverified for PLA/PETG.
+  slicer reads only the process value, so `two-filament-plate` carries it and `dual-material-interface` does not.
+  `support_interface_speed` stays out (a per-nozzle array). `check` and `build` print a WARN when either recipe sits at the other scope; the keys still apply.
+- Studio's hard-coded suggestion for soluble and PLA-under-TPU supports (`slic3r/GUI/Tab.cpp:2489-2520`) sets top z 0,
+  interface spacing 0, `support_object_xy_distance` 0, the interlaced rectilinear pattern and
+  `independent_support_layer_height` off, and for soluble supports puts the interface material in the base too. For
+  PLA/PETG pairs it reads `support_recommended_params.json` instead. The notes keep the base in the part material, so
+  `dual-material-interface` keeps `support_object_xy_distance` at the preset 0.35 and `support_filament` at `"0"`.
+  `independent_support_layer_height 0` lives in `two-filament-plate`, the only scope the slicer reads it from.
 - `fuzzy-skin-external` values 0.15 / 0.4 are starting values, not from the notes.
 
 ## 3. Facts for the skill text, not for code

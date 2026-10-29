@@ -355,7 +355,7 @@ and `docs/specs/2026-10-29-gui-preset-bookkeeping.md`.
    `presets.PresetResolver.for_cli`), not from a recipe.
 3. **Who writes `project_settings.config`.** The Studio CLI writes it from shambu's preset inputs; shambu
    post-processes it (0.6.0 adds the preset bookkeeping there as a patch).
-4. **The headless slice was right.** The CLI never resets values (`BambuStudio.cpp:3135-3137`, `update_all` true), so
+4. **The headless slice was right.** The CLI never resets values (`BambuStudio.cpp:3135-3137`, `update_all` true) (it copies every input key, but can change and list a tower key, `BambuStudio.cpp:3388`, `:4182-4208`; hence shambu merges its list with the CLI's), so
    shambu's 216 g / 6 h 36 slice had the spec's values. Only the GUI open lost them (`Preset.cpp:2258-2269`).
 5. **"Slice plate" lit is not a shambu fault.** Studio loads the embedded G-code only when the model has no objects
    (`Plater.cpp:9578-9581`), so a project with objects always opens unsliced. The GUI slice is the check.
