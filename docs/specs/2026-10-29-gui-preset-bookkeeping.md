@@ -18,7 +18,7 @@ encode cites its line here so the reference files can carry it.
    presets, then calls `PresetBundle::load_config_model` → `load_config_file_config(name, is_external=true, ...)`
    (`libslic3r/PresetBundle.cpp:3729`).
 2. `load_config_file_config` pads `inherits_group` and `different_settings_to_system` to `num_filaments + 2` entries
-   (`:3775-3776`). Index layout: `[0]` process, `[1..N]` filaments, `[N+1]` printer (`:3867`, `:3885`, `:3990`).
+   (`:3775-3776`). Index layout: `[0]` process, `[1..N]` filaments, `[N+1]` printer (`:3866-3867`, `:3885`, `:3985`).
 3. For the process slot it splits `different_settings_to_system[0]` on `;`, adds the four ignore keys (`inherits`,
    `print_settings_id`, `filament_settings_id`, `printer_settings_id`, `:3250-3253`) and calls
    `PresetCollection::load_external_preset(..., different_keys, LoadAndSelect::Always)` (`:3866-3879`). The guard
@@ -216,8 +216,10 @@ against the `inherits_group[0]` parent. Exit 1 when the key is unknown to the re
 the file, and reports per line: process preset id and diff list (expected vs file), every spec and recipe process
 key (value expected vs in file), each filament preset id and colour, `filament_map` and mode at project and plate
 level, bed type, print sequence, every object's per-object settings against its part's recipes and `set`, and each
-object's position against `at` when the spec gives one (tolerance 0.05 mm). Exit 0 when nothing differs, 1 when
-anything does, 3 on a file that does not load. It reuses `Pipeline.plan()` up to the presets and the existing
+object's position against `at` when the spec gives one (tolerance 0.05 mm). Exit 0 when no FAIL line, 1 on any FAIL, 3 on a file or spec that
+does not load. A key the spec does not set but the GUI changed is a WARN with its file value and does not change the
+exit code: the exit code answers "is the spec honoured", the WARN lines answer "what did the user change" (decided in
+review, 2026-10-29). It reuses `Pipeline.plan()` up to the presets and the existing
 `Project.summary()`; no new parsing. Positions use the existing `summary()["objects"][i]["position"]`.
 
 ### 5.7 `shambu open` focus (F7)
