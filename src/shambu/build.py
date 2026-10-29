@@ -71,7 +71,7 @@ TOWER_KEYS = (
     "enable_prime_tower",
 )  # set by tower planning  # sub-parts whose filament reaches the nozzle
 UNRESOLVED_FILAMENT = "loaded (unresolved)"  # placeholder preset name for a "loaded" slot the printer did not fill
-# The GUI couples these keys to their source when the user edits the source (Tab.cpp:2106-2119, Studio v02.08.02.61),
+# The GUI couples these keys to their source when the user edits the source (Tab.cpp:2106-2111, :2114-2119, Studio v02.08.02.61),
 # so a GUI save of an untouched shambu file writes the same diff list. The skin and skeleton densities change the fill
 # only for the locked-zag pattern (Fill.cpp:307-329).
 GUI_DERIVED_KEYS = {
@@ -93,6 +93,11 @@ def with_gui_derived(overrides: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+def _is_user(preset: Mapping) -> bool:
+    """A user preset (`from: User`; Studio writes "User", older files "user")."""
+    return str(preset.get("from", "")).lower() == "user"
+
+
 def system_base(resolver: P.PresetResolver, kind: str, name: str) -> str:
     """The system preset a preset name stands on: `name` itself, or for a user preset (`from: User`) the first system
     preset up its `inherits` chain. Studio resolves a slot's id by name against its installed library (Preset.cpp:
@@ -102,7 +107,7 @@ def system_base(resolver: P.PresetResolver, kind: str, name: str) -> str:
         seen.append(name)
         raw = resolver.load_raw(kind, name)
         parent = raw.get("inherits")
-        if str(raw.get("from", "")).lower() != "user" or not parent:
+        if not _is_user(raw) or not parent:
             return name
         name = str(parent)
     raise BuildError(f"{kind} preset inherits loop: {' -> '.join(seen + [name])}")
@@ -131,7 +136,7 @@ def _bookkeeping(plan: Plan, resolver: P.PresetResolver) -> list[tuple[str, str,
         if f.get("name") == UNRESOLVED_FILAMENT:
             out.append(("filament", UNRESOLVED_FILAMENT, []))
             continue
-        start = str(f["inherits"]) if f.get("from") == "User" and f.get("inherits") else str(f["name"])
+        start = str(f["inherits"]) if _is_user(f) and f.get("inherits") else str(f["name"])
         base = system_base(resolver, "filament", start)
         out.append(("filament", base, slot_keys(resolver, "filament", base, f, fspec.set)))
     machine_base = system_base(resolver, "machine", spec.printer)
@@ -289,6 +294,8 @@ class Plan:
     # into the export by `SetPresetBookkeeping`, read by the report and the verifier.
     bookkeeping: list[tuple[str, str, list[str]]] = field(default_factory=list)
     filament_resolution: FilamentResolution | None = None  # how each filament was chosen: the printer, the GUI or the spec
+    # What the CLI export named before the bookkeeping patch replaced the names (`Pipeline.patch`); verify() reports it.
+    export_problems: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1670,8 +1677,15 @@ class Pipeline:
 
     def patch(self, plan: Plan, project: Path, sliced: bool = False) -> list[str]:
         ps = self.patch_set(plan, sliced)
-        if Project(str(project)).n_filaments() != len(plan.filaments):
-            # The slot numbers follow the plan's filament count; verify() reports the count that differs.
+        export = Project(str(project))
+        plan.export_problems = self.export_names(plan, export.project_settings)
+        n = len(plan.filaments)
+        n_col, n_ids = len(export.project_settings.get("filament_colour") or []), export.n_filaments()
+        if not sliced:
+            n_col = n  # SetFilamentColours runs before the bookkeeping patches in this set
+        if n_ids != n or (n_col and n_col != n):
+            # The slot numbers follow the plan's filament count, and Studio counts filament_colour
+            # (PresetBundle.cpp:3750-3755): verify() reports the count or the colours that differ.
             ps.patches = [x for x in ps.patches if not isinstance(x, SetPresetBookkeeping)]
         done = ps.apply(str(project))
         self.emit("patched", patches=done)
@@ -1713,6 +1727,7 @@ class Pipeline:
                 probs.append(f"plate {pl['id']} print_sequence is {got_seq!r}, expected {want_seq!r}")
         probs += [f"not re-sliceable by the CLI: {x}" for x in pr.reslice_problems(len(plan.facts["extruders"]))]
         probs += self._verify_tower(plan, ps)
+        probs += plan.export_problems
         probs += self._verify_process_bookkeeping(plan, pr, book)
         if len(s["filaments"]) != len(plan.filaments):
             probs.append(f"{len(s['filaments'])} filaments in file, expected {len(plan.filaments)}")
@@ -1741,6 +1756,20 @@ class Pipeline:
             elif str(ps[k]) != str(v):
                 probs.append(f"process setting {k} is {ps[k]!r} in the file, spec says {v!r}")
         self.emit("verified", problems=probs)
+        return probs
+
+    @staticmethod
+    def export_names(plan: Plan, ps: Mapping) -> list[str]:
+        """The CLI export's preset names against the composed presets it was given, read before the bookkeeping patch
+        writes the system bases over them: a wrong name means the CLI loaded another preset."""
+        probs = []
+        if ps.get("print_settings_id") != plan.process.get("name"):
+            probs.append(f"process in file is {ps.get('print_settings_id')}, expected {plan.process.get('name')} (the CLI export)")
+        names = [f.get("name") for f in plan.filaments]
+        if list(ps.get("filament_settings_id") or []) != names:
+            probs.append(f"filament presets in file are {ps.get('filament_settings_id')}, expected {names} (the CLI export)")
+        if ps.get("printer_settings_id") != plan.machine.get("name"):
+            probs.append(f"printer in file is {ps.get('printer_settings_id')}, expected {plan.machine.get('name')} (the CLI export)")
         return probs
 
     @staticmethod

@@ -994,7 +994,7 @@ class Inspect(Command):
                 stat = f"{ns['key']} {ns['value']!r} has no entry for extruder {f.get('extruder')}"
             else:
                 stat = f"{ns['key']} {f['nozzle_stats']}"
-            n_keys = len(book[f["slot"]]["keys"]) if f["slot"] < len(book) else 0
+            n_keys = next((len(b["keys"]) for b in book if b["kind"] == "filament" and b["slot"] == f["slot"]), 0)
             over = f" (+{n_keys} overrides)" if n_keys else ""
             lines.append(
                 f"filament {f['slot']}: {f['preset']}{over} ({f['type']}) {f['colour'] or ''}, extruder {f.get('extruder')}, {stat}"
@@ -1172,9 +1172,15 @@ class PatchCmd(Command):
             ps.add(ClearObjectSetting(obj, k))
         if a.process_set or a.process_unset:
             name, base = PatchCmd._process_base(a.file, app)
+            other = PatchCmd._other_preset_keys(a.file, app) if a.process_set else None
+            if a.process_set and other is None:
+                log.warning("no printer or filament preset of %s resolves: --process-set cannot tell a process key from them", a.file)
             for x in a.process_set:
                 k, v = x.split("=", 1)
-                ps.add(SetProcessSetting(k.strip(), v, base))
+                k = k.strip()
+                if other is not None and k in other and k not in (base or {}) and k not in recipes.all_keys():
+                    raise ProjectError(f"{k} is a filament/printer setting; `--process-set` takes process keys")
+                ps.add(SetProcessSetting(k, v, base))
             for k in a.process_unset:
                 k = k.strip()
                 if base is None:
@@ -1238,23 +1244,52 @@ class PatchCmd(Command):
 
     @staticmethod
     def _process_base(file: str, app) -> tuple[str, dict | None]:
-        """The file's process preset as the Studio library resolves it: `print_settings_id` when it names an installed
-        preset, else `inherits_group[0]` (a GUI-saved user preset's parent). (the name, None) when neither resolves."""
+        """The preset Studio resets the file's process to on open: `inherits_group[0]` when it is set and resolves
+        (Preset.cpp:2258-2264: with `inherits` the reset target is that parent), else `print_settings_id` (a system
+        preset, :2266-2269). (the name, None) when neither resolves."""
         slot = Project(file).preset_bookkeeping()[0]
-        names = [n for n in (str(slot["id"] or ""), slot["inherits"]) if n]
-        if app is None:
-            return (names[0] if names else "?"), None
-        try:
-            resolver = app.presets()
-        except PresetError as e:  # no profile tree at all: nothing resolves
-            log.warning("no Studio presets to resolve the process base: %s", e)
-            return (names[0] if names else "?"), None
+        names = [n for n in (slot["inherits"], str(slot["id"] or "")) if n]
+        first = names[0] if names else "?"
+        resolver = PatchCmd._resolver(app)
+        if resolver is None:
+            return first, None
         for n in names:
             try:
                 return n, resolver.resolve("process", n)
             except PresetError:
-                log.info("process preset %s is not in the Studio library", n)
-        return (names[0] if names else "?"), None
+                log.warning("process preset %s is not in the Studio library", n)
+        return first, None
+
+    @staticmethod
+    def _resolver(app):
+        if app is None:
+            return None
+        try:
+            return app.presets()
+        except PresetError as e:  # no profile tree at all: nothing resolves
+            log.warning("no Studio presets to resolve against: %s", e)
+            return None
+
+    @staticmethod
+    def _other_preset_keys(file: str, app) -> set[str] | None:
+        """The keys of the file's printer and filament presets as the Studio library resolves them (each by name; one
+        that does not resolve is skipped). None when none resolves."""
+        resolver = PatchCmd._resolver(app)
+        if resolver is None:
+            return None
+        ps = Project(file).project_settings
+        wanted = [("machine", ps.get("printer_settings_id"))] + [("filament", n) for n in ps.get("filament_settings_id") or []]
+        keys: set[str] = set()
+        found = False
+        for kind, name in wanted:
+            if not name:
+                continue
+            try:
+                keys |= set(resolver.resolve(kind, str(name)))
+                found = True
+            except PresetError:
+                log.warning("%s preset %s is not in the Studio library", kind, name)
+        return keys if found else None
 
 
 NO_CHECK_HELP = (
