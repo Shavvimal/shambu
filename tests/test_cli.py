@@ -818,9 +818,12 @@ def test_slice_verb_repairs_an_unsliced_cli_export_first(capsys, tmp_path, monke
 
     src = make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[], extruder_max_nozzle_count=["1", "1"])
     raw = src.read_bytes()
-    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
-    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
     from conftest import MACHINE, PROCESS
+
+    # the export names the loaded presets as the CLI writes them (BambuStudio.cpp:2382-2386), else slice refuses it
+    export = make_3mf(tmp_path / "f.gcode.3mf", sliced=True, print_settings_id=PROCESS, printer_settings_id=MACHINE)
+    studio = SequenceStudio(export, codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
 
     spec = write_spec(tmp_path, printer=MACHINE, process={"base": PROCESS})
     code, out, _ = run(capsys, "--json", "slice", str(src), "--settings-from", str(spec), "-o", str(tmp_path / "o.gcode.3mf"))
