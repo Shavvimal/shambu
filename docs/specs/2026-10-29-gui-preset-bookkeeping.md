@@ -109,7 +109,8 @@ and `wall_loops 4`.
 3. The user's GUI slice of the opened project gives the same grams and minutes as shambu's report (the 29 October
    runs matched to 0.03 g and 1 minute once the settings agreed), so the GUI final pass checks shambu's numbers
    instead of replacing them.
-4. The hand-back says what the GUI will show: the base preset name with "(modified)", the plate unsliced (Studio does
+4. The hand-back says what the GUI will show: the base preset name, shown as modified when any override differs from
+   the base (Studio selects it clean when every value equals the base, `Preset.cpp:2292-2305`), the plate unsliced (Studio does
    not load the embedded G-code of a project with objects), and that a GUI slice must land on shambu's estimate.
 5. A GUI-saved project can be checked against its spec (`shambu verify FILE --against SPEC`), and a process key can be
    patched in place (`shambu patch FILE --process-set KEY=VALUE`) with the bookkeeping kept right.
@@ -226,9 +227,9 @@ review, 2026-10-29). It reuses `Pipeline.plan()` up to the presets and the exist
 
 ### 5.7 `shambu open` focus (F7)
 
-`facade.open_in_studio`: after `open -a BambuStudio FILE`, when `StudioCLI.running_pids()` was non-empty before the
-call, print one WARN line: "Bambu Studio was already running: the project opened in a new window behind the
-current one". No AppleScript keystrokes (rubric item 16). `open -g`/`--new` are not used: Studio is single-instance
+`facade.open_in_studio`: it reads `StudioCLI.running_pids()` before `open -a BambuStudio FILE` and returns the fact;
+the CLI prints one WARN line: "Bambu Studio was already running: check that the front window shows <file name>"
+(where the project lands depends on Studio's `single_instance` setting, `GUI_App.cpp:7711-7722`). No AppleScript keystrokes (rubric item 16). `open -g`/`--new` are not used: Studio is single-instance
 (`single_instance` in its config) and a second instance is refused.
 
 ### 5.8 Include precedence (section 3 item 1)
@@ -287,7 +288,7 @@ entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density
   `verify()` passes; a fake export missing one list key fails with the key named.
 - `test_cli.py`: `patch --process-set wall_loops=4` on the fixture: value and list updated, slice invalidated;
   `--process-unset` restores the base value; `verify --against` exit codes 0 and 1 with one line per difference.
-- `test_pipeline.py`: the hand-back text contains "(modified)", the diff keys, "opens unsliced", and never
+- `test_pipeline.py`: the hand-back text names the base, the diff keys with values, "opens unsliced", and never
   "Re-slice in Studio after any change", "SD card" or "Device tab".
 - `test_spec.py`: the scope WARN for a mis-scoped recipe; `dual-material-interface` is `[object]`.
 
