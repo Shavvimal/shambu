@@ -34,7 +34,7 @@ from .edits import (
     SetTower,
 )
 from .errors import BambuError, BuildError, ConfError, PresetError, PrinterError, ProjectError, StudioError
-from .facade import Bambu
+from .facade import Bambu, OpenResult
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
     AddCustomGcode,
@@ -961,11 +961,13 @@ class Build(Command):
         doc, lines = r.to_json(), r.report.splitlines()
         if a.open and r.run and r.run.ok:
             try:  # before the output, so a failed open lands in the one JSON document
-                app.open_in_studio(r.project)
+                opened = app.open_in_studio(r.project)
             except StudioError as e:
                 doc["open_error"] = f"StudioError: {e}"
                 out.emit(doc, [*lines, f"StudioError: {e}"])
                 return 3
+            doc["open_already_running"] = opened.already_running
+            warn_open_behind(opened)
         out.emit(doc, lines)
         return 0 if r.ok else 1
 
@@ -1400,9 +1402,21 @@ class Open(Command):
         p.add_argument("file")
 
     def run(self, a, app, out):
-        app.open_in_studio(a.file)
-        out.emit({"opened": a.file}, [f"opened {a.file} in Bambu Studio"])
+        opened = app.open_in_studio(a.file)
+        warn_open_behind(opened)
+        out.emit({"opened": a.file, "already_running": opened.already_running}, [f"opened {a.file} in Bambu Studio"])
         return 0
+
+
+OPEN_ALREADY_RUNNING = "WARN: Bambu Studio was already running: check that the front window shows {name}"
+
+
+def warn_open_behind(opened: OpenResult) -> None:
+    """The one WARN line on stderr (stdout keeps the one document) when Studio ran before `open`: the project can open
+    in a window behind the current one (a running process proves no window order), and on 29 October the user read
+    the old window's grams as the new file's."""
+    if opened.already_running:
+        print(OPEN_ALREADY_RUNNING.format(name=Path(opened.path).name), file=sys.stderr)
 
 
 @command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw | login | list | forget")
@@ -1832,3 +1846,35 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     except KeyboardInterrupt:
         return 130
+
+
+# ---------------------------------------------------------------------------- verify (registered at import, like the rest)
+@command(
+    "verify",
+    "Compare a project (a Bambu Studio save) with the spec it was built from: preset ids and override lists, every spec "
+    "setting, filaments, maps, bed type, print sequence, per-object settings and positions. No Studio run, no STL needed",
+)
+class Verify(Command):
+    def configure(self, p):
+        p.add_argument("file", help="the .3mf or .gcode.3mf to check, e.g. the project after a save in Bambu Studio")
+        p.add_argument(
+            "--against",
+            required=True,
+            metavar="SPEC",
+            help="the spec JSON the project was built from (or the build's shambu/spec.json); presets are composed from it, as the build does",
+        )
+        p.epilog = (
+            "Save the project in Studio first (File > Save project as): changes made on open live in memory until then. "
+            "One line per item that is not as expected: FAIL a value differs or Studio resets it on open, WARN a key the "
+            "spec does not set changed in the GUI (with its file value) or other bookkeeping, INFO a fact the spec does "
+            "not decide. Exit 0 no FAIL, 1 any FAIL or a spec that does not load, 2 usage, 3 a project file that does "
+            "not read or a preset the Studio library lacks."
+        )
+
+    def run(self, a, app, out):
+        spec = load_spec_or_error(a.against, out)
+        if isinstance(spec, int):
+            return spec
+        rep = app.verify(a.file, spec, a.against)
+        out.emit(rep.to_json(), [x.text() for x in rep.lines] + [rep.last_line()])
+        return 0 if rep.ok else 1

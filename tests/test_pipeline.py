@@ -264,3 +264,69 @@ def test_supported_part_gets_the_support_spread(tmp_path, stls, resolver):
     plan = pipeline(resolver, studio).plan(one_part_spec(tmp_path, stls["body"]))
     p = plan.plates[0].parts[0].placed
     assert p.brim == pytest.approx(5.2) and p.spread.source == "none"  # no supports: the brim only
+
+
+# ---------------------------------------------------------------------------- hand-back (spec 2026-10-29 section 5.5)
+def _sliced_report(tmp_path, stls, resolver, cli_export, bookkeeping=None, **spec_over):
+    from shambu import report
+
+    r = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls, **spec_over))
+    if bookkeeping is not None:
+        r.plan.bookkeeping = bookkeeping
+    r.sliced = True
+    r.verify_problems = []  # the fixture file keeps the CLI's values; this test reads the text, not the file
+    r.summary = {
+        "plates": [
+            {"id": 1, "slice": {"prediction_s": 23400 + 1260, "weight_g": 212.4, "warnings": "", "filaments": [], "support_used": "false"}}
+        ]
+    }
+    return report.render(r)
+
+
+def test_handback_names_the_modified_base_and_every_override(tmp_path, stls, resolver, cli_export):
+    bk = [("process", PROCESS, ["sparse_infill_density", "wall_loops"]), ("filament", "Test PLA", []), ("filament", "Test PLA", [])]
+    text = _sliced_report(
+        tmp_path,
+        stls,
+        resolver,
+        cli_export,
+        bk,
+        process={"base": PROCESS, "name": PROCESS_NAME, "set": {"wall_loops": "4", "sparse_infill_density": "25%"}},
+    )
+    steps = text.split("## Owner steps in Bambu Studio")[1]
+    assert "`shambu open" in steps
+    assert f"`{PROCESS} (modified)`" in steps
+    assert "wall_loops = 4" in steps and "sparse_infill_density = 25%" in steps
+    assert "opens unsliced" in steps and "Plater.cpp:9578-9581" in steps
+    assert "6 h 51 min, 212.4 g" in steps and "within 1 min and 1 g" in steps
+    assert "shambu verify" in steps and "--against" in steps and "a setting changed on open" in steps
+    assert "filament 2 on the auxiliary (right) nozzle" in steps and "Leave the Filament grouping dialog alone" in steps
+    assert "File > Save project as" in steps and "-checked.3mf" in steps and "Do not Print until it exits 0" in steps
+    assert "type the key into the tab's search box" in steps
+    assert (
+        steps.split("## Standing warnings")[0]
+        .rstrip()
+        .endswith("Print only when the GUI estimate matched, or `shambu verify` on the saved copy passed.")
+    )
+    assert f"process `{PROCESS}` + 2 override(s) (sparse_infill_density, wall_loops)" in text
+
+
+def test_handback_without_bookkeeping_falls_back_to_the_spec_set(tmp_path, stls, resolver, cli_export):
+    text = _sliced_report(tmp_path, stls, resolver, cli_export)
+    assert f"`{PROCESS} (modified)`" in text and "wall_loops = 2" in text
+
+
+def test_handback_never_promises_what_the_gui_does_not_do(tmp_path, stls, resolver, cli_export):
+    for text in (
+        _sliced_report(tmp_path, stls, resolver, cli_export),
+        pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls)).report,
+    ):
+        assert "Re-slice in Studio after any change" not in text
+        assert "SD card" not in text and "Device tab" not in text
+    unsliced = pipeline(resolver, FakeStudio(cli_export)).build(make_spec(tmp_path, stls)).report
+    assert "compare the GUI estimate with a `shambu slice` of the same file" in unsliced
+
+
+def test_handback_unmodified_process_has_no_modified_suffix(tmp_path, stls, resolver, cli_export):
+    text = _sliced_report(tmp_path, stls, resolver, cli_export, [("process", PROCESS, [])])
+    assert f"The process combo shows `{PROCESS}` (no process overrides)" in text and "(modified)" not in text
