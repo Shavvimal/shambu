@@ -301,7 +301,13 @@ def test_handback_names_the_modified_base_and_every_override(tmp_path, stls, res
     assert "6 h 51 min, 212.4 g" in steps and "within 1 min and 1 g" in steps
     assert "shambu verify" in steps and "--against" in steps and "a setting changed on open" in steps
     assert "filament 2 on the auxiliary (right) nozzle" in steps and "Leave the Filament grouping dialog alone" in steps
-    assert steps.rstrip().split("## Standing warnings")[0].rstrip().endswith("Print.")
+    assert "File > Save project as" in steps and "-checked.3mf" in steps and "Do not Print until it exits 0" in steps
+    assert "type the key into the tab's search box" in steps
+    assert (
+        steps.split("## Standing warnings")[0]
+        .rstrip()
+        .endswith("Print only when the GUI estimate matched, or `shambu verify` on the saved copy passed.")
+    )
     assert f"process `{PROCESS}` + 2 override(s) (sparse_infill_density, wall_loops)" in text
 
 

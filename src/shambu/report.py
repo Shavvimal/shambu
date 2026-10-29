@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import conf
@@ -187,7 +188,10 @@ def owner_steps(r: BuildResult) -> list[str]:
     steps = [f'Open the project with `shambu open "{r.project}"`.']
     if keys:
         vals = ", ".join(f"{k} = {pl.process.get(k, spec.process.set.get(k, '?'))}" for k in keys)
-        steps.append(f"The process combo shows `{base} (modified)`. Open its tab and confirm: {vals}.")
+        steps.append(
+            f"The process combo shows `{base} (modified)`. Open its tab and confirm each value (type the key into the tab's search "
+            f"box: the tab shows labels, not keys): {vals}."
+        )
     else:
         steps.append(f"The process combo shows `{base}` (no process overrides).")
     check = f"Confirm the plate type ({spec.bed_type}) and the filament colours"
@@ -199,6 +203,14 @@ def owner_steps(r: BuildResult) -> list[str]:
             f", and that the Filament grouping shows {where}. Leave the Filament grouping dialog alone unless it shows the wrong nozzle"
         )
     steps.append(check + ".")
+    proj = Path(str(r.project))
+    saved = proj.with_name(f"{proj.name.split('.')[0]}-checked.3mf")
+    # Studio holds what it changed on open in memory: verifying the export would check the unchanged file
+    fallback = (
+        f"save the project in Studio under a new name (File > Save project as, e.g. `{saved.name}`), then run "
+        f'`shambu verify "{saved}" --against {against}`, which lists the settings that differ. Do not Print until it '
+        "exits 0 or every FAIL line is one you intended."
+    )
     est = r.estimates() if r.sliced else []
     if est:
         figures = "; ".join(
@@ -207,18 +219,17 @@ def owner_steps(r: BuildResult) -> list[str]:
         steps.append(
             "Slice plate: Studio does not load shambu's embedded G-code for a project with objects (Plater.cpp:9578-9581 at "
             f"v02.08.02.61), so the plate opens unsliced. The GUI estimate must land within 1 min and 1 g of {figures} above. "
-            "If it does not, a setting changed on open: stop and run "
-            f'`shambu verify "{r.project}" --against {against}`, which lists the settings that differ.'
+            "If it does not, a setting changed on open: " + fallback
         )
     else:
         steps.append(
             "Slice plate, then compare the GUI estimate with a `shambu slice` of the same file: they must agree within 1 min and 1 g. "
-            f'If they do not, a setting changed on open: run `shambu verify "{r.project}" --against {against}`.'
+            "If they do not, a setting changed on open: " + fallback
         )
     steps.append(
         "In Preview, set the colour scheme to Line Type and look at the Overhang wall, Bridge and Support rows and at the first layer."
     )
-    steps.append("Print.")
+    steps.append("Print only when the GUI estimate matched, or `shambu verify` on the saved copy passed.")
     return [f"{i}. {t}" for i, t in enumerate(steps, 1)]
 
 
