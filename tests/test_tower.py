@@ -612,7 +612,7 @@ def test_placement_takes_a_clearance_binding():
 
 
 # ---------------------------------------------------------------------------- review round 2
-def recipe_spec(tmp_path, plates, recipes=("dual-material-interface",), **process_set) -> Spec:
+def recipe_spec(tmp_path, plates, recipes=("dual-material-interface", "two-filament-plate"), **process_set) -> Spec:
     return Spec.from_json(
         {
             "name": "towers",

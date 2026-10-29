@@ -33,8 +33,8 @@ from .edits import (
     ReplaceMesh,
     SetTower,
 )
-from .errors import BambuError, BuildError, ConfError, PrinterError, ProjectError, StudioError
-from .facade import Bambu
+from .errors import BambuError, BuildError, ConfError, PresetError, PrinterError, ProjectError, StudioError
+from .facade import Bambu, OpenResult
 from .mesh import DEFAULT_THRESHOLD
 from .patches import (
     AddCustomGcode,
@@ -50,11 +50,14 @@ from .patches import (
     SetHeightRange,
     SetObjectSetting,
     SetPrintSequence,
+    SetProcessSetting,
+    UnsetProcessSetting,
 )
 from .profiles import ProfileSet
 from .report import checks_skipped_lines, estimate_lines
 from .spec import Spec
 from .studio import CliCommand
+from .threemf import Project
 
 log = logging.getLogger("shambu")
 _REGISTRY: dict[str, Command] = {}
@@ -958,11 +961,13 @@ class Build(Command):
         doc, lines = r.to_json(), r.report.splitlines()
         if a.open and r.run and r.run.ok:
             try:  # before the output, so a failed open lands in the one JSON document
-                app.open_in_studio(r.project)
+                opened = app.open_in_studio(r.project)
             except StudioError as e:
                 doc["open_error"] = f"StudioError: {e}"
                 out.emit(doc, [*lines, f"StudioError: {e}"])
                 return 3
+            doc["open_already_running"] = opened.already_running
+            warn_open_behind(opened)
         out.emit(doc, lines)
         return 0 if r.ok else 1
 
@@ -974,9 +979,12 @@ class Inspect(Command):
 
     def run(self, a, app, out):
         s = app.inspect(a.file, features=out.as_json)  # only --json shows grams by feature, so only it parses the G-code
+        book = s.get("preset_bookkeeping") or []
+        listed = book[0]["keys"] if book else []
+        proc = f"{s['process']} (+{len(listed)} overrides: {';'.join(listed)})" if listed else f"{s['process']}"
         lines = [
             f"{a.file}: {s['application']}, {'SLICED' if s['sliced'] else 'unsliced'}",
-            f"printer {s['printer']}; process {s['process']}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']}); "
+            f"printer {s['printer']}; process {proc}; bed {s['bed_type']}; map {s['filament_map']} ({s['filament_map_mode']}); "
             f"print sequence {s.get('print_sequence') or 'not set (by layer)'}",
         ]
         lines += [f"not re-sliceable by the CLI: {x}" for x in s.get("reslice_problems") or []]
@@ -988,7 +996,11 @@ class Inspect(Command):
                 stat = f"{ns['key']} {ns['value']!r} has no entry for extruder {f.get('extruder')}"
             else:
                 stat = f"{ns['key']} {f['nozzle_stats']}"
-            lines.append(f"filament {f['slot']}: {f['preset']} ({f['type']}) {f['colour'] or ''}, extruder {f.get('extruder')}, {stat}")
+            n_keys = next((len(b["keys"]) for b in book if b["kind"] == "filament" and b["slot"] == f["slot"]), 0)
+            over = f" (+{n_keys} overrides)" if n_keys else ""
+            lines.append(
+                f"filament {f['slot']}: {f['preset']}{over} ({f['type']}) {f['colour'] or ''}, extruder {f.get('extruder')}, {stat}"
+            )
         for p in s["plates"]:
             lines.append(
                 f"plate {p['id']} '{p['name']}': bed {p['bed_type'] or 'project default'}, map {p['filament_maps'] or 'project default'}, "
@@ -1039,6 +1051,20 @@ class PatchCmd(Command):
         p.add_argument("--map", help="comma list of extruder per filament, e.g. 1,2")
         p.add_argument("--set", action="append", default=[], metavar="OBJECT:KEY=VALUE", help="per-object setting")
         p.add_argument("--unset", action="append", default=[], metavar="OBJECT:KEY")
+        p.add_argument(
+            "--process-set",
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            help="project-wide process setting, listed in the process preset's overrides so Studio keeps it on open",
+        )
+        p.add_argument(
+            "--process-unset",
+            action="append",
+            default=[],
+            metavar="KEY",
+            help="restore a process setting to the base preset's value (needs the base preset in the Studio library)",
+        )
         p.add_argument("--extruder", action="append", default=[], metavar="OBJECT[/PART]:N")
         p.add_argument("--range", action="append", default=[], metavar="OBJECT:MIN-MAX:KEY=VALUE[,KEY=VALUE]")
         p.add_argument("--pause", action="append", default=[], metavar="PLATE:Z")
@@ -1146,6 +1172,25 @@ class PatchCmd(Command):
         for x in a.unset:
             obj, k = x.split(":", 1)
             ps.add(ClearObjectSetting(obj, k))
+        if a.process_set or a.process_unset:
+            name, base = PatchCmd._process_base(a.file, app)
+            other = PatchCmd._other_preset_keys(a.file, app) if a.process_set else None
+            if a.process_set and other is None:
+                log.warning("no printer or filament preset of %s resolves: --process-set cannot tell a process key from them", a.file)
+            for x in a.process_set:
+                k, v = x.split("=", 1)
+                k = k.strip()
+                if other is not None and k in other and k not in (base or {}) and k not in recipes.all_keys():
+                    raise ProjectError(f"{k} is a filament/printer setting; `--process-set` takes process keys")
+                ps.add(SetProcessSetting(k, v, base))
+            for k in a.process_unset:
+                k = k.strip()
+                if base is None:
+                    raise ProjectError(f"process preset {name} is not in the Studio library; cannot restore {k}")
+                if k not in base:
+                    raise ProjectError(f"process preset {name} does not define {k}; cannot restore {k}")
+                v = base[k]
+                ps.add(UnsetProcessSetting(k, tuple(str(e) for e in v) if isinstance(v, list) else str(v), base))
         for x in a.extruder:
             obj, n = x.rsplit(":", 1)
             o, _, part = obj.partition("/")
@@ -1198,6 +1243,55 @@ class PatchCmd(Command):
         for x in a.tower:
             ps.add(SetTower(*_tower_arg(x)))
         return ps
+
+    @staticmethod
+    def _process_base(file: str, app) -> tuple[str, dict | None]:
+        """The preset Studio resets the file's process to on open: `inherits_group[0]` when it is set and resolves
+        (Preset.cpp:2258-2264: with `inherits` the reset target is that parent), else `print_settings_id` (a system
+        preset, :2266-2269). (the name, None) when neither resolves."""
+        slot = Project(file).preset_bookkeeping()[0]
+        names = [n for n in (slot["inherits"], str(slot["id"] or "")) if n]
+        first = names[0] if names else "?"
+        resolver = PatchCmd._resolver(app)
+        if resolver is None:
+            return first, None
+        for n in names:
+            try:
+                return n, resolver.resolve("process", n)
+            except PresetError:
+                log.warning("process preset %s is not in the Studio library", n)
+        return first, None
+
+    @staticmethod
+    def _resolver(app):
+        if app is None:
+            return None
+        try:
+            return app.presets()
+        except PresetError as e:  # no profile tree at all: nothing resolves
+            log.warning("no Studio presets to resolve against: %s", e)
+            return None
+
+    @staticmethod
+    def _other_preset_keys(file: str, app) -> set[str] | None:
+        """The keys of the file's printer and filament presets as the Studio library resolves them (each by name; one
+        that does not resolve is skipped). None when none resolves."""
+        resolver = PatchCmd._resolver(app)
+        if resolver is None:
+            return None
+        ps = Project(file).project_settings
+        wanted = [("machine", ps.get("printer_settings_id"))] + [("filament", n) for n in ps.get("filament_settings_id") or []]
+        keys: set[str] = set()
+        found = False
+        for kind, name in wanted:
+            if not name:
+                continue
+            try:
+                keys |= set(resolver.resolve(kind, str(name)))
+                found = True
+            except PresetError:
+                log.warning("%s preset %s is not in the Studio library", kind, name)
+        return keys if found else None
 
 
 NO_CHECK_HELP = (
@@ -1308,9 +1402,21 @@ class Open(Command):
         p.add_argument("file")
 
     def run(self, a, app, out):
-        app.open_in_studio(a.file)
-        out.emit({"opened": a.file}, [f"opened {a.file} in Bambu Studio"])
+        opened = app.open_in_studio(a.file)
+        warn_open_behind(opened)
+        out.emit({"opened": a.file, "already_running": opened.already_running}, [f"opened {a.file} in Bambu Studio"])
         return 0
+
+
+OPEN_ALREADY_RUNNING = "WARN: Bambu Studio was already running: check that the front window shows {name}"
+
+
+def warn_open_behind(opened: OpenResult) -> None:
+    """The one WARN line on stderr (stdout keeps the one document) when Studio ran before `open`: the project can open
+    in a window behind the current one (a running process proves no window order), and on 29 October the user read
+    the old window's grams as the new file's."""
+    if opened.already_running:
+        print(OPEN_ALREADY_RUNNING.format(name=Path(opened.path).name), file=sys.stderr)
 
 
 @command("printer", "Read the printer over LAN MQTT (read-only): status | filaments | watch | discover | raw | login | list | forget")
@@ -1740,3 +1846,35 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     except KeyboardInterrupt:
         return 130
+
+
+# ---------------------------------------------------------------------------- verify (registered at import, like the rest)
+@command(
+    "verify",
+    "Compare a project (a Bambu Studio save) with the spec it was built from: preset ids and override lists, every spec "
+    "setting, filaments, maps, bed type, print sequence, per-object settings and positions. No Studio run, no STL needed",
+)
+class Verify(Command):
+    def configure(self, p):
+        p.add_argument("file", help="the .3mf or .gcode.3mf to check, e.g. the project after a save in Bambu Studio")
+        p.add_argument(
+            "--against",
+            required=True,
+            metavar="SPEC",
+            help="the spec JSON the project was built from (or the build's shambu/spec.json); presets are composed from it, as the build does",
+        )
+        p.epilog = (
+            "Save the project in Studio first (File > Save project as): changes made on open live in memory until then. "
+            "One line per item that is not as expected: FAIL a value differs or Studio resets it on open, WARN a key the "
+            "spec does not set changed in the GUI (with its file value) or other bookkeeping, INFO a fact the spec does "
+            "not decide. Exit 0 no FAIL, 1 any FAIL or a spec that does not load, 2 usage, 3 a project file that does "
+            "not read or a preset the Studio library lacks."
+        )
+
+    def run(self, a, app, out):
+        spec = load_spec_or_error(a.against, out)
+        if isinstance(spec, int):
+            return spec
+        rep = app.verify(a.file, spec, a.against)
+        out.emit(rep.to_json(), [x.text() for x in rep.lines] + [rep.last_line()])
+        return 0 if rep.ok else 1

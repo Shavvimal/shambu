@@ -28,10 +28,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import presets as P
-from .build import DEFAULT_COLOURS, _estimate, sliced_problems, summarise, two_pass_slice, verify_tower
+from .build import (
+    DEFAULT_COLOURS,
+    _as_text,
+    _estimate,
+    sliced_problems,
+    slot_keys,
+    summarise,
+    system_base,
+    two_pass_slice,
+    verify_tower,
+    with_gui_derived,
+)
 from .edits import AddFilament, EditError, EditSet, FilamentSlot, SetTower, check_preset, slot_from_export, slot_from_preset, slot_presets
-from .errors import BambuError, FileError, StudioError
-from .patches import PatchSet, RepairNozzleStats
+from .errors import BambuError, FileError, ProjectError, StudioError
+from .patches import PatchSet, RepairNozzleStats, SetPresetBookkeeping
 from .spec import Spec
 from .studio import NO_PAIR, CliCommand, RunResult, StudioCLI, conflict_phrase, conflicts_in_log
 from .threemf import Project
@@ -246,11 +257,33 @@ def slice_project(
         if inp != src:
             inp.unlink(missing_ok=True)
         inp = rep
+    bookkeeping: list[tuple[str, list[str]]] = []  # (base, keys) for the process and the printer slot
+    asked: dict[str, object] = {}  # what the export must hold before the bookkeeping patch renames its presets
     if settings_from is not None:
         machine = resolver.for_cli("machine", settings_from.printer)
-        process = resolver.for_cli("process", settings_from.process.base, settings_from.process.set, settings_from.process.name)
+        overrides = with_gui_derived(settings_from.process.set)
+        process = resolver.for_cli("process", settings_from.process.base, overrides, settings_from.process.name)
         loads = [P.write(machine, work / "machine.json"), P.write(process, work / "process.json")]
+        # filament_prime_volume goes on the command line in every pass, so the export holds that value, not the JSON's
+        asked = {
+            "print_settings_id": process["name"],
+            "printer_settings_id": machine["name"],
+            **{k: process.get(k, v) for k, v in sorted(overrides.items()) if not (prime and k == "filament_prime_volume")},
+        }
         notes.append(f"settings: machine {machine['name']}, process {process['name']}; the project's filaments kept")
+        # The CLI writes print_settings_id from the JSON's name and copies no diff list from a 3MF input
+        # (BambuStudio.cpp:2382-2386, :3352-3360): the export names the system bases and lists the keys (spec
+        # 2026-10-29 section 5.1), else Studio resets the process to its base on open (Preset.cpp:2258-2269).
+        # The input's own lists stay listed: the CLI applies only the supplied preset's keys over the input's config
+        # (update_full_config, BambuStudio.cpp:3132-3137, :3352-3360), so a GUI-listed key the preset does not define
+        # keeps the input's value in the slice and must stay listed, or the GUI resets it on open.
+        book_in = project.preset_bookkeeping()
+        proc_base = system_base(resolver, "process", settings_from.process.base)
+        machine_base = system_base(resolver, "machine", settings_from.printer)
+        bookkeeping = [
+            (proc_base, sorted({*slot_keys(resolver, "process", proc_base, process, overrides), *book_in[0]["keys"]})),
+            (machine_base, sorted({*slot_keys(resolver, "machine", machine_base, machine), *book_in[-1]["keys"]})),
+        ]
 
     def make(nc: bool, pl: int, outdir: Path) -> CliCommand:
         cmd = CliCommand(inputs=[str(inp)])
@@ -276,6 +309,23 @@ def slice_project(
     if inp != src:
         inp.unlink(missing_ok=True)
     estimates: list[dict] = []
+    export_problems: list[str] = []
+    if rr.ok and asked:
+        try:  # before the bookkeeping patch writes the system bases over the names the CLI wrote
+            export_problems = settings_problems(Project(str(tmp_dest)).project_settings, asked)
+        except BambuError as e:
+            raise EditError(f"Studio exited 0 but its export {tmp_dest} does not read back ({e}); {dest} is unchanged") from e
+    if rr.ok and bookkeeping and not export_problems:  # names and lists only: the G-code and its MD5 stay as Studio wrote them
+        (proc_base, proc_keys), (machine_base, machine_keys) = bookkeeping
+        try:
+            n = Project(str(tmp_dest)).studio_filament_count()
+        except ProjectError as e:  # an ambiguous slot count: writing slots by a guess could name the wrong preset
+            notes.append(f"WARN: preset bookkeeping not written ({e}); Studio resets the process to its base on open")
+        else:
+            PatchSet(
+                [SetPresetBookkeeping(0, proc_base, tuple(proc_keys)), SetPresetBookkeeping(n + 1, machine_base, tuple(machine_keys))]
+            ).apply(str(tmp_dest))
+            notes.append(f"preset bookkeeping: process {proc_base} + {len(proc_keys)} overrides")
     if rr.ok:
         try:  # read the export back before it replaces anything
             s = summarise(tmp_dest, rr)
@@ -285,7 +335,8 @@ def slice_project(
         estimates = [_estimate(pl, by_id.get(pl["id"])) for pl in s["plates"] if pl.get("slice")]
         back = Project(str(tmp_dest))
         wanted = {plate} if plate else set(range(1, max(n_plates, 1) + 1))  # from the input, not the export
-        problems = sliced_problems(back, back.summary(features=False), wanted)  # an unsliced "success" never replaces dest
+        # an unsliced "success", or an export of another config, never replaces dest
+        problems = export_problems + sliced_problems(back, back.summary(features=False), wanted)
         problems += [f"not re-sliceable by the CLI: {x}" for x in back.reslice_problems(n_ext)]
         spots = {i: (tower[0], tower[1]) for i in range(n_plates) if tower[2] in (None, i + 1)} if tower else {}
         problems += verify_tower(back.project_settings, n_plates, {}, spots, "--tower")
@@ -300,6 +351,25 @@ def slice_project(
         notes.append(f"filament_prime_volume pinned to the project's {prime} in every pass (Studio resets it to 45 on a checked slice)")
     notes.append(f"logs and Studio's result.json: {work}")
     return res
+
+
+def settings_problems(ps: dict, asked: dict[str, object]) -> list[str]:
+    """The CLI export of `slice --settings-from` against the presets it was given: the CLI writes `print_settings_id`
+    and `printer_settings_id` from the loaded JSONs' names (BambuStudio.cpp:2382-2386) and applies the loaded keys over
+    the input's config (BambuStudio.cpp:3352-3360), so another name or another value of an explicit process key means
+    the CLI sliced another config than the one asked for."""
+    probs = []
+    for key, what in (("print_settings_id", "process"), ("printer_settings_id", "printer")):
+        if key in asked and ps.get(key) != asked[key]:
+            probs.append(f"the export's {what} is {ps.get(key)!r}, the slice asked for {asked[key]!r} ({key})")
+    for k, v in asked.items():
+        if k in ("print_settings_id", "printer_settings_id"):
+            continue
+        if k not in ps:
+            probs.append(f"the export lacks process setting {k}, the slice asked for {v!r}")
+        elif _as_text(ps[k]) != _as_text(v):
+            probs.append(f"the export's process setting {k} is {ps[k]!r}, the slice asked for {v!r}")
+    return probs
 
 
 def slice_fails(rr: RunResult, project: Project) -> list[str]:

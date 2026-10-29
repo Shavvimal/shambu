@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import conf
@@ -153,6 +154,88 @@ def orientation_text(x: PlannedPart) -> str:
     )
 
 
+def _process_slot(r: BuildResult) -> tuple[str, list[str]]:
+    """The process combo's base preset and the keys Studio keeps on open: `plan.bookkeeping[0]` when the plan filled
+    it, else the spec's base and its `set` keys (a plan from before the bookkeeping, or a test plan)."""
+    pl = r.plan
+    if pl.bookkeeping:
+        _, base, keys = pl.bookkeeping[0]
+        return base, sorted(keys)
+    return pl.spec.process.base, sorted(pl.spec.process.set)
+
+
+def _process_claim(r: BuildResult) -> str:
+    """The process part of the `verified:` line: the base preset and the override list the file carries."""
+    base, keys = _process_slot(r)
+    return f"process `{base}` + {len(keys)} override(s)" + (f" ({', '.join(keys)})" if keys else "")
+
+
+def _hm(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600} h {s % 3600 // 60} min"
+
+
+def owner_steps(r: BuildResult) -> list[str]:
+    """The numbered steps for the user's final pass in the GUI, written for what Studio 02.08 does on open
+    (spec 2026-10-29 section 5.5): the process combo names `<base>` with the listed keys kept (Preset.cpp:2258-2269
+    and :2330-2345 at v02.08.02.61). It shows the base as modified only when a listed value differs from the base:
+    Studio selects the preset clean when every value equals it (Preset.cpp:2292-2305), and the exporter lists the
+    explicit keys even when they equal shambu's base, so the step checks the values, not the suffix. A project with
+    objects opens unsliced because Studio loads the embedded G-code only when the model has no objects
+    (Plater.cpp:9578-9581). The GUI slice is therefore the check, and it must land on this report's estimate."""
+    pl, spec = r.plan, r.plan.spec
+    base, keys = _process_slot(r)
+    spec_path = r.inputs.get("spec")
+    against = f'"{spec_path}"' if spec_path else "SPEC"
+    steps = [f'Open the project with `shambu open "{r.project}"`.']
+    if keys:
+        vals = ", ".join(f"{k} = {pl.process.get(k, spec.process.set.get(k, '?'))}" for k in keys)
+        steps.append(
+            f"The process combo shows `{base}` (shown as modified when any override differs from the base). The values are what "
+            "to check, not the suffix: open its tab and confirm each value (type the key into the tab's search "
+            f"box: the tab shows labels, not keys): {vals}."
+        )
+    else:
+        steps.append(f"The process combo shows `{base}` (no process overrides).")
+    check = f"Confirm the plate type ({spec.bed_type}) and the filament colours"
+    if len(pl.filaments) >= 2:
+        where = ", ".join(
+            f"filament {i} on the {'auxiliary (right)' if e == 2 else 'main (left)'} nozzle" for i, e in enumerate(pl.filament_map, 1)
+        )
+        check += (
+            f", and that the Filament grouping shows {where}. Leave the Filament grouping dialog alone unless it shows the wrong nozzle"
+        )
+    steps.append(check + ".")
+    proj = Path(str(r.project))
+    saved = proj.with_name(f"{proj.name.split('.')[0]}-checked.3mf")
+    # Studio holds what it changed on open in memory: verifying the export would check the unchanged file
+    fallback = (
+        f"save the project in Studio under a new name (File > Save project as, e.g. `{saved.name}`), then run "
+        f'`shambu verify "{saved}" --against {against}`, which lists the settings that differ. Do not Print until it '
+        "exits 0. If a FAIL is a change you want, put it in the spec and rebuild."
+    )
+    est = r.estimates() if r.sliced else []
+    if est:
+        figures = "; ".join(
+            (f"plate {sl['plate']}: " if len(est) > 1 else "") + f"{_hm(sl['prediction_s'])}, {sl['weight_g']:.1f} g" for sl in est
+        )
+        steps.append(
+            "Slice plate: Studio does not load shambu's embedded G-code for a project with objects (Plater.cpp:9578-9581 at "
+            f"v02.08.02.61), so the plate opens unsliced. The GUI estimate must land within 1 min and 1 g of {figures} above. "
+            "If it does not, a setting changed on open: " + fallback
+        )
+    else:
+        steps.append(
+            "Slice plate, then compare the GUI estimate with a `shambu slice` of the same file: they must agree within 1 min and 1 g. "
+            "If they do not, a setting changed on open: " + fallback
+        )
+    steps.append(
+        "In Preview, set the colour scheme to Line Type and look at the Overhang wall, Bridge and Support rows and at the first layer."
+    )
+    steps.append("Print only when the GUI estimate matched, or `shambu verify` on the saved copy exited 0.")
+    return [f"{i}. {t}" for i, t in enumerate(steps, 1)]
+
+
 def render(r: BuildResult) -> str:
     from .build import effective_filaments
 
@@ -244,7 +327,7 @@ def render(r: BuildResult) -> str:
         out += ["- patched: " + x for x in r.patches]
         if r.verify_problems == []:
             out.append(
-                "- verified: bed type (project and plates), process name and every override, filament presets, colours and map, "
+                f"- verified: bed type (project and plates), {_process_claim(r)}, filament presets, colours and map, "
                 "plate and object counts, object names, machine start/end/filament-change G-code" + (", G-code present" if r.sliced else "")
             )
         try:
@@ -281,26 +364,7 @@ def render(r: BuildResult) -> str:
         ]
         out += ["", "## Standing warnings"] + ["- " + w for w in STANDING_WARNINGS[1:]]
         return "\n".join(out) + "\n"
-    out += ["", "## Owner steps in Bambu Studio"]
-    step = 1
-    out.append(
-        f'{step}. Open the project (`open -a BambuStudio "{r.project}"`), confirm the plate type ({spec.bed_type}) and the filament colours.'
-    )
-    if pl.map_applies:
-        step += 1
-        out.append(
-            f"{step}. Check the filament-to-nozzle map on the plate (Manual: "
-            + ", ".join(f"filament {i + 1} -> nozzle {e}" for i, e in enumerate(pl.filament_map))
-            + ")."
-        )
-    step += 1
-    if r.sliced:
-        out.append(
-            f"{step}. The plate is already sliced (the estimate above comes from the slicer). In Preview, set the colour scheme to Line Type and "
-            "look at the Overhang wall, Bridge and Support rows and at the first layer; then Print. Re-slice in Studio after any change."
-        )
-    else:
-        out.append(f"{step}. Slice Plate, read the time and filament estimate, then Print.")
+    out += ["", "## Owner steps in Bambu Studio"] + owner_steps(r)
     warnings = [w for w in STANDING_WARNINGS if not (r.sliced and w.startswith("This project is unsliced"))]
     out += ["", "## Standing warnings"] + ["- " + w for w in warnings]
     return "\n".join(out) + "\n"

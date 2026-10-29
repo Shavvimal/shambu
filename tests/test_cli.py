@@ -818,9 +818,12 @@ def test_slice_verb_repairs_an_unsliced_cli_export_first(capsys, tmp_path, monke
 
     src = make_3mf(tmp_path / "u.3mf", extruder_nozzle_stats=[], extruder_max_nozzle_count=["1", "1"])
     raw = src.read_bytes()
-    studio = SequenceStudio(make_3mf(tmp_path / "f.gcode.3mf", sliced=True), codes=[0])
-    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
     from conftest import MACHINE, PROCESS
+
+    # the export names the loaded presets as the CLI writes them (BambuStudio.cpp:2382-2386), else slice refuses it
+    export = make_3mf(tmp_path / "f.gcode.3mf", sliced=True, print_settings_id=PROCESS, printer_settings_id=MACHINE)
+    studio = SequenceStudio(export, codes=[0])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
 
     spec = write_spec(tmp_path, printer=MACHINE, process={"base": PROCESS})
     code, out, _ = run(capsys, "--json", "slice", str(src), "--settings-from", str(spec), "-o", str(tmp_path / "o.gcode.3mf"))
@@ -1907,3 +1910,51 @@ def test_login_by_ip_keeps_the_credential_key_of_an_existing_lower_case_profile(
     (p,) = stored()["printers"]
     assert p["serial"] == P_SERIAL.lower()
     assert offline.vault.items == {P_SERIAL.lower(): P_CODE}
+
+
+# ---------------------------------------------------------------------------- open focus (spec 2026-10-29 section 5.7)
+def _fake_open(monkeypatch, pids):
+    from shambu import facade
+
+    calls = []
+    order = []
+
+    class Studio(FakeStudio):
+        def running_pids(self):
+            order.append("pgrep")
+            return pids
+
+    def fake_run(argv, **kw):
+        order.append("open")
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(facade.subprocess, "run", fake_run)
+    return Studio(), calls, order
+
+
+@pytest.mark.parametrize(("pids", "warned", "running"), [([4242], True, True), ([], False, False), (None, False, None)])
+def test_open_warns_once_when_studio_already_runs(capsys, tmp_path, monkeypatch, resolver, pids, warned, running):
+    studio, calls, order = _fake_open(monkeypatch, pids)
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    f = make_3mf(tmp_path / "p.3mf")
+    code, out, err = run(capsys, "--json", "open", str(f))
+    assert code == 0 and one_json(out)["already_running"] is running
+    assert order == ["pgrep", "open"]  # the process table is read before `open` starts anything
+    assert calls == [["open", "-a", "BambuStudio", str(f.resolve())]]  # no --new, no AppleScript
+    assert err.count("Bambu Studio was already running") == (1 if warned else 0)
+    if warned:
+        assert "WARN: Bambu Studio was already running: check that the front window shows p.3mf" in err
+
+
+def test_build_open_warns_when_studio_already_runs(capsys, tmp_path, monkeypatch, resolver):
+    from types import SimpleNamespace
+
+    studio, _, _ = _fake_open(monkeypatch, [7])
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    fake = SimpleNamespace(to_json=lambda: {"ok": True}, report="# r\n", run=SimpleNamespace(ok=True), ok=True, project=tmp_path / "p.3mf")
+    monkeypatch.setattr(Bambu, "build", lambda self, spec, **kw: fake)
+    code, out, err = run(capsys, "--json", "build", str(write_spec(tmp_path)), "--open")
+    doc = one_json(out)
+    assert code == 0 and doc["open_already_running"] is True
+    assert err.count("WARN: Bambu Studio was already running") == 1

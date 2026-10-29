@@ -17,12 +17,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 SCOPES = ("process", "object")
+# The recipe keys that are global PrintConfig keys in Studio (PrintConfig.hpp:1403-1588: enable_prime_tower :1517,
+# initial_layer_print_height :1475, independent_support_layer_height :1558). Written per object, the slicer ignores them.
+GLOBAL_KEYS = frozenset({"enable_prime_tower", "initial_layer_print_height", "independent_support_layer_height"})
 
 
 @dataclass(frozen=True)
 class Recipe:
     name: str
-    scope: str  # process | object (an object recipe also works at process scope)
+    scope: str  # process | object (listed at the other scope it still applies, with a WARN: spec.scope_warnings)
     description: str
     set: dict[str, str] = field(default_factory=dict)
     when: str = ""
@@ -132,8 +135,14 @@ RECIPES: tuple[Recipe, ...] = (
     ),
     Recipe(
         "dual-material-interface",
-        "process",
-        "Support interface in the other material on nozzle 2: Bambu's own X2D values for PLA/PETG pairs.",
+        "object",
+        "Support interface in the other material on nozzle 2: Bambu's own X2D values for PLA/PETG pairs, per object. "
+        "The interface keys are the ones Studio's own suggestion dialog writes per object (interface filament 2, top z 0, "
+        "spacing 0, rectilinear_interlaced, threshold 35, branch 3 / 7 degrees, raft expansion 5, tree_hybrid), plus "
+        "shambu's tree(auto), build-plate-only off, support_filament 0, support_interface_not_for_body 1 and "
+        "thick_bridges 0. The GUI keeps per-object settings across an open, while it resets the process values of a preset it cannot find by name "
+        "(docs/specs/2026-10-29-gui-preset-bookkeeping.md, sections 1 and 5.3). Pair it with `two-filament-plate` in "
+        "process.recipes.",
         {
             "enable_support": "1",
             "support_type": "tree(auto)",
@@ -149,9 +158,7 @@ RECIPES: tuple[Recipe, ...] = (
             "tree_support_branch_diameter": "3",
             "tree_support_branch_diameter_angle": "7",
             "raft_first_layer_expansion": "5",
-            "independent_support_layer_height": "0",
             "thick_bridges": "0",
-            "enable_prime_tower": "1",
         },
         "PETG part with PLA interface or PLA part with PETG interface; they barely bond. The plate counts as two filaments even "
         "though only the supports use filament 2, so Studio builds a prime tower sized by the tallest part (with the rib wall: "
@@ -170,6 +177,18 @@ RECIPES: tuple[Recipe, ...] = (
         '`--slice 1` ("No valid nozzle found"): `shambu build` applies it, `shambu patch --repair-nozzle-stats` fixes an older file. '
         "Bed temperature follows the hotter filament (PETG 70 C under a PLA part). Bambu prints PLA interface at 230 C and PETG HF "
         "interface at 265 C with a 10 mm3/s cap; the slicer's own table also sets support_interface_speed 50, a per-nozzle array left alone here.",
+    ),
+    Recipe(
+        "two-filament-plate",
+        "process",
+        "Plate-wide half of a two-filament interface (prime tower on, independent support layer height off): pair it with "
+        "`dual-material-interface` on the parts.",
+        {"enable_prime_tower": "1", "independent_support_layer_height": "0"},
+        "Any plate whose parts carry `dual-material-interface`. Both keys are one value per plate in Studio (PrintConfig), "
+        "so they belong in process.recipes.",
+        "notes / research 08; docs/specs/2026-10-29-gui-preset-bookkeeping.md section 5.3",
+        "independent_support_layer_height is a global key (PrintConfig.hpp:1558, moved from PrintObjectConfig): a "
+        "per-object copy does nothing, so only this process recipe sets it.",
     ),
     Recipe(
         "fuzzy-skin",

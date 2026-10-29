@@ -143,3 +143,39 @@ def test_write_round_trips(tmp_path, resolver):
     d = resolver.for_cli("process", PROCESS)
     p = P.write(d, tmp_path / "a" / "p.json")
     assert json.loads(p.read_text()) == d
+
+
+def test_leaf_wins_over_include_wins_over_parent(tmp_path):
+    """Studio's order (PresetBundle.cpp:5108, :5141-5143, :5158): parent chain, then the include templates, then
+    the preset's own keys. Before 0.6.0 the template was merged last and overrode the leaf."""
+    (tmp_path / "filament").mkdir()
+
+    def w(name, d):
+        (tmp_path / "filament" / f"{name}.json").write_text(json.dumps(d))
+
+    w("fdm_parent", {"name": "fdm_parent", "from": "system", "a": "parent", "b": "parent", "c": "parent"})
+    w("template", {"name": "template", "type": "filament", "b": "template", "c": "template"})
+    w("Leaf", {"name": "Leaf", "from": "system", "inherits": "fdm_parent", "include": ["template"], "c": "leaf"})
+    r = P.PresetResolver(P.ChainedSource([P.DirectorySource(tmp_path)]))
+    d = r.resolve("filament", "Leaf")
+    assert (d["a"], d["b"], d["c"]) == ("parent", "template", "leaf")
+    assert d["name"] == "Leaf" and "include" not in d and "inherits" not in d
+
+
+def test_diff_keys_names_overrides_and_keys_absent_from_the_base(resolver):
+    composed = resolver.for_cli("process", PROCESS, {"wall_loops": 6, "brim_type": "no_brim", "layer_height": "0.2"}, "My recipe")
+    composed["sparse_infill_density"] = ["25%"]  # a list compares element by element
+    keys = resolver.diff_keys("process", PROCESS, composed)
+    assert "wall_loops" in keys  # changed
+    assert "brim_type" in keys  # the synthetic base has no brim_type: Studio would reset it to its built-in default
+    assert "layer_height" not in keys  # equal to the base
+    assert "sparse_infill_density" in keys
+    assert keys == sorted(keys)
+    assert not set(keys) & P.BOOKKEEPING_KEYS  # name, from, inherits, print_settings_id, type, is_custom_defined ...
+
+
+def test_diff_keys_is_empty_for_an_unmodified_system_preset(resolver):
+    assert resolver.diff_keys("process", PROCESS, resolver.for_cli("process", PROCESS)) == []
+    f = resolver.for_cli("filament", "Test PLA")
+    f["filament_colour"] = ["#FFFFFF"]  # the colour is a project value, never a preset diff
+    assert resolver.diff_keys("filament", "Test PLA", f) == []

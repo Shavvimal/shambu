@@ -26,6 +26,7 @@ from pathlib import Path
 from . import conf, presets, recipes, runs
 from . import printer as printer_mod
 from . import vault as vault_mod
+from . import verify as verify_mod
 from .build import BuildResult, Listener, Pipeline, load_spec
 from .edits import AddFilament, EditSet
 from .errors import BambuError, ConfError, PrinterError, StudioError
@@ -136,6 +137,15 @@ def shambu_section(expected: str | None, direct_url: dict | None = None) -> dict
 
 def install_command(version: str) -> str:
     return f'uv tool install --reinstall "shambu @ git+{REPO}@v{version}"'
+
+
+@dataclass(frozen=True)
+class OpenResult:
+    """What `open_in_studio` did: the path it opened and whether Studio was running before (None: pgrep failed or the
+    Studio binary is absent, so it is unknown)."""
+
+    path: str
+    already_running: bool | None
 
 
 @dataclass(frozen=True)
@@ -390,6 +400,13 @@ class Bambu:
             o["position"] = pos.get(o["name"])
         return s
 
+    def verify(self, path: str | Path, spec: Spec, spec_path: str | Path = "") -> verify_mod.Report:
+        """Compare a project (a GUI save, typically) with the spec it was built from (`verify.check_project`). Needs the
+        preset library, not the Studio binary or the STL files. A file that is not a project or whose metadata does not
+        parse is ProjectError; a process or printer preset the library lacks is PresetError (both exit 3 at the CLI).
+        The CLI loads the spec first, so a bad spec is exit 1 as for every other command."""
+        return verify_mod.check_project(str(path), spec, self.presets(), str(spec_path))
+
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)
 
@@ -414,16 +431,23 @@ class Bambu:
     def studio_raw(self, raw: list[str], out_dir: str | Path = ".", timeout: int = 1200) -> dict:
         return runs.studio_raw(self.studio_cli(), raw, Path.cwd(), Path(out_dir), timeout)
 
-    def open_in_studio(self, path: str | Path) -> None:
-        """Opens the project for the user. With single_instance off this starts a second Studio process. StudioError
-        when `open` fails or is missing (exit 3 at the CLI, not a traceback)."""
+    def open_in_studio(self, path: str | Path) -> OpenResult:
+        """Opens the project for the user and says whether Studio was already running before the call (`running_pids`
+        read first: [] none, None unknown). Studio keeps one process (`single_instance`), so a project opened into a
+        running Studio lands in a new window behind the current one; the CLI warns about that. No AppleScript and no
+        `open --new` (rubric item 16; a second instance is refused). StudioError when `open` fails or is missing
+        (exit 3 at the CLI, not a traceback)."""
+        studio = self.studio_or_none()
+        pids = studio.running_pids() if studio is not None else None
+        resolved = Path(path).resolve()
         try:
-            subprocess.run(["open", "-a", "BambuStudio", str(Path(path).resolve())], check=True, capture_output=True)
+            subprocess.run(["open", "-a", "BambuStudio", str(resolved)], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             err = (e.stderr or b"").decode("utf-8", "replace").strip()[:200]
             raise StudioError(f"`open -a BambuStudio` exited {e.returncode}" + (f": {err}" if err else "")) from e
         except OSError as e:
             raise StudioError(f"`open -a BambuStudio` could not run ({e.strerror or e})") from e
+        return OpenResult(str(resolved), None if pids is None else bool(pids))
 
     # ---- printer (read-only)
     def printer(

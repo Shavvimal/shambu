@@ -34,6 +34,37 @@ APPSUPPORT = Path.home() / "Library/Application Support/BambuStudio"
 SYSTEM_PROFILES = APPSUPPORT / "system/BBL"
 ID_KEY = {"machine": "printer_settings_id", "process": "print_settings_id", "filament": "filament_settings_id"}
 _TEMPLATE_META = {"name", "type", "from", "instantiation", "inherits", "include"}
+# Keys that describe a preset rather than a print: never part of a `different_settings_to_system` slot. Studio's own
+# ignore list is the four at the end (PresetBundle.cpp:3250-3253); the rest are the JSON file's own bookkeeping.
+BOOKKEEPING_KEYS = frozenset(
+    {
+        "name",
+        "type",
+        "from",
+        "inherits",
+        "include",
+        "instantiation",
+        "setting_id",
+        "is_custom_defined",
+        "version",
+        "description",
+        "compatible_printers",
+        "compatible_printers_condition",
+        "compatible_prints",
+        "compatible_prints_condition",
+        "filament_id",
+        "print_settings_id",
+        "filament_settings_id",
+        "printer_settings_id",
+    }
+)
+
+
+def _as_strings(v) -> list[str]:
+    """The string form Studio stores, one entry per value (a scalar is a one-entry list)."""
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v]
+    return [str(v)]
 
 
 class PresetSource(Protocol):
@@ -107,19 +138,39 @@ class PresetResolver:
             return json.load(f)
 
     def resolve(self, kind: str, name: str, _seen: tuple[str, ...] = ()) -> dict:
-        """Flatten the `inherits` chain (parent first, child overrides) and merge `include` templates."""
+        """Flatten a preset the way Studio does: the parent chain first, the `include` templates on top of it, and
+        the preset's own keys last, so the leaf wins over a template and a template over an ancestor
+        (PresetBundle::load_vendor_configs_from_json, PresetBundle.cpp:5108, :5141-5143, :5158 at v02.08.02.61).
+
+        Known approximation: Studio applies only the template keys that differ from the collection default
+        (`include_config.diff(*include_default_config)`); shambu has no default table and applies every template
+        key. Before 0.6.0 the template was merged after the leaf, which gave the CLI three X2D filament values the
+        GUI never uses (`filament_cooling_before_tower`, `retraction_distances_when_ec`, `slow_down_min_speed`)."""
         if name in _seen:
             raise PresetError(f"inherits loop: {' -> '.join(_seen + (name,))}")
-        d = self.load_raw(kind, name)
-        parent = d.pop("inherits", None)
-        if parent:
-            base = self.resolve(kind, parent, _seen + (name,))
-            base.update(d)
-            d = base
-        for inc in d.pop("include", []) or []:
+        own = self.load_raw(kind, name)
+        parent = own.pop("inherits", None)
+        d = self.resolve(kind, parent, _seen + (name,)) if parent else {}
+        for inc in own.pop("include", []) or []:
             t = self.load_raw(kind, inc)
             d.update({k: v for k, v in t.items() if k not in _TEMPLATE_META})
+        d.update(own)
         return d
+
+    def diff_keys(self, kind: str, base: str, composed: dict) -> list[str]:
+        """The keys of `composed` that Studio must keep when it opens the project: every key whose value differs from
+        the resolved system preset `base`, or that the base does not define, minus the bookkeeping keys. Sorted and
+        `;`-joined this is one slot of `different_settings_to_system`; Studio resets every other key to the base
+        (Preset.cpp:2258-2269, PrintConfig.cpp:9218 at v02.08.02.61). Values compare as the strings Studio stores;
+        a list compares element by element."""
+        resolved = self.resolve(kind, base)
+        out = []
+        for k, v in composed.items():
+            if k in BOOKKEEPING_KEYS or (kind == "filament" and k == "filament_colour"):
+                continue
+            if k not in resolved or _as_strings(resolved[k]) != _as_strings(v):
+                out.append(k)
+        return sorted(out)
 
     def for_cli(self, kind: str, name: str, overrides: dict | None = None, new_name: str | None = None) -> dict:
         """A complete preset JSON the CLI accepts.

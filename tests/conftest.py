@@ -460,10 +460,68 @@ def write_cli_tower(project: Path, args: list[str]) -> None:
     p.save(str(project))
 
 
+def _cli_value(args: list[str], option: str) -> str | None:
+    """The value of `--option` in a CLI argument list, in either the `--option value` or the `--option=value` form."""
+    for i, a in enumerate(args):
+        if a == f"--{option}" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(f"--{option}="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def write_cli_presets(project: Path, args: list[str]) -> None:
+    """What the real CLI writes into the exported project for the loaded presets and the assemble list, so a fixture
+    can stand in for an export that `shambu verify` checks: the full config of the machine and process JSON
+    (`--load-settings`) with `printer_settings_id` and `print_settings_id` set to their names, the filament names in
+    `filament_settings_id` (`--load-filaments`; the filament values stay the fixture's), and each object's
+    `print_params` and filament as `model_settings.config` metadata (`--load-assemble-list`). An object is found by the
+    CLI's name: `<stem>_<n>` for copy n of a file, `assemble_<k>` for a merged object, so the fixture must carry those
+    names. Height ranges are not written. No slice invalidation: the fake writes what the export itself holds."""
+    from shambu.threemf import MODEL_SETTINGS, PROJECT_SETTINGS, Project, _set_meta
+
+    p = Project(str(project))
+    ps = p.project_settings
+    for path in (_cli_value(args, "load-settings") or "").split(";"):
+        if not path or not Path(path).is_file():
+            continue
+        preset = json.loads(Path(path).read_text(encoding="utf-8"))
+        ps.update({k: v for k, v in preset.items() if k not in P.BOOKKEEPING_KEYS})
+        if Path(path).name == "process.json":
+            ps["print_settings_id"] = preset.get("name", "")
+        elif Path(path).name == "machine.json":
+            ps["printer_settings_id"] = preset.get("name", "")
+    filaments = [f for f in (_cli_value(args, "load-filaments") or "").split(";") if f and Path(f).is_file()]
+    if filaments:
+        ps["filament_settings_id"] = [json.loads(Path(f).read_text(encoding="utf-8")).get("name", "") for f in filaments]
+    p._dirty.add(PROJECT_SETTINGS)
+    assemble = _cli_value(args, "load-assemble-list")
+    if assemble and Path(assemble).is_file():
+        objects = {o.find("metadata[@key='name']").get("value"): o for o in p.model_settings.findall("object")}
+        for plate in json.loads(Path(assemble).read_text(encoding="utf-8")).get("plates", []):
+            targets: list[tuple[str, dict, int | None]] = []
+            for item in plate.get("objects", []):
+                if not item.get("assemble_index"):
+                    stem = Path(item["path"]).stem
+                    fil = item.get("filaments", [None])[0]
+                    targets += [(f"{stem}_{n}", item.get("print_params", {}), fil) for n in range(1, int(item.get("count", 1)) + 1)]
+            targets += [(f"assemble_{a['assemble_index']}", a.get("print_params", {}), None) for a in plate.get("assembled_params", [])]
+            for name, params, fil in targets:
+                if name not in objects:
+                    continue
+                if fil is not None:
+                    _set_meta(objects[name], "extruder", fil, after="name")
+                for k, v in params.items():
+                    _set_meta(objects[name], k, v, after="name")
+        p._dirty.add(MODEL_SETTINGS)
+    p.save(str(project))
+
+
 @dataclass
 class FakeStudio:
     """Same surface as StudioCLI. `run()` copies `fixture` to the expected output, or fails with `code`; `result` adds
-    keys to the run's result.json (as Studio writes `error_string` and `warning_message`)."""
+    keys to the run's result.json (as Studio writes `error_string` and `warning_message`). With `cli_presets` the copy
+    also gets the loaded presets and the object settings (`write_cli_presets`), as a real export holds them."""
 
     fixture: Path | None = None
     code: int = 0
@@ -479,6 +537,7 @@ class FakeStudio:
     )
 
     orient_best: OrientCandidate | None = None  # the `best:` row; None: the first row after sorting
+    cli_presets: bool = False  # run(): also write the loaded presets and the object settings (write_cli_presets)
 
     def orient(self, paths, outdir, *, settings=None, convert_unit=True, timeout=300, name="orient") -> OrientResult:
         """Copies each input to obj_<i>_<stem>.stl, scaled by 1000 when `convert_unit` and the mesh is under 1 mm."""
@@ -535,7 +594,9 @@ class FakeStudio:
             log.write_text("$ fake\n", encoding="utf-8")
         if self.code == 0 and expect_output is not None and self.fixture is not None:
             shutil.copyfile(self.fixture, expect_output)
-            write_cli_tower(expect_output, args)
+            if self.cli_presets:
+                write_cli_presets(expect_output, args)
+            write_cli_tower(expect_output, args)  # after the presets: a command-line setting beats a loaded one
         res = (
             {"return_code": self.code, **self.result}
             if self.result is not None

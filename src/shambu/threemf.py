@@ -15,7 +15,8 @@ Rules the code follows:
 - layer_config_ranges.xml keys objects by the 1-based order of their first <build><item>,
   not by object id.
 - A change to settings makes an existing slice stale, so a patch on a sliced project drops
-  the G-code entries and the plate slice data (invalidate_slices()). Renames do not.
+  the G-code entries and the plate slice data (invalidate_slices()). Renames and the preset bookkeeping
+  (`*_settings_id`, `inherits_group`, `different_settings_to_system`) do not: they never change the G-code.
 - Every height range carries `layer_height`: the slicer reads it without a null check and
   segfaults in layer_height_profile_from_ranges when it is absent.
 - save() writes a temporary file next to the destination, checks it, then renames it over the
@@ -39,12 +40,13 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from .errors import ProjectError
+from .presets import BOOKKEEPING_KEYS
 
 NS_CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
 NS_PROD = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
@@ -64,7 +66,27 @@ GCODE_TYPES = {"color_change": 0, "pause": 1, "tool_change": 2, "template": 3, "
 GCODE_TYPE_NAMES = {v: k for k, v in GCODE_TYPES.items()}
 
 
+# The two per-slot vectors of the preset bookkeeping (PresetBundle.cpp:3775-3776 at v02.08.02.61)
+BOOKKEEPING_VECTORS = ("inherits_group", "different_settings_to_system")
+
 STATS_NEW, STATS_OLD = "extruder_nozzle_stats_new", "extruder_nozzle_stats"
+
+
+def _strings(v) -> list[str]:
+    """The string form Studio stores, one entry per value (a scalar is a one-entry list)."""
+    return [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
+
+
+def _scalar(v) -> bool:
+    """True for an entry of a numeric or bool vector: a number (optionally a percentage) or a bool word."""
+    t = str(v).strip()
+    if t.lower() in ("true", "false"):
+        return True
+    try:
+        float(t.removesuffix("%"))
+    except ValueError:
+        return False
+    return True
 
 
 def _entry_count(entry) -> int:
@@ -634,6 +656,7 @@ class Project:
             "objects": objects,
             "custom_gcode": custom,
             "reslice_problems": self.reslice_problems(),
+            "preset_bookkeeping": self.preset_bookkeeping(),
         }
 
     # ------------------------------------------------------------------ (b) patches
@@ -642,9 +665,10 @@ class Project:
         if invalidate:
             self.invalidate_slices()
 
-    def _touch_ps(self):
+    def _touch_ps(self, invalidate: bool = True):
         self._dirty.add(PROJECT_SETTINGS)
-        self.invalidate_slices()
+        if invalidate:
+            self.invalidate_slices()
 
     def set_bed_type(self, bed_type: str, plate: int | None = None) -> None:
         """Project-wide curr_bed_type, and the per-plate override (<metadata key="bed_type">) for
@@ -725,6 +749,167 @@ class Project:
             _set_meta(p, "filament_map_mode", mode, after="locked")
             _set_meta(p, "filament_maps", " ".join(str(v) for v in nozzle_of_filament), after="filament_map_mode")
             self._touch_ms()
+
+    # -- the preset bookkeeping Studio honours on open (spec 2026-10-29 section 1, Studio v02.08.02.61) -------------------
+    def _counts(self) -> tuple[int, int]:
+        ps = self.project_settings
+        cols, ids = ps.get("filament_colour"), ps.get("filament_settings_id")
+        return (len(cols) if isinstance(cols, list) else 0), (len(ids) if isinstance(ids, list) else 0)
+
+    def studio_filament_count(self) -> int:
+        """N as Studio counts it on open: the entries of `filament_colour`, because `filament_settings_id` is
+        sometimes not generated (PresetBundle.cpp:3750-3755); `filament_settings_id` when the file has no colours.
+        Raises when both are present and differ: the slot layout would be a guess."""
+        n_col, n_ids = self._counts()
+        if n_col and n_ids and n_col != n_ids:
+            raise ProjectError(
+                f"{self.path}: {n_col} filament_colour entries but {n_ids} filament_settings_id entries; Studio counts the "
+                "colours, so the preset slots are ambiguous (give one colour per filament: `shambu patch --colours`)"
+            )
+        return n_col or n_ids
+
+    def _slot_kind(self, slot: int) -> str:
+        n = self.studio_filament_count()
+        if not 0 <= slot <= n + 1:
+            raise ProjectError(f"preset slot must be in 0..{n + 1} (0 process, 1..{n} filaments, {n + 1} printer), not {slot}")
+        return "process" if slot == 0 else ("machine" if slot == n + 1 else "filament")
+
+    def _bookkeeping_vectors(self) -> tuple[list[str], list[str]]:
+        """`inherits_group` and `different_settings_to_system`, created or padded to N+2 with "" (the other slots
+        kept, a longer vector never cut). Studio pads both to num_filaments + 2 on load (PresetBundle.cpp:3775-3776):
+        [0] process, [1..N] filaments, [N+1] printer (:3867, :3885, :3990). N is `studio_filament_count()`."""
+        ps = self.project_settings
+        size = self.studio_filament_count() + 2
+        out = []
+        for key in BOOKKEEPING_VECTORS:
+            v = ps.get(key)
+            vec = [str(x) for x in v] if isinstance(v, list) else ([] if v in (None, "") else [str(v)])
+            vec += [""] * max(0, size - len(vec))
+            ps[key] = vec
+            out.append(vec)
+        return out[0], out[1]
+
+    def set_preset_bookkeeping(self, slot: int, base: str, keys: Sequence[str]) -> None:
+        """Name the system preset `base` for one slot (0 process, 1..N filaments, N+1 printer) and list the keys whose
+        inline values Studio must keep. On open Studio resets every key not in the slot's `different_settings_to_system`
+        entry to the base preset (Preset.cpp:2258-2269, PrintConfig.cpp:9218); a name it cannot find in its library
+        forks a parentless `<name>(<file>.3mf)` preset (Preset.cpp:2364-2418). Writes the slot's `*_settings_id` =
+        `base`, `inherits_group[slot]` = "" (a system preset has no parent, PresetBundle.cpp:3304-3313) and the union
+        of `keys` and the keys the slot already lists (the CLI can list its own, BambuStudio.cpp:3388, :4182-4208),
+        sorted and `;`-joined as Studio's own save writes them (Preset.cpp:3162-3186). Listing a key equal to the base
+        is harmless: Studio drops it on save (PresetBundle.cpp:3306-3313). These keys never change the G-code, so a
+        sliced project stays sliced.
+
+        Studio selects slot 1 with LoadAndSelect::Always but filament slots 2..N only if modified (PresetBundle.cpp:3855,
+        :3931, :4003-4013): a modified secondary filament opens as a project-embedded `<base>(<file>.3mf)` preset with
+        `inherits_group[i]` = base and its values kept (Preset.cpp:2332, :2354-2365, :2401-2439), not as "base
+        (modified)". The export still writes id = base for every slot; a GUI save shows the other form."""
+        kind = self._slot_kind(slot)
+        if not base:
+            raise ProjectError(f"preset slot {slot}: the base preset name is empty")
+        ps = self.project_settings
+        if kind == "process":
+            ps["print_settings_id"] = base
+        elif kind == "machine":
+            ps["printer_settings_id"] = base
+        else:
+            ids = list(ps.get("filament_settings_id") or [])
+            # no ids at all: Studio counted the colours, so pad to all N slots at once, else the next call recounts a
+            # short id vector against the colours and calls the layout ambiguous
+            ids += [""] * max(0, self.studio_filament_count() - len(ids))
+            ids[slot - 1] = base
+            ps["filament_settings_id"] = ids
+        inherits, diff = self._bookkeeping_vectors()
+        inherits[slot] = ""
+        diff[slot] = ";".join(sorted({*(k for k in diff[slot].split(";") if k), *(k for k in keys if k)}))
+        self._touch_ps(invalidate=False)
+
+    def preset_bookkeeping(self) -> list[dict]:
+        """Per Studio slot: `slot`, `kind` (process, filament, machine), `id` (the `*_settings_id`; None for a filament
+        slot the file names no preset for), `inherits` (`inherits_group[slot]`: "" for a system preset, the base for
+        a project-embedded or user preset a GUI save wrote) and `keys` (the slot's `different_settings_to_system` entry
+        split on `;`). The slots follow Studio's count (`filament_colour`, else `filament_settings_id`,
+        PresetBundle.cpp:3750-3755); this reader never raises on an ambiguous count, it shows what Studio reads. A
+        missing or short vector reads as "" for that slot, as Studio pads it (PresetBundle.cpp:3775-3776)."""
+        ps = self.project_settings
+        n_col, n_ids = self._counts()
+        n = n_col or n_ids
+        fil = list(ps.get("filament_settings_id") or [])
+
+        def entry(key: str, slot: int) -> str:
+            v = ps.get(key)
+            vec = v if isinstance(v, list) else ([] if v in (None, "") else [v])
+            return str(vec[slot]) if slot < len(vec) else ""
+
+        out = []
+        for slot in range(n + 2):
+            kind = "process" if slot == 0 else ("machine" if slot == n + 1 else "filament")
+            if kind == "process":
+                pid = ps.get("print_settings_id")
+            elif kind == "machine":
+                pid = ps.get("printer_settings_id")
+            else:
+                pid = fil[slot - 1] if slot - 1 < len(fil) else None
+            keys = [k for k in entry("different_settings_to_system", slot).split(";") if k]
+            out.append({"slot": slot, "kind": kind, "id": pid, "inherits": entry("inherits_group", slot), "keys": keys})
+        return out
+
+    def _process_key(self, key: str) -> None:
+        if key in BOOKKEEPING_KEYS or key in BOOKKEEPING_VECTORS:
+            raise ProjectError(f"{key} is preset bookkeeping, not a print setting")
+        if key not in self.project_settings:
+            raise ProjectError(f"{key} is not in {PROJECT_SETTINGS}: Studio writes every key it knows, so it is not a Studio setting")
+
+    def _relist_process(self, add: str | None, drop: str | None, base_values: Mapping[str, Any] | None) -> None:
+        """Slot 0 of `different_settings_to_system` after a process key changed: the keys already listed (minus `drop`,
+        the one key an unset removes), plus `add`, plus, with the resolved base preset, every key whose file value
+        differs from it. A listed key is never dropped for equalling shambu's base: Studio's effective base can
+        differ (PresetBundle.cpp:5141-5143), and an equal listed key is harmless (Studio drops it on save,
+        PresetBundle.cpp:3306-3313)."""
+        ps = self.project_settings
+        _, diff = self._bookkeeping_vectors()
+        keys = {k for k in diff[0].split(";") if k} - ({drop} if drop else set())
+        if add:
+            keys.add(add)
+        if base_values is not None:
+            keys |= {
+                k
+                for k, v in base_values.items()
+                if k != drop and k in ps and k not in BOOKKEEPING_KEYS and k not in BOOKKEEPING_VECTORS and _strings(ps[k]) != _strings(v)
+            }
+        diff[0] = ";".join(sorted(keys))
+
+    def set_process_setting(self, key: str, value: str | Sequence[str], base_values: Mapping[str, Any] | None = None) -> None:
+        """Set one process key in `project_settings.config` and list it in the process slot's
+        `different_settings_to_system` entry, so Studio keeps it on open (Preset.cpp:2258-2269). Refuses a key the
+        file does not hold (Studio writes its full config, so an absent key is unknown to Studio) and a bookkeeping
+        key. A list value stays a list. A string for a key the file holds as a list is split on "," when every
+        existing entry is a number or a bool (Studio's numeric vectors), else it becomes the one entry. Anything else
+        is stored as a string. `base_values`: the resolved base preset (the caller resolves it); the list then also
+        gains every key whose file value differs from it (`_relist_process`). Drops the slice: the value changes the G-code."""
+        self._process_key(key)
+        ps = self.project_settings
+        if isinstance(value, (list, tuple)):
+            ps[key] = [str(x) for x in value]
+        elif isinstance(ps[key], list):
+            # A numeric or bool vector serialises its entries with "," (ConfigOptionFloats/Ints/Bools); a string vector
+            # such as post_process can hold commas inside one entry, so it stays one entry.
+            ps[key] = str(value).split(",") if ps[key] and all(_scalar(x) for x in ps[key]) else [str(value)]
+        else:
+            ps[key] = str(value)
+        self._relist_process(key, None, base_values)
+        self._touch_ps()
+
+    def clear_process_setting(self, key: str, base_value: str | Sequence[str], base_values: Mapping[str, Any] | None = None) -> None:
+        """Restore one process key to `base_value` (the caller resolved it from the base preset) and remove only that
+        key from the process slot's `different_settings_to_system` entry; with `base_values` the other differing
+        keys are listed as in set_process_setting. Studio then takes the key from the base on open
+        (Preset.cpp:2258-2269, PrintConfig.cpp:9218). Drops the slice: the value changes the G-code."""
+        self._process_key(key)
+        ps = self.project_settings
+        ps[key] = [str(x) for x in base_value] if isinstance(base_value, (list, tuple)) else str(base_value)
+        self._relist_process(None, key, base_values)
+        self._touch_ps()
 
     # -- the per-extruder keys a CLI re-slice needs (reference 03 section "Re-slicing a CLI export") ------------------
     def _variant_block(self, slot: int, given: Sequence[Sequence[str]] | None) -> list[str]:
