@@ -2,6 +2,9 @@
 
 A `PatchSet` is a Composite of patches. The build pipeline and the `patch` subcommand both build a
 PatchSet, so a new kind of patch is one new class here and one flag in the CLI.
+
+Not here: preset I/O (a caller resolves any base preset values and passes them in), Studio runs, and the geometry and
+filament-slot edits (`edits.py`).
 """
 
 from __future__ import annotations
@@ -304,7 +307,10 @@ class PatchSet:
         for patch in self.patches:
             patch.apply(project)
             done.append(patch.describe())
-        project.save(out or path)
+        # The union of what the patches declare: a set of narrow patches is checked narrowly; any patch with the
+        # default `Metadata/*` widens it to that.
+        touches: frozenset[str] = frozenset().union(*(p.resolve_touches(project) for p in self.patches))
+        project.save(out or path, touches)
         return done
 
     def describe(self) -> list[str]:
