@@ -265,7 +265,7 @@ come out right either way. A test on the synthetic library pins the order (leaf 
 
 ## 6. Experiments for the owner (five minutes, one Studio open each)
 
-Files in `/private/tmp/claude-501/-Users-shav-Code-shambu/7e472d4d-d270-4fc4-b452-1e466b3a9e19/scratchpad/experiments/`,
+Two files built by a scratch script in the fixing session (kept outside the repo; ask for the paths),
 built by `make_experiments.py` from the untouched 19:22 export; only `project_settings.config` changed (exp2 adds one
 entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density;sparse_infill_pattern;wall_loops`.
 
