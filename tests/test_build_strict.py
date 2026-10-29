@@ -242,9 +242,16 @@ def test_verify_compares_machine_gcode_with_the_preset(tmp_path, stls, resolver)
 
 
 def test_verify_compares_filament_presets(tmp_path, stls, resolver):
-    fx = make_3mf(tmp_path / "f.3mf", object_names=("body_1", "assemble_1"), filament_settings_id=["Other", "Test PLA"], **CHANGE_FILAMENT)
-    r = build_with(tmp_path, stls, resolver, fx)
-    assert any("filament presets in file" in p for p in r.verify_problems)
+    class NoPatch(Pipeline):  # the bookkeeping patch would write the system bases over the CLI's names
+        def patch(self, plan, project, sliced=False):
+            return []
+
+    fx = make_3mf(tmp_path / "f.3mf", object_names=("body", "label"), filament_settings_id=["Other", "Test PLA"], **CHANGE_FILAMENT)
+    r = build_with(tmp_path, stls, resolver, fx, pipeline_cls=NoPatch)
+    assert any(
+        "filament presets in file are ['Other', 'Test PLA'], expected the system bases ['Test PLA', 'Test PLA']" in p
+        for p in r.verify_problems
+    )
 
 
 def test_verify_requires_plate_bed_type(tmp_path, stls, resolver):

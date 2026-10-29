@@ -103,9 +103,15 @@ def test_command_has_loads_and_export(tmp_path, stls, resolver, cli_export):
 
 
 def test_verify_flags_wrong_process_name(tmp_path, stls, resolver):
+    class NoBookkeeping(Pipeline):  # the bookkeeping patch would write the system base over the CLI's name
+        def patch_set(self, plan, sliced=False):
+            ps = super().patch_set(plan, sliced)
+            ps.patches = [x for x in ps.patches if type(x).__name__ != "SetPresetBookkeeping"]
+            return ps
+
     wrong = make_3mf(tmp_path / "wrong.3mf", object_names=("body_1", "assemble_1"), print_settings_id="Other", **CHANGE_FILAMENT)
-    r = pipeline(resolver, FakeStudio(wrong)).build(make_spec(tmp_path, stls))
-    assert any("process in file is Other" in p for p in r.verify_problems)
+    r = NoBookkeeping(FakeStudio(wrong), resolver).build(make_spec(tmp_path, stls))
+    assert any(f"process in file is Other, expected the system base {PROCESS} + " in p for p in r.verify_problems)
     assert not r.ok
     assert "verify problems below" in r.report
 
