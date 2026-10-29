@@ -166,8 +166,9 @@ def effective_filaments(
     Support, wall and infill filament keys in `set` and every height range's filament keys add their slot.
     With `process` (the resolved process: recipes and process.set included), its wall and infill filament keys
     add their slot for every part, and its support and support-interface filament keys for every part with
-    `enable_support` on: the `dual-material-interface` recipe sets support_interface_filament 2 at process level,
-    and a checker that missed it passed a plate that exited -102 (reference 06 section 5). "Has support" is
+    `enable_support` on: before 0.6.0 the `dual-material-interface` recipe set support_interface_filament 2 at process
+    level (it is per object since 0.6.0), and a checker that missed it passed a plate that exited -102 (reference 06
+    section 5). "Has support" is
     `layout.needs_support` (a raft prints with the support filaments too). `skip` leaves out those keys of the part
     `set` and the process (`interface_uses` asks which slots the rest uses).
     Raises BuildError for a value that is not an integer. Slots are not range-checked here.
