@@ -718,7 +718,7 @@ export still writes the base id. `shambu verify` accepts the embedded form for s
 preset, `inherits_group[slot]` = `""`, and `different_settings_to_system[slot]` = sorted(the explicit overrides
 together with every key that differs from the resolved base), merged with any key the CLI listed. The explicit
 overrides go on the list even when shambu's resolved base already holds that value. Reason: Studio applies only the
-include keys that differ from its collection default (`PresetBundle.cpp:5141-5143`), so shambu's resolved base can
+include keys that differ from its collection default (`PresetBundle.cpp:5142-5144`), so shambu's resolved base can
 differ from Studio's for a key nobody overrode. An equal key on the list is harmless (step 6 drops it on save). A
 missing one is reset. The spec's `process.name` stays a report label, never the preset id. `shambu inspect` prints
 `process <id> (+N overrides: ...)`. `shambu patch --process-set KEY=VALUE` / `--process-unset KEY` change a process
@@ -726,18 +726,21 @@ key and keep the list right.
 
 **The CLI is not the GUI.** The Studio CLI copies `different_settings_to_system[0]` from an input process JSON only
 for a non-3MF input model (`BambuStudio.cpp:2382-2386`, `:3352-3360`), so shambu sets the list with a patch after the
-export. The CLI never resets values (`update_all` true, `BambuStudio.cpp:3135-3137`) (it copies every input key, but can change and list a tower key, `BambuStudio.cpp:3388`, `:4182-4208`; hence shambu merges its list with the CLI's): the headless slice always had
-the spec's values.
+export. The CLI never resets values on shambu's path, which supplies a new process JSON (`update_all` true,
+`BambuStudio.cpp:3388`); the path that updates an existing preset passes false (`:3375`). It copies every input key,
+but can change and list a tower key (`:4182-4208`), hence shambu merges its list with the CLI's. The headless slice
+always had the spec's values.
 
 **Short vectors are padded, not reset.** `filament_map`, `filament_nozzle_map` and `filament_volume_map` with fewer
-entries than filaments are padded on load (`Plater.cpp:~8935-8948`); `extruder_ams_count` is parsed and erased
+entries than filaments are padded on load (`Plater.cpp:8944-8958`); `extruder_ams_count` is parsed and erased
 (`PresetBundle.cpp:3827-3831`). A short vector never triggers the reset (F5 of the 29 October post-mortem is not a
 fault).
 
-**Include order.** Studio resolves a system preset as: the flattened parent (`PresetBundle.cpp:5108-5109`), then the
-`include` template keys that differ from the collection default (`:5141-5143`), then the leaf's own keys
-(`:5158`). The leaf wins over the template, the template over the ancestors. shambu's `presets.resolve()` follows
-that order from 0.6.0; it applies every template key (it has no default table).
+**Include order.** Studio resolves a system preset as: the flattened parent (looked up at
+`PresetBundle.cpp:5084-5086`, copied at `:5109`), then the `include` template keys that differ from the collection
+default (`apply_only`, `:5142-5144`), then the leaf's own keys (`:5158`). The leaf wins over the template, the
+template over the ancestors. shambu's `presets.resolve()` follows that order from 0.6.0; it applies every template key
+(it has no default table).
 
 ## Appendix: `project_settings.config` keys by source
 

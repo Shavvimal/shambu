@@ -237,7 +237,7 @@ def test_dual_material_interface_is_per_object_and_two_filament_plate_is_per_pro
     dmi, plate = R.by_name()["dual-material-interface"], R.by_name()["two-filament-plate"]
     assert dmi.scope == "object" and dmi.set == DMI_KEYS
     assert len(dmi.set) == 15 and "enable_prime_tower" not in dmi.set and "support_interface_speed" not in dmi.set
-    assert "independent_support_layer_height" not in dmi.set  # a PrintConfig key: per object it does nothing
+    assert not set(dmi.set) & R.GLOBAL_KEYS  # a PrintConfig key does nothing per object
     assert plate.scope == "process" and plate.set == {"enable_prime_tower": "1", "independent_support_layer_height": "0"}
     assert "dual-material-interface" in plate.description and "two-filament-plate" in dmi.description
 
@@ -257,8 +257,8 @@ def test_process_recipe_on_a_part_warns_and_still_applies(tmp_path):
     d["plates"][0]["parts"][0]["recipes"] = ["two-filament-plate"]
     s = Spec.from_json(d)
     assert s.warnings == (
-        "recipe two-filament-plate is [process] scope; on part a its plate-wide keys "
-        "(enable_prime_tower, independent_support_layer_height) apply to that object only",
+        "recipe two-filament-plate is [process] scope; on part a it is written per object, where its plate-wide keys "
+        "(enable_prime_tower, independent_support_layer_height) are ignored by the slicer; list it in process.recipes",
     )
     assert s.plates[0].parts[0].set["enable_prime_tower"] == "1"  # soft: the keys stay
 
@@ -279,7 +279,10 @@ def test_scope_warning_names_a_merged_part_and_comes_after_unknown_keys(tmp_path
     d["plates"][0]["parts"][1]["brim_margn"] = 2
     w = Spec.from_json(d).warnings
     assert len(w) == 2 and w[0].startswith("plate 1 part 2: unknown key 'brim_margn'")
-    assert w[1].startswith("recipe pla-light is [process] scope; on part label its plate-wide keys (wall_loops, ")
+    assert w[1] == (
+        "recipe pla-light is [process] scope; on part label it is written per object, so its keys apply to that object "
+        "only; list it in process.recipes"
+    )  # no global key in pla-light: nothing the slicer ignores
 
 
 # ---------------------------------------------------------------------------- wipe_tower and unknown keys

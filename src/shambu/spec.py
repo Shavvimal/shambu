@@ -113,9 +113,10 @@ def spec_warnings(d: dict) -> list[str]:
 
 def scope_warnings(process_recipes: Sequence[str], plates: Sequence[PlateSpec]) -> list[str]:
     """A WARN per recipe listed at the other scope (spec 2026-10-29 section 5.3): the keys still apply, so this never
-    errors. A `[process]` recipe on a part writes its plate-wide keys to that object only; an `[object]` recipe in
+    errors. A `[process]` recipe on a part is written per object, where the slicer ignores its global keys
+    (`recipes.GLOBAL_KEYS`) and its object and region keys reach that object only; an `[object]` recipe in
     process.recipes writes its keys for every object. Names unknown to `recipes.RECIPES` are left to the recipe check."""
-    from .recipes import by_name
+    from .recipes import GLOBAL_KEYS, by_name
 
     known = by_name()
     out = []
@@ -133,8 +134,17 @@ def scope_warnings(process_recipes: Sequence[str], plates: Sequence[PlateSpec]) 
                     where = part.key()
                 except BuildError:
                     where = "?"
-                keys = ", ".join(r.set)
-                out.append(f"recipe {name} is [process] scope; on part {where} its plate-wide keys ({keys}) apply to that object only")
+                plate_wide = [k for k in r.set if k in GLOBAL_KEYS]
+                if plate_wide:
+                    out.append(
+                        f"recipe {name} is [process] scope; on part {where} it is written per object, where its plate-wide keys "
+                        f"({', '.join(plate_wide)}) are ignored by the slicer; list it in process.recipes"
+                    )
+                else:
+                    out.append(
+                        f"recipe {name} is [process] scope; on part {where} it is written per object, so its keys apply to that "
+                        "object only; list it in process.recipes"
+                    )
     return list(dict.fromkeys(out))
 
 

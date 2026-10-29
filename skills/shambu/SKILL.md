@@ -86,7 +86,8 @@ Cause (only when something failed): the check line or Studio log line that state
 Sweep (when run): the table rows that decided the choice, and why.
 Still by hand in Studio: painted supports, brim ear points, variable layer height, <anything the spec cannot say>.
 Next: `shambu open project.3mf`; confirm `<base> (modified)` with <override values>, plate type, colours, (two filaments) filament 2 on the auxiliary nozzle.
-      Slice plate (it opens unsliced): GUI estimate within 1 min and 1 g of shambu's, else `shambu verify FILE --against SPEC`. Preview (Overhang wall, Bridge, Support; first layer), Print.
+      Slice plate (it opens unsliced). GUI estimate off by over 1 min or 1 g: File > Save project as (new name), `shambu verify <saved>.3mf --against SPEC`.
+      Preview (Overhang wall, Bridge, Support; first layer). Print only when the estimate matched or verify exits 0.
 Standing warnings:
 - The first print of any new fit is a coupon or one part, in the same orientation as the feature. A flat coupon cannot qualify a sideways bore.
 - Holes print undersize: about 0.1 mm vertical, 0.2 to 0.3 mm horizontal (bridged), more on long bridged bores. Every bore that prints horizontal is flagged above.

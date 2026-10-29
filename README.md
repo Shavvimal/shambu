@@ -136,8 +136,10 @@ final pass. The process combo shows the base preset marked modified, for example
 (modified)`, with every spec and recipe value in place: shambu names the base preset in the project and lists the
 overrides in `different_settings_to_system`, the list Studio keeps on open. The spec's `process.name` is a label for
 the report, not the GUI's preset name. The plate opens unsliced: Studio never loads the embedded G-code of a project
-with objects. Press Slice plate. The GUI estimate must match the report within a minute and a gram; if it does not,
-run `shambu verify project.3mf --against plate.json` and read its FAIL lines. When Studio is already running, the
+with objects. Press Slice plate. The GUI estimate must match the report within a minute and a gram. If it does not,
+save the project in Studio under a new name (File > Save project as), run `shambu verify <saved>.3mf --against
+plate.json` and read its FAIL lines: the export on disk does not change with what Studio holds in memory. Print only
+when the estimate matched or verify exits 0. When Studio is already running, the
 project opens in a new window behind the current one (`open` prints a WARN).
 
 **4. Read the printer (read-only) and measure prints.**

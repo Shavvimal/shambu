@@ -21,16 +21,19 @@ key that list does not name (post-mortem `docs/errors/2026-10-29-gui-open-drops-
   printer bookkeeping too. The GUI shows `<base> (modified)` with the values in place, and a GUI save keeps them (read
   from the Studio source at v02.08.02.61; the live open check is spec section 6). The spec's `process.name` stays the report label.
 - Include order in preset resolution: the leaf's own keys now win over its `include` template, as in Studio
-  (`PresetBundle.cpp:5108-5109`, `:5141-5143`, `:5158`). Three X2D filament values were the template's before:
+  (`PresetBundle.cpp:5084-5086`, `:5109`, `:5142-5144`, `:5158`). Three X2D filament values were the template's before:
   `filament_cooling_before_tower`, `retraction_distances_when_ec`, `slow_down_min_speed`.
 - The hand-back text: open with `shambu open`, confirm the process reads `<base> (modified)` with the override
   values, Slice plate (Studio opens a project with objects unsliced), and the GUI estimate must land within 1 min and
-  1 g of shambu's, else `shambu verify`. "Re-slice in Studio after any change" is gone.
+  1 g of shambu's. Otherwise the user saves the project in Studio under a new name and runs `shambu verify` on the
+  save, and prints only when the estimate matched or verify exits 0. "Re-slice in Studio after any change" is gone.
 
 ### Added
-- `shambu verify FILE --against SPEC [--json]`: checks a GUI-saved project against its spec (process id and
-  override list, every process key, filaments, map, bed, sequence, per-object settings, positions). Exit 0 when no line is FAIL, 1 on any FAIL line (WARN-only GUI edits exit 0), 3 when the file or spec does not load; lines prefixed FAIL, WARN, INFO. A filament 2..N saved by the GUI as `<base>(<file>.3mf)`
-  passes when its values match.
+- `shambu verify FILE --against SPEC [--json]`: compares a GUI-saved project with its spec: the spec's process keys
+  (recipes included), the preset ids and lists, filament colours and set keys, map and mode at project and plate
+  level, bed type, print sequence, and each object's spec-set settings, filament and position (`at`); one FAIL, WARN or
+  INFO line per difference. Exit 0 when no line is FAIL, 1 on any FAIL line (WARN-only GUI edits exit 0), 3 when the
+  file or spec does not load. A filament 2..N saved by the GUI as `<base>(<file>.3mf)` passes when its values match.
 - `shambu patch FILE --process-set KEY=VALUE` and `--process-unset KEY`: change a process key and keep the override
   list right.
 - The `two-filament-plate` recipe (`[process]`: `enable_prime_tower 1`, `independent_support_layer_height 0`), paired

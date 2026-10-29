@@ -17,6 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 SCOPES = ("process", "object")
+# The recipe keys that are global PrintConfig keys in Studio (PrintConfig.hpp:1403-1588: enable_prime_tower :1517,
+# initial_layer_print_height :1475, independent_support_layer_height :1558). Written per object, the slicer ignores them.
+GLOBAL_KEYS = frozenset({"enable_prime_tower", "initial_layer_print_height", "independent_support_layer_height"})
 
 
 @dataclass(frozen=True)
