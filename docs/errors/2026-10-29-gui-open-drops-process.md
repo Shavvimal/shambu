@@ -341,3 +341,34 @@ shambu 0.5.1 exports the process as an unknown user preset with empty `different
 02.08 replaces it with the stock preset on open and drops every override, so a GUI final pass re-slices at 2 walls and
 15 %. Per-object settings survive. Fix by exporting the process as the base preset plus its diff list, moving the
 interface recipe to object scope, adding a process-level patch, and rewriting the hand-back.
+
+## 10. Corrections from the fixing session (2026-10-29)
+
+The fixing session read the Bambu Studio source at tag `v02.08.02.61` and the shambu tree. Each item corrects or
+settles a claim above; the rules with their line cites are in `skills/shambu/references/03-3mf-format.md` section 9
+and `docs/specs/2026-10-29-gui-preset-bookkeeping.md`.
+
+1. **Section 2.3, the per-object interface keys.** They came from the owner's GUI suggestion at 20:49 (screenshot
+   `10.png`), not from shambu. shambu wrote `support_style snug` (`snug-normal-supports`) and no interface keys per
+   object; its interface keys were in the process.
+2. **Section 2.2, the preset name.** The name comes from the spec's `process.name` (`spec.py`, passed to
+   `presets.PresetResolver.for_cli`), not from a recipe.
+3. **Who writes `project_settings.config`.** The Studio CLI writes it from shambu's preset inputs; shambu
+   post-processes it (0.6.0 adds the preset bookkeeping there as a patch).
+4. **The headless slice was right.** The CLI never resets values (`BambuStudio.cpp:3135-3137`, `update_all` true), so
+   shambu's 216 g / 6 h 36 slice had the spec's values. Only the GUI open lost them (`Preset.cpp:2258-2269`).
+5. **"Slice plate" lit is not a shambu fault.** Studio loads the embedded G-code only when the model has no objects
+   (`Plater.cpp:9578-9581`), so a project with objects always opens unsliced. The GUI slice is the check.
+6. **F5.** Short `filament_map`, `filament_nozzle_map` and `filament_volume_map` vectors are padded on load, never
+   reset (`Plater.cpp:~8935-8948`). F5 did not contribute to the loss.
+7. **F6.** The plate metadata already carries `filament_map_mode` Manual, and the plate value wins
+   (`PartPlate.cpp:300-311`). The global reset to Auto For Flush comes from a `printer_model` change on open
+   (`Plater.cpp:24529-24533`); nothing in a file prevents it.
+8. **A defect the post-mortem missed.** `presets.resolve()` merged `include` templates after the preset's own keys, so
+   the template won. Three X2D filament values (`filament_cooling_before_tower`, `retraction_distances_when_ec`,
+   `slow_down_min_speed`) differed from Studio's. Found and fixed in 0.6.0 (Studio's order:
+   `PresetBundle.cpp:5108`, `:5141-5143`, `:5158`).
+9. **Section 2.1, the 28-key list.** It compares two different projects (the 19:22 all-PETG export and the 20:50 save
+   of the PLA-interface build), so most of its keys are not GUI drops. The process keys the GUI dropped are the six
+   named in the evidence (`print_settings_id`, `wall_loops`, `sparse_infill_density`, `sparse_infill_pattern`,
+   `bottom_shell_layers`, `brim_type`) plus `filament_map_mode`.
