@@ -1,6 +1,6 @@
 # Feature spec: a shambu project must open in Bambu Studio with the process it was sliced with (2026-10-29)
 
-Status: DRAFT, for the 0.6.0 work. Severity: high (every build with a recipe or a `set` key loses those values the
+Status: IN PROGRESS for 0.6.0; section 9 records the Codex design review and what it changed. Severity: high (every build with a recipe or a `set` key loses those values the
 moment the GUI opens it; the GUI then re-slices on the stock preset and the user prints something shambu never
 checked). Owner's requirement, verbatim: "I WANT to see it in the Bambu studio. I don't trust it yet to just send,
 wait 9 hours to realise Shambu was wrong. I need it to work well with the GUI so I can do my final pass check." And:
@@ -101,7 +101,11 @@ and `wall_loops 4`.
 1. A project built by shambu, opened in Studio 02.08, shows the process preset shambu built from, marked modified,
    with every spec and recipe value in place (wall loops, infill, shells, brim, supports, interface filament). A GUI
    save keeps them. `shambu inspect` on that save shows the same values and the same diff list.
-2. The same for a filament or printer preset with overrides.
+2. The same for the printer and for filament slot 1. Studio loads filament slots 2..N with
+   `LoadAndSelect::OnlyIfModified`/`Never` (`PresetBundle.cpp:4003-4013`), so a modified secondary filament comes back
+   from a GUI save as a project-embedded copy named `<base>(<file>.3mf)` with `inherits_group[i]` = base and the values
+   kept (`Preset.cpp:2332`, `:2354-2365`, `:2401-2439`). The export still writes the base id; the verifier accepts the
+   embedded form for slots 2..N and compares the values.
 3. The user's GUI slice of the opened project gives the same grams and minutes as shambu's report (the 29 October
    runs matched to 0.03 g and 1 minute once the settings agreed), so the GUI final pass checks shambu's numbers
    instead of replacing them.
@@ -116,6 +120,11 @@ and `wall_loops 4`.
 
 ### 5.1 Export the process (and filaments, printer) as the base preset plus its diff list (F1a)
 
+- The list for a slot is `sorted(explicit overrides ∪ diff_keys)`. Explicit overrides: every key of `spec.process.set`
+  (recipes included), the tower keys tower planning wrote, and the derived infill keys (5.2); for a filament, its
+  `set` keys; the machine has none. An equal key on the list is harmless (Studio drops it on save,
+  `PresetBundle.cpp:3306-3313`); a missing one is reset. The export merges its list with any keys the CLI already
+  put in the slot (the CLI can list a tower key it changed, `BambuStudio.cpp:3388`, `:4182-4208`).
 - `presets.py`: new `PresetResolver.diff_keys(kind, base, composed) -> list[str]`: the sorted keys of `composed` whose
   value differs from `resolve(kind, base)` or that the resolved base does not define, minus the bookkeeping keys
   (`name`, `type`, `from`, `inherits`, `instantiation`, `setting_id`, `is_custom_defined`, the three `*_settings_id`,
@@ -282,3 +291,37 @@ entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density
 0.6.0 (a behaviour change in every export). Bump `src/shambu/__init__.py`, `.claude-plugin/plugin.json`,
 `skills/shambu/SKILL.md` `--expect-version`, `skills/setup/SKILL.md`, `README.md`; CHANGELOG entry under 0.6.0 with
 the one-line summary from the post-mortem section 9 and the include-order fix.
+
+## 9. Design review (Codex gpt-6-astra high, thread 01a189a0, 2026-10-29) and the decisions
+
+Verdict was "reject" on three blockers. Each finding, and what changed:
+
+1. **Blocker, diff baseline (F).** shambu's resolved base can differ from Studio's effective base (the include
+   diff-against-default filter, a different vendor bundle version), so a key equal to shambu's base but not Studio's
+   would be left off the list and reset. Accepted: the list is explicit overrides ∪ computed diff (5.1), merged with the
+   CLI's own entries. Dismissed the stronger "list every key" option: it would carry a wrong shambu base value into the
+   GUI and hide it; the intent list lets the GUI reset such a key and the verifier (5.6) then shows the value difference.
+2. **Blocker, secondary filaments (C).** Slots 2..N are loaded `OnlyIfModified`/`Never` and become embedded copies.
+   Accepted: requirement 4.2 and the verifier (5.6) now describe and accept that form; a test covers two slots on one
+   base. The export keeps writing the base id, which is what the export check sees.
+3. **Blocker, verifier gaps (G/I).** `summary()` has no position field (`edits.object_positions()` through the facade
+   does), `Pipeline.plan()` runs Studio, and ids/colours alone miss dropped filament or printer overrides. Accepted: the
+   verifier composes presets from the spec without planning, reuses the position helper, compares values for every
+   preset kind, keeps the explicit-override value check independent of the list, normalises empty vectors and compares
+   key sets.
+4. **Should, process patch (G).** Append-only bookkeeping would list a key set back to its base value. Accepted: the
+   patch recomputes the slot canonically when the base resolves, appends only when it does not; the resolver stays in
+   the CLI, the patch receives values (rubric 4).
+5. **Should, every slot (I).** Accepted: every slot is normalised, including empty diffs (a `name`-only filament). The
+   "CLI never resets values" claim is narrowed: it copies every input key (`update_all`), but may change and list the
+   tower key; hence the merge in 5.1.
+6. **Should, mechanism qualifications (A, B).** Accepted: `inherits_group[0] = ""`; listed variant-dependent vectors are
+   remapped, not kept verbatim (`PrintConfig.cpp:9273-9287`); a known `inherits` parent can also be selected modified.
+7. **Should, derived keys (E).** Skin/skeleton densities change fill only for the locked-zag pattern
+   (`Fill.cpp:307-329`). Accepted: couple only on an explicit `sparse_infill_density` override, keep explicit derived
+   values, share the helper with `slice --settings-from`, document locked-zag.
+8. **Nit, G-code kept (D).** Agreed: the MD5 covers the G-code bytes only (`bbs_3mf.cpp:6776-6800`); the bookkeeping
+   patch declares `Metadata/project_settings.config` as its only touch and a test checks the G-code bytes are unchanged.
+9. **Should, rubric (G).** Accepted: the open warning is returned by the facade and printed by the CLI; exit codes as
+   rubric 19.
+10. **Nit, deferrals (H).** Agreed; the embedded named process preset stays an experiment (section 6).
