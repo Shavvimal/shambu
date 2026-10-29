@@ -809,6 +809,28 @@ def test_studio_counts_the_colours_when_the_ids_are_missing(tmp_path):
     assert ps["filament_settings_id"] == ["", "F2 base"] and ps["different_settings_to_system"] == ["", "", "nozzle_temperature", ""]
 
 
+def test_missing_ids_are_padded_to_the_colour_count_in_ascending_slot_order(tmp_path):
+    """Slot 1 first must not leave a one-entry id vector that the next slot recounts against the two colours."""
+    f = two(tmp_path / "f.3mf", filament_settings_id=[])
+    apply(
+        f,
+        X.SetPresetBookkeeping(0, "P base", ("wall_loops",)),
+        X.SetPresetBookkeeping(1, "F1 base", ()),
+        X.SetPresetBookkeeping(2, "F2 base", ("nozzle_temperature",)),
+        X.SetPresetBookkeeping(3, MACHINE, ()),
+    )
+    ps = settings(f)
+    assert ps["filament_settings_id"] == ["F1 base", "F2 base"]
+    assert ps["different_settings_to_system"] == ["wall_loops", "", "nozzle_temperature", ""]
+
+
+def test_slot_one_alone_pads_the_missing_ids(tmp_path):
+    p = Project(str(two(tmp_path / "f.3mf", filament_settings_id=[])))
+    p.set_preset_bookkeeping(1, "F1 base", ())
+    assert p.project_settings["filament_settings_id"] == ["F1 base", ""]
+    assert p.studio_filament_count() == 2
+
+
 def test_two_ids_and_one_colour_are_refused(project_file):  # the fixture: 2 ids, 1 colour
     with pytest.raises(ProjectError, match="1 filament_colour entries but 2 filament_settings_id entries"):
         Project(str(project_file)).set_preset_bookkeeping(0, "x", ())

@@ -114,36 +114,57 @@ def test_inspect_without_a_list_keeps_the_plain_process(capsys, tmp_path):
     assert code == 0 and "process Test Process; bed" in out
 
 
-def test_slice_settings_from_writes_the_process_and_printer_bookkeeping(capsys, tmp_path, monkeypatch, resolver):
-    from test_edits import SequenceStudio
+def cli_studio(fixture):
+    """A fake CLI whose export carries the loaded machine and process JSONs as the real CLI writes them
+    (`write_cli_presets`): their names in the preset ids and their values in the config."""
+    return FakeStudio(fixture=fixture, cli_presets=True)
 
+
+def test_slice_settings_from_writes_the_process_and_printer_bookkeeping(capsys, tmp_path, monkeypatch, resolver):
     src = two(tmp_path / "in.3mf")
-    gcode = two(tmp_path / "studio.gcode.3mf", sliced=True, print_settings_id="Sweeper", inherits_group=[PROCESS, "", "", ""])
-    studio = SequenceStudio(gcode, codes=[0])
+    studio = cli_studio(two(tmp_path / "studio.gcode.3mf", sliced=True))
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
-    spec = tmp_path / "spec.json"
-    spec.write_text(
-        json.dumps(
-            {
-                "name": "s",
-                "outdir": str(tmp_path),
-                "printer": MACHINE,
-                "process": {"base": PROCESS, "name": "Sweeper", "set": {"wall_loops": "4"}},
-                "filaments": [{"preset": "Test PLA"}],
-                "plates": [{"parts": []}],
-            }
-        ),
-        encoding="utf-8",
-    )
     dest = tmp_path / "o.gcode.3mf"
-    code, out, _ = run(capsys, "--json", "slice", str(src), "--settings-from", str(spec), "-o", str(dest))
+    code, out, _ = run(
+        capsys, "--json", "slice", str(src), "--settings-from", str(_slice_spec(tmp_path, {"wall_loops": "4"})), "-o", str(dest)
+    )
     doc = json.loads(out)
     assert code == 0, doc
     ps = ps_of(dest)
     assert ps["print_settings_id"] == PROCESS and ps["printer_settings_id"] == MACHINE
     assert ps["inherits_group"] == ["", "", "", ""] and ps["different_settings_to_system"][0] == "wall_loops"
+    assert ps["wall_loops"] == "4"
     assert Project(str(dest)).is_sliced()
     assert f"preset bookkeeping: process {PROCESS} + 1 overrides" in doc["notes"]
+
+
+def _fail_slice(capsys, tmp_path, monkeypatch, resolver, studio):
+    monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
+    dest = tmp_path / "o.gcode.3mf"
+    dest.write_bytes(b"old")
+    spec = _slice_spec(tmp_path, {"wall_loops": "4"})
+    code, out, _ = run(capsys, "--json", "slice", str(two(tmp_path / "in.3mf")), "--settings-from", str(spec), "-o", str(dest))
+    assert code == 1, out
+    assert dest.read_bytes() == b"old"  # the export stays in the run folder
+    return json.loads(out)
+
+
+def test_slice_settings_from_refuses_an_export_with_another_process(capsys, tmp_path, monkeypatch, resolver):
+    """The CLI writes print_settings_id from the loaded JSON's name (BambuStudio.cpp:2382-2386): another name means it
+    sliced another process, so the export does not replace the output and keeps the CLI's names."""
+    fixture = two(tmp_path / "studio.gcode.3mf", sliced=True, print_settings_id="Other", printer_settings_id=MACHINE, wall_loops="4")
+    doc = _fail_slice(capsys, tmp_path, monkeypatch, resolver, FakeStudio(fixture=fixture))
+    text = json.dumps(doc)
+    assert "the export's process is 'Other', the slice asked for 'Sweeper' (print_settings_id)" in text
+    kept = next(tmp_path.glob("o.slice-*/o.gcode.3mf"))
+    assert ps_of(kept)["print_settings_id"] == "Other"  # no bookkeeping written over a wrong export
+
+
+def test_slice_settings_from_refuses_an_export_with_another_override_value(capsys, tmp_path, monkeypatch, resolver):
+    fixture = two(tmp_path / "studio.gcode.3mf", sliced=True, print_settings_id="Sweeper", printer_settings_id=MACHINE, wall_loops="2")
+    doc = _fail_slice(capsys, tmp_path, monkeypatch, resolver, FakeStudio(fixture=fixture))
+    assert "the export's process setting wall_loops is '2', the slice asked for '4'" in json.dumps(doc)
+    assert "the export's process is" not in json.dumps(doc)
 
 
 def _user_process(profiles, name="My 4 walls"):
@@ -208,9 +229,7 @@ def _slice_spec(tmp_path, process_set):
 
 
 def _slice(capsys, tmp_path, monkeypatch, resolver, src, process_set):
-    from test_edits import SequenceStudio
-
-    studio = SequenceStudio(two(tmp_path / "studio.gcode.3mf", sliced=True), codes=[0])
+    studio = cli_studio(two(tmp_path / "studio.gcode.3mf", sliced=True))
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
     dest = tmp_path / "o.gcode.3mf"
     code, out, _ = run(capsys, "--json", "slice", str(src), "--settings-from", str(_slice_spec(tmp_path, process_set)), "-o", str(dest))
@@ -221,6 +240,7 @@ def _slice(capsys, tmp_path, monkeypatch, resolver, src, process_set):
 def test_slice_settings_from_lists_the_derived_infill_keys(capsys, tmp_path, monkeypatch, resolver):
     ps = _slice(capsys, tmp_path, monkeypatch, resolver, two(tmp_path / "in.3mf"), {"sparse_infill_density": "25%"})
     assert ps["different_settings_to_system"][0] == "skeleton_infill_density;skin_infill_density;sparse_infill_density"
+    assert ps["sparse_infill_density"] == ps["skin_infill_density"] == ps["skeleton_infill_density"] == "25%"
 
 
 def test_slice_settings_from_keeps_the_keys_the_input_listed(capsys, tmp_path, monkeypatch, resolver):
@@ -233,9 +253,7 @@ def test_slice_settings_from_keeps_the_keys_the_input_listed(capsys, tmp_path, m
 
 
 def test_slice_settings_from_skips_an_ambiguous_export_with_a_warning(capsys, tmp_path, monkeypatch, resolver):
-    from test_edits import SequenceStudio
-
-    studio = SequenceStudio(make_3mf(tmp_path / "studio.gcode.3mf", sliced=True), codes=[0])  # 2 ids, 1 colour
+    studio = cli_studio(make_3mf(tmp_path / "studio.gcode.3mf", sliced=True))  # 2 ids, 1 colour
     monkeypatch.setattr(cli, "Bambu", lambda: Bambu(studio=studio, resolver=resolver))
     spec = _slice_spec(tmp_path, {"wall_loops": "4"})
     code, out, _ = run(

@@ -814,7 +814,9 @@ class Project:
             ps["printer_settings_id"] = base
         else:
             ids = list(ps.get("filament_settings_id") or [])
-            ids += [""] * max(0, slot - len(ids))  # no ids at all: Studio counted the colours
+            # no ids at all: Studio counted the colours, so pad to all N slots at once, else the next call recounts a
+            # short id vector against the colours and calls the layout ambiguous
+            ids += [""] * max(0, self.studio_filament_count() - len(ids))
             ids[slot - 1] = base
             ps["filament_settings_id"] = ids
         inherits, diff = self._bookkeeping_vectors()
