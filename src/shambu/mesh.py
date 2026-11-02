@@ -16,6 +16,7 @@ vertical wall, 90 = a flat ceiling). The default 60 is what Studio supports by d
 Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), convex hulls, painted supports, and
 anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those. Open edges, bridges,
 wall thickness, tip-over and bed fit are findings of `printability.py` (`shambu printability`), not orientation metrics.
+Booleans between parts (clearance, sweeps) live in `cad/geom`, behind the optional `geom` extra (`shambu cad`).
 """
 
 from __future__ import annotations

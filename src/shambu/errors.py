@@ -40,3 +40,26 @@ class BuildError(BambuError):
 class FileError(BambuError):
     """A file or folder shambu had to create, write or replace could not be: the operation and the path, from the
     OSError at the orchestration boundary (exit 3 at the CLI, one JSON document with --json)."""
+
+
+class CadError(BambuError):
+    """A `shambu cad` input that cannot be used: a file that does not read, a record or a destination that cannot be
+    written. Exit 3 at the CLI."""
+
+
+class MeshMissing(CadError):
+    """A part's mesh file is not there. Inside a gate it becomes `cad.incomplete.mesh_missing` for that rule."""
+
+
+class CadSpecError(CadError):
+    """A CAD gate spec (`shambu.cad/1`) or an expectation file that breaks its schema. The CLI reports it as a failed
+    check (exit 1, like an invalid plate spec), not as an environment error."""
+
+
+class GeomMissing(CadError):
+    """The optional `geom` extra (numpy, scipy, manifold3d) is not installed; the message carries the install line."""
+
+
+class GeomError(CadError):
+    """The geometry library refused an operation (a Boolean on a mesh it cannot use). Inside a gate it becomes a FAIL
+    finding for the pair, never an exemption."""
