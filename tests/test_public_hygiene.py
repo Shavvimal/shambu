@@ -1,6 +1,7 @@
 """The repository is public: no tracked file may carry a home path, a LAN address, a Bambu account folder id, a
-printer serial, a session id or a path into the owner's private notes. These shapes are generic, so they live here and
-CI checks them. Employer, client and private project names cannot be listed in a public file: they live in the
+printer serial, a session id, a path into personal notes, or the narration of one person's working session (their
+quoted words, their screenshots, a dated agent session, clock-time ranges in a post-mortem). These shapes are
+generic, so they live here and CI checks them. Employer, client and private project names cannot be listed in a public file: they live in the
 untracked file `$XDG_CONFIG_HOME/shambu/private-terms` (one per line), which only a local run reads. CI has no such
 file, and `test_tracked_files_carry_no_private_term` says so in its skip reason instead of passing silently."""
 
@@ -37,6 +38,21 @@ MASKED_SERIAL = re.compile(r"(?<![0-9A-Za-z])(?!00X)[0-9][0-9A-Z]{2}(?:…|\.\.\
 # `https://example.com/blog/` passes: the segment must not follow a host name or another URL character.
 PRIVATE_PATH = re.compile(r"\bcontent/drafts/|(?<![\w.:/~-])(?:[\w.~-]*/)+blogs?(?![\w.-])|(?<![\w.:/~-])blogs?/")
 
+# Narration of one person's working session. A post-mortem states the requirement, the tester's action and the
+# evidence file; it does not quote the owner, cite their screenshots or their notes, or name the agent session.
+SESSION_NARRATION = re.compile(
+    r"\bowner['\u2019]s (?:own )?(?:words|screenshots?|verdict|requirement|assistant|private|X2D)\b"
+    r"|\brequirement, verbatim\b"
+    r"|\bClaude Code session\b",
+    re.I,
+)
+
+# A clock-time range (hyphen, en dash or "to"), the shape of a session log ("17:13 to 21:11 local time"). Only under docs/: the skill
+# references quote Studio log lines and G-code timestamps, which are evidence, not narration.
+CLOCK_RANGE = re.compile(
+    r"(?<![\d:])[0-2]?\d:[0-5]\d(?::[0-5]\d)?\s*(?:to|-|\u2013)\s*[0-2]?\d:[0-5]\d\b|\b[0-2]?\d:[0-5]\d\s+local time\b", re.I
+)
+
 # Generic words that only appear when a private context leaks. Safe to publish: none names a person or a company.
 GENERIC_TERMS = ["blog repo", "owner's blog", "my employer", "our client"]
 
@@ -50,6 +66,8 @@ SHAPES = [
     ("printer serial", SERIAL, ""),
     ("masked printer serial", MASKED_SERIAL, ""),
     ("private notes path", PRIVATE_PATH, ""),
+    ("session narration", SESSION_NARRATION, ""),
+    ("clock-time range", CLOCK_RANGE, "docs/"),
 ]
 
 SELF = "tests/test_public_hygiene.py"
@@ -156,6 +174,16 @@ def test_tracked_files_carry_no_private_term():
         ("docs/x.md", "the plate files in the Blog Repo"),
         ("docs/x.md", "the Secret-Project plate"),
         ("docs/x.md", "Secret-Project's plate"),
+        ("docs/errors/x.md", 'The owner\'s words: "it fits fine".'),
+        ("docs/errors/x.md", 'Owner\'s requirement, verbatim: "I want to see it".'),
+        ("docs/errors/x.md", "see the owner's screenshot `8.png`"),
+        ("docs/errors/x.md", "in a Claude Code session on 29 October 2026"),
+        ("docs/errors/x.md", "the owner's X2D with two spools"),
+        ("docs/errors/x.md", "kept in the owner's private notes"),
+        ("docs/errors/x.md", "on 29 October 2026, 17:13 to 21:11 local time"),
+        ("docs/specs/x.md", "the runs of 20:26-20:43"),
+        ("docs/errors/x.md", "the export at 19:22 local time"),
+        ("docs/errors/x.md", "the owner\u2019s words, with a curly apostrophe"),
     ],
 )
 def test_scan_flags_each_shape(rel, bad):
@@ -167,9 +195,17 @@ def test_scan_passes_placeholders():
         "~/Library/Application Support/BambuStudio/user/<preset_folder>/\nsession `<session-id>`\n/Users/<name>/x\n"
         'SERIAL = "00X0TEST0000999"\nOTHER = "00X0OTHER000111"\nmasked 00X…999 and 00X…123\n'
         "the X2D printer `<printer-serial>`, serial prefix `20P`, `hms_en_20P.json`\n"
-        "`<repo>/plates/` in the owner's private notes\n"
+        "`<repo>/plates/` kept outside the repo\n"
+        "the tester's save, the user's words in the spec, Studio's log at 02:31:19, a read at HH:MM\n"
+        '"Owner steps in Bambu Studio", the code owner, a session digest\n'
     )
     assert scan("docs/errors/x.md", text, []) == []
+
+
+def test_clock_ranges_count_only_under_docs():
+    line = "the `.ips` reports at 11:23-11:25\n"
+    assert scan("docs/errors/x.md", line, []) != []
+    assert scan("skills/shambu/references/x.md", line, []) == []
 
 
 def test_scan_passes_commit_hashes_3mf_uuids_and_urls():
