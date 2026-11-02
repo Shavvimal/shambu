@@ -157,8 +157,9 @@ def missing_gcode_findings(project: Project, info: dict[int, dict], plates: list
     """A plate that `slice_info.config` lists or whose `gcode_file` metadata is set, with no `plate_N.gcode` entry."""
     declared = {p for p in info if p > 0}
     for i, pl in enumerate(project.model_settings.findall("plate"), 1):
-        if any(m.get("key") == "gcode_file" and m.get("value") for m in pl.findall("metadata")):
-            declared.add(i)
+        keys = {m.get("key"): m.get("value") for m in pl.findall("metadata")}
+        if keys.get("gcode_file"):  # named by its plater_id, as Project.summary does; the position when there is none
+            declared.add(project.meta_number(int, keys.get("plater_id"), "model_settings.config plater_id") or i)
     return [
         Finding(
             "gcode.missing",
@@ -223,6 +224,14 @@ def md5_findings(project: Project, plate: int, g: GcodeFacts, row: dict) -> list
     return []
 
 
+def _markers_match(markers: set[int], header: int) -> bool:
+    """The markers are exactly 1..header. Compared by count and ends, so a header number from the file never sizes an
+    allocation (a set of distinct integers with that count, lowest 1 and highest `header`, is that range)."""
+    if not markers:
+        return header == 0
+    return len(markers) == header and min(markers) == 1 and max(markers) == header
+
+
 def gcode_findings(plate: int, g: GcodeFacts, prediction_s: int | None, row: dict) -> list[Finding]:
     out: list[Finding] = []
     row.update(
@@ -246,15 +255,16 @@ def gcode_findings(plate: int, g: GcodeFacts, prediction_s: int | None, row: dic
                 fix=Fix("slice the project again; hand-edited G-code loses the header"),
             )
         )
-    elif g.m73_layers != set(range(1, g.header_layers + 1)):
+    elif not _markers_match(g.m73_layers, g.header_layers):
         got = len(g.m73_layers)
+        lo, hi = (min(g.m73_layers), max(g.m73_layers)) if g.m73_layers else (0, 0)
         out.append(
             Finding(
                 "gcode.layer_markers",
                 WARN,
                 "gcode",
                 f"the header says {g.header_layers} layers, the `M73 L` markers number {got} "
-                f"(highest {max(g.m73_layers) if g.m73_layers else 0}): the printer's layer count will be off",
+                f"(lowest {lo}, highest {hi}): the printer's layer count will be off",
                 OBSERVED,
                 plate=plate,
                 measure={"expected": g.header_layers, "got": got},

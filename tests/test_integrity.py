@@ -231,3 +231,29 @@ def test_truncated_ihdr_is_unreadable(tmp_path):
     assert integrity.png_header(png) == (64, 64, 6)
     assert integrity.png_header(png[:26]) is None
     assert integrity.png_header(png[:8] + b"\x00\x00\x00\x0c" + png[12:]) is None
+
+
+def test_huge_header_layer_count_does_not_allocate():
+    import tracemalloc
+
+    g = integrity.scan_gcode(iter([b"; total layer number: 2000000\n", b"M73 L1\n"]))
+    tracemalloc.start()
+    try:
+        out = integrity.gcode_findings(1, g, None, {})
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 5_000_000
+    assert next(f for f in out if f.code == "gcode.layer_markers").measure == {"expected": 2000000, "got": 1}
+
+
+def test_missing_gcode_is_named_by_the_plater_id(sliced):
+    def swap(t: str) -> str:
+        t = t.replace('key="plater_id" value="1"', 'key="plater_id" value="@"')
+        return t.replace('key="plater_id" value="2"', 'key="plater_id" value="1"').replace('value="@"', 'value="2"')
+
+    two = make_geo_3mf(sliced.parent / "two.gcode.3mf", sliced=True, plates=2)
+    with zipfile.ZipFile(two) as z:
+        ms = z.read("Metadata/model_settings.config").decode()
+    rewrite(two, {"Metadata/model_settings.config": swap(ms).encode()})
+    assert only(run(two), "gcode.missing").plate == 2
