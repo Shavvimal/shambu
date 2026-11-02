@@ -46,6 +46,19 @@ jobs:
       - run: uv sync --group dev --extra geom
       - run: uv run pytest -q
 
+  topo:
+    # The optional topo extras (numpy, scipy, shapely, scikit-image): the stiffness map solver, the Michell check and
+    # window tracing. The main job stays extra-free, so it proves `topo check`, `--help` and the missing-extra path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev --extra topo --extra topo-trace --extra topo-mesh
+      - run: uv run mypy
+      - run: uv run pytest -q tests/test_topo_cli.py tests/test_topo_solver.py tests/test_topo_trace.py
+
   version-bump:
     name: version-bump
     if: github.event_name == 'pull_request'

@@ -26,6 +26,7 @@ binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a 
 | A printability check | `src/shambu/printability.py` (a `PrintCheck`), `meshgeom.py`, `findings.py` | `references/08-optimisation.md` section 12 |
 | A file integrity check | `src/shambu/integrity.py` | `references/03-3mf-format.md` section 2.9 |
 | A CAD gate or finding code | `src/shambu/cad/` (pure modules; Booleans and distances in `cad/geom/`, the geom extra) | `skills/designing-for-print/references/gates.md` |
+| A topology solver step or a `topo.*` code | `src/shambu/topo/` (`spec.py` and `result.py` stdlib; the rest behind the topo extras) | `skills/designing-for-print/references/topology.md` |
 | Skill text | `skills/shambu/SKILL.md`, `skills/setup/SKILL.md`, `skills/designing-for-print/SKILL.md` | the plugin docs |
 
 Every rule the code encodes about Bambu Studio should cite the reference that proved it. A finding names its
@@ -51,6 +52,9 @@ CLI on actual STLs of several kinds, not one favourite part:
 - organic forms (a character lamp, a logo duck, a funnel): dense meshes, no flat faces, supports everywhere,
   the orientation scorer's blind spots;
 - an assembly STL with several bodies (`shambu split`) and a non-manifold mesh.
+
+After a change under `src/shambu/topo/`, run `shambu topo validate --size paper` and one `shambu topo solve` on a
+real part spec with the topo extras installed, and read the findings, not only the exit code.
 
 Keep such files in `data/` (gitignored; `data/README.md` says what to keep and why) and run the loop from that
 README: `shambu info`, `shambu orient`, `shambu printability` in the pose `orient` picks, `shambu build --slice`,
