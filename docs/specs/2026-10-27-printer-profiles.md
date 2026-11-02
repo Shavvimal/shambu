@@ -1,14 +1,14 @@
 # Feature spec: printer profiles for LAN-only mode and cloud mode (2026-10-27)
 
-Status: IMPLEMENTED in 0.5.0 with the section 11 decisions; section 11 supersedes every Keychain, `security`, `code_source`, relocation and Application Support passage below. Severity of the gap: medium (the tool reads the printer only through Bambu Studio's config plus an ARP scan; the day the printer went to LAN-only mode, every read failed until the owner's assistant hand-edited Studio's config with Studio closed). The owner's words: "I need to enable LAN access, what does that mean for me?" and "keep in mind I want to use Account mode (Bambu Cloud) as well as LAN mode. Both should be supported." Written up from the 2026-10-27 session and three research passes over `src/shambu/printer.py`, `src/shambu/conf.py`, the Studio source (master `79df7ae`, 13 Oct 2026), ha-bambulab (`0e027ff`, 21 Sep 2026) and the community protocol docs. Nothing in this document is implemented.
+Status: IMPLEMENTED in 0.5.0 with the section 11 decisions; section 11 supersedes every Keychain, `security`, `code_source`, relocation and Application Support passage below. Severity of the gap: medium (the tool reads the printer only through Bambu Studio's config plus an ARP scan; the day the printer went to LAN-only mode, every read failed until the agent hand-edited Studio's config with Studio closed). Requirement: explain what LAN-only mode changes for the user, and support both Account mode (Bambu Cloud) and LAN-only mode. Written up from the 2026-10-27 incident and three research passes over `src/shambu/printer.py`, `src/shambu/conf.py`, the Studio source (master `79df7ae`, 13 Oct 2026), ha-bambulab (`0e027ff`, 21 Sep 2026) and the community protocol docs. Nothing in this document is implemented.
 
 ## 1. What happened, in order
 
-1. 2026-10-27, morning: the owner switched the X2D to LAN-only mode on the touchscreen so a teammate can develop against it. The printer regenerated its LAN access code (one X2D observation, n=1; sources conflict on whether the toggle always does this, section 8).
+1. 27 October: the tester switched the test printer (an X2D) to LAN-only mode on the touchscreen for local development. The printer regenerated its LAN access code (one X2D observation, n=1; sources conflict on whether the toggle always does this, section 8).
 2. `shambu doctor` reported `loaded on the printer: not read (PrinterError: no host on this LAN answers on port 8883. Is the printer on and on this network? Pass --ip.)`. `shambu printer discover` (ARP plus a port probe, no SSDP by default) found nothing, because the ARP table on this Mac had no entry for the printer.
 3. A hand scan of the subnet for port 8883 found the printer. `shambu printer status --ip <ip>` then failed with `printer <serial> at <ip> refused the MQTT login (Not authorized): check the LAN access code in Studio`. Studio's stored code was the old one.
-4. shambu has no way to take a new access code. The assistant backed up `BambuStudio.conf`, wrote the new code under `access_code.<serial>` while Studio was closed, and the read worked. This is exactly the write that `conf.py`'s docstring forbids callers to do, and it survives only until Studio next saves its config (Studio writes the whole file every 5 s while dirty and again on exit, `GUI_App.cpp:2999-3000,3716-3721`; after a refused login it clears the stored code, `GUI_App.cpp:2280-2290`).
-5. Every later command needs `--ip`, and nothing remembers it. The session memory outside the repo now holds the IP, which is the wrong place.
+4. shambu has no way to take a new access code. The agent backed up `BambuStudio.conf`, wrote the new code under `access_code.<serial>` while Studio was closed, and the read worked. This is exactly the write that `conf.py`'s docstring forbids callers to do, and it survives only until Studio next saves its config (Studio writes the whole file every 5 s while dirty and again on exit, `GUI_App.cpp:2999-3000,3716-3721`; after a refused login it clears the stored code, `GUI_App.cpp:2280-2290`).
+5. Every later command needs `--ip`, and nothing remembers it. The agent's notes outside the repo now hold the IP, which is the wrong place.
 
 ## 2. Root cause
 
@@ -36,7 +36,7 @@ Status: IMPLEMENTED in 0.5.0 with the section 11 decisions; section 11 supersede
 7. **The 8883 subnet probe replaces the ARP-only probe** as the default finder: ARP hosts first (they are cheap and usually right), then the rest of the /24 that the Mac's primary interface is on, 64 threads, 0.5 s per host, inside the existing discovery deadline. A /24 at 0.5 s and 64 threads takes about 2 s. Larger subnets are not scanned; the user passes `--ip` or runs `login`.
 8. **No profile, no change.** With no `printers.json`, every command behaves as 0.4.0 does. A profile is opt-in through `login`.
 9. **Studio's config is never written.** `login --from-studio` copies Studio's selected serial and code into a profile and the Keychain. Nothing copies the other way: Studio rewrites its file every 5 s while running and clears the code after a refused login, so a write from shambu would be lost or would mislead.
-10. **Cloud MQTT and the Bambu account API are out of scope** for 0.5.0. They need an account token that lasts about 90 days, a Cloudflare-fingerprint workaround, and the login endpoint broke in May 2026 (ha-bambulab issue #1999). SECURITY.md promises no network call other than the printer. A later phase can add a single bind-list call to refresh the code after a refusal, behind an explicit flag; section 8 keeps the question.
+10. **Cloud MQTT and the Bambu account API are out of scope** for 0.5.0. They need an account token that lasts about 90 days, a workaround for Cloudflare's TLS client check, and the login endpoint broke in May 2026 (ha-bambulab issue #1999). SECURITY.md promises no network call other than the printer. A later phase can add a single bind-list call to refresh the code after a refusal, behind an explicit flag; section 8 keeps the question.
 
 ## 5. The verbs and flags
 
@@ -70,7 +70,7 @@ The refused-login message becomes, in LAN-only mode: `printer <masked> at <ip> r
 
 ### 5.5 `doctor`
 
-The config line `selected printer <masked>, access code stored: True` becomes two lines: `printer profile x2d (default): serial <masked>, mode lan (SSDP 10:57 | stored | unknown), code from Keychain, last read HH:MM` and, when Studio also holds a code, `Studio: selected printer <masked>, access code stored: True`. The printer section's `not read (...)` line names the source it tried, for example `not read (PrinterError: ... (source: Keychain, profile x2d))`. The timings line gains `printer.profile` and `printer.keychain`.
+The config line `selected printer <masked>, access code stored: True` becomes two lines: `printer profile x2d (default): serial <masked>, mode lan (SSDP HH:MM | stored | unknown), code from Keychain, last read HH:MM` and, when Studio also holds a code, `Studio: selected printer <masked>, access code stored: True`. The printer section's `not read (...)` line names the source it tried, for example `not read (PrinterError: ... (source: Keychain, profile x2d))`. The timings line gains `printer.profile` and `printer.keychain`.
 
 ### 5.6 `shambu printer probe`
 
@@ -113,7 +113,7 @@ The verb reference 04 planned (`04-app-printer-control.md:362`) and never shippe
 1. **When does the X2D regenerate the code?** One X2D observation says a LAN-only toggle does. A 2023 P1P thread agrees; SimplyPrint says the toggle does not rotate it; a firmware update and the refresh icon do. Test: note the code, toggle LAN-only off and on, compare. About 10 minutes per toggle including the Wi-Fi reconnect. The section 5.4 text lists every cause until this is settled.
 2. **Does the X2D send NOTIFY in each mode on current firmware?** `SsdpListen` heard nothing in 145 s on 2026-10-16 (cloud) and nothing on 2026-10-27 (LAN-only). Test: `shambu printer discover --ssdp 1900` in each mode while Studio is closed, on the same Wi-Fi as the printer. If nothing arrives in either mode, `mode` stays `unknown` unless `login` is told, and a `--mode lan|cloud` flag on `login` is the fallback.
 3. **The touchscreen path to the code on the X2D.** Third parties disagree (Settings > General > LAN-Only mode, or Settings > LAN Mode). The official page returned HTTP 402 to the fetcher. Read it off the printer once and fix the section 5.4 text.
-4. **A later cloud refresh.** One `GET /v1/iot-service/api/user/bind` call returns `dev_access_code` for every bound printer, which is how ha-bambulab heals a rotated code in cloud mode. It needs an account token in the Keychain (about 90 days), a login flow with e-mail code or TOTP, and a Chrome TLS fingerprint to pass Cloudflare. Decide after 0.5.0 whether the SECURITY.md promise "no network calls other than the printer" is worth changing for it.
+4. **A later cloud refresh.** One `GET /v1/iot-service/api/user/bind` call returns `dev_access_code` for every bound printer, which is how ha-bambulab heals a rotated code in cloud mode. It needs an account token in the Keychain (about 90 days), a login flow with e-mail code or TOTP, and a Chrome-like TLS handshake to pass Cloudflare. Decide after 0.5.0 whether the SECURITY.md promise "no network calls other than the printer" is worth changing for it.
 5. **The SEARCH port.** Studio sends SSDP SEARCH requests, and the printer appears not to answer them. If an active SEARCH did work, discovery across a sleeping ARP table would be instant. A packet capture while Studio runs settles it. Not needed for 0.5.0: the /24 probe covers it.
 
 ## 9. Files touched
@@ -136,7 +136,7 @@ The verb reference 04 planned (`04-app-printer-control.md:362`) and never shippe
 - ha-bambulab: `pybambu/bambu_client.py` on_disconnect and `coordinator.py` `_async_handle_access_denied` (CONNACK 5 as a rotated code), `config_flow.py:340-400` (cloud MQTT by default, `local_mqtt` option), `pybambu/const.py:282-285` (the signature bit); issues #1863, #1973, #1999, #2036.
 - Bambu: "Firmware Update Introducing New Authorization Control System" (16 Jan 2025, updated 17 and 20 Jan): status pushes unaffected. Developer Mode wiki (fetched as snippets only, HTTP 402).
 - Community: Doridian/OpenBambuAPI `mqtt.md`, `cloud-http.md`; the SSDP NOTIFY capture gist (Benny-Git); jonans/bsnotify (ports 2021 and 1990, SEARCH unanswered); OctoEverywhere and SimplyPrint help pages on the access code; `man security` (tested here: `-i` keeps the secret off argv, exit 44 for a missing item, no prompt when `security` is both creator and reader).
-- The 2026-10-27 session: doctor, discover, the subnet probe, the refused login, the hand edit, and the successful read at 10:57 UTC.
+- The 2026-10-27 incident: doctor, discover, the subnet probe, the refused login, the hand edit, and the successful read.
 
 ## 11. Decisions after review (2026-10-27)
 

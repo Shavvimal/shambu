@@ -1,14 +1,13 @@
 # Feature spec: a shambu project must open in Bambu Studio with the process it was sliced with (2026-10-29)
 
-Status: IN PROGRESS for 0.6.0; section 9 records the Codex design review and what it changed. Severity: high (every build with a recipe or a `set` key loses those values the
+Status: IN PROGRESS for 0.6.0; section 9 records the automated design review and what it changed. Severity: high (every build with a recipe or a `set` key loses those values the
 moment the GUI opens it; the GUI then re-slices on the stock preset and the user prints something shambu never
-checked). Owner's requirement, verbatim: "I WANT to see it in the Bambu studio. I don't trust it yet to just send,
-wait 9 hours to realise Shambu was wrong. I need it to work well with the GUI so I can do my final pass check." And:
-"the slice we use and the GUI SHOULD match up. there is no reason for them not to, so keep GUI validation as part of
-the workflow". Sending the file to the printer without Studio is not a fix.
+checked). Requirements: the user checks every plate in the Studio GUI before printing, because a wrong slice found only
+after a nine-hour print costs the print; and the headless slice and the GUI slice must match, so GUI validation stays
+part of the workflow. Sending the file to the printer without Studio is not a fix.
 
 Written from the post-mortem `docs/errors/2026-10-29-gui-open-drops-process.md`, a read of the Bambu Studio source at
-the installed tag `v02.08.02.61` (commit `926a7192`), the three evidence files in the private project's plates folder, and the
+the installed tag `v02.08.02.61` (commit `926a7192`), the three evidence project files (E1, S1 and S2 in the post-mortem), and the
 shambu tree at `5efeabd`. Studio paths below are relative to `src/` of that tag. Every Studio rule the code will
 encode cites its line here so the reference files can carry it.
 
@@ -76,9 +75,9 @@ encode cites its line here so the reference files can carry it.
 - The export check (`build.py:1615-1616`) requires `print_settings_id` == the composed name and the report claims
   "verified: process name and every override" (`report.py:247`). Both describe the file, not what the GUI will do.
 
-Evidence (`<repo>/plates/`): the untouched 19:22 export has `print_settings_id "PETG custom 4 walls 25 pc gyroid"`,
+Evidence (the post-mortem's files): the untouched export E1 has `print_settings_id "PETG custom 4 walls 25 pc gyroid"`,
 `inherits_group ["0.20mm Standard @BBL X2D","","",""]`, `different_settings_to_system ["","","",""]`, `wall_loops 4`;
-Studio's 20:50 save has `0.20mm Standard @BBL X2D`, no list, `wall_loops 2`; Studio's 21:07 save after the owner's
+Studio's save S1 has `0.20mm Standard @BBL X2D`, no list, `wall_loops 2`; Studio's save S2 after the tester's
 manual edit has the list `bottom_shell_layers;skeleton_infill_density;skin_infill_density;sparse_infill_density;sparse_infill_pattern;wall_loops`
 and `wall_loops 4`.
 
@@ -169,7 +168,7 @@ composed, so the diff list includes them, as the GUI's does.
 ### 5.3 Object-scoped interface recipe (F2)
 
 - `recipes.py`: `dual-material-interface` keeps its name but becomes `[object]` scope with the keys Studio's own
-  suggestion writes per object (evidence, the 20:50 save of `cap_print`): `enable_support 1`,
+  suggestion writes per object (evidence, the save S1 of `cap_print`): `enable_support 1`,
   `support_type tree(auto)`, `support_style tree_hybrid`, `support_threshold_angle 35`,
   `support_on_build_plate_only 0`, `support_interface_filament 2`, `support_filament 0`,
   `support_interface_not_for_body 1`, `support_top_z_distance 0`, `support_interface_spacing 0`,
@@ -251,7 +250,7 @@ come out right either way. A test on the synthetic library pins the order (leaf 
 - **F5, full-length dual-nozzle vectors.** Studio pads them on load and never resets anything because of them
   (section 1 step 9). Nothing to fix; the reference notes it.
 - **F6, `filament_map_mode` Manual.** shambu already writes it where Studio reads it: in each `<plate>` of
-  `model_settings.config` (`build.py:1463` plate params; the 19:22 export has it) and at project level. The plate
+  `model_settings.config` (`build.py:1463` plate params; the export E1 has it) and at project level. The plate
   value wins (`PartPlate.cpp:300-311`) and survives the grouping popup (`FilamentGroupPopup.cpp:429` always offers
   Manual). The global value is reset to Auto For Flush by a `printer_model` change on open (`Plater.cpp:24529-24533`,
   when the GUI held another printer or the printer sync reselects it); nothing in a file prevents that. The plate
@@ -263,10 +262,9 @@ come out right either way. A test on the synthetic library pins the order (leaf 
 - **Keeping the sliced state on open.** Impossible for a project with objects (section 1 step 7). The hand-back says
   so and makes the GUI slice the check.
 
-## 6. Experiments for the owner (five minutes, one Studio open each)
+## 6. Experiments for the tester (five minutes, one Studio open each)
 
-Two files built by a scratch script in the fixing session (kept outside the repo; ask for the paths),
-built by `make_experiments.py` from the untouched 19:22 export; only `project_settings.config` changed (exp2 adds one
+Two files built by a scratch script (`make_experiments.py`, kept outside the repo) from the untouched export E1; only `project_settings.config` changed (exp2 adds one
 entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density;sparse_infill_pattern;wall_loops`.
 
 1. `exp1-base-plus-diff.gcode.3mf`: expect the process combo `0.20mm Standard @BBL X2D (modified)`, wall loops 4,
@@ -298,7 +296,7 @@ entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density
 `skills/shambu/SKILL.md` `--expect-version`, `skills/setup/SKILL.md`, `README.md`; CHANGELOG entry under 0.6.0 with
 the one-line summary from the post-mortem section 9 and the include-order fix.
 
-## 9. Design review (Codex gpt-6-astra high, 2026-10-29) and the decisions
+## 9. Automated design review (2026-10-29) and the decisions
 
 Verdict was "reject" on three blockers. Each finding, and what changed:
 
@@ -332,7 +330,7 @@ Verdict was "reject" on three blockers. Each finding, and what changed:
    rubric 19.
 10. **Nit, deferrals (H).** Agreed; the embedded named process preset stays an experiment (section 6).
 
-## 10. Code review round 1 (Codex per worktree, rubric reviewers), decisions
+## 10. Code review round 1 (one automated review per worktree, against the rubric), decisions
 
 - **Bookkeeping worktree**, four blockers accepted: `_relist_process` keeps listed keys and adds a newly set key absent
   from the base; `_process_base` takes `inherits_group[0]` before `print_settings_id` (Studio's reset target,
@@ -359,7 +357,7 @@ Verdict was "reject" on three blockers. Each finding, and what changed:
   were tightened (`:3985`, `:5084-5086` + `:5109`, `:5142-5144`, `Plater.cpp:8944-8958`).
 - Dismissed: "GUI edits exit 1" (kept WARN, exit 0: the exit code answers whether the spec is honoured).
 
-## 11. Final Codex pass on the merged branch (two threads, by module), decisions
+## 11. Final automated review of the merged branch (two passes, by module), decisions
 
 Core path: (1) `slice --settings-from` rewrote the preset ids without checking the export's original ids and values
 the way `Pipeline.patch` does through `export_names`; accepted, the export now has to carry the composed process and
@@ -381,4 +379,4 @@ and README.
 Confirmed by the same pass: the live export of the merged code (16 listed process keys, system filament and printer
 ids, `inherits_group` all empty) opens as the base preset marked modified with every listed value kept
 (`Preset.cpp:2258-2269`, `:2330-2345`); `support_interface_filament` is per object and outside the reset. This is
-a source-and-file confirmation; the GUI round trip itself is the owner's check in section 6.
+a source-and-file confirmation; the GUI round trip itself is the tester's check in section 6.

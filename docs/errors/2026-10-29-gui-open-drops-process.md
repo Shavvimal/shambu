@@ -1,19 +1,19 @@
 # Post-mortem: shambu projects lose their process when Bambu Studio opens them (2026-10-29)
 
 Scope: every use of shambu 0.5.1 (installed CLI, `uv tool`, git tag v0.5.1, commit 5efeabd; plugin skill 0.5.1) on the
-plates of a private robot-gripper project in a Claude Code session on 29 October 2026, 17:13 to 21:11 local time, against Bambu Studio
-02.08.02.61 on macOS and the X2D printer `<printer-serial>`. Written for the agent that fixes shambu. Every claim carries a tag:
-[V] read from a file named here, [S] seen on a screenshot kept here, [E] estimate or hypothesis, [Calc] arithmetic.
+plates of a multi-part functional print job on 29 October 2026 (one test run of about four hours), against Bambu
+Studio 02.08.02.61 on macOS and the test printer (an X2D, `<printer-serial>`). Written for the agent that fixes shambu.
+Every claim carries a tag: [V] read from a file named here, [G] seen in the Studio GUI (observation numbers G1 to G9
+in the timeline), [E] estimate or hypothesis, [Calc] arithmetic.
 
-The owner's requirement, verbatim: "I WANT to see it in the Bambu studio. I don't trust it yet to just send, wait 9 hours to
-realise Shambu was wrong. I need it to work well with the GUI so I can do my final pass check." So the fix target is:
-**a shambu project opened in the Studio GUI must show the process, filaments, supports and sliced result shambu built,
-and survive the user's final-pass edits without silently reverting.** "Send the file to the printer without Studio" is
-NOT an acceptable workaround; the assistant proposed it twice this session and the owner rejected it.
+Requirement: the tester checks every plate in the Studio GUI before printing, because a wrong slice found only after a
+nine-hour print costs the print. So the fix target is: **a shambu project opened in the Studio GUI must show the
+process, filaments, supports and sliced result shambu built, and survive the user's final-pass edits without silently
+reverting.** "Send the file to the printer without Studio" is NOT an acceptable workaround; the agent proposed it twice
+and the tester rejected it.
 
-Evidence folder: `<repo>/plates/` in the owner's private notes (this file's parent), screenshots in
-`postmortem/screenshots/` (file names below are the session image numbers). Session transcript: Claude Code session
-`<session-id>` (`cairn` export of this session when synced).
+Evidence: the project files, specs, logs and GUI captures are kept outside the repo. The file labels below (E1, E2, S0,
+S1, R1, S2) name them.
 
 ## 0. Verdict
 
@@ -29,7 +29,7 @@ Evidence folder: `<repo>/plates/` in the owner's private notes (this file's pare
    dialog (filament 2 was still in the project; it was simply no longer used once `support_interface_filament` went back
    to 0). The re-slice at 157 g / 5 h 02 and 162.5 g / 5 h 22 instead of 212 to 216.8 g / 6 h 30 to 6 h 36 (2 walls and
    15 % grid instead of 4 walls and 25 % gyroid). The "Slice plate" button lit on a file that was exported sliced. The
-   filament map mode falling from `Manual` to `Auto For Flush`. [V, S]
+   filament map mode falling from `Manual` to `Auto For Flush`. [V, G]
 3. **shambu's own docs recorded the behaviour on 16 October and did not fix it.** `docs/errors/2026-10-16-loaded-filament-not-used.md`
    and the skill reference 00-findings.md line 130: "Studio offered a swap on open, and the swap reset the process to the
    stock preset without a word (5 h 08 against 6 h 34 for the same part)". The skill then added a rule about filaments, and
@@ -38,55 +38,56 @@ Evidence folder: `<repo>/plates/` in the owner's private notes (this file's pare
    the process (the GUI writes the same keys per object, where they survive); `shambu patch --set` cannot change a process
    key, only object keys; and the hand-back text promises "open, confirm, Print" without saying that any change in the GUI
    re-slices on the stock preset. [V]
-5. **Two assistant errors, not shambu's.** Combining `snug-normal-supports` with the PLA interface instead of Bambu's own
-   tree-hybrid set (cosmetic), and recommending the SD-card upload as the fix (rejected by the user). Recorded in section 6.
+5. **Two agent errors, not shambu's.** Combining `snug-normal-supports` with the PLA interface instead of Bambu's own
+   tree-hybrid set (cosmetic), and recommending the SD-card upload as the fix (rejected by the tester). Recorded in section 4.
 
 ## 1. Timeline
 
-Local time (BST), from file mtimes (`ls -laT`), screenshot mtimes and the session. Shambu commands are quoted as run.
+In order, from file modification times, the GUI observations and the build logs. Shambu commands are quoted as run.
+Step numbers give the order; the whole sequence took about four hours.
 
-| Time | Who | What | Evidence |
+| Step | Who | What | Evidence |
 | --- | --- | --- | --- |
-| 17:13 | shambu | `shambu build plate.json --slice` (all PETG, `petg-supports`): exit 0, 5 h 41 min, 194.5 g. `shambu open` | `plate-left.report.md` (first version, overwritten at 19:22), `shambu/` dir mtime 17:13:32 |
-| 17:16 | owner | moves parts in Studio; warning "object body_print has floating cantilever" | screenshot `7.png` (a real geometry fault, fixed in CAD rev S1.1f; not a shambu fault) |
-| 17:17 | owner | saves the project in Studio over the shambu file: 153 KB, unsliced | `shambu inspect` at 17:2x printed `process 0.20mm Standard @BBL X2D; map ['1','2'] (Auto For Flush)`; the positions were the owner's |
-| 17:26 | assistant | puts the owner's six positions into `plate.json` as `at`; `shambu check` all OK | `plate.json` mtime 17:26:15 |
-| 19:22 | shambu | rebuild on CAD S1.1g with `snug-normal-supports` + `petg-supports` on cap and vane: 6 h 30 min, 212.3 g, support 3.9 g | `plate-left.gcode.3mf` 4.9 MB 19:22:02, `plate-left.report.md`, `plate-left.log` |
-| 20:39 | shambu | `shambu build plate-pla-interface.json --slice` (process recipes + `dual-material-interface`, cap and vane `snug-normal-supports`, tower auto): exit 0, 6 h 36 min, 216.1 g, PLA 1.2 g, 6 changes, tower 39 x 28.4 at (81, 195) | `plate-pla-interface.json` 20:39:39, `plate-left-pla-interface.report.md` 20:39:47, `.log` 20:39:46, `plate_1.gcode` 21.4 MB 20:39:45, `result.json`, `shambu/process.json`, `shambu/assemble.json` |
-| 20:39 | shambu | `shambu open plate-left-pla-interface.gcode.3mf` | session |
-| 20:42 | owner | opens the Filament grouping dialog, chooses Custom; Studio re-slices: 157.28 g, 5 h 02, main nozzle PETG only, auxiliary empty | `8.png` |
-| 20:44 | owner | the grouping dialog shows Main Extruder: 1 PETG, Auxiliary: empty; "Slice plate" button active | `9.png` |
-| 20:49 | owner | per the assistant's GUI steps, sets the cap's and vane's support interface filament to 2 (PLA); Studio offers Bambu's PLA-on-PETG set; Yes | `10.png` |
-| 20:50 | owner | saves the project in Studio over the shambu file: 154 934 bytes, unsliced | `plate-left-pla-interface.gcode.3mf` mtime 20:50:11; copied unchanged to `plate-left-pla-interface-gui-saved.3mf` at 20:52 |
-| 20:51 | owner | slices in the GUI: 162.53 g, 5 h 22, PETG main, PLA auxiliary, tower present | `11.png` |
-| 20:52 | shambu | `shambu slice plate-left-pla-interface.gcode.3mf --settings-from plate-pla-interface.json`: exit 0, 6 h 36 min, 216.8 g, "the project's filaments kept", wrote `...resliced.gcode.3mf` | `plate-left-pla-interface.resliced.slice-ntg9j2hq/` (log, result.json, plate_1.gcode 21.5 MB, process.json, machine.json; mtimes 20:52:52 to 20:52:54) |
-| 20:53 | owner | the earlier window still in front: 162.53 g | `12.png` |
-| 20:54 | owner | the resliced file opened (window title `...resliced.gcode`): Studio shows 162.53 g, 5 h 22, "Slice plate" greyed (sliced), i.e. it re-sliced on load with the stock process | `14.png` |
-| 21:00 | owner | sets Wall loops 4, infill 25 % gyroid, bottom shells 5 by hand, slices: 216.77 g, 6 h 37 | `15.png` |
-| 21:07 | owner | saves over the resliced file: 155 080 bytes, unsliced | `plate-left-pla-interface.resliced.gcode.3mf` mtime 21:07:51 |
-| 21:11 | owner | preview check, prints | `16.png` |
+| 1 | shambu | `shambu build plate.json --slice` (all PETG, `petg-supports`): exit 0, 5 h 41 min, 194.5 g. `shambu open` | `plate-left.report.md` (first version, overwritten at step 5) |
+| 2 | tester | moves parts in Studio; warning "object body_print has floating cantilever" | G1 (a real geometry fault, fixed in a later CAD revision; not a shambu fault) |
+| 3 | tester | saves the project in Studio over the shambu file (S0): 153 KB, unsliced | `shambu inspect` of S0 printed `process 0.20mm Standard @BBL X2D; map ['1','2'] (Auto For Flush)`; the positions were the tester's |
+| 4 | agent | puts the tester's six positions into `plate.json` as `at`; `shambu check` all OK | `plate.json` |
+| 5 | shambu | rebuild on the next CAD revision with `snug-normal-supports` + `petg-supports` on cap and vane (E1): 6 h 30 min, 212.3 g, support 3.9 g | `plate-left.gcode.3mf` 4.9 MB, `plate-left.report.md`, `plate-left.log` |
+| 6 | shambu | `shambu build plate-pla-interface.json --slice` (process recipes + `dual-material-interface`, cap and vane `snug-normal-supports`, tower auto) (E2): exit 0, 6 h 36 min, 216.1 g, PLA 1.2 g, 6 changes, tower 39 x 28.4 at (81, 195) | `plate-pla-interface.json`, `plate-left-pla-interface.report.md`, `.log`, `plate_1.gcode` 21.4 MB, `result.json`, `shambu/process.json`, `shambu/assemble.json` |
+| 7 | shambu | `shambu open plate-left-pla-interface.gcode.3mf` | build log |
+| 8 | tester | opens the Filament grouping dialog, chooses Custom; Studio re-slices: 157.28 g, 5 h 02, main nozzle PETG only, auxiliary empty | G2 |
+| 9 | tester | the grouping dialog shows Main Extruder: 1 PETG, Auxiliary: empty; "Slice plate" button active | G3 |
+| 10 | tester | per the agent's GUI steps, sets the cap's and vane's support interface filament to 2 (PLA); Studio offers Bambu's PLA-on-PETG set; Yes | G4 |
+| 11 | tester | saves the project in Studio over the shambu file (S1): 154 934 bytes, unsliced | `plate-left-pla-interface.gcode.3mf`; copied unchanged to `plate-left-pla-interface-gui-saved.3mf` |
+| 12 | tester | slices in the GUI: 162.53 g, 5 h 22, PETG main, PLA auxiliary, tower present | G5 |
+| 13 | shambu | `shambu slice plate-left-pla-interface.gcode.3mf --settings-from plate-pla-interface.json` (R1): exit 0, 6 h 36 min, 216.8 g, "the project's filaments kept", wrote `...resliced.gcode.3mf` | `plate-left-pla-interface.resliced.slice-ntg9j2hq/` (log, result.json, plate_1.gcode 21.5 MB, process.json, machine.json) |
+| 14 | tester | the earlier window still in front: 162.53 g | G6 |
+| 15 | tester | the resliced file opened (window title `...resliced.gcode`): Studio shows 162.53 g, 5 h 22, "Slice plate" greyed (sliced), i.e. it re-sliced on load with the stock process | G7 |
+| 16 | tester | sets Wall loops 4, infill 25 % gyroid, bottom shells 5 by hand, slices: 216.77 g, 6 h 37 | G8 |
+| 17 | tester | saves over the resliced file (S2): 155 080 bytes, unsliced | `plate-left-pla-interface.resliced.gcode.3mf` |
+| 18 | tester | preview check, prints | G9 |
 
-Net cost: about 2 hours of the owner's evening, three re-slices, two assistant explanations that were wrong, and the print
+Net cost: about 2 hours of the tester's time, three re-slices, two agent explanations that were wrong, and the print
 started 4 hours after the first plate was ready.
 
 ## 2. What shambu wrote (the export) and what Studio kept (the save)
 
-Three project files, all in the plates folder. Only `plate-left.gcode.3mf` (19:22, all PETG) is an untouched shambu
+Three project files, all in the plates folder. Only `plate-left.gcode.3mf` (E1, all PETG) is an untouched shambu
 export: it still carries `Metadata/plate_1.gcode` and `plate_1.gcode.md5`. The two others were saved by Studio over
 shambu's files and have no G-code entry (Studio drops it on save when the plate is invalid). [V: zip listings]
 
 ```
 plate-left.gcode.3mf                         shambu export, sliced   Metadata: plate_1.gcode, plate_1.gcode.md5, project_settings.config, model_settings.config, slice_info.config (full), ...
-plate-left-pla-interface-gui-saved.3mf       Studio save 20:50       Metadata: no gcode; slice_info.config holds only the header
-plate-left-pla-interface.resliced.gcode.3mf  Studio save 21:07       same shape as above, plus different_settings_to_system filled by the GUI
+plate-left-pla-interface-gui-saved.3mf       Studio save S1          Metadata: no gcode; slice_info.config holds only the header
+plate-left-pla-interface.resliced.gcode.3mf  Studio save S2          same shape as above, plus different_settings_to_system filled by the GUI
 ```
 
 ### 2.1 `Metadata/project_settings.config`, the keys that decide it
 
-Read with `python3 -I -c "import zipfile,json; ..."` on each file (the exact script is in the session; it reads the
-JSON and prints the keys below).
+Read with `python3 -I -c "import zipfile,json; ..."` on each file (a short script that reads the JSON and prints the
+keys below).
 
-| Key | shambu export (19:22) | Studio save 20:50 | Studio save 21:07 (after the owner's manual walls) |
+| Key | shambu export E1 | Studio save S1 | Studio save S2 (after the tester's manual walls) |
 | --- | --- | --- | --- |
 | `print_settings_id` | `PETG custom 4 walls 25 pc gyroid` | `0.20mm Standard @BBL X2D` | `0.20mm Standard @BBL X2D` |
 | `different_settings_to_system` | `["", "", "", ""]` | `null` (key absent) | `["bottom_shell_layers;skeleton_infill_density;skin_infill_density;sparse_infill_density;sparse_infill_pattern;wall_loops", "", "", ""]` |
@@ -96,7 +97,7 @@ JSON and prints the keys below).
 | `sparse_infill_pattern` | `gyroid` | `grid` | `gyroid` |
 | `bottom_shell_layers` | `5` | `3` | `5` |
 | `brim_type` | `no_brim` | `auto_brim` | `auto_brim` |
-| `support_interface_filament` | `0` here; `2` in the 20:39 export per `shambu/process.json` | `0` | `0` |
+| `support_interface_filament` | `0` here; `2` in the E2 export per `shambu/process.json` | `0` | `0` |
 | `filament_map_mode` | `Manual` | `Auto For Flush` | `Auto For Flush` |
 | `filament_map` | `["1", "2"]` | `["1", "2"]` | `["1", "2"]` |
 | `filament_settings_id` | both filaments | both filaments | both filaments |
@@ -106,12 +107,12 @@ JSON and prints the keys below).
 | `filament_map_2` | `["1"]` (shambu-only key) | absent | absent |
 | `wipe_tower_x`, `wipe_tower_y` | `["208"]`, `["208"]` (all-PETG file, no tower) | `["81"]`, `["195"]` | same |
 
-Read it as a fingerprint: **Studio keeps modifications of a known preset only when `different_settings_to_system[0]`
-names the modified keys**. The owner's manual edit produced exactly that list; shambu's export produced an empty string and
+Read it as a signature: **Studio keeps modifications of a known preset only when `different_settings_to_system[0]`
+names the modified keys**. The tester's manual edit produced exactly that list; shambu's export produced an empty string and
 a preset name Studio has never heard of. Whether Studio first fails the name lookup and then trusts the empty
 bookkeeping, or applies the bookkeeping regardless of the name, is the one thing to establish by experiment (section 7).
 
-The 28 keys that differ between the shambu export and the 20:50 save, for completeness: `bottom_shell_layers`,
+The 28 keys that differ between the shambu export E1 and the save S1, for completeness: `bottom_shell_layers`,
 `brim_type`, `default_filament_colour`, `enable_overhang_bridge_fan`, `enable_pressure_advance`, `extruder_ams_count`,
 `filament_change_length_nc`, `filament_cooling_before_tower`, `filament_dev_ams_drying_ams_limitations`,
 `filament_dev_ams_drying_temperature`, `filament_dev_ams_drying_time`, `filament_flush_temp_fast`, `filament_map_mode`,
@@ -149,18 +150,18 @@ name turns the preset into `from: User` with `inherits` = the system" preset; `d
 that exists only inside the 3MF. The GUI's library (`~/Library/Application Support/BambuStudio/user/<id>/process/`) has
 no such preset. [V: grep of `src/shambu`, `presets.py`]
 
-Note the all-PETG export (19:22) carries `inherits_group[0] = "0.20mm Standard @BBL X2D"`, so Studio did know the base
+Note the all-PETG export E1 carries `inherits_group[0] = "0.20mm Standard @BBL X2D"`, so Studio did know the base
 preset; it still dropped the values. [V]
 
 ### 2.3 What survived: the per-object settings
 
-`Metadata/model_settings.config` in the 20:50 save, object `cap_print`: `enable_support 1`, `support_interface_filament 2`,
+`Metadata/model_settings.config` in the save S1, object `cap_print`: `enable_support 1`, `support_interface_filament 2`,
 `support_interface_pattern rectilinear_interlaced`, `support_interface_spacing 0`, `support_interface_speed 50,50,50,50`,
 `support_on_build_plate_only 1`, `support_style tree_hybrid`, `support_threshold_angle 35`, `support_top_z_distance 0`,
 `support_type normal(auto)`, `tree_support_branch_diameter 3`, `tree_support_branch_diameter_angle 7`, `raft_first_layer_expansion 5`,
-`brim_type outer_only`, `brim_width 5`, `brim_object_gap 0.1`, `extruder 1`. The object positions are the owner's from 17:17
+`brim_type outer_only`, `brim_width 5`, `brim_object_gap 0.1`, `extruder 1`. The object positions are the tester's from step 3
 (body min corner 7.882, 7.528; cap 148.656, 11.236; vane 96.453, 81.722; gates 118.895/131.11, 15.579/132.403,
-189.145/137.688), unchanged through every save. [V: `shambu inspect` outputs in the session; the config]
+189.145/137.688), unchanged through every save. [V: `shambu inspect` outputs; the config]
 
 shambu writes its per-object settings through `shambu/assemble.json` (`print_params` per object: `brim_type`,
 `enable_support`, `support_type`, `support_style`, `support_on_build_plate_only`, `support_filament`, ...), and those
@@ -173,7 +174,7 @@ the fix.
 
 - Symptom: open a shambu project in Studio, the process preset reads `0.20mm Standard @BBL X2D`, and wall loops, infill,
   bottom shells, brim type, support interface filament, support style and the filament map mode are the preset's, not
-  the spec's. The sliced result is invalidated and the next slice runs at 2 walls / 15 % grid. [S 8, 9, 14; V 2.1]
+  the spec's. The sliced result is invalidated and the next slice runs at 2 walls / 15 % grid. [G2, G3, G7; V 2.1]
 - Where: `presets.py` 128 to 146 (the user-preset naming), and the absence of any writer for
   `different_settings_to_system` / a GUI-installable preset.
 - Known since: `docs/errors/2026-10-16-loaded-filament-not-used.md` ("the swap reset the process to the stock preset
@@ -187,23 +188,23 @@ the fix.
   (`support_interface_filament 2`, `support_top_z_distance 0`, `support_interface_spacing 0`,
   `support_interface_pattern rectilinear_interlaced`, `support_style tree_hybrid`, `support_threshold_angle 35`,
   `raft_first_layer_expansion 5`, `enable_support 1`, `support_on_build_plate_only 0`) are what Studio's own
-  "Suggestion" dialog applies PER OBJECT when the user picks a different interface filament on an object [S 10], and those
+  "Suggestion" dialog applies PER OBJECT when the user picks a different interface filament on an object [G4], and those
   per-object keys survived the save [V 2.3]. shambu's process-level placement was the one that vanished.
-- Consequence seen: the grouping dialog listed only PETG, because no object used filament 2 any more [S 8, 9].
+- Consequence seen: the grouping dialog listed only PETG, because no object used filament 2 any more [G2, G3].
 
 ### F3. No verb patches a process key
 
 - `shambu patch --set` takes `OBJECT:KEY=VALUE` only (`shambu patch --help`); `--set wall_loops=4` fails with
-  "bad patch option: not enough values to unpack" [V, session]. The only route was `shambu slice FILE --settings-from
+  "bad patch option: not enough values to unpack" [V, build log]. The only route was `shambu slice FILE --settings-from
   SPEC`, which re-applies the spec's process and wrote `...resliced.gcode.3mf` at 216.8 g; Studio then discarded that
-  process again on open (F1) [S 14].
+  process again on open (F1) [G7].
 
 ### F4. The hand-back promises what the GUI does not do
 
 - `report.py` lines 284 to 303: "Open the project (`open -a BambuStudio ...`), confirm the plate type ... and the filament
   colours ... The plate is already sliced ... then Print. Re-slice in Studio after any change." On this machine the
   project opened unsliced or re-sliced on load, and "re-slice after any change" is exactly what reverted it. The
-  hand-back template in the skill (section "Hand-back") carries the same text. The assistant repeated it twice.
+  hand-back template in the skill (section "Hand-back") carries the same text. The agent repeated it twice.
 
 ### F5. Dual-nozzle vectors are written one entry short
 
@@ -223,13 +224,13 @@ the fix.
 ### F7. `shambu open` leaves the old window in front
 
 - With a project already open, `shambu open` (`open -a BambuStudio FILE`) opened the new file in a second window behind the
-  first; the user read the old window's 162.53 g as the new file's result [S 12]. Minor, but it cost one round.
+  first; the tester read the old window's 162.53 g as the new file's result [G6]. Minor, but it cost one round.
 
-## 4. What the assistant got wrong (so the fixing agent does not inherit it)
+## 4. What the agent got wrong (so the fixing agent does not inherit it)
 
 1. Chose `snug-normal-supports` on the plate only for the cap and the vane, with the PLA interface, instead of Bambu's
-   tree-hybrid set that the GUI suggests [S 10]. The slice worked; the setting is not the tuned one.
-2. Told the user twice to bypass Studio (Device tab upload, or "print the embedded G-code without touching anything").
+   tree-hybrid set that the GUI suggests [G4]. The slice worked; the setting is not the tuned one.
+2. Told the tester twice to bypass Studio (Device tab upload, or "print the embedded G-code without touching anything").
    Rejected: the GUI final pass is a requirement. The fix must make the GUI path work.
 3. Explained the empty auxiliary nozzle as "Studio dropped filament 2 on load". Wrong: filament 2 was in the project all
    along (`filament_settings_id` has two entries in every save); it was unused once the interface setting reverted.
@@ -238,10 +239,10 @@ the fix.
 
 ## 5. What worked, so it is not "fixed" by accident
 
-- `shambu check`: packing, bed and reach checks, the overlap rule, the owner's positions as `at`, the support spread
+- `shambu check`: packing, bed and reach checks, the overlap rule, the tester's positions as `at`, the support spread
   warnings ("the slice decides") all behaved; the warnings were right (the slice found no clash). [V reports]
 - `shambu build --slice`: four exports, four verified reports, exit 0 each time; the shambu slice numbers matched the GUI
-  slice to the gram once the GUI had the same settings (216.8 against 216.77 g; 6 h 36 against 6 h 37). [V, S 15]
+  slice to the gram once the GUI had the same settings (216.8 against 216.77 g; 6 h 36 against 6 h 37). [V, G8]
 - `shambu slice --settings-from`: re-applied the spec process onto a GUI-saved layout and kept the GUI's per-object edits
   and filaments. [V resliced report]
 - `shambu inspect`: every diagnosis in this note came from it or from reading the 3MF it describes.
@@ -249,13 +250,13 @@ the fix.
 
 ## 6. Fixes to investigate, with acceptance tests
 
-The agent cannot drive the Studio GUI. Each fix therefore ends in a file-level assertion that the owner confirms once by opening
-the file, after which `shambu inspect` on the owner's save proves it.
+The agent cannot drive the Studio GUI. Each fix therefore ends in a file-level assertion that the tester confirms once by opening
+the file, after which `shambu inspect` on the tester's save proves it.
 
 F1a. **Write the process as a modified system preset, not a new user preset.** In the exported `project_settings.config`
 set `print_settings_id` to the base system preset (`0.20mm Standard @BBL X2D`), keep `inherits_group[0]` = base, and fill
 `different_settings_to_system[0]` with the `;`-joined list of every process key that differs from the base preset (compute
-the diff against the resolved base; Studio's own list for the owner's edit was
+the diff against the resolved base; Studio's own list for the tester's edit was
 `bottom_shell_layers;skeleton_infill_density;skin_infill_density;sparse_infill_density;sparse_infill_pattern;wall_loops`,
 note the two derived infill keys it adds). Do the same for `[1]`, `[2]` (filaments) and `[3]` (printer) when a recipe
 or the spec overrides them. Keep the readable recipe name elsewhere (a plate name or a comment key), not as the preset
@@ -279,7 +280,7 @@ F3. **Add a process-level patch.** `shambu patch FILE --process-set KEY=VALUE` (
 into `project_settings.config` AND updating `different_settings_to_system[0]`. Acceptance: patch a GUI-saved file's
 `wall_loops` to 4, open it in Studio, see 4.
 
-F4. **Rewrite the hand-back and the skill.** The "Owner steps" and the hand-back `Next:` line must say what the GUI will do
+F4. **Rewrite the hand-back and the skill.** The "Owner steps" section and the hand-back `Next:` line must say what the GUI will do
 on open under the current writer (until F1a lands): that the process preset shows the base name, which values to confirm
 in the GUI (wall loops, infill, bottom shells, interface filament per object) before slicing or printing, and that any
 change re-slices. After F1a: say the process shows "(modified)" and list the keys. Remove "Re-slice in Studio after any
@@ -298,8 +299,8 @@ F7. **`shambu open` focus.** Use `open -a BambuStudio --new` or raise the window
 `running_pids`). Acceptance: the opened file's name is in the front window's title.
 
 F8. **A GUI round-trip verifier.** `shambu verify FILE.3mf --against plate.json` that reads a GUI-saved file and reports
-every process, filament, object and position value that differs from the spec, so the owner's final pass has a check behind
-it. This is the tool-side half of "I need it to work well with the GUI": the user edits, shambu tells the user what changed.
+every process, filament, object and position value that differs from the spec, so the tester's final pass has a check behind
+it. This is the tool-side half of the GUI requirement: the user edits, shambu tells the user what changed.
 
 ## 7. The experiments, in order (each about five minutes, one Studio open per row)
 
@@ -313,27 +314,26 @@ it. This is the tool-side half of "I need it to work well with the GUI": the use
    dialog must show PLA on the auxiliary with no user action; save; `shambu inspect` must show the interface keys on
    the objects and `wall_loops 4`.
 
-The owner opens the files; the agent prepares them and reads the saves. Do not ask the owner to "just send it to the printer".
+The tester opens the files; the agent prepares them and reads the saves. Do not ask the tester to "just send it to the printer".
 
 ## 8. Evidence index
 
-Paths relative to `<repo>/plates/` in the owner's private notes unless absolute.
+The project files are kept outside the repo; the labels match sections 1 and 2.
 
-| What | Path |
+| What | File |
 | --- | --- |
-| Spec, all-PETG, the owner's positions | `plate.json` (17:26) |
-| Spec, PLA interface | `plate-pla-interface.json` (20:39) |
-| shambu export, all PETG, sliced, untouched | `plate-left.gcode.3mf` (19:22, 4.9 MB), `plate-left.report.md`, `plate-left.log` |
-| shambu's composed presets for the 20:39 build | `shambu/process.json`, `shambu/machine.json`, `shambu/filament-1.json`, `shambu/filament-2.json`, `shambu/assemble.json`, `shambu/spec.json` |
-| shambu's 20:39 report and log (the export itself was overwritten at 20:50) | `plate-left-pla-interface.report.md`, `plate-left-pla-interface.log` (line 1 is the Studio CLI command), `result.json`, `plate_1.gcode` (21.4 MB, not in git) |
-| Studio's save of that project at 20:50 (unsliced, process reset, per-object interface kept) | `plate-left-pla-interface-gui-saved.3mf` (identical bytes to `plate-left-pla-interface.gcode.3mf`) |
-| shambu's `slice --settings-from` run (216.8 g) | `plate-left-pla-interface.resliced.slice-ntg9j2hq/` (log, `result.json`, `plate_1.gcode` 21.5 MB, `process.json`, `machine.json`); the 3MF it wrote was overwritten by Studio at 21:07 |
-| Studio's save at 21:07 after the owner's manual process edits (the `different_settings_to_system` fingerprint) | `plate-left-pla-interface.resliced.gcode.3mf` |
-| Screenshots | `postmortem/screenshots/7.png` (17:16 cantilever), `8.png` (20:42, 157 g PETG only), `9.png` (20:44 grouping dialog), `10.png` (20:49 Bambu suggestion), `11.png` (20:51, 162.53 g with PLA), `12.png` (20:53 old window), `14.png` (20:54 resliced file shows 162.53 g), `15.png` (21:00, 216.77 g after manual walls), `16.png` (21:11 preview) |
+| Spec, all-PETG, the tester's positions | `plate.json` |
+| Spec, PLA interface | `plate-pla-interface.json` |
+| E1: shambu export, all PETG, sliced, untouched | `plate-left.gcode.3mf` (4.9 MB), `plate-left.report.md`, `plate-left.log` |
+| shambu's composed presets for the E2 build | `shambu/process.json`, `shambu/machine.json`, `shambu/filament-1.json`, `shambu/filament-2.json`, `shambu/assemble.json`, `shambu/spec.json` |
+| E2: shambu's report and log (the export itself was overwritten by S1) | `plate-left-pla-interface.report.md`, `plate-left-pla-interface.log` (line 1 is the Studio CLI command), `result.json`, `plate_1.gcode` (21.4 MB, not in git) |
+| S1: Studio's save of E2 (unsliced, process reset, per-object interface kept) | `plate-left-pla-interface-gui-saved.3mf` (identical bytes to `plate-left-pla-interface.gcode.3mf`) |
+| R1: shambu's `slice --settings-from` run (216.8 g) | `plate-left-pla-interface.resliced.slice-ntg9j2hq/` (log, `result.json`, `plate_1.gcode` 21.5 MB, `process.json`, `machine.json`); the 3MF it wrote was overwritten by S2 |
+| S2: Studio's save after the tester's manual process edits (the `different_settings_to_system` signature) | `plate-left-pla-interface.resliced.gcode.3mf` |
+| GUI observations | G1 cantilever warning, G2 157 g PETG only, G3 grouping dialog, G4 Bambu suggestion, G5 162.53 g with PLA, G6 old window in front, G7 resliced file shows 162.53 g, G8 216.77 g after manual walls, G9 preview |
 | shambu source | the shambu repo at 5efeabd: `src/shambu/presets.py` 128 to 146, `build.py` 1463, 1509, 1597 to 1608, `threemf.py` 576 to 726, `edits.py` 84 to 91, 1692, 1803, `report.py` 284 to 303 |
 | shambu's prior record of the behaviour | `docs/errors/2026-10-16-loaded-filament-not-used.md`; skill `references/00-findings.md` lines 128 to 136; `references/03-3mf-format.md` lines 295 to 340 (the vector table, `different_settings_to_system` "user-preset bookkeeping") and section 8 (re-slicing a CLI export) |
-| The earlier post-mortem (format and the "owner places by hand, Studio's default process 2 walls 15 %" precedent at 20:57 on 20 Oct) | an earlier post-mortem in the owner's private notes |
-| Session | Claude Code `<session-id>`, 29 Oct 2026 |
+| The earlier precedent (the tester placed parts by hand and Studio's default process gave 2 walls and 15 %) | `docs/errors/2026-10-21-three-plates-and-uncalibrated-estimates.md`, section 1 item 5 |
 
 ## 9. One-line summary for the changelog
 
@@ -342,14 +342,14 @@ shambu 0.5.1 exports the process as an unknown user preset with empty `different
 15 %. Per-object settings survive. Fix by exporting the process as the base preset plus its diff list, moving the
 interface recipe to object scope, adding a process-level patch, and rewriting the hand-back.
 
-## 10. Corrections from the fixing session (2026-10-29)
+## 10. Corrections from the fix (October 2026)
 
-The fixing session read the Bambu Studio source at tag `v02.08.02.61` and the shambu tree. Each item corrects or
+The fix read the Bambu Studio source at tag `v02.08.02.61` and the shambu tree. Each item corrects or
 settles a claim above; the rules with their line cites are in `skills/shambu/references/03-3mf-format.md` section 9
 and `docs/specs/2026-10-29-gui-preset-bookkeeping.md`.
 
-1. **Section 2.3, the per-object interface keys.** They came from the owner's GUI suggestion at 20:49 (screenshot
-   `10.png`), not from shambu. shambu wrote `support_style snug` (`snug-normal-supports`) and no interface keys per
+1. **Section 2.3, the per-object interface keys.** They came from the tester's GUI suggestion at step 10 (G4), not
+   from shambu. shambu wrote `support_style snug` (`snug-normal-supports`) and no interface keys per
    object; its interface keys were in the process.
 2. **Section 2.2, the preset name.** The name comes from the spec's `process.name` (`spec.py`, passed to
    `presets.PresetResolver.for_cli`), not from a recipe.
@@ -371,8 +371,8 @@ and `docs/specs/2026-10-29-gui-preset-bookkeeping.md`.
    the template won. Three X2D filament values (`filament_cooling_before_tower`, `retraction_distances_when_ec`,
    `slow_down_min_speed`) differed from Studio's. Found and fixed in 0.6.0 (Studio's order:
    `PresetBundle.cpp:5084-5086`, `:5109`, `:5142-5144`, `:5158`).
-9. **Section 2.1, the 28-key list.** It compares two different projects (the 19:22 all-PETG export and the 20:50 save
-   of the PLA-interface build), so most of its keys are not GUI drops. The directly comparable all-PETG keys the GUI
+9. **Section 2.1, the 28-key list.** It compares two different projects (the all-PETG export E1 and the save S1 of
+   the PLA-interface build), so most of its keys are not GUI drops. The directly comparable all-PETG keys the GUI
    dropped are six (`print_settings_id`, `wall_loops`, `sparse_infill_density`, `sparse_infill_pattern`,
    `bottom_shell_layers`, `brim_type`). The PLA-interface build also lost `support_interface_filament` at process
    level (2 to 0, the section 2.1 row). `filament_map_mode` fell to Auto For Flush for a separate cause (item 7), not
