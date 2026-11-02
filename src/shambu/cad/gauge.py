@@ -192,6 +192,8 @@ class Gauge:
             if entry - RESOLUTION_MM - 1e-6 <= L.dot(p, a) - mouth_t <= end + RESOLUTION_MM
             and abs(math.hypot(L.dot(p, u) - cu, L.dot(p, v) - cv) - r_rays) <= RADIUS_BAND * r_rays
         ]
+        d_min: float | None
+        d_max: float | None
         try:
             cu2, cv2, r2, rms = L.fit_circle([(L.dot(p, u), L.dot(p, v)) for p in band])
             radii = [math.hypot(L.dot(p, u) - cu2, L.dot(p, v) - cv2) for p in band]
