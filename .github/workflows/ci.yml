@@ -32,15 +32,19 @@ jobs:
 
   geom:
     # The optional geom extra (numpy, scipy, manifold3d): Booleans, exact distances, clearance and sweeps. The main
-    # job stays extra-free, so it proves the stdlib verbs and the missing-extra path.
+    # job stays extra-free, so it proves the stdlib verbs and the missing-extra path; this one runs the whole suite
+    # with the extra installed, so the stdlib verbs are proven beside it too.
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: uv sync --group dev --extra geom
-      - run: uv run pytest -q tests/test_cad_geom.py tests/test_cad_cli.py tests/test_cad_spec.py
+      - run: uv run pytest -q
 
   version-bump:
     name: version-bump
