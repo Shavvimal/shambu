@@ -10,16 +10,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - `shambu printability FILE`: a pre-flight on an STL (in the pose `--lay-on-face` or `--rotate` gives) or on every
-  object of a 3MF (in its placed pose), with no slicer: overhang regions with their area, shadow and location, and
+  build instance of every object of a 3MF (in its placed pose, mirrors included), with no slicer: overhang regions with their area, shadow and location, and
   overhangs that meet the bed; bridges with their span (twice the largest distance to an anchoring wall) against
-  `max_bridge_length`; sampled wall and slab thickness against the line widths and the layer grid; bed contact and
-  tip-over; when a brim helps; and the fit on the bed and the extruder's reach. Findings are reported by area, each
+  `max_bridge_length`; sampled wall and slab thickness against the line widths and the layer grid (first layer and
+  Z position included); bed contact and tip-over, per body; when a brim helps; and the fit on the bed and the extruder's reach. Findings are reported by area, each
   with a stable code, a severity, its evidence level (measured, observed, external or heuristic) and a fix (a recipe,
   a CAD step or a shambu command). There is no overall score, and every run lists what it did not check. Exit 1 on a
   FAIL finding (an open mesh, a mesh in metres, no bed contact, a part that does not fit), as `shambu check`. The
   thresholds are the X2D `0.20mm Standard` values, a 3MF's own settings, `--process` or a flag, each with its
-  source. Reference 08 section 12 has the algorithms, the limits and the timings on real parts.
-- File integrity in `shambu inspect` and `shambu verify`: the plate G-code against its `.md5` entry, the header
+  source. A non-finite flag or vertex coordinate is a usage error (exit 2). Reference 08 section 12 has the
+  algorithms, the limits and the timings on real parts.
+- File integrity in `shambu inspect` and `shambu verify`: a plate marked sliced with no G-code entry, the plate
+  G-code against its `.md5` entry, the header
   layer count against the `M73 L` markers, the `M991` layer notices, the slice time against the G-code's own `M73 R`,
   the plate thumbnail's PNG header, the `plate_N.json` bed id, every Studio slice warning with its level and code,
   and the `flush_volumes_matrix` length (extruders x n x n: one n x n block per nozzle on the X2D, not a perfect
