@@ -60,8 +60,8 @@ leaves in the variant folder say which nozzle printed what, where. A tool that o
 - Add a line under `## [Unreleased]` in `CHANGELOG.md`.
 - Never commit a printer serial, access code, IP address or personal path. Run
   `rg -n '192\.168|access_code|/Users/'` before pushing.
-- `tests/test_public_hygiene.py` fails on a home path, a 192.168 address, a Bambu preset folder id or a session id in
-  `docs/errors/`; put any extra private name in the untracked `~/.config/shambu/private-terms` (one per line).
+- `tests/test_public_hygiene.py` fails on a home path, a 192.168 address, a Bambu preset folder id, a full session UUID or a
+  short id after "session" or "thread" in any tracked file; put any extra private name in the untracked `~/.config/shambu/private-terms` (one per line).
 
 ## Printer safety
 

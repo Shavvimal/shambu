@@ -1,7 +1,7 @@
 # Post-mortem: shambu projects lose their process when Bambu Studio opens them (2026-10-29)
 
 Scope: every use of shambu 0.5.1 (installed CLI, `uv tool`, git tag v0.5.1, commit 5efeabd; plugin skill 0.5.1) on the
-sweeper v1 plates in Claude Code session `8d0c87de` on 29 October 2026, 17:13 to 21:11 local time, against Bambu Studio
+sweeper v1 plates in a Claude Code session on 29 October 2026, 17:13 to 21:11 local time, against Bambu Studio
 02.08.02.61 on macOS and the X2D printer `20P…277`. Written for the agent that fixes shambu. Every claim carries a tag:
 [V] read from a file named here, [S] seen on a screenshot kept here, [E] estimate or hypothesis, [Calc] arithmetic.
 

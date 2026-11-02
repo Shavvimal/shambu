@@ -8,7 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - A post-mortem no longer names a Bambu account folder id or a session id, and `tests/test_public_hygiene.py` scans
-  every tracked file for home paths, 192.168 addresses, preset folder ids and session ids (plus local private terms).
+  every tracked file for home paths, 192.168 addresses, preset folder ids, session and thread ids (full UUIDs, and
+  short prefixes after "session" or "thread"), plus local private terms.
 - README opens with why the tool exists: agents can sweep orientations, print sequences and tower options in
   parallel and iterate on plates in a way a person in the Studio GUI cannot; Studio stays the final pass.
 

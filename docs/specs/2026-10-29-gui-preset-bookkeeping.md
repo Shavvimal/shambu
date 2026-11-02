@@ -298,7 +298,7 @@ entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density
 `skills/shambu/SKILL.md` `--expect-version`, `skills/setup/SKILL.md`, `README.md`; CHANGELOG entry under 0.6.0 with
 the one-line summary from the post-mortem section 9 and the include-order fix.
 
-## 9. Design review (Codex gpt-6-astra high, thread 01a189a0, 2026-10-29) and the decisions
+## 9. Design review (Codex gpt-6-astra high, 2026-10-29) and the decisions
 
 Verdict was "reject" on three blockers. Each finding, and what changed:
 
