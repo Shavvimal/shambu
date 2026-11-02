@@ -104,7 +104,9 @@ Standing warnings for every report with a fit:
   not run it in a part session (unverified), so `checkpoint` first and `restore` after. Prefer
   `shambu cad clearance` on the exports.
 - A `pass` with a rule `not-checked` (skipped, or geom missing) proves nothing about that rule. Say which.
-- `cad.incomplete.*` is not a pass: a selector matched nothing, or a mesh or record is missing.
+- `cad.incomplete.*` is not a pass, and only some causes are inputs. Fix the spec or the files for
+  `selector_empty`, `mesh_missing`, `unreadable`, `no_record` and `no_holes`. Fix the model for `no_volume` and
+  `wall_unmeasured`: the files are fresh, so a re-export alone changes nothing. Table: `references/gates.md`.
 
 ## Commands
 
