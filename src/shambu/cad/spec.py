@@ -372,7 +372,9 @@ def _feature(d: Any, where: str) -> ExpectedFeature:
     if d["kind"] not in ("hole", "boss"):
         raise CadSpecError(f"{where}.kind: 'hole' or 'boss', got {d['kind']!r}")
     angles = d.get("angles_deg")
-    if angles is not None and (not isinstance(angles, list) or not all(isinstance(a, (int, float)) and not isinstance(a, bool) for a in angles)):
+    if angles is not None and (
+        not isinstance(angles, list) or not all(isinstance(a, (int, float)) and not isinstance(a, bool) for a in angles)
+    ):
         raise CadSpecError(f"{where}.angles_deg: a list of numbers")
     count = d.get("count", len(angles) if angles else 1)
     if not isinstance(count, int) or count < 1:

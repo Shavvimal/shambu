@@ -120,9 +120,7 @@ def test_an_inward_shell_outside_every_body_is_not_a_void():
 
 def _ascii_stl(path, first_vertex):
     path.write_text(
-        "solid b\nfacet normal 0 0 0\nouter loop\n"
-        f"vertex {first_vertex}\nvertex 1 0 0\nvertex 0 1 0\n"
-        "endloop\nendfacet\nendsolid b\n"
+        f"solid b\nfacet normal 0 0 0\nouter loop\nvertex {first_vertex}\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid b\n"
     )
     return path
 

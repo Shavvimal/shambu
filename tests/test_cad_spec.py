@@ -334,7 +334,10 @@ def _doc(part=None, rule=None, intent=None):
         (_doc(part={"expected_volume_mm3": True, "volume_tol_mm3": 1}), "expected_volume_mm3"),
         (_doc(part={"expected_size_mm": [1, True, 1], "size_tol_mm": 0.05}), "expected_size_mm"),
         (_doc(rule={"id": "c", "type": "clearance", "margin_mm": -0.1}), "margin_mm"),
-        (_doc(rule={"id": "c", "type": "clearance", "exempt": [{"a": "all", "b": "all", "reason": "r", "max_overlap_mm3": -1}]}), "max_overlap_mm3"),
+        (
+            _doc(rule={"id": "c", "type": "clearance", "exempt": [{"a": "all", "b": "all", "reason": "r", "max_overlap_mm3": -1}]}),
+            "max_overlap_mm3",
+        ),
     ],
 )
 def test_intent_and_tolerances_are_validated(doc, words):
