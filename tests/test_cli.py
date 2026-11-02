@@ -1193,7 +1193,7 @@ def test_no_probe_flag_on_check_build_and_sweep():
 
 # ---------------------------------------------------------------------------- 0.5.0: login, list, forget, --printer, one-shot codes
 P_SERIAL = "00X0TEST0000999"
-P_OTHER = "01P0TEST0000123"
+P_OTHER = "00X0TEST0000123"
 P_CODE = "SENTINEL-CODE-8812"
 P_IP = "10.0.0.9"
 P_NEW_IP = "10.0.0.20"
@@ -1438,12 +1438,12 @@ def test_list_text_and_json(capsys):
     assert code == 0
     assert out.splitlines() == [
         f"x2d  {P_MASKED}  {P_IP}  lan  verified 08:00 UTC  (default)",
-        "p1s  01P…123  -  cloud  verified 08:00 UTC",
+        "p1s  00X…123  -  cloud  verified 08:00 UTC",
     ]
     code, out, _ = run(capsys, "--json", "printer", "list")
     d = one_json(out)
     assert code == 0 and d["default"] == "x2d" and d["config_dir"]
-    assert [(p["name"], p["serial"], p["ip"]) for p in d["printers"]] == [("x2d", P_MASKED, P_IP), ("p1s", "01P…123", None)]
+    assert [(p["name"], p["serial"], p["ip"]) for p in d["printers"]] == [("x2d", P_MASKED, P_IP), ("p1s", "00X…123", None)]
     assert P_SERIAL not in out + err and P_OTHER not in out
 
 
