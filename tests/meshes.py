@@ -163,3 +163,176 @@ def voxels(xs: Sequence[float], ys: Sequence[float], zs: Sequence[float], solid)
                 if not full(i, j, k + 1):
                     quad((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))
     return out
+
+
+# ---------------------------------------------------------------------------- CAD gate fixtures (shambu cad)
+def _orient(tri: Facet, want: Vec) -> Facet:
+    """`tri` wound so its normal points along `want` (flipped when it does not)."""
+    a, b, c = tri
+    u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+    return tri if n[0] * want[0] + n[1] * want[1] + n[2] * want[2] >= 0 else (a, c, b)
+
+
+def _ring(cx: float, cy: float, r: float, n: int, phase: float = 0.0) -> list[P2]:
+    return [(cx + r * math.cos(phase + 2 * math.pi * i / n), cy + r * math.sin(phase + 2 * math.pi * i / n)) for i in range(n)]
+
+
+def _zipper(outer: Sequence[P2], inner: Sequence[P2], centre: P2) -> list[tuple[P2, P2, P2]]:
+    """Triangles of the band between a convex outer loop and a convex inner loop around `centre`. Each outer corner
+    fans to the inner points nearer its direction than the next corner's; then the outer edge closes on the last of
+    them. Every inner point used by a corner is within half the angle between corners of its direction, so it sees it."""
+    two_pi = 2 * math.pi
+
+    def ang(p: P2) -> float:
+        return math.atan2(p[1] - centre[1], p[0] - centre[0]) % two_pi
+
+    def gap(x: float, y: float) -> float:
+        d = (x - y) % two_pi
+        return min(d, two_pi - d)
+
+    o = sorted(outer, key=ang)
+    i = sorted(inner, key=ang)
+    no, ni = len(o), len(i)
+    m0 = min(range(ni), key=lambda j: gap(ang(i[j]), ang(o[0])))
+    out: list[tuple[P2, P2, P2]] = []
+    k = m = 0
+    while k < no or m < ni:
+        here, nxt = o[k % no], o[(k + 1) % no]
+        cur, ahead = i[(m0 + m) % ni], i[(m0 + m + 1) % ni]
+        if m < ni and (k == no or gap(ang(ahead), ang(here)) <= gap(ang(ahead), ang(nxt))):
+            out.append((here, ahead, cur))
+            m += 1
+        else:
+            out.append((here, nxt, cur))
+            k += 1
+    return out
+
+
+def cylinder(r: float, h: float, n: int = 64, centre: Sequence[float] = (0.0, 0.0, 0.0)) -> list[Facet]:
+    """A closed n-gon prism about the z axis, from centre z to z + h."""
+    cx, cy, z0 = centre
+    ring = _ring(cx, cy, r, n)
+    out: list[Facet] = []
+    for k in range(n):
+        p, q = ring[k], ring[(k + 1) % n]
+        out.append(_orient(((cx, cy, z0 + h), (p[0], p[1], z0 + h), (q[0], q[1], z0 + h)), (0, 0, 1)))
+        out.append(_orient(((cx, cy, z0), (p[0], p[1], z0), (q[0], q[1], z0)), (0, 0, -1)))
+        mid = ((p[0] + q[0]) / 2 - cx, (p[1] + q[1]) / 2 - cy, 0.0)
+        out.append(_orient(((p[0], p[1], z0), (q[0], q[1], z0), (q[0], q[1], z0 + h)), mid))
+        out.append(_orient(((p[0], p[1], z0), (q[0], q[1], z0 + h), (p[0], p[1], z0 + h)), mid))
+    return out
+
+
+def tube(r_in: float, r_out: float, h: float, n: int = 32) -> list[Facet]:
+    """A closed annular prism about the z axis, z 0 to h."""
+    a, b = _ring(0, 0, r_out, n), _ring(0, 0, r_in, n)
+    out: list[Facet] = []
+    for k in range(n):
+        p, q = a[k], a[(k + 1) % n]
+        s, t = b[k], b[(k + 1) % n]
+        for z, nz in ((h, 1), (0.0, -1)):
+            out.append(_orient(((p[0], p[1], z), (q[0], q[1], z), (t[0], t[1], z)), (0, 0, nz)))
+            out.append(_orient(((p[0], p[1], z), (t[0], t[1], z), (s[0], s[1], z)), (0, 0, nz)))
+        mo = ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, 0.0)
+        out.append(_orient(((p[0], p[1], 0.0), (q[0], q[1], 0.0), (q[0], q[1], h)), mo))
+        out.append(_orient(((p[0], p[1], 0.0), (q[0], q[1], h), (p[0], p[1], h)), mo))
+        mi = (-(s[0] + t[0]) / 2, -(s[1] + t[1]) / 2, 0.0)
+        out.append(_orient(((s[0], s[1], 0.0), (t[0], t[1], 0.0), (t[0], t[1], h)), mi))
+        out.append(_orient(((s[0], s[1], 0.0), (t[0], t[1], h), (s[0], s[1], h)), mi))
+    return out
+
+
+def plate_with_holes(size: Sequence[float], holes: Sequence[dict], n: int = 64) -> list[Facet]:
+    """A closed plate (0..sx, 0..sy, 0..t) with round holes from the top face, watertight by construction.
+
+    Each hole is {"x", "y", "stages": [(radius, depth), ...]} (depth 0 or more than the plate: through), the radii
+    shrinking from the top; the last stage is through when its depth reaches the bottom, else it ends in a floor.
+    The plate is cut into cells between the holes (each hole alone in its cell, its circle inside it), so no two holes
+    may share an x or a y coordinate."""
+    sx, sy, t = size
+    xs = sorted(h["x"] for h in holes)
+    ys = sorted(h["y"] for h in holes)
+    cut_x = [0.0] + [(xs[i] + xs[i + 1]) / 2 for i in range(len(xs) - 1)] + [sx]
+    cut_y = [0.0] + [(ys[i] + ys[i + 1]) / 2 for i in range(len(ys) - 1)] + [sy]
+    out: list[Facet] = []
+
+    def flat(tri2: tuple[P2, P2, P2], z: float, nz: float) -> None:
+        out.append(_orient(tuple((p[0], p[1], z) for p in tri2), (0.0, 0.0, nz)))  # type: ignore[arg-type]
+
+    for i in range(len(cut_x) - 1):
+        for j in range(len(cut_y) - 1):
+            x0, x1, y0, y1 = cut_x[i], cut_x[i + 1], cut_y[j], cut_y[j + 1]
+            corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            inside = [h for h in holes if x0 < h["x"] < x1 and y0 < h["y"] < y1]
+            if not inside:
+                for z, nz in ((t, 1.0), (0.0, -1.0)):
+                    flat((corners[0], corners[1], corners[2]), z, nz)
+                    flat((corners[0], corners[2], corners[3]), z, nz)
+                continue
+            h = inside[0]
+            cx, cy = h["x"], h["y"]
+            stages = list(h["stages"])
+            top_ring = _ring(cx, cy, stages[0][0], n, 0.01)
+            for tri in _zipper(corners, top_ring, (cx, cy)):
+                flat(tri, t, 1.0)
+            z = t
+            for s, (r, depth) in enumerate(stages):
+                ring = _ring(cx, cy, r, n, 0.01)
+                z_bot = 0.0 if depth <= 0 or z - depth <= 1e-9 else z - depth
+                for k in range(n):
+                    p, q = ring[k], ring[(k + 1) % n]
+                    inward = (cx - (p[0] + q[0]) / 2, cy - (p[1] + q[1]) / 2, 0.0)
+                    out.append(_orient(((p[0], p[1], z_bot), (q[0], q[1], z_bot), (q[0], q[1], z)), inward))
+                    out.append(_orient(((p[0], p[1], z_bot), (q[0], q[1], z), (p[0], p[1], z)), inward))
+                z = z_bot
+                if z == 0.0:
+                    for tri in _zipper(corners, ring, (cx, cy)):
+                        flat(tri, 0.0, -1.0)
+                    break
+                if s + 1 < len(stages):
+                    nxt = _ring(cx, cy, stages[s + 1][0], n, 0.01)
+                    for k in range(n):
+                        p, q, u, v = ring[k], ring[(k + 1) % n], nxt[k], nxt[(k + 1) % n]
+                        flat((p, q, v), z, 1.0)
+                        flat((p, v, u), z, 1.0)
+                else:
+                    for k in range(n):
+                        flat(((cx, cy), ring[k], ring[(k + 1) % n]), z, 1.0)
+                    flat((corners[0], corners[1], corners[2]), 0.0, -1.0)
+                    flat((corners[0], corners[2], corners[3]), 0.0, -1.0)
+    for cuts, fixed, axis, sign in ((cut_x, 0.0, "x", -1.0), (cut_x, sy, "x", 1.0), (cut_y, 0.0, "y", -1.0), (cut_y, sx, "y", 1.0)):
+        for k in range(len(cuts) - 1):
+            u0, u1 = cuts[k], cuts[k + 1]
+            if axis == "x":
+                p, q, nrm = (u0, fixed), (u1, fixed), (0.0, sign, 0.0)
+            else:
+                p, q, nrm = (fixed, u0), (fixed, u1), (sign, 0.0, 0.0)
+            out.append(_orient(((p[0], p[1], 0.0), (q[0], q[1], 0.0), (q[0], q[1], t)), nrm))
+            out.append(_orient(((p[0], p[1], 0.0), (q[0], q[1], t), (p[0], p[1], t)), nrm))
+    return out
+
+
+def pcd_holes(pcd: float, angles: Sequence[float], r: float, centre: P2, depth: float = 0.0) -> list[dict]:
+    return [
+        {"x": centre[0] + pcd / 2 * math.cos(math.radians(a)), "y": centre[1] + pcd / 2 * math.sin(math.radians(a)), "stages": [(r, depth)]}
+        for a in angles
+    ]
+
+
+def mirror_y(facets: Sequence[Facet], about: float = 0.0) -> list[Facet]:
+    """The mirror image in the plane y = about, wound outward again."""
+    return [tuple((x, 2 * about - y, z) for x, y, z in (f[0], f[2], f[1])) for f in facets]  # type: ignore[misc]
+
+
+def moved(facets: Sequence[Facet], d: Sequence[float]) -> list[Facet]:
+    return [tuple((x + d[0], y + d[1], z + d[2]) for x, y, z in f) for f in facets]  # type: ignore[misc]
+
+
+def rounded_edge_bar(size: Sequence[float], r: float, n: int = 16) -> list[Facet]:
+    """A bar 0..sx along x, 0..sy along y, 0..sz along z with its +x/+z edge rounded to radius r (a fillet strip)."""
+    sx, sy, sz = size
+    arc = [(sx - r + r * math.cos(math.pi / 2 * k / n), sz - r + r * math.sin(math.pi / 2 * k / n)) for k in range(n + 1)]
+    poly = [(0.0, 0.0), (sx, 0.0), *arc, (0.0, sz)]
+    return prism(poly, sy, "xz")

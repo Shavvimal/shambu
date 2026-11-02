@@ -1,12 +1,13 @@
 """Mesh geometry for the printability pre-flight, in pure Python with `math` only: vertex welding and edge use,
 connected regions of facets, a 2D convex hull with its signed margin and minimum width, volume moments, and a uniform
-grid for ray casts.
+grid for ray casts. For the CAD gates (`shambu cad`) it also gives the inertia diagonal, the area of a plane section
+and the closest point on a triangle (the stdlib oracle the `geom` extra's distance engines are tested against).
 
 What it handles: triangle soups in mm (a list of facets, each three (x, y, z) tuples, as `mesh.py` reads them). The
 weld joins vertices on a 1e-4 mm grid, so an STL whose facets carry their own vertex copies gets an edge topology.
 Every function is deterministic for a given facet order; callers sort their output where order must not matter.
 
-What it does not do: no mesh repair, no booleans, no self-intersection test, no file I/O and no printing. A ray cast
+What it does not do: no mesh repair, no booleans (those live in `cad/geom`, behind the `geom` extra), no self-intersection test, no file I/O and no printing. A ray cast
 reports the first facet hit; it does not decide whether that hit makes a wall (printability.py does).
 """
 
@@ -356,6 +357,95 @@ def moments(facets: Iterable[Facet]) -> tuple[float, Vec]:
     if v6 == 0:
         return 0.0, (0.0, 0.0, 0.0)
     return v6 / 6, (cx / (4 * v6), cy / (4 * v6), cz / (4 * v6))
+
+
+def inertia(facets: Sequence[Facet]) -> tuple[float, float, float]:
+    """(Ixx, Iyy, Izz) of a closed, outward-wound mesh about its centroid, per unit density (mm5). Signed tetrahedra
+    against the origin: the second moment of a tetrahedron (0, a, b, c) is det/60 x (a2 + b2 + c2 + ab + ac + bc) per
+    axis, and the parallel-axis rule moves the sum to the centroid."""
+    vol, c = moments(facets)
+    sxx = syy = szz = 0.0
+    for a, b, cc in facets:
+        det = _dot(a, _cross(b, cc))
+        s = [(a[i] * a[i] + b[i] * b[i] + cc[i] * cc[i] + a[i] * b[i] + a[i] * cc[i] + b[i] * cc[i]) * det / 60 for i in range(3)]
+        sxx += s[0]
+        syy += s[1]
+        szz += s[2]
+    sxx -= vol * c[0] * c[0]
+    syy -= vol * c[1] * c[1]
+    szz -= vol * c[2] * c[2]
+    return (syy + szz, sxx + szz, sxx + syy)
+
+
+def section(facets: Iterable[Facet], axis: int, value: float) -> tuple[float, float]:
+    """(area, perimeter) of the section of a closed, outward-wound mesh by the plane `coordinate[axis] == value`.
+
+    Each facet the plane cuts gives one segment, oriented along (axis unit) x (facet normal); Green's theorem sums the
+    segments' shoelace terms to the enclosed area with no need to chain them into loops. A vertex on the plane counts
+    as above it, the same rule for every facet, so a cut through a vertex is neither lost nor counted twice."""
+    i, j = (axis + 1) % 3, (axis + 2) % 3
+    total = perim = 0.0
+    for f in facets:
+        side = [v[axis] >= value for v in f]
+        if all(side) or not any(side):
+            continue
+        pts: list[tuple[float, float]] = []
+        for k in range(3):
+            p, q = f[k], f[(k + 1) % 3]
+            if side[k] != side[(k + 1) % 3]:
+                t = (value - p[axis]) / (q[axis] - p[axis])
+                pts.append((p[i] + t * (q[i] - p[i]), p[j] + t * (q[j] - p[j])))
+        if len(pts) != 2:
+            continue
+        n = _cross(_sub(f[1], f[0]), _sub(f[2], f[0]))
+        d = (-n[j], n[i])  # (axis unit) x n, in the (i, j) plane
+        (px, py), (qx, qy) = pts
+        if (qx - px) * d[0] + (qy - py) * d[1] < 0:
+            (px, py), (qx, qy) = (qx, qy), (px, py)
+        total += (px * qy - qx * py) / 2
+        perim += math.hypot(qx - px, qy - py)
+    return total, perim
+
+
+def section_area(facets: Iterable[Facet], axis: int, value: float) -> float:
+    """The area of `section`."""
+    return section(facets, axis, value)[0]
+
+
+def point_triangle(p: Vec, tri: Facet) -> tuple[float, Vec]:
+    """(distance, closest point) from `p` to the triangle, by the Voronoi regions of its corners and edges."""
+    a, b, c = tri
+    ab, ac, ap = _sub(b, a), _sub(c, a), _sub(p, a)
+    d1, d2 = _dot(ab, ap), _dot(ac, ap)
+
+    def at(q: Vec) -> tuple[float, Vec]:
+        return math.dist(p, q), q
+
+    if d1 <= 0 and d2 <= 0:
+        return at(a)
+    bp = _sub(p, b)
+    d3, d4 = _dot(ab, bp), _dot(ac, bp)
+    if d3 >= 0 and d4 <= d3:
+        return at(b)
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0 and d1 >= 0 and d3 <= 0:
+        v = d1 / (d1 - d3)
+        return at((a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]))
+    cp = _sub(p, c)
+    d5, d6 = _dot(ab, cp), _dot(ac, cp)
+    if d6 >= 0 and d5 <= d6:
+        return at(c)
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0 and d2 >= 0 and d6 <= 0:
+        w = d2 / (d2 - d6)
+        return at((a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]))
+    va = d3 * d6 - d5 * d4
+    if va <= 0 and (d4 - d3) >= 0 and (d5 - d6) >= 0:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        return at((b[0] + w * (c[0] - b[0]), b[1] + w * (c[1] - b[1]), b[2] + w * (c[2] - b[2])))
+    den = 1.0 / (va + vb + vc)
+    v, w = vb * den, vc * den
+    return at((a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w))
 
 
 # ---------------------------------------------------------------------------- rays

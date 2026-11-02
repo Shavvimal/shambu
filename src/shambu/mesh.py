@@ -16,6 +16,7 @@ vertical wall, 90 = a flat ceiling). The default 60 is what Studio supports by d
 Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), convex hulls, painted supports, and
 anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those. Open edges, bridges,
 wall thickness, tip-over and bed fit are findings of `printability.py` (`shambu printability`), not orientation metrics.
+Booleans between parts (clearance, sweeps) live in `cad/geom`, behind the optional `geom` extra (`shambu cad`).
 """
 
 from __future__ import annotations
@@ -146,6 +147,12 @@ def read_stl(path: str | Path) -> list[Facet]:
         data = p.read_bytes()
     except OSError as e:
         raise BuildError(f"{p}: cannot read: {e}") from e
+    return parse_stl(data, str(p))
+
+
+def parse_stl(data: bytes, name: str = "STL") -> list[Facet]:
+    """Binary or ASCII STL bytes to facets (`name` labels the errors). Raises BuildError on anything it cannot parse."""
+    p = name
     if len(data) < 84 and not data.lstrip().lower().startswith(b"solid"):
         raise BuildError(f"{p}: not an STL file ({len(data)} bytes)")
     if len(data) >= 84:
@@ -154,8 +161,21 @@ def read_stl(path: str | Path) -> list[Facet]:
             return _read_binary(data, n)
     text = data.decode("utf-8", errors="replace")
     if "facet" in text or text.lstrip().lower().startswith("solid"):
-        return _read_ascii(text)
-    raise BuildError(f"{p}: neither a binary nor an ASCII STL")
+        try:
+            facets = _read_ascii(text)
+        except BuildError as e:
+            raise BuildError(f"{p}: {e}") from e
+        if facets or len(data) < 84 or "vertex" in text:
+            return facets
+    raise BuildError(f"{p}: neither a binary STL nor an ASCII STL with facets{_binary_mismatch(data)}")
+
+
+def _binary_mismatch(data: bytes) -> str:
+    """Why the bytes are not a binary STL, when they are long enough to have a binary header."""
+    if len(data) < 84:
+        return ""
+    (n,) = struct.unpack_from("<I", data, 80)
+    return f" (as binary, the header says {n} facets, {84 + 50 * n} bytes, but the file has {len(data)} bytes)"
 
 
 def _read_binary(data: bytes, n: int) -> list[Facet]:
@@ -174,7 +194,11 @@ def _read_ascii(text: str) -> list[Facet]:
             parts = s.split()
             if len(parts) != 4:
                 raise BuildError(f"bad STL vertex line: {line!r}")
-            verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            try:
+                v = (float(parts[1]), float(parts[2]), float(parts[3]))
+            except ValueError as e:
+                raise BuildError(f"bad STL vertex line: {line!r} (a coordinate is not a number)") from e
+            verts.append(v)
             if len(verts) == 3:
                 out.append((verts[0], verts[1], verts[2]))
                 verts = []

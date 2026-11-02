@@ -9,7 +9,7 @@
   {"query": "my plate has like 400 filament changes and the purge waste is insane. can you rearrange it so there are fewer swaps? file is out/coaster.3mf", "should_trigger": true},
   {"query": "add a pause at 10.2 mm in magnet-box.3mf so I can drop the magnets in", "should_trigger": true},
   {"query": "the gridfinity bin STL I downloaded is tiny when I import it, I think it's in metres. make a project with 4 of them at the right size", "should_trigger": true},
-  {"query": "design a wall-mount bracket for a 25mm pipe with two M4 screw holes 40mm apart, I need a STEP", "should_trigger": false},
+  {"query": "design a wall-mount bracket for a 25mm pipe with two M4 screw holes 40mm apart, I need a STEP", "should_trigger": false, "owner": "designing-for-print"},
   {"query": "start the print on my X2D, the file is already on the SD card", "should_trigger": false},
   {"query": "pause the printer, the first layer looks bad", "should_trigger": false},
   {"query": "repair this non-manifold mesh, Bambu Studio keeps saying there are 37 open edges in scan.stl", "should_trigger": false},
@@ -28,5 +28,5 @@
   {"query": "check jaw.stl for overhangs and bridges before I slice it", "should_trigger": true},
   {"query": "my tall rod print fell over halfway, would a brim have helped? rod.stl", "should_trigger": true},
   {"query": "fix the holes in this broken STL mesh so it is watertight", "should_trigger": false},
-  {"query": "design a bracket with a 2 mm wall in CAD and export a STEP", "should_trigger": false}
+  {"query": "design a bracket with a 2 mm wall in CAD and export a STEP", "should_trigger": false, "owner": "designing-for-print"}
 ]

@@ -22,6 +22,10 @@ classifiers = [
 ]
 dependencies = ["paho-mqtt>=2.1"]
 
+[project.optional-dependencies]
+# `shambu cad clearance`, `sweep` and `diff --surface`: Booleans and exact distances. Imported lazily (cad/geom).
+geom = ["numpy>=2.0", "scipy>=1.13", "manifold3d>=3.0"]
+
 [project.scripts]
 shambu = "shambu.cli:main"
 

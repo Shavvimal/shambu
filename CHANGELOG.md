@@ -6,6 +6,49 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
+### Added
+- `shambu cad`: offline gates on exported CAD files. `stamp` writes a provenance record (build id over the saved
+  script and parameters, STL and STEP hashes, the CAD-reported volume, area and centre of mass, faceting, bed face).
+  `check` proves one closed solid; checks volume and size against the CAD, the STEP re-import and the spec; and
+  refuses a stale export by build id and by the STL's own hash. `--promote` copies a passing STL to a new file only
+  and never overwrites. `features` reads the hole and boss inventory from the mesh, with pitch-circle patterns.
+  `fit` gauges holes and insert pockets against a fit table (ISO 273 clearance rows built in; inserts, press and
+  slip fits come from the user with their basis). `clearance` and `sweep` find pairwise clashes with named
+  exemptions, and insertion and rotation sweeps to first contact; they need the optional `geom` extra. `diff` names
+  revision changes, the plates to reslice and the fits to coupon, and fails on changes the expectation does not
+  list. `gate` runs one spec (`shambu.cad/1`) and gives one exit code. Findings use the printability finding model;
+  every result lists what it did not check.
+- The optional `geom` extra (numpy, scipy, manifold3d): `uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.8.0'`.
+  Without it, `--help` and every stdlib verb work, and a check that needs it exits 3 with the install line.
+- New skill `designing-for-print`: builds and revises printable parts in ClassCAD through its MCP and keeps an
+  export only when its gates pass.
+- CI job `geom`: installs the extra and runs the whole suite on Python 3.11 to 3.13, including the proofs that the
+  pruned distance equals the exact one and that a culled sweep equals an unculled one.
+- How the gates hold: `sweep` proves every interval between two poses clear from the exact gap at both ends and the
+  most it can change per unit of travel, so a crossing between poses is found; the end-of-travel overlap cap ignores
+  the contact zone; a Boolean failure is `sweep.boolean_failed` and the gate goes on; same-part selectors are
+  `cad.incomplete.selector_empty`. A clearance zone exemption no longer covers a gap under the margin outside the
+  zone. `--promote` publishes the exact bytes the check judged, and `stamp` never writes over its STL, STEP, an input
+  or a file that is not a record. A numeric flag that is not finite or out of range is a usage error (exit 2), input
+  JSON refuses NaN and Infinity, and no output holds them. `fit` measures depth from the material, fails an oval
+  bore on its narrow or wide side and reports an unmeasured required wall as `cad.incomplete.wall_unmeasured`.
+  `check` fails an inward shell outside every body (`solid.inverted`). `diff` needs a volume or section change to be
+  explained, keeps spec names on new holes, treats through-to-blind as a change and judges an old record by its STL
+  hash only.
+- Inputs that do not hold are named, never a pass or a traceback: a `fit` rule whose parts declare no hole is
+  `cad.incomplete.no_holes` and still reads each mesh and record; a non-numeric or non-finite STL or 3MF vertex, a
+  record field of the wrong type or range, and a provenance input that is a folder are errors that name the file and
+  field (exit 3), and a provenance glob keeps only files. The spec refuses a non-positive density, a zero bed face,
+  negative tolerances, margins and overlap caps, and booleans as numbers. The `diff` expectation file refuses unknown
+  keys and needs `change` on a feature entry and the delta on a measure entry; each entry excuses only the change it
+  names, so a listed hole no longer covers an unlisted cavity. `check` reads an inside-out shell inside a void as
+  `solid.inverted`.
+
+### Changed
+- The shambu skill points CAD modelling at `designing-for-print`.
+
 ## [0.7.0] - 2026-11-02
 
 ### Added

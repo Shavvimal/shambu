@@ -415,6 +415,24 @@ class Bambu:
         integrity lines (WARN or INFO only)."""
         return verify_mod.check_project(str(path), spec, self.presets(), str(spec_path), integrity)
 
+    def cad(self, action: str, **kw):
+        """`shambu cad ACTION`: offline gates on exported CAD files (cad/verbs.py). Returns a `cad.report.CadReport`.
+        Raises CadError (exit 3) when a file does not read or cannot be written, CadSpecError (exit 1) for a spec or
+        an expectation that breaks its schema, and GeomMissing (exit 3) when a check needs the geom extra."""
+        from .cad import verbs
+
+        table: dict[str, Callable] = {
+            "stamp": verbs.stamp,
+            "check": verbs.check,
+            "features": verbs.features,
+            "fit": verbs.fit,
+            "clearance": verbs.clearance,
+            "sweep": verbs.sweep,
+            "diff": verbs.diff,
+            "gate": verbs.gate,
+        }
+        return table[action](**kw)
+
     def printability(
         self,
         path: str | Path,

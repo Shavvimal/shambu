@@ -24,7 +24,7 @@ def test_marketplace_entries_have_no_version():
 
 
 def test_skills_exist():
-    for name in ("shambu", "setup"):
+    for name in ("shambu", "setup", "designing-for-print"):
         assert (ROOT / "skills" / name / "SKILL.md").is_file()
 
 
@@ -41,9 +41,24 @@ def test_skill_version_literals_match_package():
     skill = (ROOT / "skills" / "shambu" / "SKILL.md").read_text()
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     readme = (ROOT / "README.md").read_text()
+    cad = (ROOT / "skills" / "designing-for-print" / "SKILL.md").read_text()
+    assert VERSION_LITERALS[2].findall(cad), "the designing-for-print skill must name the CLI version"
     assert VERSION_LITERALS[0].findall(skill), "the shambu skill must run doctor with --expect-version"
     assert VERSION_LITERALS[1].findall(setup), "the setup skill must install a tagged version"
     assert VERSION_LITERALS[1].findall(readme), "the README must install a tagged version"
     assert 'shambu"' not in readme and 'shambu" shambu' not in readme, "an untagged git install line in the README"
-    found = {v for text in (skill, setup, readme) for rx in VERSION_LITERALS for v in rx.findall(text)}
+    found = {v for text in (skill, setup, readme, cad) for rx in VERSION_LITERALS for v in rx.findall(text)}
     assert found == {shambu.__version__}
+
+
+def test_the_cad_skill_names_every_incomplete_code():
+    """The skill once said `cad.incomplete.*` means a missing input, so an agent re-exported in a loop on
+    `no_volume` and `wall_unmeasured`, which a model fix clears. Every code the gate emits is named in SKILL.md
+    and in the gates reference."""
+    src = "\n".join(p.read_text() for p in (ROOT / "src" / "shambu" / "cad").rglob("*.py"))
+    emitted = set(re.findall(r"cad\.incomplete\.([a-z_]+)", src)) | set(re.findall(r'_incomplete\(\s*"([a-z_]+)"', src))
+    skill_dir = ROOT / "skills" / "designing-for-print"
+    skill = (skill_dir / "SKILL.md").read_text()
+    gates = (skill_dir / "references" / "gates.md").read_text()
+    assert emitted and {c for c in emitted if f"cad.incomplete.{c}" not in gates} == set()
+    assert {c for c in emitted if c not in skill} == set()

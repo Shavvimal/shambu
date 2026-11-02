@@ -122,3 +122,25 @@ def test_first_hit_tie_does_not_depend_on_facet_order():
         _, fid = G.RayGrid(facets).first_hit((o[0], o[1], o[2]), d)
         hits.append(sorted(facets[fid]))
     assert hits[0] == hits[1]
+
+
+def test_inertia_of_a_box():
+    ixx, iyy, izz = G.inertia(box((0, 0, 0), (2, 4, 6)))
+    m = 2 * 4 * 6
+    assert math.isclose(ixx, m * (16 + 36) / 12) and math.isclose(iyy, m * (4 + 36) / 12) and math.isclose(izz, m * (4 + 16) / 12)
+
+
+def test_section_through_a_vertex_counts_once():
+    f = box((0, 0, 0), (10, 10, 10))
+    assert math.isclose(G.section(f, 2, 5.0)[0], 100) and math.isclose(G.section(f, 2, 5.0)[1], 40)
+    # a vertex on the plane counts as above it: the bottom face is above z 0, the top face's ring is cut at z 10
+    assert G.section(f, 2, 0.0)[0] == 0 and math.isclose(G.section(f, 2, 10.0)[0], 100)
+
+
+@pytest.mark.parametrize(
+    ("p", "d"), [((0.2, 0.2, 1.0), 1.0), ((-1.0, -1.0, 0.0), math.sqrt(2)), ((0.5, -2.0, 0.0), 2.0), ((2.0, 2.0, 0.0), math.sqrt(4.5))]
+)
+def test_point_triangle_regions(p, d):
+    tri = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    got, q = G.point_triangle(p, tri)
+    assert math.isclose(got, d) and math.isclose(math.dist(p, q), d)

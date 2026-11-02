@@ -89,11 +89,12 @@ class Output:
     def __init__(self, as_json: bool):
         self.as_json = as_json
 
-    def emit(self, data, text_lines: list[str] | None = None) -> None:
+    def emit(self, data, text_lines: list[str] | None = None, strict: bool = False) -> None:
+        """`strict`: a NaN or infinity in the document raises ValueError instead of printing invalid JSON."""
         values = _scrub_values()
         doc = _scrub_tree(_jsonable(data), values)
         if self.as_json:
-            print(json.dumps(doc, indent=1, default=str))
+            print(json.dumps(doc, indent=1, default=str, allow_nan=not strict))
         else:
             for line in [conf.scrub_text(x, values) for x in text_lines] if text_lines is not None else _default_lines(doc):
                 print(line)
@@ -786,6 +787,244 @@ class Printability(Command):
             return usage(out, str(e))
         out.emit(rep.to_json(), rep.lines())
         return rep.exit_code
+
+
+CAD_ACTIONS = ("stamp", "check", "features", "fit", "clearance", "sweep", "diff", "gate")
+# Each action's flags (argparse dests); a flag given to another action is a usage error (exit 2).
+_CAD_FLAGS: dict[str, set[str]] = {
+    "stamp": {
+        "part",
+        "rev",
+        "input",
+        "cad_volume",
+        "cad_area",
+        "cad_cog",
+        "step",
+        "step_volume",
+        "faceting_tol",
+        "angle_tol",
+        "bed_face",
+        "out",
+    },
+    "check": {"record", "expect_volume", "volume_tol", "expect_size", "size_tol", "density", "promote", "spec", "part", "object"},
+    "features": {"axis_tol", "min_diameter", "spec", "part", "record", "object"},
+    "fit": {"hole", "fits", "spec", "part", "object"},
+    "clearance": {"spec", "rule", "pose"},
+    "sweep": {"spec", "rule", "no_cull"},
+    "diff": {"object", "spec", "part", "plate", "expect", "sections", "surface"},
+    "gate": {"only", "skip", "no_cull"},
+}
+_CAD_FILES = {
+    "stamp": (1, 1),
+    "check": (1, 1),
+    "features": (1, 1),
+    "fit": (1, 1),
+    "clearance": (0, 0),
+    "sweep": (0, 0),
+    "diff": (2, 2),
+    "gate": (1, 1),
+}
+
+
+@command("cad", "Gate exported CAD files: stamp | check | features | fit | clearance | sweep | diff | gate (no CAD program is run)")
+class Cad(Command):
+    def configure(self, p):
+        p.add_argument("action", choices=CAD_ACTIONS)
+        p.add_argument(
+            "files", nargs="*", help="stamp/check/features/fit: PART.stl; diff: OLD NEW (.stl, .3mf or .cad.json); gate: cad.json"
+        )
+        g = p.add_argument_group("stamp")
+        g.add_argument("--part", metavar="NAME", help="the part's name (stamp); the spec part (with --spec)")
+        g.add_argument("--rev", metavar="LABEL", help="revision label, the build id's prefix")
+        g.add_argument(
+            "--input",
+            action="append",
+            default=[],
+            metavar="FILE",
+            help="a build input to hash: the saved CAD script, the parameter file (repeat)",
+        )
+        g.add_argument("--cad-volume", type=float, metavar="MM3", help="volume the CAD session reported (calculateMassProperties)")
+        g.add_argument("--cad-area", type=float, metavar="MM2")
+        g.add_argument("--cad-cog", metavar="X,Y,Z", help="centre of mass the CAD session reported")
+        g.add_argument("--step", metavar="FILE", help="the STEP exported with this STL (its SHA-256 joins the record)")
+        g.add_argument("--step-volume", type=float, metavar="MM3", help="volume of the STEP re-imported in the CAD session")
+        g.add_argument("--faceting-tol", type=float, metavar="MM", help="the STL export's chord tolerance (default assumed 0.1)")
+        g.add_argument("--angle-tol", type=float, metavar="DEG", help="the STL export's angle tolerance")
+        g.add_argument("--bed-face", metavar="NX,NY,NZ", help="the face that goes on the bed")
+        g.add_argument("-o", "--out", metavar="FILE", help="record path (default PART.cad.json beside the STL)")
+        g = p.add_argument_group("check")
+        g.add_argument("--record", metavar="FILE", help="the stamp record (provenance, CAD volume, STEP)")
+        g.add_argument("--expect-volume", type=float, metavar="MM3")
+        g.add_argument("--volume-tol", type=float, metavar="MM3", help="required with --expect-volume")
+        g.add_argument("--expect-size", metavar="X,Y,Z")
+        g.add_argument("--size-tol", type=float, metavar="MM", help="required with --expect-size")
+        g.add_argument("--density", type=float, metavar="G_CM3", help="mass at this density (INFO; the slicer's grams are the real number)")
+        g.add_argument(
+            "--promote", metavar="DEST.stl", help="on a pass, copy the STL to this NEW file (never overwrites) with a new record beside it"
+        )
+        g = p.add_argument_group("features and fit")
+        g.add_argument(
+            "--axis-tol", type=float, metavar="DEG", help="smooth-region angle (default: the record's angle tolerance + 1, else 7)"
+        )
+        g.add_argument("--min-diameter", type=float, default=0.0, metavar="MM")
+        g.add_argument(
+            "--hole",
+            action="append",
+            default=[],
+            metavar="NAME:FIT:X,Y,Z:AX,AY,AZ",
+            help="a hole to gauge: mouth point and axis into the material",
+        )
+        g.add_argument("--fits", metavar="FILE", help="your own fits (inserts, press, slip), each with a basis")
+        g = p.add_argument_group("spec, clearance, sweep, gate")
+        g.add_argument("--spec", metavar="cad.json", help="the gate spec (shambu.cad/1)")
+        g.add_argument("--object", metavar="NAME", help="a 3MF input: the object")
+        g.add_argument("--rule", action="append", default=[], metavar="ID", help="clearance/sweep: only this rule (repeat)")
+        g.add_argument("--pose", metavar="NAME", help="clearance: place the parts in this pose from the spec")
+        g.add_argument("--no-cull", action="store_true", help="sweep/gate: evaluate every point at every step (slow reference path)")
+        g.add_argument("--only", action="append", default=[], metavar="ID", help="gate: run only this rule (repeat)")
+        g.add_argument("--skip", action="append", default=[], metavar="ID", help="gate: skip this rule (repeat)")
+        g = p.add_argument_group("diff")
+        g.add_argument("--plate", metavar="plate.json", help="a shambu plate spec: which plates to reslice")
+        g.add_argument("--expect", metavar="expect.json", help="the intended changes; anything else is diff.unexpected")
+        g.add_argument("--sections", type=int, default=24, metavar="N", help="section planes per axis (default 24)")
+        g.add_argument("--surface", action="store_true", help="surface deviation (needs the geom extra)")
+        p.epilog = (
+            "Reads exported files and the records `stamp` writes; never starts or drives a CAD program. Every result names "
+            "its findings by code with severity and evidence, lists what it did not check, and ends with the gate word: "
+            "stale, fail, incomplete or pass (no blocking finding in the rules that ran). clearance, sweep and diff --surface "
+            "need the geom extra (numpy, scipy, manifold3d). Exit 0 pass, 1 fail, incomplete or stale (or an invalid spec), "
+            "2 usage, 3 environment (a file that does not read, a record or --promote target that cannot be written, the geom "
+            "extra missing)."
+        )
+
+    # Every numeric flag is checked before a verb runs: NaN or infinity would pass every comparison (`nan < x` is
+    # False) and switch a check off, and would print as NaN, which is not JSON.
+    _RANGES = (
+        ("--cad-volume", "cad_volume", lambda x: x > 0, "over 0 mm3"),
+        ("--cad-area", "cad_area", lambda x: x > 0, "over 0 mm2"),
+        ("--step-volume", "step_volume", lambda x: x > 0, "over 0 mm3"),
+        ("--faceting-tol", "faceting_tol", lambda x: x > 0, "over 0 mm"),
+        ("--angle-tol", "angle_tol", lambda x: 0 < x < 180, "between 0 and 180 degrees"),
+        ("--expect-volume", "expect_volume", lambda x: x > 0, "over 0 mm3"),
+        ("--volume-tol", "volume_tol", lambda x: x >= 0, "0 mm3 or more"),
+        ("--size-tol", "size_tol", lambda x: x >= 0, "0 mm or more"),
+        ("--density", "density", lambda x: x > 0, "over 0 g/cm3"),
+        ("--axis-tol", "axis_tol", lambda x: 0 < x < 90, "between 0 and 90 degrees"),
+        ("--min-diameter", "min_diameter", lambda x: x >= 0, "0 mm or more"),
+    )
+
+    def run(self, a, app, out):
+        from .cad import verbs
+        from .errors import CadSpecError
+
+        lo, hi = _CAD_FILES[a.action]
+        if not lo <= len(a.files) <= hi:
+            want = {0: "no file (use --spec)", 1: "one file", 2: "two files (OLD NEW)"}[hi]
+            return usage(out, f"cad {a.action} takes {want}; got {len(a.files)}")
+        defaults = {
+            "input": [],
+            "hole": [],
+            "rule": [],
+            "only": [],
+            "skip": [],
+            "min_diameter": 0.0,
+            "sections": 24,
+            "no_cull": False,
+            "surface": False,
+        }
+        given = {d for d in set().union(*_CAD_FLAGS.values()) if getattr(a, d, None) not in (None, defaults.get(d))}
+        stray = sorted(given - _CAD_FLAGS[a.action])
+        if stray:
+            return usage(out, f"cad {a.action} does not take " + ", ".join("--" + s.replace("_", "-") for s in stray))
+        if a.action in ("clearance", "sweep") and not a.spec:
+            return usage(out, f"cad {a.action} needs --spec cad.json")
+        for flag, v, ok, want in self._RANGES:
+            v = getattr(a, v)
+            if v is not None and not (math.isfinite(v) and ok(v)):
+                return usage(out, f"{flag} must be a finite number {want}, not {v}")
+        if a.sections < 2:
+            return usage(out, f"--sections must be at least 2, not {a.sections}")
+        try:
+            kw = self._args(a, verbs)
+        except ValueError as e:
+            return usage(out, str(e))
+        try:
+            rep = app.cad(a.action, **kw)
+        except CadSpecError as e:
+            msg = f"CadSpecError: {e}"
+            out.emit({"error": msg}, [msg])
+            return 1
+        out.emit(rep.to_json(), rep.lines(), strict=True)
+        return rep.exit_code
+
+    @staticmethod
+    def _args(a, verbs) -> dict:
+        def vec(text, flag):
+            return _floats(text, 3, flag) if text else None
+
+        act = a.action
+        if act == "stamp":
+            if not a.part:
+                raise ValueError("cad stamp needs --part NAME")
+            return {
+                "a": verbs.StampArgs(
+                    a.files[0],
+                    a.part,
+                    a.rev,
+                    tuple(a.input),
+                    a.cad_volume,
+                    a.cad_area,
+                    vec(a.cad_cog, "--cad-cog"),
+                    a.step,
+                    a.step_volume,
+                    a.faceting_tol,
+                    a.angle_tol,
+                    vec(a.bed_face, "--bed-face"),
+                    a.out,
+                )
+            }
+        if act == "check":
+            return {
+                "a": verbs.CheckArgs(
+                    a.files[0],
+                    a.record,
+                    a.expect_volume,
+                    a.volume_tol,
+                    vec(a.expect_size, "--expect-size"),
+                    a.size_tol,
+                    a.density,
+                    a.promote,
+                    a.spec,
+                    a.part,
+                    a.object,
+                )
+            }
+        if act == "features":
+            return {
+                "stl": a.files[0],
+                "axis_tol_deg": a.axis_tol,
+                "min_diameter_mm": a.min_diameter,
+                "spec_path": a.spec,
+                "part_name": a.part,
+                "record_path": a.record,
+                "obj": a.object,
+            }
+        if act == "fit":
+            return {
+                "stl": a.files[0],
+                "holes": [verbs.parse_hole(h) for h in a.hole],
+                "fits_path": a.fits,
+                "spec_path": a.spec,
+                "part_name": a.part,
+                "obj": a.object,
+            }
+        if act == "clearance":
+            return {"spec_path": a.spec, "rule_ids": a.rule, "pose": a.pose}
+        if act == "sweep":
+            return {"spec_path": a.spec, "rule_ids": a.rule, "cull": not a.no_cull}
+        if act == "diff":
+            return {"a": verbs.DiffArgs(a.files[0], a.files[1], a.object, a.spec, a.part, a.plate, a.expect, a.sections, a.surface)}
+        return {"spec_path": a.files[0], "only": a.only, "skip": a.skip, "cull": not a.no_cull}
 
 
 @command("split", "Split an STL with several bodies into one STL per body (Studio's 'Split to objects')")

@@ -1,0 +1,82 @@
+[
+ {
+  "query": "make me a printable enclosure for a 40x60 PCB in ClassCAD with M3 inserts",
+  "should_trigger": true
+ },
+ {
+  "query": "is out/arm@C.stl ready to print, check the holes",
+  "should_trigger": true
+ },
+ {
+  "query": "check these two STL exports for clashes, lid.stl and base.stl",
+  "should_trigger": true
+ },
+ {
+  "query": "what changed between rev B and rev C of the bracket?",
+  "should_trigger": true
+ },
+ {
+  "query": "the lid should slide in from the top, check it does not bind",
+  "should_trigger": true
+ },
+ {
+  "query": "design a wall-mount bracket for a 25mm pipe with two M4 screw holes 40mm apart, PETG, I want to print it",
+  "should_trigger": true
+ },
+ {
+  "query": "does my hinge open to 110 degrees without hitting the base? exports are in out/",
+  "should_trigger": true
+ },
+ {
+  "query": "add two heat-set insert pockets to the lid in classcad and check the pocket depth",
+  "should_trigger": true
+ },
+ {
+  "query": "my cad export has two bodies, is it a valid solid for printing?",
+  "should_trigger": true
+ },
+ {
+  "query": "make the knob 2 mm taller and tell me which plates I need to reslice",
+  "should_trigger": true
+ },
+ {
+  "query": "slice bracket.stl for PETG on plate 2",
+  "should_trigger": false
+ },
+ {
+  "query": "how long will this 3MF take to print?",
+  "should_trigger": false
+ },
+ {
+  "query": "make a CNC-milled aluminium flange with H7 bores",
+  "should_trigger": false
+ },
+ {
+  "query": "repair this non-manifold STL",
+  "should_trigger": false
+ },
+ {
+  "query": "convert enclosure.step to STL with a fine tessellation",
+  "should_trigger": false
+ },
+ {
+  "query": "is this bracket going to need supports? bracket.stl",
+  "should_trigger": false
+ },
+ {
+  "query": "how far is my print?",
+  "should_trigger": false
+ },
+ {
+  "query": "generate a 3D model of a duck wearing a top hat",
+  "should_trigger": false
+ },
+ {
+  "query": "what is the ISO tolerance class H7?",
+  "should_trigger": false
+ },
+ {
+  "query": "move the prime tower in my 3mf to the back right corner",
+  "should_trigger": false
+ }
+]
