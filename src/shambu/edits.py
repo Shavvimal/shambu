@@ -588,19 +588,59 @@ def _outline(geo: _Geometry, obj: _Obj, item: Sequence[float] | None = None) -> 
     """The object's XY outline (every part through component then item) by `layout.outline_of`, the rule `check`
     uses, against the object's world box; None and the reason when it does not rasterise (the box stands in)."""
     t_item = obj.item if item is None else list(item)
-    facets: list[M.Facet] = []
     try:
-        for c in obj.comps:
-            m = geo.mesh(c)
-            full = _compose(t_item, c.transform)
-            w = [_apply(full, v) for v in m.vertices]
-            facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
+        facets = _world_facets(geo, obj, obj.comps, t_item)
     except BambuError as e:
         return None, str(e)
     if not facets:
         return None, "the object has no triangles"
     lo, hi = geo.world_box(obj, t_item)
     return L.outline_of(facets, (lo[0], lo[1], hi[0], hi[1]))
+
+
+def _world_facets(geo: _Geometry, obj: _Obj, comps: Sequence[_Comp], item: Sequence[float]) -> list[M.Facet]:
+    """The triangles of `comps` (components of `obj`) in world mm: component transform, then the item transform."""
+    facets: list[M.Facet] = []
+    for c in comps:
+        m = geo.mesh(c)
+        full = _compose(item, c.transform)
+        w = [_apply(full, v) for v in m.vertices]
+        facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
+    return facets
+
+
+@dataclass(frozen=True)
+class ObjectMesh:
+    """One object's printing geometry for `shambu printability`: the triangles of its `normal_part` volumes in
+    plate-local mm (the frame of `inspect`), its plate, filament and own settings, and the subtypes of the volumes left
+    out (modifiers, enforcers, blockers, negative parts)."""
+
+    name: str
+    plate: int
+    filament: int
+    facets: list[M.Facet]
+    skipped: tuple[str, ...]
+    settings: dict
+
+
+def object_meshes(project: Project) -> list[ObjectMesh]:
+    """Every object of the project with its `normal_part` triangles in plate-local mm (first instance only). A volume
+    with no subtype is a normal part, as Studio reads it. Raises EditError when a mesh does not read."""
+    geo = _Geometry(project)
+    root = _root(project)
+    out: list[ObjectMesh] = []
+    for o in project.model_settings.findall("object"):
+        obj = _object(project, o, root)
+        subtype = {p.get("id"): p.get("subtype") or "normal_part" for p in o.findall("part")}
+        keep = [c for c in obj.comps if subtype.get(c.sub_id, "normal_part") == "normal_part"]
+        skipped = tuple(sorted({subtype.get(c.sub_id, "normal_part") for c in obj.comps} - {"normal_part"}))
+        plate = _plate_of(project, obj.oid)
+        ox, oy = _origin(project, plate)
+        facets = M.translate(_world_facets(geo, obj, keep, obj.item), (-ox, -oy, 0.0))
+        out.append(
+            ObjectMesh(obj.name, plate, _slot_parser(obj)(_meta(o, "extruder"), "extruder") or 1, facets, skipped, _object_settings(obj))
+        )
+    return out
 
 
 def _placed(

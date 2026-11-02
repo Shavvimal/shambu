@@ -713,6 +713,73 @@ class Rotate(Command):
         return 0
 
 
+@command(
+    "printability",
+    "Pre-flight an STL or 3MF object in its print pose: overhangs, bridges, walls, layers, tip-over, brim, bed fit (no slicer)",
+)
+class Printability(Command):
+    def configure(self, p):
+        p.add_argument("file", help="an .stl, or a .3mf / .gcode.3mf with meshes")
+        p.add_argument("--object", action="append", default=[], metavar="NAME", help="3MF only: this object (repeat); default every object")
+        p.add_argument("--plate", type=int, metavar="N", help="3MF only: the objects on plate N")
+        pose = p.add_mutually_exclusive_group()
+        pose.add_argument("--lay-on-face", metavar="NX,NY,NZ", help="STL only: lay this face on the bed first (as `shambu rotate`)")
+        pose.add_argument("--rotate", metavar="X,Y,Z", help="STL only: degrees about X, then Y, then Z")
+        p.add_argument("--extruder", type=int, choices=(1, 2), help="STL only: the extruder that prints it (default 1)")
+        p.add_argument("--printer", metavar="PRESET", help="STL only: machine preset for the bed fit, e.g. 'Bambu Lab X2D 0.4 nozzle'")
+        p.add_argument(
+            "--process", metavar="PRESET", help="STL only: thresholds from this process preset (default: the X2D 0.20 Standard values)"
+        )
+        p.add_argument("--threshold", type=float, help=THRESHOLD_HELP)
+        p.add_argument("--max-bridge", type=float, metavar="MM", help="max_bridge_length: spans up to this print without support")
+        p.add_argument("--layer-height", type=float, metavar="MM")
+        p.add_argument("--line-width", type=float, metavar="MM", help="outer wall line width")
+        p.add_argument("--samples", type=int, default=4000, help="wall and slab rays (default 4000)")
+        p.epilog = (
+            "Findings by area, each with a code, a severity, its evidence level and a fix; no overall score. Exit 0 no FAIL, "
+            "1 a FAIL finding (open mesh, metres, no bed contact, does not fit), 2 usage, 3 a file or preset that does not read."
+        )
+
+    def run(self, a, app, out):
+        from .mesh import Orientation
+        from .printability import InputError
+
+        name = a.file.lower()
+        is_stl = name.endswith(".stl")
+        if not is_stl and not name.endswith(".3mf"):
+            return usage(out, f"{a.file}: printability reads an .stl, .3mf or .gcode.3mf file")
+        if is_stl and (a.object or a.plate is not None):
+            return usage(out, "--object and --plate are for a 3MF; an STL is one object")
+        if not is_stl and (a.lay_on_face or a.rotate or a.extruder or a.printer or a.process):
+            return usage(out, "--lay-on-face, --rotate, --extruder, --printer and --process are for an STL; a 3MF carries its own")
+        if a.samples < 1:
+            return usage(out, "--samples must be at least 1")
+        orientation = None
+        try:
+            if a.lay_on_face or a.rotate:
+                d: dict = {}
+                if a.lay_on_face:
+                    d["lay_on_face"] = list(_floats(a.lay_on_face, 3, "--lay-on-face"))
+                if a.rotate:
+                    d["rotate"] = list(_floats(a.rotate, 3, "--rotate"))
+                orientation = Orientation.from_json(d)
+                orientation.matrix()  # a zero normal fails here, as a usage error
+        except (ValueError, BuildError) as e:
+            return usage(out, f"bad --lay-on-face or --rotate: {e}")
+        flags = {
+            "overhang_deg": a.threshold,
+            "max_bridge_mm": a.max_bridge,
+            "layer_height_mm": a.layer_height,
+            "outer_line_mm": a.line_width,
+        }
+        try:
+            rep = app.printability(a.file, a.object, a.plate, orientation, a.extruder, a.printer, a.process, flags, a.samples)
+        except InputError as e:
+            return usage(out, str(e))
+        out.emit(rep.to_json(), rep.lines())
+        return rep.exit_code
+
+
 @command("split", "Split an STL with several bodies into one STL per body (Studio's 'Split to objects')")
 class Split(Command):
     def configure(self, p):
@@ -976,9 +1043,14 @@ class Build(Command):
 class Inspect(Command):
     def configure(self, p):
         p.add_argument("file")
+        p.add_argument(
+            "--no-integrity",
+            action="store_true",
+            help="skip the file integrity checks (G-code MD5, layer markers, time prediction, thumbnails, bed id, slice warnings, flush matrix)",
+        )
 
     def run(self, a, app, out):
-        s = app.inspect(a.file, features=out.as_json)  # only --json shows grams by feature, so only it parses the G-code
+        s = app.inspect(a.file, features=out.as_json, integrity=not a.no_integrity)  # only --json shows grams by feature
         book = s.get("preset_bookkeeping") or []
         listed = book[0]["keys"] if book else []
         proc = f"{s['process']} (+{len(listed)} overrides: {';'.join(listed)})" if listed else f"{s['process']}"
@@ -1029,8 +1101,27 @@ class Inspect(Command):
             lines.append(
                 f"plate {c['plate']}: {c['type']} at z {c['top_z']}" + (f" filament {c['extruder']}" if c["type"] == "color_change" else "")
             )
+        lines += integrity_text(s.get("integrity"))
         out.emit(s, lines)
-        return 0
+        return 0  # integrity findings are WARN or INFO: they never fail `inspect`
+
+
+def integrity_text(rep: dict | None) -> list[str]:
+    """The text lines of an `integrity` block (integrity.IntegrityReport.to_json): a count line, then one per finding."""
+    if rep is None:
+        return []
+    from .findings import evidence_tag
+
+    c = rep["counts"]
+    head = f"integrity: {c['WARN']} WARN, {c['INFO']} INFO ({', '.join(rep['checked'])})"
+    if rep["not_applicable"]:
+        head += f"; not applicable (unsliced): {', '.join(rep['not_applicable'])}"
+    out = [head]
+    for f in rep["findings"]:
+        where = f" plate {f['plate']}" if f.get("plate") is not None else ""
+        fix = f". Fix: {f['fix']['text']}" if f.get("fix") else ""
+        out.append(f"  {f['severity']} {f['code']}{where}: {f['message']} {evidence_tag(f['evidence'])}{fix}")
+    return out
 
 
 @command("patch", "Change a .3mf in place (or to -o): bed, colours, nozzle map, object settings, pauses, names")
@@ -1868,13 +1959,15 @@ class Verify(Command):
             "One line per item that is not as expected: FAIL a value differs or Studio resets it on open, WARN a key the "
             "spec does not set changed in the GUI (with its file value) or other bookkeeping, INFO a fact the spec does "
             "not decide. Exit 0 no FAIL, 1 any FAIL or a spec that does not load, 2 usage, 3 a project file that does "
-            "not read or a preset the Studio library lacks."
+            "not read or a preset the Studio library lacks. File integrity lines (item `integrity <code>`) are WARN or "
+            "INFO with their evidence level and never change the exit code; --no-integrity skips them."
         )
+        p.add_argument("--no-integrity", action="store_true", help="skip the file integrity lines")
 
     def run(self, a, app, out):
         spec = load_spec_or_error(a.against, out)
         if isinstance(spec, int):
             return spec
-        rep = app.verify(a.file, spec, a.against)
+        rep = app.verify(a.file, spec, a.against, integrity=not a.no_integrity)
         out.emit(rep.to_json(), [x.text() for x in rep.lines] + [rep.last_line()])
         return 0 if rep.ok else 1

@@ -14,7 +14,8 @@ vertical wall, 90 = a flat ceiling). The default 60 is what Studio supports by d
 30 counts from horizontal: convert with 90 - angle); 45 is the conservative "45 degree rule" for a clean print.
 
 Not here: mesh repair, booleans or plane cuts (Studio's Cut tool, or CAD), convex hulls, painted supports, and
-anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those.
+anything that needs the slicer (support volume, time): `shambu sweep` asks the slicer for those. Open edges, bridges,
+wall thickness, tip-over and bed fit are findings of `printability.py` (`shambu printability`), not orientation metrics.
 """
 
 from __future__ import annotations

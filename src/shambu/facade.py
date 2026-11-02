@@ -18,12 +18,14 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 
 from . import conf, presets, recipes, runs
+from . import mesh as mesh_mod
+from . import printability as pa
 from . import printer as printer_mod
 from . import vault as vault_mod
 from . import verify as verify_mod
@@ -31,6 +33,7 @@ from .build import BuildResult, Listener, Pipeline, load_spec
 from .edits import AddFilament, EditSet
 from .errors import BambuError, ConfError, PrinterError, StudioError
 from .loaded import FilamentResolution, reconcile
+from .mesh import Orientation
 from .patches import PatchSet
 from .printer import (
     ArpProbe,
@@ -388,24 +391,106 @@ class Bambu:
             **kw,
         )
 
-    def inspect(self, path: str | Path, features: bool = True) -> dict:
+    def inspect(self, path: str | Path, features: bool = True, integrity: bool = True) -> dict:
         """A project built elsewhere has no result.json, so `inspect` keeps the G-code parser for grams by feature.
-        Each object carries its `position` (plate, min corner and size in plate-local mm, `edits.object_positions`)."""
+        Each object carries its `position` (plate, min corner and size in plate-local mm, `edits.object_positions`).
+        `integrity` adds the file integrity checks (integrity.py) under `integrity`; they never change the exit code."""
         from . import edits
+        from . import integrity as integrity_mod
 
         pr = Project(str(path))
         s = pr.summary(features=features)
         pos = edits.object_positions(pr)
         for o in s["objects"]:
             o["position"] = pos.get(o["name"])
+        if integrity:
+            s["integrity"] = integrity_mod.check(pr).to_json()
         return s
 
-    def verify(self, path: str | Path, spec: Spec, spec_path: str | Path = "") -> verify_mod.Report:
+    def verify(self, path: str | Path, spec: Spec, spec_path: str | Path = "", integrity: bool = True) -> verify_mod.Report:
         """Compare a project (a GUI save, typically) with the spec it was built from (`verify.check_project`). Needs the
         preset library, not the Studio binary or the STL files. A file that is not a project or whose metadata does not
         parse is ProjectError; a process or printer preset the library lacks is PresetError (both exit 3 at the CLI).
-        The CLI loads the spec first, so a bad spec is exit 1 as for every other command."""
-        return verify_mod.check_project(str(path), spec, self.presets(), str(spec_path))
+        The CLI loads the spec first, so a bad spec is exit 1 as for every other command. `integrity` adds the file
+        integrity lines (WARN or INFO only)."""
+        return verify_mod.check_project(str(path), spec, self.presets(), str(spec_path), integrity)
+
+    def printability(
+        self,
+        path: str | Path,
+        objects: Sequence[str] = (),
+        plate: int | None = None,
+        orientation: Orientation | None = None,
+        extruder: int | None = None,
+        printer: str | None = None,
+        process: str | None = None,
+        flags: dict | None = None,
+        samples: int = 4000,
+    ) -> pa.Report:
+        """The printability pre-flight (printability.py) on an STL in its pose (`orientation`, then dropped to z 0) or on
+        every object of a 3MF in its placed pose. An STL takes its thresholds from `process` (a preset) and its machine
+        facts from `printer`; a 3MF takes both from the file and the object's own settings. `flags` (overhang_deg,
+        max_bridge_mm, layer_height_mm, outer_line_mm) win over both. Raises printability.InputError for a request the
+        file cannot answer (an unknown object, no mesh), BuildError or ProjectError when the file does not read, and
+        PresetError when a named preset is not in the library."""
+        p = Path(path)
+        name = p.name.lower()
+        flags = {k: v for k, v in (flags or {}).items() if v is not None}
+        if name.endswith(".stl"):
+            limits = pa.Limits.default()
+            if process:
+                limits = limits.from_settings(self.presets().resolve("process", process), f"preset {process}")
+            if printer:
+                limits = limits.with_machine(presets.machine_facts(self.presets().resolve("machine", printer)), f"preset {printer}")
+            limits = limits.with_flags(**flags)
+            facets = mesh_mod.read_stl(p)
+            if not facets:
+                raise pa.InputError(f"{path}: the STL has no facets")
+            o = orientation or mesh_mod.Orientation()
+            posed = facets if o.is_identity else mesh_mod.transform(facets, o.matrix())
+            lo, _ = mesh_mod.bbox(posed)
+            posed = mesh_mod.translate(posed, (0.0, 0.0, -lo[2]))
+            pose = {
+                "from": "as-is" if o.is_identity else "flag",
+                "lay_on_face": list(o.lay_on_face) if o.lay_on_face is not None else None,
+                "rotate": list(o.rotate) if any(abs(a) > 1e-9 for a in o.rotate) else None,
+            }
+            subject = pa.Subject(p.stem, posed, "posed", extruder or 1, pose, command=f"shambu orient {p.name}")
+            return pa.analyse([subject], limits, str(path), "stl", samples=samples)
+        if not name.endswith(".3mf"):
+            raise pa.InputError(f"{path}: printability reads an .stl, .3mf or .gcode.3mf file")
+        from . import edits
+
+        pr = Project(str(p))
+        ps = pr.project_settings
+        base = pa.Limits.default().from_settings(ps, "file")
+        if ps.get("printable_area"):
+            base = base.with_machine(presets.machine_facts(ps), "file")
+        else:
+            base = base.with_machine(None, "none", "the file holds no printable_area")
+        plate_maps = {pl["id"]: pl.get("filament_maps") for pl in pr.summary()["plates"]}
+        meshes = edits.object_meshes(pr)
+        known = [m.name for m in meshes]
+        missing = [n for n in objects if n not in known]
+        if missing:
+            raise pa.InputError(f"no object named {missing}; objects: {known}")
+        chosen = [m for m in meshes if (not objects or m.name in objects) and (plate is None or m.plate == plate)]
+        if not chosen or not any(m.facets for m in chosen):
+            raise pa.InputError(f"{path}: no mesh in the file" + (f" on plate {plate}" if plate is not None else ""))
+        subjects = []
+        for m in chosen:
+            if not m.facets:
+                continue
+            fmap = (plate_maps.get(m.plate) or "").split() or [str(x) for x in ps.get("filament_map") or []]
+            try:
+                ext = int(fmap[m.filament - 1]) if 0 < m.filament <= len(fmap) else 1
+            except ValueError:
+                ext = 1  # a malformed map: extruder 1, as Studio's default map
+            lim = base.from_settings(m.settings, "file object").with_flags(**flags)
+            subjects.append(
+                pa.Subject(m.name, m.facets, "plate", ext, {"from": "file", "plate": m.plate}, lim, m.skipped, "negative_part" in m.skipped)
+            )
+        return pa.analyse(subjects, base.with_flags(**flags), str(path), "3mf", samples=samples)
 
     def patch(self, path: str | Path, patch_set: PatchSet, out: str | Path | None = None) -> list[str]:
         return patch_set.apply(str(path), str(out) if out else None)

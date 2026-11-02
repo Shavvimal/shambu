@@ -431,8 +431,14 @@ class Project:
                     "color": f.get("color"),
                     "used_m": float(f.get("used_m") or 0),
                     "used_g": float(f.get("used_g") or 0),
+                    "tray_info_idx": f.get("tray_info_idx"),
                 }
                 for f in pl.findall("filament")
+            ]
+            # `warnings` stays a list of strings; `warning_details` keeps the attributes Studio writes with each one
+            details = [
+                {"msg": w.get("msg") or (w.text or ""), "level": w.get("level"), "error_code": w.get("error_code")}
+                for w in pl.findall("warning")
             ]
             out[idx] = {
                 "prediction_s": int(float(keys.get("prediction") or 0)),
@@ -441,7 +447,8 @@ class Project:
                 "outside": keys.get("outside"),
                 "filament_maps": keys.get("filament_maps"),
                 "filaments": fils,
-                "warnings": [w.get("msg") or (w.text or "") for w in pl.findall("warning")],
+                "warnings": [d["msg"] for d in details],
+                "warning_details": details,
             }
         return out
 

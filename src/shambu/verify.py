@@ -42,8 +42,12 @@ filament's variant block is the run of entries whose `filament_self_index` names
 on a project with two or more filaments a supported part's "0" support and interface filaments become its own
 filament).
 
+File integrity (integrity.py: G-code MD5, layer markers, time prediction, thumbnails, bed id, slice warnings, flush
+matrix shape) adds WARN and INFO lines with the item `integrity <code>` and the evidence level in the note. They never
+FAIL, so they never change the exit code; `last_line` counts the WARN ones as other warnings.
+
 What this module does not do: it runs no subprocess and prints nothing (cli.py does), it does not slice or compare
-G-code, it does not check height ranges, sub-part filaments or the tower position (`shambu inspect` shows them), it
+G-code with the spec, it does not check height ranges, sub-part filaments or the tower position (`shambu inspect` shows them), it
 does not compare the settings of a `group-f<n>` object that group_by_filament merged (its members are reported as not
 found, WARN), and it changes no file.
 """
@@ -54,9 +58,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 
 from . import edits
+from . import integrity as integrity_mod
 from . import presets as P
 from .build import SUPPORT_PIN_KEYS, TOWER_KEYS, effective_filaments, pin_support_filaments, slot_keys, system_base
 from .errors import BuildError, ProjectError
+from .findings import evidence_tag
 from .spec import PartSpec, Spec
 from .threemf import Project
 
@@ -332,9 +338,10 @@ def _same(expected, got, key: str = "") -> bool:
 
 
 # ---------------------------------------------------------------------------- the comparison
-def check_project(path: str, spec: Spec, resolver: P.PresetResolver, spec_path: str = "") -> Report:
+def check_project(path: str, spec: Spec, resolver: P.PresetResolver, spec_path: str = "", integrity: bool = True) -> Report:
     """Read the project and compare it with the spec. ProjectError when the file is not a project or its metadata
-    does not parse (a plate id that is not a number, a missing attribute), so the CLI gives one error document."""
+    does not parse (a plate id that is not a number, a missing attribute), so the CLI gives one error document.
+    `integrity` adds the file integrity lines (`integrity_lines`): WARN or INFO only, so `Report.ok` does not change."""
     try:
         project = Project(str(path))
         ps = project.project_settings
@@ -342,7 +349,28 @@ def check_project(path: str, spec: Spec, resolver: P.PresetResolver, spec_path: 
         positions = edits.object_positions(project)
     except (ValueError, KeyError, TypeError) as e:
         raise ProjectError(f"{path}: malformed project metadata: {type(e).__name__}: {e}") from e
-    return compare(spec, expected_slots(spec, resolver), ps, summary, positions, str(path), spec_path)
+    rep = compare(spec, expected_slots(spec, resolver), ps, summary, positions, str(path), spec_path)
+    if integrity:
+        rep.lines += integrity_lines(integrity_mod.check(project))
+    return rep
+
+
+def integrity_lines(rep: integrity_mod.IntegrityReport) -> list[Line]:
+    """One WARN or INFO line per integrity finding: item `integrity <code>`, the evidence tag in the note."""
+    out = []
+    for f in rep.findings:
+        exp, got = f.measure.get("expected"), f.measure.get("got")
+        where = f"plate {f.plate}: " if f.plate is not None else ""
+        out.append(
+            Line(
+                f.severity,
+                f"integrity {f.code}",
+                None if exp is None else str(exp),
+                None if got is None else str(got),
+                f"{where}{f.message} {evidence_tag(f.evidence)}",
+            )
+        )
+    return out
 
 
 def compare(
