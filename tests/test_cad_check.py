@@ -127,6 +127,7 @@ def _ascii_stl(path, first_vertex):
     return path
 
 
+@pytest.mark.parametrize("vertex", ["abc 0 0", "nan 0 0", "0 inf 0", "0 0 -1e400"])
 def test_a_bad_stl_coordinate_is_a_named_error(tmp_path, capsys, vertex):
     """A non-numeric or non-finite vertex once crashed every cad verb with a traceback."""
     p = _ascii_stl(tmp_path / "bad.stl", vertex)
