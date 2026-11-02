@@ -22,6 +22,7 @@ P2 = tuple[float, float]
 Edge = tuple[int, int]
 
 WELD_TOL = 1e-4  # mm: vertices closer than this on every axis share one index
+GRID_MAX_ENTRIES = 1_000_000  # a RayGrid lists at most this many (cell, facet) pairs; the cell grows to stay under it
 
 
 def _sub(a: Vec, b: Vec) -> Vec:
@@ -269,7 +270,8 @@ def farthest_in(
     A raster over the triangles and segments (cell `min_cell` mm, coarser when the box would pass `max_cells`) holds
     each cell's nearest segment, propagated in two sweeps from the cells the segments cross (a nearest-feature
     distance transform). The distance itself is exact to that segment, and the error of the maximum is under one
-    cell. Triangle corners and centroids are measured as well, so a region smaller than a cell still counts."""
+    cell. Triangle corners, edge midpoints and centroids are measured as well, so a region smaller than a cell still
+    counts (the midline of a strip narrower than a cell passes through its diagonal's midpoint)."""
     if not segments or not tris:
         return 0.0
     xs = [p[0] for t in tris for p in t] + [p[0] for s in segments for p in s]
@@ -295,11 +297,13 @@ def farthest_in(
         if d < dist[c]:
             dist[c], near[c] = d, k
 
+    crossing: dict[int, set[int]] = {}  # cell -> every segment that crosses it (a cell holds only its nearest in `near`)
     for k, (a, b) in enumerate(segments):  # seed the cells each segment crosses
         n = max(1, math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / (cell / 2)))
         for m in range(n + 1):
             i, j = cell_of((a[0] + (b[0] - a[0]) * m / n, a[1] + (b[1] - a[1]) * m / n))
             offer(i, j, k)
+            crossing.setdefault(i + j * nx, set()).add(k)
     sweeps = (
         (range(ny), range(nx), ((-1, 0), (-1, -1), (0, -1), (1, -1))),
         (range(ny - 1, -1, -1), range(nx - 1, -1, -1), ((1, 0), (1, 1), (0, 1), (-1, 1))),
@@ -312,15 +316,17 @@ def farthest_in(
                     if 0 <= ni < nx and 0 <= nj < ny and near[ni + nj * nx] >= 0:
                         offer(i, j, near[ni + nj * nx])
 
-    def exact(p: P2) -> float:  # the nearest of the candidates held around p's cell
+    def exact(p: P2) -> float:  # the nearest of the candidates held around p's cell and the segments that cross them
         i, j = cell_of(p)
-        cands = {near[ci + cj * nx] for ci in range(i - 1, i + 2) for cj in range(j - 1, j + 2) if 0 <= ci < nx and 0 <= cj < ny}
+        around = [ci + cj * nx for ci in range(i - 1, i + 2) for cj in range(j - 1, j + 2) if 0 <= ci < nx and 0 <= cj < ny]
+        cands = {near[c] for c in around} | {k for c in around for k in crossing.get(c, ())}
         return min((_seg_dist(p, *segments[k]) for k in cands if k >= 0), default=0.0)
 
     best = 0.0
     for t in tris:
         (ax, ay), (bx, by), (cx, cy) = t
-        best = max(best, exact(((ax + bx + cx) / 3, (ay + by + cy) / 3)), *(exact(p) for p in t))
+        mids = (((ax + bx) / 2, (ay + by) / 2), ((bx + cx) / 2, (by + cy) / 2), ((cx + ax) / 2, (cy + ay) / 2))
+        best = max(best, exact(((ax + bx + cx) / 3, (ay + by + cy) / 3)), *(exact(p) for p in (*t, *mids)))
         det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
         if abs(det) < 1e-12:
             continue
@@ -376,10 +382,13 @@ def ray_triangle(o: Vec, d: Vec, tri: Facet, eps: float = 1e-12) -> float | None
 class RayGrid:
     """A uniform grid over a mesh that lists the facets touching each cell (by the facet's bounding box), for
     first-hit ray casts with a 3D DDA walk. The cell edge defaults to the cube root of the bounding volume per facet,
-    clamped to 0.5..10 mm, so a cell holds a few facets on a typical part."""
+    clamped to 0.5..10 mm, so a cell holds a few facets on a typical part. The cell then grows until the grid lists at
+    most `max_entries` (cell, facet) pairs: a metre-scale mesh or one large slanted facet would otherwise fill millions
+    of cells. `tests` counts the ray-triangle tests, so a caller can stop a run that grows too long."""
 
-    def __init__(self, facets: Sequence[Facet], cell: float | None = None):
+    def __init__(self, facets: Sequence[Facet], cell: float | None = None, max_entries: int = GRID_MAX_ENTRIES):
         self.facets = facets
+        self.tests = 0
         xs = [v[0] for f in facets for v in f]
         ys = [v[1] for f in facets for v in f]
         zs = [v[2] for f in facets for v in f]
@@ -390,23 +399,38 @@ class RayGrid:
         if cell is None:
             cell = (ext[0] * ext[1] * ext[2] / max(len(facets), 1)) ** (1 / 3)
             cell = min(10.0, max(0.5, cell))
-        self.cell = cell
-        self.dims = tuple(max(1, math.ceil(e / cell)) for e in ext)
+        boxes = [(tuple(min(v[i] for v in f) for i in range(3)), tuple(max(v[i] for v in f) for i in range(3))) for f in facets]
+        while True:  # counted before any cell is filled, so the bound holds for memory as well as time
+            self.cell = cell
+            self.dims = tuple(max(1, math.ceil(e / cell)) for e in ext)
+            entries = 0
+            for lo_, hi_ in boxes:
+                n = 1
+                for i in range(3):
+                    n *= self._idx(hi_[i], i) - self._idx(lo_[i], i) + 1
+                entries += n
+            if entries <= max_entries or self.dims == (1, 1, 1):
+                break
+            cell *= 1.5
         self.cells: dict[tuple[int, int, int], list[int]] = {}
-        for fid, f in enumerate(facets):
-            lo = [self._idx(min(v[i] for v in f), i) for i in range(3)]
-            hi = [self._idx(max(v[i] for v in f), i) for i in range(3)]
+        for fid, (blo, bhi) in enumerate(boxes):
+            lo = [self._idx(blo[i], i) for i in range(3)]
+            hi = [self._idx(bhi[i], i) for i in range(3)]
             for i in range(lo[0], hi[0] + 1):
                 for j in range(lo[1], hi[1] + 1):
                     for k in range(lo[2], hi[2] + 1):
                         self.cells.setdefault((i, j, k), []).append(fid)
+
+    def _key(self, fid: int) -> tuple:
+        return tuple(sorted(tuple(round(x, 6) for x in v) for v in self.facets[fid]))
 
     def _idx(self, x: float, axis: int) -> int:
         return min(self.dims[axis] - 1, max(0, int((x - self.lo[axis]) / self.cell)))
 
     def first_hit(self, origin: Vec, direction: Vec, skip: Iterable[int] = (), t_min: float = 1e-3) -> tuple[float, int] | None:
         """(distance, facet id) of the nearest facet hit beyond `t_min` along the unit `direction`, ignoring the facets
-        in `skip`; None when the ray leaves the grid without a hit."""
+        in `skip`; None when the ray leaves the grid without a hit. A tie goes to the facet with the lowest sorted
+        corners, so the answer does not depend on facet order."""
         skipped = set(skip)
         t0, t1 = 0.0, math.inf
         for i in range(3):  # clip the ray to the grid box (slab test)
@@ -438,9 +462,12 @@ class RayGrid:
                 if fid in tested or fid in skipped:
                     continue
                 tested.add(fid)
+                self.tests += 1
                 t = ray_triangle(origin, direction, self.facets[fid])
-                if t is not None and t > t_min and (best is None or t < best[0]):
-                    best = (t, fid)
+                if t is None or t <= t_min:
+                    continue
+                if best is None or t < best[0] - 1e-9 or (t <= best[0] + 1e-9 and self._key(fid) < self._key(best[1])):
+                    best = (t, fid)  # equal distances (a ray along a shared edge): the facet with the lower corners
             exit_t = min(t_next)
             if best is not None and best[0] <= exit_t + 1e-9:
                 return best

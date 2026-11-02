@@ -97,3 +97,28 @@ def test_farthest_point_from_two_anchors(deg):
     tris = [(a, b, cc), (a, cc, d)]
     assert G.farthest_in(tris, [(a, d), (b, cc)]) == pytest.approx(15, abs=0.25)
     assert G.farthest_in(tris, [(a, d), (b, cc), (a, b), (d, cc)]) == pytest.approx(5, abs=0.25)
+
+
+def test_ray_grid_work_is_bounded_on_a_metre_scale_mesh():
+    s = 1200.0  # 4 facets; at a 10 mm cell the slanted facet alone fills 121 x 121 x 121 cells
+    a, b, c, d = (0.0, 0.0, 0.0), (s, 0.0, 0.0), (0.0, s, 0.0), (0.0, 0.0, s)
+    g = G.RayGrid([(a, c, b), (a, b, d), (a, d, c), (b, c, d)])
+    assert sum(len(v) for v in g.cells.values()) <= 1_000_000
+    hit = g.first_hit((10.0, 10.0, -5.0), (0.0, 0.0, 1.0))
+    assert hit is not None and hit[0] == pytest.approx(5.0)
+
+
+def test_farthest_in_a_strip_narrower_than_a_cell():
+    tris = [((0.0, 0.0), (10.0, 0.0), (10.0, 0.2)), ((0.0, 0.0), (10.0, 0.2), (0.0, 0.2))]
+    segs = [((0.0, 0.0), (10.0, 0.0)), ((0.0, 0.2), (10.0, 0.2))]
+    assert G.farthest_in(tris, segs) == pytest.approx(0.1, abs=1e-6)
+
+
+def test_first_hit_tie_does_not_depend_on_facet_order():
+    f = box((0, 0, 0), (10, 10, 10))
+    o, d = (5.0, 5.0, -1.0), (0.0, 0.0, 1.0)  # on the diagonal shared by the two bottom facets
+    hits = []
+    for facets in (f, f[::-1]):
+        _, fid = G.RayGrid(facets).first_hit((o[0], o[1], o[2]), d)
+        hits.append(sorted(facets[fid]))
+    assert hits[0] == hits[1]
