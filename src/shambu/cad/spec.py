@@ -274,7 +274,7 @@ class CadSpec:
         if part.bed_face is not None:
             return part.bed_face
         v = self.intent.get("bed_face")
-        return _vec3(v, "intent.bed_face") if v is not None else None
+        return _unit3(v, "intent.bed_face") if v is not None else None
 
     def hole_allowance(self) -> dict:
         v = self.intent.get("hole_allowance_mm")
@@ -283,8 +283,8 @@ class CadSpec:
 
 # ---------------------------------------------------------------------------- parsing
 def _vec3(v: Any, where: str) -> Vec:
-    if not isinstance(v, (list, tuple)) or len(v) != 3:
-        raise CadSpecError(f"{where}: expected [x, y, z], got {v!r}")
+    if not isinstance(v, (list, tuple)) or len(v) != 3 or any(isinstance(x, bool) for x in v):
+        raise CadSpecError(f"{where}: expected [x, y, z] (numbers), got {v!r}")
     try:
         out = (float(v[0]), float(v[1]), float(v[2]))
     except (TypeError, ValueError) as e:
@@ -302,16 +302,40 @@ def _unit3(v: Any, where: str) -> Vec:
     return (x[0] / n, x[1] / n, x[2] / n)
 
 
-def _num(d: Mapping, k: str, where: str, default: float | None = None, positive: bool = False) -> float | None:
+def _num(d: Mapping, k: str, where: str, default: float | None = None, positive: bool = False, nonneg: bool = False) -> float | None:
+    """The number at `d[k]`, `default` when it is absent or null. A JSON boolean is not a number. `positive` refuses
+    zero and below; `nonneg` (tolerances, margins, caps) refuses below zero."""
     if d.get(k) is None:
         return default
+    if isinstance(d[k], bool):
+        raise CadSpecError(f"{where}.{k}: must be a number, got {d[k]!r}")
     try:
         v = float(d[k])
     except (TypeError, ValueError) as e:
         raise CadSpecError(f"{where}.{k}: {e}") from e
-    if not math.isfinite(v) or (positive and v <= 0):
-        raise CadSpecError(f"{where}.{k}: must be a {'positive ' if positive else ''}number, got {d[k]!r}")
+    if not math.isfinite(v) or (positive and v <= 0) or (nonneg and v < 0):
+        want = "positive " if positive else "non-negative " if nonneg else ""
+        raise CadSpecError(f"{where}.{k}: must be a {want}number, got {d[k]!r}")
     return v
+
+
+def _num_or(d: Mapping, k: str, where: str, default: float, positive: bool = False, nonneg: bool = False) -> float:
+    """`_num` with a default: an explicit 0 stays 0 (never the default)."""
+    v = _num(d, k, where, default, positive, nonneg)
+    return default if v is None else v
+
+
+def _intent(intent: Mapping) -> None:
+    """Validates the intent keys a rule reads."""
+    _num(intent, "density_g_cm3", "intent", positive=True)
+    if intent.get("bed_face") is not None:
+        _unit3(intent["bed_face"], "intent.bed_face")
+    allow = intent.get("hole_allowance_mm")
+    if allow is not None:
+        if not isinstance(allow, Mapping):
+            raise CadSpecError(f"intent.hole_allowance_mm: an object such as {{'vertical': 0.1, 'horizontal': 0.25}}, got {allow!r}")
+        for k in allow:
+            _num(allow, k, "intent.hole_allowance_mm", nonneg=True)
 
 
 def placement(d: Any, where: str) -> Placement:
@@ -348,7 +372,7 @@ def _feature(d: Any, where: str) -> ExpectedFeature:
     if d["kind"] not in ("hole", "boss"):
         raise CadSpecError(f"{where}.kind: 'hole' or 'boss', got {d['kind']!r}")
     angles = d.get("angles_deg")
-    if angles is not None and (not isinstance(angles, list) or not all(isinstance(a, (int, float)) for a in angles)):
+    if angles is not None and (not isinstance(angles, list) or not all(isinstance(a, (int, float)) and not isinstance(a, bool) for a in angles)):
         raise CadSpecError(f"{where}.angles_deg: a list of numbers")
     count = d.get("count", len(angles) if angles else 1)
     if not isinstance(count, int) or count < 1:
@@ -357,10 +381,10 @@ def _feature(d: Any, where: str) -> ExpectedFeature:
         d["kind"],
         _num(d, "diameter_mm", where, positive=True) or 0.0,
         count,
-        _num(d, "diameter_tol_mm", where, 0.02) or 0.02,
+        _num_or(d, "diameter_tol_mm", where, 0.02, nonneg=True),
         _num(d, "pcd_mm", where),
         tuple(float(a) for a in angles) if angles else None,
-        _num(d, "angle_tol_deg", where, 0.5) or 0.5,
+        _num_or(d, "angle_tol_deg", where, 0.5, nonneg=True),
         _unit3(d["axis"], f"{where}.axis") if d.get("axis") is not None else None,
     )
 
@@ -391,7 +415,7 @@ def _part(d: Any, i: int, r: _Reader) -> PartSpec:
                 str(h["fit"]),
                 _vec3(h["mouth"], f"{hw}.mouth"),
                 _unit3(h["axis"], f"{hw}.axis"),
-                _num(h, "offset_max_mm", hw),
+                _num(h, "offset_max_mm", hw, nonneg=True),
             )
         )
     feats = []
@@ -413,9 +437,9 @@ def _part(d: Any, i: int, r: _Reader) -> PartSpec:
         str(d.get("group") or ""),
         placement(d["placement"], f"{where}.placement") if d.get("placement") is not None else Placement(),
         _num(d, "expected_volume_mm3", where),
-        _num(d, "volume_tol_mm3", where),
+        _num(d, "volume_tol_mm3", where, nonneg=True),
         _vec3(d["expected_size_mm"], f"{where}.expected_size_mm") if d.get("expected_size_mm") is not None else None,
-        _num(d, "size_tol_mm", where),
+        _num(d, "size_tol_mm", where, nonneg=True),
         tuple(feats),
         tuple(holes),
         _num(d, "density_g_cm3", where, positive=True),
@@ -454,7 +478,7 @@ def _rule(d: Any, i: int, r: _Reader, zones: Mapping[str, Zone], poses: Mapping[
                     Selector.parse(e.get("b"), f"{ew}.b"),
                     str(e["reason"]).strip(),
                     zone,
-                    _num(e, "max_overlap_mm3", ew),
+                    _num(e, "max_overlap_mm3", ew, nonneg=True),
                 )
             )
         pose = d.get("pose")
@@ -465,7 +489,7 @@ def _rule(d: Any, i: int, r: _Reader, zones: Mapping[str, Zone], poses: Mapping[
             rtype,
             Selector.parse(d.get("a", "all"), f"{where}.a"),
             Selector.parse(d.get("b", "all"), f"{where}.b"),
-            _num(d, "margin_mm", where, 0.0) or 0.0,
+            _num_or(d, "margin_mm", where, 0.0, nonneg=True),
             tuple(exempt),
             bool(d.get("skip_same_group", False)),
             pose,
@@ -483,9 +507,9 @@ def _rule(d: Any, i: int, r: _Reader, zones: Mapping[str, Zone], poses: Mapping[
         "fixed": Selector.parse(d.get("fixed"), f"{where}.fixed"),
         "motion": motion,
         "axis": _unit3(d["axis"], f"{where}.axis"),
-        "margin_mm": _num(d, "margin_mm", where, 0.0) or 0.0,
+        "margin_mm": _num_or(d, "margin_mm", where, 0.0, nonneg=True),
         "contact_zone": zone,
-        "max_overlap_mm3": _num(d, "max_overlap_mm3", where),
+        "max_overlap_mm3": _num(d, "max_overlap_mm3", where, nonneg=True),
     }
     if motion == "translate":
         if "from_mm" not in d:
@@ -558,6 +582,7 @@ def parse(doc: Any, path: str = "cad.json", base: str = ".") -> CadSpec:
     if not isinstance(intent, Mapping):
         raise CadSpecError(f"{path}: 'intent' is an object")
     r.keys(intent, _INTENT, "intent")
+    _intent(intent)
     prov = doc.get("provenance") or {}
     if not isinstance(prov, Mapping):
         raise CadSpecError(f"{path}: 'provenance' is an object")

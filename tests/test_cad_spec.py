@@ -312,3 +312,37 @@ def test_a_fit_rule_with_no_holes_reads_its_inputs_and_is_incomplete(tmp_path, c
     write_record(stl(tmp_path / "bracket.stl", box((0, 0, 0), (10, 10, 10))))
     code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
     assert code == 1 and doc["gate"] == "incomplete" and fails(doc) == {"cad.incomplete.no_holes"}
+
+
+def _doc(part=None, rule=None, intent=None):
+    d = {"schema": S.SCHEMA, "parts": [{"name": "a", "mesh": "a.stl", **(part or {})}], "rules": [rule or {"id": "c", "type": "check"}]}
+    if intent is not None:
+        d["intent"] = intent
+    return d
+
+
+@pytest.mark.parametrize(
+    ("doc", "words"),
+    [
+        (_doc(intent={"density_g_cm3": -1.27}), "intent.density_g_cm3"),
+        (_doc(intent={"density_g_cm3": True}), "intent.density_g_cm3"),
+        (_doc(intent={"bed_face": [0, 0, 0]}), "intent.bed_face"),
+        (_doc(intent={"hole_allowance_mm": {"vertical": "x"}}), "intent.hole_allowance_mm"),
+        (_doc(intent={"hole_allowance_mm": {"vertical": -0.1}}), "intent.hole_allowance_mm"),
+        (_doc(part={"expected_volume_mm3": 100, "volume_tol_mm3": -1}), "volume_tol_mm3"),
+        (_doc(part={"expected_size_mm": [1, 1, 1], "size_tol_mm": -0.05}), "size_tol_mm"),
+        (_doc(part={"expected_volume_mm3": True, "volume_tol_mm3": 1}), "expected_volume_mm3"),
+        (_doc(part={"expected_size_mm": [1, True, 1], "size_tol_mm": 0.05}), "expected_size_mm"),
+        (_doc(rule={"id": "c", "type": "clearance", "margin_mm": -0.1}), "margin_mm"),
+        (_doc(rule={"id": "c", "type": "clearance", "exempt": [{"a": "all", "b": "all", "reason": "r", "max_overlap_mm3": -1}]}), "max_overlap_mm3"),
+    ],
+)
+def test_intent_and_tolerances_are_validated(doc, words):
+    with pytest.raises(CadSpecError, match=words.replace(".", r"\.")):
+        S.parse(doc)
+
+
+def test_an_explicit_zero_tolerance_is_kept_not_replaced_by_the_default():
+    feat = {"kind": "hole", "diameter_mm": 4, "diameter_tol_mm": 0.0, "angle_tol_deg": 0.0}
+    (e,) = S.parse(_doc(part={"expected_features": [feat]})).parts[0].expected_features
+    assert e.diameter_tol_mm == 0.0 and e.angle_tol_deg == 0.0
