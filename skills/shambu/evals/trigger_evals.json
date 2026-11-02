@@ -1,5 +1,5 @@
 [
-  {"query": "I've got three STLs in ~/prints/gripper (base.stl, finger.stl x4, cap.stl). can you make me a bambu studio project with them all on one plate, PETG, 6 walls?", "should_trigger": true},
+  {"query": "I've got three STLs in ~/prints/clamp (base.stl, arm.stl x4, cap.stl). can you make me a bambu studio project with them all on one plate, PETG, 6 walls?", "should_trigger": true},
   {"query": "how long would parts/housing.stl take to print at 0.2mm layers with 15% gyroid? and how many grams of filament", "should_trigger": true},
   {"query": "which way up should I print this hook (hook.stl)? it has to hold a backpack and I don't want it to snap at the bend", "should_trigger": true},
   {"query": "how far is my print? it started like 3 hours ago", "should_trigger": true},

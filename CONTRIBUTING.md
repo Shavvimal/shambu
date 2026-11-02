@@ -44,7 +44,7 @@ a unit test, and none would have been invented for one.
 So before a release, and after any change to `mesh.py`, `layout.py`, `build.py`, `sweep.py` or a recipe, run the
 CLI on actual STLs of several kinds, not one favourite part:
 
-- functional robot parts exported in an assembly frame (gripper links, brackets, motor mounts, gears): off-origin
+- functional parts exported in an assembly frame (links, brackets, motor mounts, gears): off-origin
   STLs, copies, holes in every direction, tree supports;
 - URDF or simulation meshes in metres (SO-101, or any robot-arm URDF): the metres warning and `rotate --scale 1000`;
 - Gridfinity bins, baseplates and labels: 45-degree feet and lips, thin two-colour plates, many small objects on

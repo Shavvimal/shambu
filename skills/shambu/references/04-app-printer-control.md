@@ -233,7 +233,7 @@ python3 -I $S/tools/ssdp_listen.py 120
 
 Interpretation: the X2D did not announce itself on this LAN during the 145 s window. Possible causes: printer off or asleep, a different subnet / VLAN, or AP client isolation. Studio was not holding UDP 2021 at the time, so the port was free (when Studio runs with LAN discovery it binds 2021, and a second listener needs `SO_REUSEPORT`). No MQTT or FTPS connection was tried, because no printer IP was known and none is stored in readable config. A port scan of the LAN was not done.
 
-Incident to note: the Studio GUI process (PID <n>, opened at 10:49) **exited at about 11:23** during this session. No crash report exists for that PID. The `.ips` reports at 11:23-11:25 belong to other short-lived BambuStudio CLI runs (PID <n>, crash in `FilamentGroup::calc_one_change_budget`) started by the parallel `bin-re` agent. This track only did AX reads and a passive UDP listen. The cause of the GUI exit is unknown. A print in progress runs on the printer and does not depend on Studio.
+Incident to note: the Studio GUI process (PID <n>) **exited about 34 minutes after it opened**, during this research. No crash report exists for that PID. The `.ips` reports from the same two minutes belong to other short-lived BambuStudio CLI runs (PID <n>, crash in `FilamentGroup::calc_one_change_budget`) started by a parallel research agent. This track only did AX reads and a passive UDP listen. The cause of the GUI exit is unknown. A print in progress runs on the printer and does not depend on Studio.
 
 ---
 

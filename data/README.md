@@ -1,7 +1,7 @@
 # data/: real CAD parts for testing (gitignored)
 
 Synthetic boxes pass the unit tests; real parts find the bugs. Everything in this folder except this README is
-ignored by git. Copy STLs here from your CAD exports (the parts of a robot-gripper build, a funnel, a URDF
+ignored by git. Copy STLs here from your CAD exports (the parts of a multi-part functional build, a funnel, a URDF
 mesh in metres) and run the manual loop below before a release. Nothing here is committed, so sizes and
 licences do not matter.
 
@@ -17,14 +17,14 @@ different assumption. Suggested contents (what found the 0.2.0 bugs, see
 - a part with a band of chamfers (`carrier.stl`): found the zero-contact orientation candidates;
 - a mesh in metres (`so101_moving_jaw_metres.stl`): the metres warning and `rotate --scale 1000`; its inward
   cavity shell (-76.5 mm3) found the `split` cavity bug; a metres copy in a spec found the `check` gap (Studio -100);
-- a big part with tree supports next to a small one (gripper `bracket.stl` 5 mm from a nut holder): found the
+- a big part with tree supports next to a small one (`bracket.stl` next to a small holder, 5 mm apart): found the
   support-spread margin (Studio -101 at gap 15, sliced at 20);
 - Gridfinity bins and two-colour labels: the exact-45-degree foot and lip found the threshold float noise, the
   label height range on filament 2 found the filament-change count, and a multi-object 3MF found `info` keeping
   only the last object;
 - organic forms (a lamp with no flat base, a duck, two funnels): found the slenderness gap (a 6 mm rod ranked
   standing), the empty orientation sweep, and the by-object win (1 h 13 against 2 h 40, 273 swaps);
-- an assembly with several bodies (a robot-arm gripper with motors, 88 bodies): found the missing multi-body note
+- an assembly with several bodies (an assembly of 88 bodies, motors included): found the missing multi-body note
   and the `split` count that disagrees with Studio's parts.
 
 The loop (each command takes up to about 1.6 s per part, a 520k-facet `orient` about 13 s, a sweep 1 to 7 s per

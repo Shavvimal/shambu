@@ -156,15 +156,15 @@ Loader rules (F:1916-1930, F:5322, F:5383):
  <metadata name="Copyright"></metadata> ... CreationDate, Description, Designer, DesignerCover,
    DesignerUserId, License, ModificationDate, Origin, ProfileCover, ProfileDescription, ProfileTitle, Title
  <resources>
-  <object id="7" p:UUID="00000003-61cb-4c03-9d28-80fed5dfa1dc" type="model">
+  <object id="7" p:UUID="00000003-1a2b-4c3d-8e4f-5a6b7c8d9e0f" type="model">
    <components>
-    <component p:path="/3D/Objects/object_3.model" objectid="5" p:UUID="00030000-b206-40ff-9872-83e8017abed1" transform="1 0 0 0 1 0 0 0 1 132 7.5 0.600000024"/>
-    <component p:path="/3D/Objects/object_3.model" objectid="6" p:UUID="00030001-b206-40ff-9872-83e8017abed1" transform="1 0 0 0 1 0 0 0 1 132 7.54381108 0.900000036"/>
+    <component p:path="/3D/Objects/object_3.model" objectid="5" p:UUID="00030000-2b3c-4d5e-9f60-6b7c8d9e0f1a" transform="1 0 0 0 1 0 0 0 1 132 7.5 0.600000024"/>
+    <component p:path="/3D/Objects/object_3.model" objectid="6" p:UUID="00030001-2b3c-4d5e-9f60-6b7c8d9e0f1a" transform="1 0 0 0 1 0 0 0 1 132 7.54381108 0.900000036"/>
    </components>
   </object>
  </resources>
- <build p:UUID="2c7c17d8-22b5-4d84-8835-1976022ea369">
-  <item objectid="7" p:UUID="00000007-b1ec-4553-aec9-835e5b724bb4" transform="1 0 0 0 1 0 0 0 1 0 0 0" printable="1"/>
+ <build p:UUID="3c4d5e6f-7081-4293-a4b5-c6d7e8f90a1b">
+  <item objectid="7" p:UUID="00000007-4d5e-4f60-b172-7c8d9e0f1a2b" transform="1 0 0 0 1 0 0 0 1 0 0 0" printable="1"/>
  </build>
 </model>
 ```
@@ -177,8 +177,9 @@ Loader rules (F:1916-1930, F:5322, F:5383):
 - Transform: 12 numbers, column-major 3x4 (r00 r10 r20 r01 r11 r21 r02 r12 r22 tx ty tz).
 - Ids: each part gets a mesh object id in the sub-file (1, 3, 5, 6) and each printable object
   gets a root id (2, 4, 7). Root objects hold only `<components>`.
-- `p:UUID` patterns are deterministic counters (`0000000N-61cb-...`, `000N0000-b206-...`,
-  `0000000N-b1ec-...`). The loader does not need them to be unique across files.
+- `p:UUID` patterns are deterministic counters on a fixed suffix per kind (object `0000000N-<suffix>`, component
+  `000N0000-<suffix>`, build item `0000000N-<suffix>`; the build element has one fixed id). The sample's suffixes are
+  invented. The loader does not need them to be unique across files.
 
 ### 2.3 `3D/Objects/object_N.model` (meshes)
 
@@ -188,7 +189,7 @@ bounding-box centre** (`add_volume(mesh, MODEL_PART, true)`, Model.cpp:3461). Th
 <model ...same namespaces...>
  <metadata name="BambuStudio:3mfVersion">1</metadata>
  <resources>
-  <object id="5" p:UUID="00030000-81cb-4c03-9d28-80fed5dfa1dc" type="model">
+  <object id="5" p:UUID="00030000-5e6f-4071-8283-8d9e0f1a2b3c" type="model">
    <mesh><vertices><vertex x="-17.7777843" y="-5.41573477" z="-0.600000024"/>...</vertices>
          <triangles><triangle v1="0" v2="1" v3="2"/>...</triangles></mesh>
   </object>
@@ -219,7 +220,7 @@ Real example (fit test, abridged):
   <object id="7">                                   <!-- = root object id in 3dmodel.model -->
     <metadata key="name" value="assemble_1"/>
     <metadata face_count="3976"/>
-    <part id="5" subtype="normal_part" uuid="81d97e24-a4e0-4acd-a9aa-45f427c676e6">
+    <part id="5" subtype="normal_part" uuid="6f708192-a3b4-4c5d-9e6f-708192a3b4c5">
       <metadata key="name" value="a01_1"/>
       <metadata key="matrix" value="1 0 0 132 0 1 0 7.5 0 0 1 0.60000002384185791 0 0 0 1"/>
       <metadata key="source_file" value="a01.stl"/>
