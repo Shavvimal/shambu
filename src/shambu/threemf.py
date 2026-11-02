@@ -224,7 +224,8 @@ class Project:
         try:
             with zipfile.ZipFile(path) as z:
                 self._entries = [_Entry(copy.copy(i), z.read(i.filename)) for i in z.infolist()]
-        except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, EOFError) as e:
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, EOFError, zlib.error, NotImplementedError) as e:
+            # zlib.error: an entry's deflate data is damaged; NotImplementedError: a compression method zipfile lacks
             raise ProjectError(f"{path}: not a readable 3MF zip ({e})") from e
         if not self.has(PROJECT_SETTINGS) or not self.has(MODEL_SETTINGS):
             raise ProjectError(f"{path}: no Metadata/project_settings.config or model_settings.config: not a Bambu Studio project")
@@ -248,6 +249,15 @@ class Project:
             if e.info.filename == name:
                 return e.data
         raise ProjectError(f"{self.path}: no entry {name!r} in the zip")
+
+    def meta_number(self, cast: Callable[[str], Any], value: Any, what: str) -> Any:
+        """A metadata number: 0 when absent or empty, ProjectError naming the key when it does not parse."""
+        if value is None or str(value).strip() == "":
+            return cast("0")
+        try:
+            return cast(str(value).strip())
+        except ValueError as e:
+            raise ProjectError(f"{self.path}: malformed project metadata: {what} is {value!r}, not a number") from e
 
     def _parse_xml(self, name: str) -> ET.Element:
         try:
@@ -423,14 +433,14 @@ class Project:
         si = self._parse_xml(SLICE_INFO)
         for pl in si.findall("plate"):
             keys = {m.get("key"): m.get("value") for m in pl.findall("metadata")}
-            idx = int(keys.get("index") or 0)
+            idx = self.meta_number(int, keys.get("index"), "slice_info.config plate index")
             fils = [
                 {
                     "id": f.get("id"),
                     "type": f.get("type"),
                     "color": f.get("color"),
-                    "used_m": float(f.get("used_m") or 0),
-                    "used_g": float(f.get("used_g") or 0),
+                    "used_m": self.meta_number(float, f.get("used_m"), "slice_info.config filament used_m"),
+                    "used_g": self.meta_number(float, f.get("used_g"), "slice_info.config filament used_g"),
                     "tray_info_idx": f.get("tray_info_idx"),
                 }
                 for f in pl.findall("filament")
@@ -441,8 +451,8 @@ class Project:
                 for w in pl.findall("warning")
             ]
             out[idx] = {
-                "prediction_s": int(float(keys.get("prediction") or 0)),
-                "weight_g": float(keys.get("weight") or 0),
+                "prediction_s": int(self.meta_number(float, keys.get("prediction"), f"slice_info.config plate {idx} prediction")),
+                "weight_g": self.meta_number(float, keys.get("weight"), f"slice_info.config plate {idx} weight"),
                 "support_used": keys.get("support_used"),
                 "outside": keys.get("outside"),
                 "filament_maps": keys.get("filament_maps"),
@@ -553,8 +563,8 @@ class Project:
         for o in self._layer_ranges_root().findall("object"):
             ranges[o.get("id") or ""] = [
                 {
-                    "min_z": float(r.get("min_z", 0)),
-                    "max_z": float(r.get("max_z", 0)),
+                    "min_z": self.meta_number(float, r.get("min_z"), "layer_config_ranges.xml min_z"),
+                    "max_z": self.meta_number(float, r.get("max_z"), "layer_config_ranges.xml max_z"),
                     "options": {op.get("opt_key"): op.text for op in r.findall("option")},
                 }
                 for r in o.findall("range")
@@ -597,7 +607,7 @@ class Project:
             keys = {m.get("key"): m.get("value") for m in p.findall("metadata")}
             plates.append(
                 {
-                    "id": int(keys.get("plater_id") or 0),
+                    "id": self.meta_number(int, keys.get("plater_id"), "model_settings.config plater_id"),
                     "name": keys.get("plater_name", ""),
                     "locked": keys.get("locked"),
                     "bed_type": keys.get("bed_type"),
@@ -614,11 +624,11 @@ class Project:
             pid = (info_el.get("id") if info_el is not None else None) or "1"
             mode = mode_el.get("value") if mode_el is not None else None
             for ly in pl.findall("layer"):
-                t = int(ly.get("type") or -1)
+                t = self.meta_number(int, ly.get("type") or -1, "custom_gcode_per_layer.xml type")
                 custom.append(
                     {
-                        "plate": int(pid),
-                        "top_z": float(ly.get("top_z") or 0),
+                        "plate": self.meta_number(int, pid, "custom_gcode_per_layer.xml plate id"),
+                        "top_z": self.meta_number(float, ly.get("top_z"), "custom_gcode_per_layer.xml top_z"),
                         "type": GCODE_TYPE_NAMES.get(t, t),
                         "extruder": ly.get("extruder"),
                         "color": ly.get("color"),

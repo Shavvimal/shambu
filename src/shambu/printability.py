@@ -4,10 +4,10 @@ score, and every run lists what it did not check (`NOT_CHECKED`).
 
 What it handles (reference 08 section 12 has the algorithms and the thresholds):
 
-- mesh: open and non-manifold edges, flipped facets, bodies, a mesh in metres;
+- mesh: open and non-manifold edges, flipped facets, inside-out shells, bodies, a mesh in metres;
 - support: overhang regions beyond Studio's support threshold, with area, shadow, steepest angle and location, and
   overhangs that start at the bed (a fillet to chamfer in CAD);
-- bridges: flat ceilings with anchors on two sides or all round, and their span (twice the largest distance from the
+- bridges: flat ceilings anchored on opposite sides (two, three or all round), and their span (twice the largest distance from the
   ceiling to its nearest anchor), against the file's `max_bridge_length`;
 - walls and layers: sampled wall (XY) and slab (Z) thickness from ray casts along the inward normal, against the line
   widths and the layer height;
@@ -21,9 +21,11 @@ Limits (honest, also in reference 08 section 12):
   tessellation (a 64-segment bore: 2.8 degrees); regions on curves split or merge at that resolution.
 - The bridge anchor test reads one facet across each boundary edge. A ceiling anchored on a slope or a fillet can read
   as unanchored, and an anchor on two adjacent sides reads as one chain: both stay overhangs (the conservative side).
+  One chain with anchors on opposite sides and the ceiling between them (three sides of a slot, a roof held all
+  round) is a bridge; a ledge round a post is anchored only on the post, so it stays an overhang.
 - Wall and slab values are sampled, not a medial axis. The 30-degree pair filter drops chords across sharp edges but
   also skips walls whose faces are not near-parallel (tapers over 30 degrees). The JSON says how many facets were
-  sampled.
+  sampled. Past MAX_RAY_TESTS ray-triangle tests the wall and slab areas stop and say so (`not-checked`).
 - Tip-over uses the finished part, a uniform density and a free-standing body. It ignores adhesion, brims, supports
   and infill (infill puts the real centre of mass nearer the walls).
 - The thresholds are Studio's defaults for one process (`Limits.default`, the X2D 0.20 Standard values); a 3MF's own
@@ -65,6 +67,9 @@ OFF_GRID_MM = 0.02  # a slab within this of a whole number of layers is on the g
 OFF_GRID_LAYERS = 10  # slabs thicker than this many layers lose little to rounding: not reported
 ALWAYS_SAMPLE = 200  # the largest facets are always ray sources
 DEFAULT_SAMPLES = 4000
+MAX_RAY_TESTS = 3_000_000  # ray-triangle tests per object before the wall and slab checks stop (a few seconds)
+PATCH_DEG = 5.0  # neighbouring facets within this of one plane are one face: thin samples on it are one finding
+FLAT_SLAB_NZ = math.cos(math.radians(5.0))  # a slab face this close to horizontal is judged against the layer grid
 TIP_DEG = 10.0  # heuristic: a static tip angle under this is a low margin
 SLENDER = 3.0  # heuristic: the knee of `mesh.Metrics.score`; no published height-to-base ratio exists
 LONG_CONTACT_MM, NARROW_CONTACT_MM = 100.0, 15.0  # heuristic: long, narrow contact (216 mm rails, 112 mm jaws, reference 06 s3)
@@ -238,6 +243,7 @@ class Subject:
     negative: bool = False  # the object has a negative part (not subtracted here)
     command: str | None = None  # the shambu command a fix can name, e.g. "shambu orient bracket.stl"
     extruder_reason: str = ""  # set when the extruder is not known (a malformed filament map): reach is not checked
+    extruders: tuple[int, ...] = ()  # every extruder the object's parts print on, when more than `extruder`
 
 
 class Geo:
@@ -262,9 +268,12 @@ class Geo:
         self.flipped = self.welded.flipped_edges()
         self.closed = not self.open_edges and not self.nonmanifold
         self.contact = [f for f in range(len(self.facets)) if self.on_bed(f) and self.normals[f][2] < -FLAT_DOWN]
+        self.metres = looks_like_metres(self.facets)
         self._grid: G.RayGrid | None = None
         self._bridges: tuple[list[Bridge], set[int]] | None = None
         self._bodies: list[list[int]] | None = None
+        self._inverted = 0
+        self._patches: list[int] | None = None
 
     def on_bed(self, f: int) -> bool:
         return max(v[2] for v in self.facets[f]) <= self.bed + BED_TOL
@@ -295,10 +304,30 @@ class Geo:
 
     def bodies(self) -> list[list[int]]:
         """The facet ids of each separate body: every outward shell with the inward shells (cavities) whose box it
-        holds, ordered by position so the facet order does not change the order. One body: the whole mesh."""
+        holds, and every inward shell that no body holds (an inside-out body), ordered by position so the facet order
+        does not change the order. Degenerate facets (no area) belong to no shell. One body: the whole mesh."""
         if self._bodies is None:
-            self._bodies = _split_bodies(self)
+            self._bodies, self._inverted = _split_bodies(self)
         return self._bodies
+
+    @property
+    def inverted(self) -> int:
+        """Closed shells wound inside out (negative volume) that no outward shell holds; 0 for an open mesh."""
+        self.bodies()
+        return self._inverted
+
+    def patch(self, f: int) -> int:
+        """A label for the smooth face that holds facet `f`: neighbours whose normals are within PATCH_DEG share it."""
+        if self._patches is None:
+            cos_tol = math.cos(math.radians(PATCH_DEG))
+            uf = G._UnionFind()
+            for g in range(len(self.facets)):
+                uf.add(g)
+            for fs in self.welded.edge_map().values():
+                if len(fs) == 2 and G._dot(self.normals[fs[0]], self.normals[fs[1]]) >= cos_tol:
+                    uf.union(fs[0], fs[1])
+            self._patches = [uf.find(g) for g in range(len(self.facets))]
+        return self._patches[f]
 
     def bridges(self) -> tuple[list[Bridge], set[int]]:
         """The flat ceilings that are bridges, and the facet ids they hold (left out of the overhang regions)."""
@@ -307,25 +336,48 @@ class Geo:
         return self._bridges
 
 
-def _split_bodies(geo: Geo) -> list[list[int]]:
-    shells = G.regions(range(len(geo.facets)), geo.welded)
-    if len(shells) < 2:
-        return [list(range(len(geo.facets)))]
+def _split_bodies(geo: Geo) -> tuple[list[list[int]], int]:
+    """(bodies, inverted shells). Volumes need a closed mesh: an open mesh has one body per connected shell (a cavity
+    cannot be told from a body) and is never inverted."""
+    everything = [list(range(len(geo.facets)))]
+    shells = G.regions((f for f in range(len(geo.facets)) if not geo.welded.degenerate(f)), geo.welded)
+    if len(shells) < 2 and not geo.closed:
+        return everything, 0
+    if not geo.closed:
+        shells.sort(key=lambda g: tuple(round(x, 6) for corner in geo.region_box(g) for x in corner))
+        return shells, 0
+    if not shells:
+        return everything, 0
     vols = [G.moments(geo.facets[f] for f in sh)[0] for sh in shells]
     outer = [(sh, v) for sh, v in zip(shells, vols, strict=True) if v > 0]
-    if len(outer) < 2:
-        return [list(range(len(geo.facets)))]
+    if not outer:
+        return everything, len(shells)  # every shell inside out
     groups = [list(sh) for sh, _ in outer]
     boxes = [geo.region_box(sh) for sh, _ in outer]
+    inverted = 0
     for sh, v in zip(shells, vols, strict=True):
         if v > 0:
             continue
         lo, hi = geo.region_box(sh)
         holders = [i for i, (blo, bhi) in enumerate(boxes) if all(blo[k] <= lo[k] + 1e-9 and hi[k] <= bhi[k] + 1e-9 for k in range(3))]
-        if holders:  # a cavity (or a degenerate sliver) inside the smallest body whose box holds it
+        if holders:  # a cavity inside the smallest body whose box holds it
             groups[min(holders, key=lambda i: outer[i][1])] += sh
+        elif v < 0:  # an inward shell that no body holds: a body wound inside out
+            inverted += 1
+            groups.append(list(sh))
+    if len(groups) < 2:
+        return everything, inverted
     groups.sort(key=lambda g: tuple(round(x, 6) for corner in geo.region_box(g) for x in corner))
-    return [sorted(g) for g in groups]
+    return [sorted(g) for g in groups], inverted
+
+
+def _blocked(geo: Geo) -> str:
+    """Why the checks that read facet direction or mm cannot run on this mesh, or ''."""
+    if geo.metres:
+        return "the mesh is probably in metres (mesh.metres): convert it first"
+    if geo.inverted:
+        return f"{geo.inverted} shell(s) wound inside out (mesh.inverted)"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -346,6 +398,7 @@ def _find_bridges(geo: Geo) -> tuple[list[Bridge], set[int]]:
     for reg in G.regions(cands, w):
         rs = set(reg)
         anchored: list[G.Edge] = []
+        outward: dict[G.Edge, tuple[float, float, float, float]] = {}  # edge midpoint and its direction out of the ceiling
         for f in reg:
             c = geo.centroid(f)
             for e in w.edges_of(f):
@@ -369,16 +422,36 @@ def _find_bridges(geo: Geo) -> tuple[list[Bridge], set[int]]:
                 ng = geo.normals[g]
                 if ng[0] * ux + ng[1] * uy < ANCHOR_FACING:
                     anchored.append(e)
+                    outward[e] = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, ux, uy)
         chains = G.edge_chains(anchored)
         closed = any(c for _, c in chains)
-        if len(chains) < 2 and not closed:
-            continue  # anchored on one side (or nowhere): a cantilever, it stays an overhang
+        if len(chains) < 2 and not _faces_across(chains, outward):
+            continue  # anchored on one side, two adjacent sides, round a post, or nowhere: a cantilever, an overhang
         segs = [((w.verts[a][0], w.verts[a][1]), (w.verts[b][0], w.verts[b][1])) for a, b in anchored]
         tris = [tuple((v[0], v[1]) for v in geo.facets[f]) for f in reg]
         span = 2 * G.farthest_in(tris, segs)  # type: ignore[arg-type]
         out.append(Bridge(tuple(reg), span, len(chains), closed))
         held |= rs
     return out, held
+
+
+FACE_PAIR_EDGES = 256  # anchored edges per chain the opposite-sides test compares pairwise (an even subsample past it)
+
+
+def _faces_across(chains: list[tuple[list[G.Edge], bool]], outward: dict[G.Edge, tuple[float, float, float, float]]) -> bool:
+    """True when one chain holds two anchors on opposite sides with the ceiling between them: their directions out of
+    the ceiling point apart, and each anchor lies beyond the other along its own direction. A slot anchored on three
+    sides and a roof held all round pass; a ledge round a post (anchors on the post, directions pointing at each other)
+    and an L (two adjacent sides) do not."""
+    for es, _ in chains:
+        pick = es if len(es) <= FACE_PAIR_EDGES else [es[i * len(es) // FACE_PAIR_EDGES] for i in range(FACE_PAIR_EDGES)]
+        for i, e in enumerate(pick):
+            ax, ay, ux, uy = outward[e]
+            for f in pick[i + 1 :]:
+                bx, by, vx, vy = outward[f]
+                if ux * vx + uy * vy < -0.5 and (bx - ax) * vx + (by - ay) * vy > 0 and (ax - bx) * ux + (ay - by) * uy > 0:
+                    return True
+    return False
 
 
 # ---------------------------------------------------------------------------- results
@@ -420,7 +493,7 @@ class MeshSound:
 
     def run(self, subject: Subject, geo: Geo, limits: Limits) -> dict[str, AreaResult]:
         name = subject.name
-        bodies = len(G.regions(range(len(geo.facets)), geo.welded))
+        bodies = len(geo.bodies())
         fs: list[Finding] = []
         holes = geo.open_edges + geo.nonmanifold
         if holes:
@@ -454,7 +527,20 @@ class MeshSound:
                     fix=Fix("re-export from CAD; Studio usually repairs the winding on load"),
                 )
             )
-        if looks_like_metres(geo.facets):
+        if geo.inverted:
+            fs.append(
+                Finding(
+                    "mesh.inverted",
+                    WARN,
+                    "mesh",
+                    f"{geo.inverted} closed shell(s) wound inside out: every facet faces inwards, so the bottom reads as a top",
+                    MEASURED,
+                    name,
+                    measure={"inverted_shells": geo.inverted},
+                    fix=Fix("re-export from CAD with the normals facing out; Studio usually repairs the winding on load"),
+                )
+            )
+        if geo.metres:
             fs.append(
                 Finding(
                     "mesh.metres",
@@ -484,7 +570,7 @@ class MeshSound:
             "open_edges": len(geo.open_edges),
             "flipped_edges": geo.flipped,
             "bodies": bodies,
-            "watertight": geo.closed and not geo.flipped,
+            "watertight": geo.closed and not geo.flipped and not geo.inverted,
         }
         return {"mesh": _result(measures, fs)}
 
@@ -493,6 +579,8 @@ class Overhangs:
     areas: tuple[str, ...] = ("support",)
 
     def run(self, subject: Subject, geo: Geo, limits: Limits) -> dict[str, AreaResult]:
+        if why := _blocked(geo):
+            return {"support": _skip(why)}
         thr = float(limits.v("overhang_deg"))
         sin_thr = math.cos(math.radians(90.0 - thr))
         _, bridged = geo.bridges()
@@ -579,6 +667,8 @@ class Bridges:
     areas: tuple[str, ...] = ("bridges",)
 
     def run(self, subject: Subject, geo: Geo, limits: Limits) -> dict[str, AreaResult]:
+        if why := _blocked(geo):
+            return {"bridges": _skip(why)}
         bridges, _ = geo.bridges()
         max_free = float(limits.v("max_bridge_mm"))
         fs: list[Finding] = []
@@ -668,7 +758,13 @@ class Thickness:
         cos_pair = math.cos(math.radians(PAIR_DEG))
         walls: dict[int, tuple[float, int]] = {}
         slabs: dict[int, tuple[float, int]] = {}
-        for f in sources:
+        for done, f in enumerate(sources):
+            if grid.tests > MAX_RAY_TESTS:
+                why = (
+                    f"work limit: {grid.tests} ray-triangle tests after {done} of {len(sources)} rays "
+                    f"({len(geo.facets)} facets); pass a lower --samples"
+                )
+                return {"walls": _skip(why), "layers": _skip(why)}
             n = geo.normals[f]
             skip = {g for v in w.tris[f] for g in w.facets_at(v)}
             hit = grid.first_hit(geo.centroid(f), (-n[0], -n[1], -n[2]), skip)
@@ -707,15 +803,24 @@ class Thickness:
             geo,
             slabs,
             [
-                ("slab.below_layer", WARN, lambda f, t: t < lh - 1e-9, "thinner than one {lh:g} mm layer"),
+                (
+                    "slab.below_layer",
+                    WARN,
+                    lambda f, t: t < layers.at(faces(f)[0]) - 1e-9,
+                    "thinner than one layer ({first:g} mm first, {lh:g} mm after)",
+                ),
                 (
                     "slab.off_grid",
                     INFO,
-                    lambda f, t: lh - 1e-9 <= t < OFF_GRID_LAYERS * lh and layers.off_grid(*faces(f)),
+                    lambda f, t: (
+                        layers.at(faces(f)[0]) - 1e-9 <= t < OFF_GRID_LAYERS * lh
+                        and abs(geo.normals[f][2]) >= FLAT_SLAB_NZ
+                        and layers.off_grid(*faces(f))
+                    ),
                     "{grid}",
                 ),
             ],
-            {"lh": lh},
+            {"lh": lh, "first": layers.first},
             lambda f: layers.text(*faces(f)),
         )
         wall_m = {
@@ -729,7 +834,7 @@ class Thickness:
 
     def _sources(self, geo: Geo) -> list[int]:
         """Deterministic sample: the largest facets first (ties by position), the ALWAYS_SAMPLE largest always (fewer
-        when `samples` is smaller), then every k-th so that at most `samples` rays are cast."""
+        when `samples` is smaller), then the rest spread evenly over what is left of `samples`."""
 
         def key(f: int) -> tuple:
             c = geo.centroid(f)
@@ -743,7 +848,7 @@ class Thickness:
         budget = self.samples - n_head
         if budget <= 0 or not rest:
             return head
-        return head + rest[:: math.ceil(len(rest) / budget)]
+        return head + [rest[i * len(rest) // budget] for i in range(budget)]
 
     @staticmethod
     def _group(
@@ -762,6 +867,9 @@ class Thickness:
                 continue
             nodes = set(thin) | {g for _, g in thin.values()}
             links = [(f, g) for f, (_, g) in thin.items()]
+            first_on: dict[int, int] = {}  # sampled facets on one smooth face are one finding, however far apart
+            for f in sorted(thin):
+                links.append((first_on.setdefault(geo.patch(f), f), f))
             for reg in G.regions(nodes, geo.welded, links):
                 own = [f for f in reg if f in thin]
                 if not own:
@@ -813,6 +921,10 @@ class LayerGrid:
         n = (z - top) / self.layer
         return top + math.floor(n + 1e-9) * self.layer, top + math.ceil(n - 1e-9) * self.layer
 
+    def at(self, z: float) -> float:
+        """The height of the layer that starts at `z`: the first layer at the bed, the layer height above it."""
+        return self.first if z < self.bed + self.first - OFF_GRID_MM else self.layer
+
     def off(self, z: float) -> bool:
         lo, hi = self.around(z)
         return min(z - lo, hi - z) > OFF_GRID_MM
@@ -835,6 +947,8 @@ class LayerGrid:
 
 
 def _no_inside(subject: Subject, geo: Geo) -> str:
+    if why := _blocked(geo):
+        return why
     if not geo.closed:
         return "open mesh: no inside (mesh.open_edges)"
     if geo.flipped:
@@ -848,6 +962,8 @@ class Stability:
     areas: tuple[str, ...] = ("stability",)
 
     def run(self, subject: Subject, geo: Geo, limits: Limits) -> dict[str, AreaResult]:
+        if why := _blocked(geo):
+            return {"stability": _skip(why)}
         contact = sum(geo.areas[f] for f in geo.contact)
         footprint = (geo.hi[0] - geo.lo[0]) * (geo.hi[1] - geo.lo[1])
         need = max(MIN_CONTACT_MM2, 0.01 * footprint)
@@ -870,8 +986,29 @@ class Stability:
         bodies = geo.bodies()
         on_bed = set(geo.contact)
         tips: list[tuple[str, float, float, float, Vec]] = []  # (body label, margin, angle, height, centre of mass)
+        fs: list[Finding] = []
         for k, fids in enumerate(bodies, 1):
+            label = f"body {k} of {len(bodies)}: " if len(bodies) > 1 else ""
             con = [f for f in fids if f in on_bed]
+            if len(bodies) > 1 and min(v[2] for f in fids for v in geo.facets[f]) <= geo.bed + BED_TOL:
+                lo, hi = geo.region_box(fids)  # the body reaches the bed: it needs its own first layer
+                own = sum(geo.areas[f] for f in con)
+                need_b = max(MIN_CONTACT_MM2, 0.01 * (hi[0] - lo[0]) * (hi[1] - lo[1]))
+                if own < need_b:
+                    fs.append(
+                        Finding(
+                            "contact.none",
+                            FAIL,
+                            "stability",
+                            f"{label}{own:.1f} mm2 flat on the bed, under the {need_b:.0f} mm2 a first layer needs",
+                            MEASURED,
+                            subject.name,
+                            geo.location(fids),
+                            {"contact_mm2": own, "needed_mm2": need_b},
+                            Fix("choose another pose", command=subject.command),
+                        )
+                    )
+                    continue
             if not con:
                 continue  # a body off the bed stands on support: its overhang region says so
             vol, com = G.moments(geo.facets[f] for f in fids)
@@ -881,16 +1018,18 @@ class Stability:
             margin = G.convex_margin((com[0], com[1]), hull)
             height = com[2] - geo.bed
             angle = math.degrees(math.atan2(margin, height)) if height > 0 else 90.0
-            tips.append((f"body {k} of {len(bodies)}: " if len(bodies) > 1 else "", margin, angle, height, com))
+            tips.append((label, margin, angle, height, com))
         if not tips:
-            r = _result(measures, [])
-            r.reason = "tip-over not checked: the mesh volume is not positive (inverted winding)"
+            why = "tip-over not checked: no body on the bed has a positive volume"
+            if not fs:
+                return {"stability": AreaResult(NOT_CHECKED_STATUS, measures, why, [])}
+            r = _result(measures, fs)
+            r.reason = why
             return {"stability": r}
         worst = min(tips, key=lambda t: (t[2], t[1]))
         measures.update({"com_margin_mm": worst[1], "tip_angle_deg": worst[2], "com_height_mm": worst[3]})
         if len(bodies) > 1:
             measures["bodies_checked"] = len(tips)
-        fs: list[Finding] = []
         for label, margin, angle, height, com in tips:
             loc = Location(geo.frame, com)
             if margin < 0:
@@ -928,6 +1067,8 @@ class Adhesion:
     areas: tuple[str, ...] = ("adhesion",)
 
     def run(self, subject: Subject, geo: Geo, limits: Limits) -> dict[str, AreaResult]:
+        if why := _blocked(geo):
+            return {"adhesion": _skip(why)}
         contact = sum(geo.areas[f] for f in geo.contact)
         if contact <= 0:
             return {"adhesion": _skip("no bed contact (stability: contact.none)")}
@@ -945,8 +1086,15 @@ class Adhesion:
             rows.append(
                 (f"body {k} of {len(bodies)}: " if len(bodies) > 1 else "", area, height / math.sqrt(max(area, 1.0)), width, length)
             )
+        if not rows:
+            return {"adhesion": _skip("no body has bed contact of its own (stability: contact.none)")}
         brim = str(limits.v("brim_type"))
-        top = max(rows, key=lambda r: r[2])
+
+        def wants(r: tuple[str, float, float, float, float]) -> bool:
+            return r[2] > SLENDER or (r[4] >= LONG_CONTACT_MM and r[3] < NARROW_CONTACT_MM)
+
+        # the measures describe the body that wants a brim (the most slender of them), else the most slender body
+        top = max(rows, key=lambda r: (wants(r), r[2]))
         measures = {
             "slenderness": top[2],
             "contact_width_mm": top[3],
@@ -975,17 +1123,19 @@ class Adhesion:
                         fix=Fix("add an outer brim", {"recipes": ["tall-outer-brim"]}),
                     )
                 )
+        least = min(r[1] for r in rows)  # every body must stand on its own contact
         slender = top[2]
-        if not wanted and contact >= BIG_CONTACT_MM2 and slender <= 1.0 and brim == "auto_brim":
+        if not wanted and least >= BIG_CONTACT_MM2 and slender <= 1.0 and brim == "auto_brim":
             fs.append(
                 Finding(
                     "brim.not_needed",
                     INFO,
                     "adhesion",
-                    f"{contact:.0f} mm2 flat on the bed and slenderness {slender:.1f}: no brim needed; the default is auto_brim",
+                    f"{least:.0f} mm2 flat on the bed{' under each body' if len(rows) > 1 else ''} and slenderness {slender:.1f}: "
+                    "no brim needed; the default is auto_brim",
                     HEURISTIC,
                     subject.name,
-                    measure={"contact_mm2": contact, "slenderness": slender},
+                    measure={"contact_mm2": least, "slenderness": slender},
                     fix=Fix("say it explicitly", {"recipes": ["flat-no-brim"]}),
                 )
             )
@@ -1021,28 +1171,46 @@ class BedFit:
             )
             measures["limit_mm"] = list(bed_lim)
             return {"fit": _result(measures, fs)}
-        if subject.extruder_reason:
-            r = _result(measures, fs)
-            r.reason = f"{subject.extruder_reason}: reach not checked"
-            return {"fit": r}
-        if not 1 <= subject.extruder <= len(exts):
-            r = _result(measures, fs)
-            r.reason = f"extruder {subject.extruder} is not in the printer facts ({len(exts)} extruders): reach not checked"
-            return {"fit": r}
-        e = exts[subject.extruder - 1]
-        reach = (e["x"][1] - e["x"][0], e["y"][1] - e["y"][0], float(e["z_max"]))
+        used = sorted({subject.extruder, *subject.extruders})
+        if len(used) > 1:
+            measures["extruders"] = used
+        if subject.extruder_reason:  # the bed fit above ran; the reach did not
+            return {"fit": AreaResult(NOT_CHECKED_STATUS, measures, f"{subject.extruder_reason}: reach not checked", fs)}
+        unknown = [x for x in used if not 1 <= x <= len(exts)]
+        if unknown:
+            why = f"extruder {', '.join(map(str, unknown))} is not in the printer facts ({len(exts)} extruders): reach not checked"
+            return {"fit": AreaResult(NOT_CHECKED_STATUS, measures, why, fs)}
+
+        def reach_of(x: int) -> tuple[float, float, float]:
+            e = exts[x - 1]
+            return (e["x"][1] - e["x"][0], e["y"][1] - e["y"][0], float(e["z_max"]))
+
+        def holds(x: int) -> bool:
+            return all(size[i] <= reach_of(x)[i] + tol for i in range(3))
+
+        reach = tuple(min(reach_of(x)[i] for x in used) for i in range(3))
         measures["limit_mm"] = [round(v, 2) for v in reach]
-        if any(size[i] > reach[i] + tol for i in range(3)):
+        for x in used:
+            if holds(x):
+                continue
+            others = [y for y in range(1, len(exts) + 1) if y != x and holds(y)]
+            fix = (
+                Fix(f"print it with a filament mapped to extruder {others[0]}, whose reach holds it, or choose another pose")
+                if others
+                else Fix(
+                    "choose another pose, `shambu split`, or a cut in CAD: no extruder reaches the whole part", command=subject.command
+                )
+            )
             fs.append(
                 Finding(
                     "fit.extruder_reach",
                     FAIL,
                     "fit",
-                    f"{_dims(size)} mm in this pose is beyond extruder {subject.extruder}'s reach of {_dims(reach)} mm",
+                    f"{_dims(size)} mm in this pose is beyond extruder {x}'s reach of {_dims(reach_of(x))} mm",
                     MEASURED,
                     subject.name,
-                    measure={"size_mm": list(size), "limit_mm": list(reach)},
-                    fix=Fix("print the part on filament 1 (the left nozzle), or choose another pose"),
+                    measure={"size_mm": list(size), "limit_mm": list(reach_of(x)), "extruder": x},
+                    fix=fix,
                 )
             )
         brim = str(limits.v("brim_type"))
@@ -1237,8 +1405,8 @@ def analyse(
                 s.frame,
                 s.pose,
                 len(s.facets),
-                mesh.measures.get("bodies", 1) if mesh else len(G.regions(range(len(s.facets)), geo.welded)),
-                geo.closed and not geo.flipped,
+                mesh.measures.get("bodies", 1) if mesh else len(geo.bodies()),
+                geo.closed and not geo.flipped and not geo.inverted,
                 [geo.hi[i] - geo.lo[i] for i in range(3)],
                 s.extruder,
                 areas,

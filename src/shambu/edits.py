@@ -453,7 +453,10 @@ def _plate_of(project: Project, oid: str) -> int:
 
 
 def _bed(project: Project) -> dict:
-    return machine_facts(project.project_settings)
+    try:
+        return machine_facts(project.project_settings)
+    except (ValueError, TypeError) as e:
+        raise EditError(f"{project.path}: the printable_area or extruder areas do not parse ({e})") from e
 
 
 def _origin(project: Project, plate: int) -> tuple[float, float]:
@@ -635,6 +638,7 @@ class ObjectMesh:
     skipped: tuple[str, ...]
     settings: dict
     object: str = ""  # the object's own name (what `--object` matches)
+    filaments: tuple[int, ...] = ()  # every filament its normal parts print with: the object's and each part's own
 
 
 def object_meshes(project: Project) -> list[ObjectMesh]:
@@ -649,14 +653,19 @@ def object_meshes(project: Project) -> list[ObjectMesh]:
         subtype = {p.get("id"): p.get("subtype") or "normal_part" for p in o.findall("part")}
         keep = [c for c in obj.comps if subtype.get(c.sub_id, "normal_part") == "normal_part"]
         skipped = tuple(sorted({subtype.get(c.sub_id, "normal_part") for c in obj.comps} - {"normal_part"}))
-        filament = _slot_parser(obj)(_meta(o, "extruder"), "extruder") or 1
+        slot = _slot_parser(obj)
+        filament = slot(_meta(o, "extruder"), "extruder") or 1
+        own = {
+            slot(_meta(p, "extruder"), f"part {p.get('id')} extruder") for p in o.findall("part") if p.get("id") in {c.sub_id for c in keep}
+        }
+        filaments = tuple(sorted({filament} | (own - {0})))  # 0 or absent: the part takes the object's filament
         where = _instance_plates(project, obj.oid)
         for k, text in enumerate(obj.item_texts or [obj.item_text]):
             plate = where.get(k, _plate_of(project, obj.oid))
             ox, oy = _origin(project, plate)
             facets = M.translate(_world_facets(geo, obj, keep, parse_transform(text)), (-ox, -oy, 0.0))
             label = obj.name if obj.n_items <= 1 else f"{obj.name} (instance {k})"
-            out.append(ObjectMesh(label, plate, filament, facets, skipped, _object_settings(obj), obj.name))
+            out.append(ObjectMesh(label, plate, filament, facets, skipped, _object_settings(obj), obj.name, filaments))
     return out
 
 

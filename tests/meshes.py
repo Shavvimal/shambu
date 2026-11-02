@@ -127,3 +127,39 @@ def without(facets: Sequence[Facet], i: int) -> list[Facet]:
 def flipped(facets: Sequence[Facet], i: int) -> list[Facet]:
     """The mesh with facet `i` wound the other way."""
     return [(f[0], f[2], f[1]) if k == i else f for k, f in enumerate(facets)]
+
+
+def voxels(xs: Sequence[float], ys: Sequence[float], zs: Sequence[float], solid) -> list[Facet]:
+    """The closed, outward-wound surface of the grid cells `solid(i, j, k)` holds, where cell (i, j, k) spans
+    xs[i]..xs[i+1], ys[j]..ys[j+1], zs[k]..zs[k+1]. Every face lies on the grid, so neighbouring faces share edges.
+    The solid must not touch itself along an edge only (that edge would be non-manifold)."""
+    nx, ny, nz = len(xs) - 1, len(ys) - 1, len(zs) - 1
+
+    def full(i: int, j: int, k: int) -> bool:
+        return 0 <= i < nx and 0 <= j < ny and 0 <= k < nz and bool(solid(i, j, k))
+
+    out: list[Facet] = []
+
+    def quad(a: Vec, b: Vec, c: Vec, d: Vec) -> None:  # counter-clockwise seen from outside
+        out.append((a, b, c))
+        out.append((a, c, d))
+
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                if not full(i, j, k):
+                    continue
+                x0, x1, y0, y1, z0, z1 = xs[i], xs[i + 1], ys[j], ys[j + 1], zs[k], zs[k + 1]
+                if not full(i - 1, j, k):
+                    quad((x0, y0, z0), (x0, y0, z1), (x0, y1, z1), (x0, y1, z0))
+                if not full(i + 1, j, k):
+                    quad((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1))
+                if not full(i, j - 1, k):
+                    quad((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1))
+                if not full(i, j + 1, k):
+                    quad((x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (x1, y1, z0))
+                if not full(i, j, k - 1):
+                    quad((x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (x1, y0, z0))
+                if not full(i, j, k + 1):
+                    quad((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))
+    return out

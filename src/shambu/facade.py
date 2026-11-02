@@ -31,7 +31,7 @@ from . import vault as vault_mod
 from . import verify as verify_mod
 from .build import BuildResult, Listener, Pipeline, load_spec
 from .edits import AddFilament, EditSet
-from .errors import BambuError, ConfError, PrinterError, StudioError
+from .errors import BambuError, ConfError, PrinterError, ProjectError, StudioError
 from .loaded import FilamentResolution, reconcile
 from .mesh import Orientation
 from .patches import PatchSet
@@ -465,7 +465,10 @@ class Bambu:
         ps = pr.project_settings
         base = pa.Limits.default().from_settings(ps, "file")
         if ps.get("printable_area"):
-            base = base.with_machine(presets.machine_facts(ps), "file")
+            try:
+                base = base.with_machine(presets.machine_facts(ps), "file")
+            except (ValueError, TypeError) as e:  # the plate origins need the bed too: the file does not read
+                raise ProjectError(f"{path}: the printable_area or extruder areas do not parse ({e})") from e
         else:
             base = base.with_machine(None, "none", "the file holds no printable_area")
         plate_maps = {pl["id"]: pl.get("filament_maps") for pl in pr.summary()["plates"]}
@@ -484,9 +487,10 @@ class Bambu:
             fmap = (plate_maps.get(m.plate) or "").split() or [str(x) for x in ps.get("filament_map") or []]
             why = ""
             try:
-                ext = int(fmap[m.filament - 1]) if 0 < m.filament <= len(fmap) else 1
+                exts = [int(fmap[f - 1]) if 0 < f <= len(fmap) else 1 for f in (m.filament, *m.filaments)]
             except ValueError:
-                ext, why = 1, f"the filament map {' '.join(fmap)!r} of plate {m.plate} is malformed"  # never silent (rubric 13)
+                exts, why = [1], f"the filament map {' '.join(fmap)!r} of plate {m.plate} is malformed"  # never silent (rubric 13)
+            ext = exts[0]
             lim = base.from_settings(m.settings, "file object").with_flags(**flags)
             subjects.append(
                 pa.Subject(
@@ -499,6 +503,7 @@ class Bambu:
                     m.skipped,
                     "negative_part" in m.skipped,
                     extruder_reason=why,
+                    extruders=tuple(sorted(set(exts) - {ext})),
                 )
             )
         return pa.analyse(subjects, base.with_flags(**flags), str(path), "3mf", samples=samples)

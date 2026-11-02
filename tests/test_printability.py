@@ -9,7 +9,7 @@ import random
 import pytest
 
 from conftest import MACHINE, FakeStudio, make_geo_3mf
-from meshes import box, cup, flipped, prism, rotate_z, without
+from meshes import box, cup, flipped, prism, rotate_z, voxels, without
 from shambu import cli, findings, presets
 from shambu import mesh as M
 from shambu import printability as pa
@@ -508,6 +508,7 @@ def test_malformed_filament_map_is_not_silent(tmp_path, x2d):
     rewrite(f, "Metadata/model_settings.config", lambda t: t.replace('key="filament_maps" value="1 2"', 'key="filament_maps" value="a b"'))
     o = Bambu().printability(f, objects=["label"]).objects[0]
     assert "malformed" in (o.areas["fit"].reason or "") and "limit_mm" not in o.areas["fit"].measures
+    assert o.areas["fit"].status == "not-checked"
 
 
 def test_inner_brim_does_not_silence_the_suggestion_or_widen_the_fit(x2d):
@@ -527,3 +528,166 @@ def test_thin_feature_location_does_not_depend_on_facet_order():
         return sorted((x.code, x.location.point) for x in o.findings if x.location and x.code.startswith(("slab.", "wall.")))
 
     assert points(f) == points(g) == points(f[::-1])
+
+
+# ---------------------------------------------------------------------------- second review round
+def tetra(s: float) -> list:
+    a, b, c, d = (0.0, 0.0, 0.0), (s, 0.0, 0.0), (0.0, s, 0.0), (0.0, 0.0, s)
+    return [(a, c, b), (a, b, d), (a, d, c), (b, c, d)]
+
+
+def test_thickness_stops_at_its_work_limit(monkeypatch):
+    monkeypatch.setattr(pa, "MAX_RAY_TESTS", 5, raising=False)
+    o = run(box((0, 0, 0), (20, 20, 20)))
+    for a in ("walls", "layers"):
+        assert o.areas[a].status == "not-checked" and "work limit" in (o.areas[a].reason or "")
+
+
+def test_cavity_and_degenerate_facets_are_not_separate_bodies():
+    inner = [tuple(reversed(t)) for t in box((5, 5, 5), (15, 15, 15))]
+    sliver = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (20.0, 0.0, 0.0))]
+    for facets in (box((0, 0, 0), (20, 20, 20)) + inner, box((0, 0, 0), (20, 20, 20)) + sliver):
+        o = run(facets)
+        assert "mesh.bodies" not in codes(o) and o.bodies == 1 and o.areas["mesh"].measures["bodies"] == 1
+
+
+def test_inside_out_mesh_warns_and_skips_the_direction_checks():
+    o = run([tuple(reversed(t)) for t in box((0, 0, 0), (20, 20, 20))])
+    assert only(o, "mesh.inverted").severity == "WARN"
+    assert "contact.none" not in codes(o) and not any(c.startswith("bridge.") for c in codes(o))
+    for a in ("support", "bridges", "walls", "layers", "stability", "adhesion"):
+        assert o.areas[a].status == "not-checked" and "mesh.inverted" in (o.areas[a].reason or ""), a
+
+
+def edge_cube(x: float) -> list:
+    """A 20 mm cube turned 45 degrees about x, standing on one edge at the bed, moved to `x`."""
+    c, s = math.cos(math.radians(45)), math.sin(math.radians(45))
+    f = [tuple((v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c) for v in t) for t in box((-10, -10, -10), (10, 10, 10))]
+    z0 = min(v[2] for t in f for v in t)
+    return [tuple((v[0] + x, v[1], v[2] - z0) for v in t) for t in f]
+
+
+def test_body_on_an_edge_beside_a_wide_body_has_no_contact():
+    f = only(run(box((0, 0, 0), (100, 100, 10)) + edge_cube(200)), "contact.none")
+    assert f.severity == "FAIL" and "body 2 of 2" in f.message
+
+
+def test_adhesion_measures_come_from_the_body_that_wants_a_brim():
+    o = run(box((0, 0, 0), (10, 10, 28)) + box((50, 0, 0), (170, 10, 5)))
+    assert "body 2 of 2" in only(o, "brim.suggest").message
+    assert o.areas["adhesion"].measures["contact_length_mm"] == pytest.approx(120)
+
+
+def test_mesh_in_metres_skips_the_geometry_checks():
+    o = run(box((0, 0, 0), (0.02, 0.02, 0.03)))
+    assert codes(o) == ["mesh.metres"]
+    for a in ("support", "bridges", "walls", "layers", "stability", "adhesion"):
+        assert o.areas[a].status == "not-checked" and "mesh.metres" in (o.areas[a].reason or ""), a
+
+
+def test_slab_one_first_layer_thick_on_the_bed_is_one_layer():
+    lim = pa.Limits.default().from_settings({"layer_height": "0.28", "initial_layer_print_height": "0.2"}, "file")
+    assert "slab.below_layer" not in codes(run(box((0, 0, 0), (20, 20, 0.2)), lim))
+    assert "slab.below_layer" in codes(run(box((0, 0, 0), (20, 20, 0.15)), lim))
+
+
+def test_sloped_slab_is_not_judged_against_the_layer_grid():
+    th, length, t = math.radians(40), 20.0, 1.0
+    poly = [
+        (0.0, 0.0),
+        (length * math.cos(th), length * math.sin(th)),
+        (length * math.cos(th) - t * math.sin(th), length * math.sin(th) + t * math.cos(th)),
+        (-t * math.sin(th), t * math.cos(th)),
+    ]
+    f = prism(poly, 10)
+    x0, z0 = min(v[0] for t_ in f for v in t_), min(v[2] for t_ in f for v in t_)
+    assert "slab.off_grid" not in codes(run([tuple((v[0] - x0, v[1], v[2] - z0) for v in t_) for t_ in f]))
+
+
+def test_one_thin_wall_sampled_sparsely_is_one_finding():
+    fin = voxels([float(i) for i in range(41)], [0.0, 0.3], [float(k) for k in range(11)], lambda i, j, k: True)
+    o = pa.analyse([pa.Subject("fin", fin, "posed")], pa.Limits.default(), samples=300).objects[0]
+    assert len([c for c in codes(o) if c == "wall.below_line"]) == 1
+
+
+def test_sources_spread_over_the_whole_budget():
+    fin = voxels([float(i) for i in range(41)], [0.0, 0.3], [float(k) for k in range(11)], lambda i, j, k: True)
+    n = len(pa.Thickness(1300)._sources(pa.Geo(pa.Subject("fin", fin, "posed"))))
+    assert 1290 <= n <= 1300  # 200 always, then 1100 of the other 1600: a whole-number step would cast only 800
+
+
+def test_ceiling_anchored_on_three_sides_is_a_bridge():
+    # a 30 x 30 x 20 block with a 10 mm pocket under a roof at z 15, open at the front (y < 20) and at the bed
+    block = voxels([0, 10, 20, 30], [0, 20, 30], [0, 15, 20], lambda i, j, k: not (i == 1 and j == 0 and k == 0))
+    o = run(block)
+    assert "overhang.region" not in codes(o)
+    assert o.areas["bridges"].measures["bridges"] == 1
+    assert o.areas["bridges"].measures["longest_span_mm"] == pytest.approx(10, abs=0.5)
+
+
+def test_ledge_round_a_post_is_an_overhang_not_a_bridge():
+    # a 10 mm post with a 10 mm wide square ledge round it at z 10..12: the ledge is anchored only on the post
+    post = voxels([0, 10, 20, 30], [0, 10, 20, 30], [0, 10, 12, 20], lambda i, j, k: (i == 1 and j == 1) or k == 1)
+    o = run(post)
+    assert o.areas["bridges"].measures["bridges"] == 0 and "overhang.region" in codes(o)
+
+
+def test_every_extruder_of_the_parts_is_checked_for_reach(tmp_path):
+    f = make_geo_3mf(tmp_path / "p.3mf")
+    body_part = '<metadata key="name" value="body_1"/>'
+    rewrite(f, "Metadata/model_settings.config", lambda t: t.replace(body_part, body_part + '\n      <metadata key="extruder" value="2"/>'))
+    o = Bambu().printability(f, objects=["body"]).objects[0]
+    assert o.areas["fit"].measures["extruders"] == [1, 2]
+
+
+@pytest.mark.parametrize(("size", "extruder", "other"), [((240, 10, 10), 2, 1), ((10, 10, 322), 1, 2)])
+def test_reach_fix_names_the_extruder_that_reaches(x2d, size, extruder, other):
+    o = pa.analyse([pa.Subject("p", box((0, 0, 0), size), "posed", extruder)], x2d).objects[0]
+    text = only(o, "fit.extruder_reach").fix.text
+    assert f"extruder {other}" in text and "left nozzle" not in text
+
+
+def corrupt_entry(path, name: str) -> None:
+    """Flip bytes inside one compressed entry's data: the deflate stream no longer decodes."""
+    import zipfile
+
+    with zipfile.ZipFile(path) as z:
+        i = z.getinfo(name)
+    data = bytearray(path.read_bytes())
+    start = i.header_offset + 30 + len(i.filename.encode()) + len(i.extra)
+    for k in range(start + 5, start + 40):
+        data[k] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+def unknown_method(path, name: str) -> None:
+    """Set an entry's compression method to 99 in the central directory: zipfile cannot decode it."""
+    import struct
+
+    data = bytearray(path.read_bytes())
+    k = data.rfind(b"PK\x01\x02", 0, data.rfind(name.encode()))
+    struct.pack_into("<H", data, k + 10, 99)
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("cmd", ["inspect", "printability"])
+@pytest.mark.parametrize("damage", ["deflate", "method", "plater_id", "prediction"])
+def test_malformed_3mf_is_a_named_error(tmp_path, capsys, cmd, damage):
+    f = make_geo_3mf(tmp_path / "bad.3mf", sliced=True)
+    if damage == "deflate":
+        corrupt_entry(f, "Metadata/project_settings.config")
+    elif damage == "method":
+        unknown_method(f, "Metadata/project_settings.config")
+    elif damage == "plater_id":
+        rewrite(f, "Metadata/model_settings.config", lambda t: t.replace('key="plater_id" value="1"', 'key="plater_id" value="x"'))
+    else:
+        rewrite(f, "Metadata/slice_info.config", lambda t: t.replace('key="prediction" value="1234"', 'key="prediction" value="soon"'))
+    assert cli.main(["--json", cmd, str(f)]) == 3
+    assert "ProjectError" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_malformed_printable_area_is_a_named_error(tmp_path, capsys):
+    f = make_geo_3mf(tmp_path / "a.3mf")
+    rewrite(f, "Metadata/project_settings.config", lambda t: t.replace('"0x0"', '"axb"', 1))
+    assert cli.main(["--json", "printability", str(f)]) == 3  # the plate origins need the bed: the file does not read
+    assert "printable_area" in json.loads(capsys.readouterr().out)["error"]
