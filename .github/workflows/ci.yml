@@ -30,6 +30,18 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest -q
 
+  geom:
+    # The optional geom extra (numpy, scipy, manifold3d): Booleans, exact distances, clearance and sweeps. The main
+    # job stays extra-free, so it proves the stdlib verbs and the missing-extra path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev --extra geom
+      - run: uv run pytest -q tests/test_cad_geom.py tests/test_cad_cli.py tests/test_cad_spec.py
+
   version-bump:
     name: version-bump
     if: github.event_name == 'pull_request'
