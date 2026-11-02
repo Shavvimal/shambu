@@ -25,7 +25,8 @@ binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a 
 | Printer profiles and the credentials file | `src/shambu/profiles.py`, `conf.py`, `vault.py` | `docs/specs/2026-10-27-printer-profiles.md` |
 | A printability check | `src/shambu/printability.py` (a `PrintCheck`), `meshgeom.py`, `findings.py` | `references/08-optimisation.md` section 12 |
 | A file integrity check | `src/shambu/integrity.py` | `references/03-3mf-format.md` section 2.9 |
-| Skill text | `skills/shambu/SKILL.md`, `skills/setup/SKILL.md` | the plugin docs |
+| A CAD gate or finding code | `src/shambu/cad/` (pure modules; Booleans and distances in `cad/geom/`, the geom extra) | `skills/designing-for-print/references/gates.md` |
+| Skill text | `skills/shambu/SKILL.md`, `skills/setup/SKILL.md`, `skills/designing-for-print/SKILL.md` | the plugin docs |
 
 Every rule the code encodes about Bambu Studio should cite the reference that proved it. A finding names its
 evidence level (`measured`, `observed`, `external`, `heuristic`; reference 08 section 12.1): only a measured finding
@@ -53,6 +54,7 @@ CLI on actual STLs of several kinds, not one favourite part:
 
 Keep such files in `data/` (gitignored; `data/README.md` says what to keep and why) and run the loop from that
 README: `shambu info`, `shambu orient`, `shambu printability` in the pose `orient` picks, `shambu build --slice`,
+`shambu cad gate` on a spec for a real CAD export with holes and a two-part assembly (the geom extra installed),
 `shambu sweep ... --orientations ... --by-object`. After a change to `printability.py` or `meshgeom.py`, update the
 timings and findings table in reference 08 section 12.5.
 Read the sweep table and the Studio log of any variant that fails; the failing exit code and the G-code Studio

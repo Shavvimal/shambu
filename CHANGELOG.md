@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
+### Added
+- `shambu cad`: offline gates on exported CAD files. `stamp` writes a provenance record (build id over the saved
+  script and parameters, STL and STEP hashes, the CAD-reported volume, area and centre of mass, faceting, bed face).
+  `check` proves one closed solid; checks volume and size against the CAD, the STEP re-import and the spec; and
+  refuses a stale export by build id and by the STL's own hash. `--promote` copies a passing STL to a new file only
+  and never overwrites. `features` reads the hole and boss inventory from the mesh, with pitch-circle patterns.
+  `fit` gauges holes and insert pockets against a fit table (ISO 273 clearance rows built in; inserts, press and
+  slip fits come from the user with their basis). `clearance` and `sweep` find pairwise clashes with named
+  exemptions, and insertion and rotation sweeps to first contact; they need the optional `geom` extra. `diff` names
+  revision changes, the plates to reslice and the fits to coupon, and fails on changes the expectation does not
+  list. `gate` runs one spec (`shambu.cad/1`) and gives one exit code. Findings use the printability finding model;
+  every result lists what it did not check.
+- The optional `geom` extra (numpy, scipy, manifold3d): `uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.8.0'`.
+  Without it, `--help` and every stdlib verb work, and a check that needs it exits 3 with the install line.
+- New skill `designing-for-print`: builds and revises printable parts in ClassCAD through its MCP and keeps an
+  export only when its gates pass.
+- CI job `geom`: installs the extra and runs the geom tests, including the proofs that the pruned distance equals
+  the exact one and that a culled sweep equals an unculled one.
+
+### Changed
+- The shambu skill points CAD modelling at `designing-for-print`.
+
 ## [0.7.0] - 2026-11-02
 
 ### Added
