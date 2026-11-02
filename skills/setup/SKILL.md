@@ -21,7 +21,7 @@ ls /Applications/BambuStudio.app/Contents/MacOS/BambuStudio && defaults read /Ap
 
 - `uv` missing: install it with `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`), then open a new shell.
 - Bambu Studio missing: shambu needs a local Bambu Studio (02.08.x tested). The user installs it from bambulab.com.
-  Without it, only `shambu inspect`, `patch`, `recipes`, `spec` and `printer` work.
+  Without it, only `shambu inspect`, `patch`, `recipes`, `spec`, `printer`, `cad` and `topo` work.
 - Platform: tested on macOS (Apple Silicon). The binary path and config location are macOS paths today.
 
 ## 2. Install or update the CLI
@@ -33,8 +33,8 @@ shambu --version        # must print: shambu 0.9.1
 
 With the CAD gates' geom extra (`shambu cad clearance`, `sweep`, `diff --surface`), install
 `"shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.1"` instead; the rest of shambu runs without it.
-For the topology map (`shambu topo solve`, `validate`), install `shambu[topo]`; `shambu[topo-trace]` adds window
-tracing and `shambu[topo-mesh]` the smooth iso-surface. Extras combine: `"shambu[geom,topo] @ ..."`.
+For the topology map (`shambu topo voxelise`, `solve`, `validate`), install `shambu[topo]`; `shambu[topo-trace]`
+adds window tracing and `shambu[topo-mesh]` the smooth iso-surface. Extras combine: `"shambu[geom,topo] @ ..."`.
 
 The tag matches this setup text, and the `/shambu` skill text expects the same version. If `shambu` is not found
 afterwards, run `uv tool update-shell` and open a new shell (the uv tool bin dir must be on PATH). Alternative

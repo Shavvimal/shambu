@@ -48,7 +48,9 @@ spec.json  ->  check  ->  build  ->  patch  ->  verify  ->  report.md (+ project
 ## Requirements
 
 - macOS with [Bambu Studio](https://bambulab.com/en/download/studio) installed (02.08.x tested; the CLI lives in the app bundle).
-- [uv](https://docs.astral.sh/uv/) (Python 3.11+ is fetched by uv if needed).
+  `shambu cad` and `shambu topo` never run Studio.
+- [uv](https://docs.astral.sh/uv/) and Python 3.11 or newer (uv fetches one if needed). CI tests 3.11, 3.12 and 3.13.
+- The base install needs only `paho-mqtt`. The CAD gates and the topology map need an optional extra (below).
 - For the plugin: [Claude Code](https://code.claude.com/).
 - A Bambu Lab printer for the status commands (tested on an X2D, in LAN-only and in cloud mode; the printer must be
   on the same LAN). shambu needs its LAN access code once: `shambu printer login` stores a profile and the code, or
@@ -81,6 +83,21 @@ shambu doctor --expect-version 0.9.1
 uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.1" shambu doctor --expect-version 0.9.1
 ```
 
+Optional extras. Each is imported only when a command needs it. Without it, that command exits 3 and prints the
+install line; the rest of shambu runs as before.
+
+| Extra | Adds | Needed by |
+|---|---|---|
+| `geom` | numpy, scipy, manifold3d | `shambu cad clearance`, `cad sweep`, `cad diff --surface`, a `cad gate` with a clearance or sweep rule |
+| `topo` | numpy, scipy | `shambu topo voxelise`, `solve`, `validate` |
+| `topo-trace` | `topo` + shapely | `shambu topo trace` |
+| `topo-mesh` | `topo` + scikit-image | `shambu topo solve --mesh smooth` (`--mesh auto` uses it when installed, else cell faces) |
+
+```
+uv tool install --force 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.1'
+uv tool install --force 'shambu[geom,topo-trace,topo-mesh] @ git+https://github.com/Shavvimal/shambu@v0.9.1'   # all of them
+```
+
 ## Usage
 
 **1. Build a project from STLs.** Write a spec, check it, build it.
@@ -88,6 +105,8 @@ uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.1" shambu doctor --expe
 ```
 shambu spec                      # prints the spec shape
 shambu recipes                   # named settings bundles: petg-functional, tree-supports, tall-outer-brim, ...
+shambu presets list process --printer "Bambu Lab X2D 0.4 nozzle"   # Studio's presets; also resolve, keys
+shambu info part.stl             # Studio's --info: bounding box, facet count, manifold (exit 1 if not)
 shambu check  plate.json         # resolve presets, measure STLs, place parts, check limits
 shambu build  plate.json         # + export with Studio's CLI, patch, verify, write the report
 shambu build  plate.json --slice # also slice headless: <name>.gcode.3mf with time and filament estimates
@@ -117,32 +136,6 @@ bridges and their span, sampled wall and slab thickness, tip-over, brim need and
 severity, its evidence (measured, observed, external or heuristic) and a fix; there is no overall score, and every run
 lists what it did not check. `shambu inspect` and `shambu verify` also check a file's integrity (G-code MD5, layer
 markers, time prediction, thumbnails, bed id, slice warnings, flush matrix shape) as WARN or INFO lines.
-
-Design in ClassCAD with `/shambu:designing-for-print`; `shambu cad gate cad.json` judges the exported STL before
-`shambu build`. The gates read files only (they never drive a CAD program): `stamp` writes a provenance record,
-`check` proves one closed solid and its volume and size against the CAD and refuses a stale export, `features` and
-`fit` read holes, bosses and insert pockets from the mesh, `clearance` and `sweep` find clashes and first contact,
-and `diff` names what changed between revisions and which plates to reslice. `clearance`, `sweep` and
-`diff --surface` need the optional geom extra (numpy, scipy, manifold3d):
-`uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.1'`.
-
-`shambu topo` maps where a part's material carries the load cases you give and where it works little: a SIMP
-density optimisation on a voxel grid of the STL, with supports, passive regions, weighted cases and self-weight from
-a spec (`shambu.topo/1`). `check` validates the spec on the base install; `voxelise`, `solve` and `validate` (the
-Michell cantilever) need the topo extra (numpy, scipy); `trace` turns a map into window polygons for plate-like
-walls with the topo-trace extra (shapely). It is a map, not a proof: every `solve`, `validate` and `trace` result
-carries `topo.map_not_proof` and a not-checked list (no stress, buckling, fatigue or layer strength). A domain over
-30000 cells is refused with a memory estimate; `--max-cells` raises the cap. The reference is
-`skills/designing-for-print/references/topology.md`.
-
-```
-shambu topo check topo.json
-shambu topo solve topo.json --out topo/bracket@B --volfrac 0.5   # run.json, density_v50.npy, regions.md, iso_v50.stl
-shambu topo trace topo/bracket@B/run.json --faces faces.json --rules conservative
-```
-
-`uv tool install 'shambu[topo] @ git+https://github.com/Shavvimal/shambu@v0.9.1'` (add `topo-trace` or
-`topo-mesh` inside the brackets for tracing or a smooth iso-surface).
 
 A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`
 (one object after another: on a two-filament plate that drops the prime tower and the per-layer nozzle changes,
@@ -187,7 +180,57 @@ estimate matched, or verify on the saved copy exited 0. When Studio is already r
 Studio was already running: check that the front window shows <file name>": where the project opens depends on
 Studio's `single_instance` setting (`GUI_App.cpp:7711-7722`).
 
-**4. Read the printer (read-only) and measure prints.**
+**4. Gate a CAD export before it reaches a plate.** Design in ClassCAD with `/shambu:designing-for-print`, then let
+`shambu cad` judge the exported files. It reads files only and never starts or drives a CAD program.
+
+| Verb | What it does |
+|---|---|
+| `cad stamp PART.stl --part NAME` | Writes the provenance record `PART.cad.json`: hashes of the inputs, the STL and the STEP, and the volume the CAD session reported. The one verb that writes, and never the STL. |
+| `cad check PART.stl` | One closed solid, volume and size against the record or `--expect-volume` and `--expect-size`; refuses a stale export. `--promote DEST.stl` copies a pass to a new file. |
+| `cad features PART.stl` | The hole and boss inventory read from the mesh: axis, diameter, depth. |
+| `cad fit PART.stl` | Gauges holes against a fit: ISO 273 clearance holes M2 to M8, or your own inserts and press fits (`--fits`). |
+| `cad clearance --spec cad.json` | Overlap and margin between placed parts, in a pose from the spec (geom extra). |
+| `cad sweep --spec cad.json` | Moves a part along its insertion or rotation path and reports the first contact (geom extra). |
+| `cad diff OLD NEW` | What changed between two revisions (below). |
+| `cad gate cad.json` | Every rule in the spec (`shambu.cad/1`); `--only` and `--skip` pick rules. |
+
+Every result lists its findings by code, severity and evidence, lists what it did not check, and ends with one gate
+word: `stale`, `fail`, `incomplete` or `pass`. A pass means no blocking finding in the rules that ran. Exit codes:
+0 pass, 1 fail, incomplete or stale (or an invalid spec), 2 usage, 3 environment (a file that does not read, a
+record or `--promote` target that cannot be written, the geom extra missing). `--json` prints one
+`shambu.cad.result/1` document.
+
+```
+shambu cad stamp out/.candidate/bracket.stl --part bracket --rev B --cad-volume 12840
+shambu cad check out/.candidate/bracket.stl --promote out/bracket@B.stl
+shambu cad gate cad.json
+```
+
+Change management between revisions. `shambu cad diff bracket@A.stl bracket@B.stl` compares volume, size, centre of
+mass, section areas along each axis and the hole inventory, and names each feature `same`, `resized`, `moved`,
+`gone` or `new`. A changed section is reported as a band ("changed between z 18.0 and 24.0"). With
+`--plate plate.json` it names the plates that hold the part, which you must reslice, and says whether
+`shambu patch --replace-mesh` applies. With `--spec cad.json --part NAME` a changed feature that carries a fit gets
+`diff.coupon`: print a coupon of that fit before the part. With `--expect expect.json` a change you did not list is
+`diff.unexpected` (FAIL), and a listed change that did not happen is `diff.expected_missing` (FAIL).
+`--surface` adds the surface deviation (geom extra).
+
+**5. Map where a part carries load.** `shambu topo` runs a SIMP density optimisation on a voxel grid of the STL,
+with supports, passive regions, weighted load cases and self-weight from a spec (`shambu.topo/1`). `check` validates
+the spec on the base install, `validate` runs the Michell cantilever, and `trace` turns a map into window polygons
+for plate-like walls. It is a map, not a proof: every `solve`, `validate` and `trace` result carries
+`topo.map_not_proof` and a not-checked list (no stress, buckling, fatigue or layer strength). A domain over 30000
+cells is refused with a memory estimate; `--max-cells` raises the cap. Exit codes: 0 ok (WARN and INFO allowed),
+1 a spec error, a FAIL finding or a failed validation, 2 usage, 3 environment (a missing extra, a file that does not
+read or write, a singular model). The reference is `skills/designing-for-print/references/topology.md`.
+
+```
+shambu topo check topo.json
+shambu topo solve topo.json --out topo/bracket@B --volfrac 0.5   # run.json, density_v50.npy, regions.md, iso_v50.stl
+shambu topo trace topo/bracket@B/run.json --faces faces.json --rules conservative
+```
+
+**6. Read the printer (read-only) and measure prints.**
 
 ```
 shambu printer login --ip <printer-ip> --serial <serial> --mode lan   # prompts for the LAN access code (not shown)
@@ -277,15 +320,29 @@ Exit codes: 0 ok, 1 a check or verification failed or a patch was refused, 2 usa
   nozzle found". Every export gets the repaired key, and verify refuses a file without it.
 - A mesh whose whole bbox is under 1 mm is in metres (URDF exports); Studio fails it with -100. `check` refuses it,
   and `shambu rotate --scale 1000` writes a mm copy.
+- A printability or integrity finding carries a code, a severity, an evidence level (`measured`, `observed`,
+  `external`, `heuristic`) and usually a fix. Only a measured finding can FAIL: the `Finding` constructor refuses
+  anything else. Every run lists what it did not check, and there is no overall score.
+- File integrity findings (`inspect`, `verify`) are WARN or INFO, never FAIL, and never change the exit code.
+- `shambu cad` and `shambu topo` never start a CAD program or talk to a printer. They never change an input file:
+  `cad stamp` writes only its record, `cad check --promote` writes only a new file, and `topo solve` writes only
+  under `--out`.
+- A CAD gate never passes on something it could not measure. A missing mesh, a selector with no match or a volume cap
+  on a pair with no volume is `cad.incomplete.*`, so the gate word is `incomplete`, not `pass`. A pass covers only
+  the rules that ran, and the text never says "ready" or "OK to print".
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `src/shambu/` | The package: `presets` (chain of profile sources, flattening), `studio` (binary adapter, `CliCommand` builder), `assemble` (assemble-list model and validation), `layout` (placer and limit rules), `mesh` (STL read/write, orientation scoring), `threemf` + `patches` (3MF read/patch commands, G-code feature usage), `spec` (typed spec, builder), `recipes`, `build` (template-method pipeline), `sweep` (variant builds and the comparison table), `report`, `printer` (discovery, MQTT reader, decoder), `conf` (Studio's config, the config dir), `profiles` (printer profiles), `vault` (the credentials file), `facade`, `cli` |
+| `src/shambu/` | The package: `presets` (chain of profile sources, flattening), `studio` (binary adapter, `CliCommand` builder), `assemble` (assemble-list model and validation), `layout` (placer and limit rules), `mesh` (STL read/write, orientation scoring), `threemf` + `patches` (3MF read/patch commands, G-code feature usage), `spec` (typed spec, builder), `recipes`, `build` (template-method pipeline), `sweep` (variant builds and the comparison table), `report`, `printer` (discovery, MQTT reader, decoder), `conf` (Studio's config, the config dir), `profiles` (printer profiles), `vault` (the credentials file), `loaded` (spec filaments against the printer's spools), `probe` (support spread by solo slice), `tower` (prime tower), `edits` + `runs` (mesh, move and filament edits with their Studio runs), `verify` (a GUI save against its spec), `calibrate` (estimates against measured prints), `findings` (the finding model), `printability` + `meshgeom` (mesh pre-flight, pure-Python geometry), `integrity` (file integrity checks), `facade`, `cli` |
+| `src/shambu/cad/` | `shambu cad`: provenance records, solid and size checks, features and fits, clearance and sweep verdicts, revision diff, the gate report. Pure Python; Booleans and distances in `cad/geom/` (geom extra) |
+| `src/shambu/topo/` | `shambu topo`: spec, voxel grid, finite elements, density optimisation, region report, window tracing. `spec.py` and `result.py` are stdlib; the rest needs the topo extras |
 | `tests/` | Offline pytest suite with fakes for the binary, the profile tree and the MQTT transport |
 | `skills/shambu/` | The Claude Code skill and the reverse-engineering references |
 | `skills/setup/` | `/shambu:setup`: installs the CLI, runs `shambu doctor` |
+| `skills/designing-for-print/` | `/shambu:designing-for-print`: designs parts in ClassCAD and gates each export with `shambu cad`; references for gates, print intent, revisions and topology |
+| `docs/` | Specs and post-mortems (`docs/specs/`, `docs/errors/`) |
 | `.claude-plugin/` | Plugin manifest and single-plugin marketplace |
 | `REVIEW-RUBRIC.md` | The checklist pull requests are reviewed against |
 | `DISCLAIMER.md` | Responsible use, reverse engineering, third-party licences |

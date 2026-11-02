@@ -1,6 +1,7 @@
 # Contributing
 
-Thanks for helping. shambu is small on purpose: one CLI, one Python package, two skills.
+Thanks for helping. shambu is small on purpose: one CLI, one Python package, three skills (`shambu`, `setup`,
+`designing-for-print`).
 
 ## Set up
 
@@ -10,7 +11,9 @@ make install          # uv sync --group dev
 make check            # ruff, mypy, pytest
 ```
 
-Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). The tests run offline and never call the Bambu Studio
+Python 3.11 or newer (CI runs 3.11, 3.12 and 3.13) and [uv](https://docs.astral.sh/uv/). `make install` installs
+no optional extra, so the tests that need numpy, scipy, manifold3d or shapely skip. Run
+`uv sync --group dev --all-extras` to run them too. The tests run offline and never call the Bambu Studio
 binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a Bambu Studio install is present.
 
 ## Where things live

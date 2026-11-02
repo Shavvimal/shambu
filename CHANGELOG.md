@@ -21,6 +21,11 @@ A docs and test release: no CLI behaviour changes. The skill texts move, so the 
   small holder", "an assembly of 88 bodies") instead of one build.
 - The 3MF format reference uses invented `p:UUID` and `uuid` values in its sample, and says that each kind of id is a
   counter on a fixed suffix.
+- The README documents every `shambu cad` verb in one table with its exit codes and `--json`, change management
+  between revisions with `cad diff`, `shambu topo` as its own section, `shambu info` and `shambu presets`, a table of
+  the optional extras, the rules for findings, integrity lines and CAD gates, and the `cad/`, `topo/` and
+  `designing-for-print` rows of the repository layout. `CONTRIBUTING.md` counts three skills and states the Python
+  versions CI runs.
 - The calibration helper that hashes a log session is renamed `calibrate.session_digest`. The stored value and its
   `session` key do not change.
 - `tests/test_public_hygiene.py` also fails on session narration in any tracked file (a quoted remark, verdict,
