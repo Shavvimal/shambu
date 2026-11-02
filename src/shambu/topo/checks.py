@@ -1,6 +1,7 @@
 """The invariants and the "a map, not a proof" findings of a topology run.
 
-What it handles: `equilibrium` (at full density the reactions balance the loads, fixed DOFs read zero, the free-DOF
+What it handles: `free_rigid_modes` (the rigid-body motions the supports leave free: a mechanism has no unique
+displacement, so the solve stops with `topo.under_constrained`, FAIL, before any factorisation), `equilibrium` (at full density the reactions balance the loads, fixed DOFs read zero, the free-DOF
 residual is small: else `topo.equilibrium`, FAIL), `passive_sanity` (every passive region reads density 1: else
 `topo.passive_not_one`, FAIL), and the computed caveats of a domain (`domain_findings`) and of each run
 (`run_findings`). The thresholds are module constants, each with its reason. `result.py` holds the codes and texts.
@@ -14,8 +15,9 @@ import numpy as np
 
 from ..findings import Finding
 from .fe import VoxelFE
-from .optimise import Analysis, Problem, RunResult
+from .optimise import VOLUME_TOL, Analysis, Problem, RunResult
 from .result import finding
+from .spec import volfrac_tag
 from .voxel import VoxelDomain
 
 EQ_REL = 1e-6  # relative force and moment balance: a direct solve on a sane model lands near 1e-10
@@ -25,6 +27,46 @@ FILTER_MIN_CELLS = 1.5  # below 1.5 x pitch the filter no longer suppresses chec
 UNLOADED_SHARE = 1e-3  # a region holding under 0.1 % of the strain energy in every case is idle
 INERT_BAND = 0.01  # optimised / full compliance within 1 % of 1
 DOMINATE_SHARE = 0.8  # one case over 80 % of the objective
+RIGID_TOL = 1e-8  # a singular value under this share of the largest one leaves a rigid-body mode free
+RIGID_NAMES = ("x translation", "y translation", "z translation", "rotation about x", "rotation about y", "rotation about z")
+
+
+def free_rigid_modes(nodes_xyz: np.ndarray, fixed: np.ndarray) -> list[str]:
+    """The rigid-body motions of the whole part that move no fixed DOF, each named by its largest component.
+
+    The six modes (three translations, three rotations about the node centroid, scaled by the part's span) are
+    evaluated at the fixed DOFs only; the null space of that n_fixed x 6 matrix is what the supports leave free."""
+    fixed = np.asarray(fixed, dtype=np.int64)
+    if len(fixed) == 0:
+        return list(RIGID_NAMES)
+    span = float(np.ptp(nodes_xyz, axis=0).max()) or 1.0
+    r = (nodes_xyz[fixed // 3] - nodes_xyz.mean(axis=0)) / span
+    comp = fixed % 3
+    a = np.zeros((len(fixed), 6))
+    a[np.arange(len(fixed)), comp] = 1.0
+    # rotation about x moves (0, -z, y), about y (z, 0, -x), about z (-y, x, 0)
+    rot = {
+        3: {1: -r[:, 2], 2: r[:, 1]},
+        4: {0: r[:, 2], 2: -r[:, 0]},
+        5: {0: -r[:, 1], 1: r[:, 0]},
+    }
+    for col, parts in rot.items():
+        for c, vals in parts.items():
+            on = comp == c
+            a[on, col] = vals[on]
+    if len(a) < 6:  # pad to six rows, so the SVD returns all six right singular vectors
+        a = np.vstack([a, np.zeros((6 - len(a), 6))])
+    _, sv, vt = np.linalg.svd(a, full_matrices=False)  # U is n_fixed x 6, never n_fixed x n_fixed
+    free = sv <= RIGID_TOL * max(float(np.max(sv)), 1e-300)
+    return [RIGID_NAMES[int(np.argmax(np.abs(vt[i])))] for i in np.flatnonzero(free)]
+
+
+def under_constrained(free: list[str], note: str | None = None) -> Finding:
+    msg = note or (
+        f"the supports leave {len(free)} rigid-body mode(s) free ({', '.join(free)}): the part can move without "
+        "straining, so no displacement is unique. Hold every direction and rotation with the supports"
+    )
+    return finding("topo.under_constrained", msg, {"free_modes": len(free), "modes": list(free)})
 
 
 def equilibrium(fe: VoxelFE, prob: Problem, a: Analysis, nodes_xyz: np.ndarray, names: list[str]) -> tuple[list[dict], list[Finding]]:
@@ -99,6 +141,16 @@ def domain_findings(dom: VoxelDomain, design3d: np.ndarray) -> tuple[list[Findin
             )
     if dom.odd_columns:
         out.append(finding("topo.odd_parity", None, {"odd_columns": dom.odd_columns}))
+    if dom.open_edges:
+        out.append(
+            finding(
+                "topo.open_mesh",
+                f"{dom.open_edges} welded edges are open or shared by more than two facets: the fill can be wrong near them",
+                {"edges": dom.open_edges},
+            )
+        )
+    if dom.inverted:
+        out.append(finding("topo.inverted_mesh", None, {"signed_volume_mm3": -(dom.mesh_volume_mm3 or 0.0)}))
     if dom.dropped:
         out.append(
             finding("topo.dropped_pieces", f"{dom.dropped} cells in {dom.pieces - 1} smaller pieces were removed", {"cells": dom.dropped})
@@ -139,8 +191,23 @@ def run_findings(
     raw_weights: bool,
     names: list[str],
 ) -> list[Finding]:
-    tag = f"v{round(100 * run.volfrac):02d}"
+    tag = volfrac_tag(run.volfrac)
     out = []
+    missed = abs(run.design_volume_fraction - run.volfrac) > VOLUME_TOL
+    if missed:
+        why = (
+            f"; the passive regions and the filter hold at least {run.min_volume:.4f}, so the target is out of reach"
+            if run.min_volume > run.volfrac + VOLUME_TOL
+            else ""
+        )
+        out.append(
+            finding(
+                "topo.volume_missed",
+                f"{tag}: design volume {run.design_volume_fraction:.4f} against the target {run.volfrac:g}{why}",
+                {"design_volume_fraction": run.design_volume_fraction, "target": run.volfrac, "min_volume": run.min_volume},
+                tag,
+            )
+        )
     if run.budget_stop:
         out.append(
             finding(
@@ -150,7 +217,7 @@ def run_findings(
                 tag,
             )
         )
-    elif not run.converged:
+    elif run.final_change >= run.tol:
         drift = run.drift_last20
         d = "n/a" if drift is None else f"{drift:.2g}"
         out.append(

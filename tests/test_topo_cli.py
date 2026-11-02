@@ -15,7 +15,7 @@ from shambu import cli
 from shambu.findings import CEILING, FAIL, Finding
 from shambu.topo import michell
 from shambu.topo.result import ALWAYS, CODES, NOT_CHECKED, TopoReport, finding
-from shambu.topo.spec import PRESETS, parse_spec, rules_from
+from shambu.topo.spec import PRESETS, parse_faces, parse_spec, rules_from
 
 HEAVY = ("numpy", "scipy", "shapely", "skimage")
 
@@ -161,9 +161,102 @@ def test_topo_package_never_prints():
 
 
 # ---------------------------------------------------------------------------- the finding table
-def test_twenty_two_codes_and_three_fails():
-    assert len(CODES) == 22
-    assert {c for c, v in CODES.items() if v[0] == FAIL} == {"topo.equilibrium", "topo.passive_not_one", "topo.clearance"}
+def test_twenty_seven_codes_and_five_fails():
+    assert len(CODES) == 27
+    assert {c for c, v in CODES.items() if v[0] == FAIL} == {
+        "topo.equilibrium",
+        "topo.passive_not_one",
+        "topo.clearance",
+        "topo.under_constrained",
+        "topo.non_finite",
+    }
+
+
+def test_stiffness_text_is_scoped_to_fixed_loads():
+    text = CODES["topo.stiffness_not_strength"][3]
+    assert "under fixed loads" in text and "self-weight" in text
+
+
+def test_seal_turns_a_nan_into_null_and_a_fail():
+    from shambu.topo.result import seal
+
+    rep = seal(TopoReport("solve", {"runs": [{"ratio": [1.5, float("nan")]}], "x": float("inf")}, [finding(c) for c in ALWAYS]))
+    doc = rep.to_json()
+    json.dumps(doc, allow_nan=False)  # strict JSON
+    assert doc["runs"][0]["ratio"] == [1.5, None] and doc["x"] is None
+    assert rep.exit_code == 1 and doc["ok"] is False
+    (nf,) = [f for f in doc["findings"] if f["code"] == "topo.non_finite"]
+    assert "runs[0].ratio[1]" in nf["message"] and nf["severity"] == "FAIL"
+
+
+# ---------------------------------------------------------------------------- names, tags and flags
+@pytest.mark.parametrize(
+    ("key", "needle"),
+    [
+        ("passive", "spec.passive: passive region name 'pad' is used twice"),
+        ("regions", "spec.regions: region name 'pad' is used twice"),
+        ("supports", "spec.supports: support name 'pad' is used twice"),
+    ],
+)
+def test_a_name_used_twice_is_a_spec_error(key, needle):
+    """Two passive regions named alike would collapse into one dict entry and drop a constraint."""
+    doc = michell.spec_doc("small")
+    doc[key] = [
+        {"name": "pad", "cells" if key != "supports" else "nodes": {"box": {"x": [0, 2]}}},
+        {"name": "pad", "cells" if key != "supports" else "nodes": {"box": {"x": [22, 24]}}},
+    ]
+    spec, errors = parse_spec(doc)
+    assert spec is None and needle in errors
+
+
+def test_a_face_name_used_twice_and_a_bad_keepout_list_are_errors():
+    face = {"name": "f", "axis": "z", "slab": [0, 2], "u": [0, 1], "v": [0, 1]}
+    _, errors = parse_faces({"schema": "shambu.topo.faces/1", "build_axis": "z", "faces": [face, face], "keepouts": 5})
+    assert any("face name 'f' is used twice" in e for e in errors)
+    assert any("keepouts: must be a list" in e for e in errors)
+
+
+def test_volfrac_tags_never_collide():
+    from shambu.topo.spec import volfrac_tag
+
+    assert [volfrac_tag(x) for x in (0.5, 0.4, 0.05, 0.401, 0.404, 1e-05)] == ["v50", "v40", "v05", "v401", "v404", "v00001"]
+    doc = michell.spec_doc("small")
+    doc["simp"]["volfrac"] = [0.4, 0.4]
+    assert "spec.simp.volfrac: 0.4 is given twice" in parse_spec(doc)[1]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--pitch", "0"],
+        ["--pitch", "nan"],
+        ["--pitch", "-1"],
+        ["--maxit", "0"],
+        ["--tol", "nan"],
+        ["--tol", "0"],
+        ["--budget-min", "inf"],
+        ["--volfrac", "1.5"],
+        ["--volfrac", "0.4", "--volfrac", "0.4"],
+        ["--max-cells", "0"],
+    ],
+)
+def test_solve_flags_take_the_spec_ranges(tmp_path, capsys, flags):
+    """A flag outside its range is a usage error before anything runs: no traceback, no empty run."""
+    code, doc, _, _ = run(capsys, "topo", "solve", str(_spec(tmp_path)), "--out", str(tmp_path / "o"), *flags)
+    assert code == 2 and flags[0] in doc["error"], doc
+    assert not (tmp_path / "o").exists()
+
+
+def test_check_refuses_a_grid_over_the_cap_with_a_memory_estimate(tmp_path, capsys):
+    from shambu.topo.spec import MAX_CELLS
+
+    p = _spec(tmp_path, domain={"box": {"min": [0, 0, 0], "max": [24, 1, 8]}, "pitch": 0.001})
+    code, doc, _, _ = run(capsys, "topo", "check", str(p))
+    assert code == 1 and doc["size"]["grid_cells"] == 24000 * 1000 * 8000
+    (err,) = doc["errors"]
+    assert f"over the cap of {MAX_CELLS}" in err and " MB" in err and "--max-cells" in err
+    code, doc, _, _ = run(capsys, "topo", "check", str(_spec(tmp_path)))
+    assert code == 0 and doc["size"]["grid_cells"] == 192 and doc["size"]["caps"]["cells"] == MAX_CELLS
 
 
 def test_every_code_respects_its_evidence_ceiling():

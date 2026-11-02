@@ -6,6 +6,12 @@
                                                                                that scales with density)
     x_new   = clip(x (-dJ/dx / (lambda dV/dx))^eta, x - move, x + move, 0, 1), lambda by bisection on the volume
 
+The bisection brackets lambda from the largest sensitivity ratio and widens the upper bound until the volume falls to
+the target, so the scale of the loads (raw weights, large forces) does not saturate it. A run counts as converged
+only when the change is under `tol` and the design volume is within `VOLUME_TOL` of the target; `min_volume` (all
+design variables at 0, passive cells at 1, through the filter) shows when the passive regions make the target
+unreachable.
+
 `rho` is the physical density (the filtered design variable `x`; passive cells are 1). Weights are either given
 (`raw`) or `(1/n) / c_k(full density)` (`normalised`), so every case counts the same at the start. A positive
 sensitivity (where self-weight makes added mass hurt) is clipped to a tiny negative value, because the update needs
@@ -33,6 +39,7 @@ from .loads import CaseLoads, body_load
 
 Listener = Callable[[str, dict], None]
 CLIP = -1e-30  # the largest sensitivity the update accepts (it needs negative values)
+VOLUME_TOL = 0.005  # the design volume may miss the target by this much (absolute) and still count as held
 
 
 @dataclass
@@ -131,6 +138,8 @@ class RunResult:
     rho: np.ndarray
     energy: np.ndarray
     design_volume_fraction: float
+    min_volume: float  # the smallest design volume the filter allows next to the passive cells
+    tol: float
     clipped: int
     seconds: float
     timings: dict
@@ -155,6 +164,7 @@ def optimise(
 ) -> RunResult:
     design = prob.design
     n_design = int(design.sum())
+    min_volume = prob.volume(prob.physical(np.where(design, 0.0, 1.0))) if n_design else float("nan")
     x = np.where(design, volfrac, 1.0)
     dv_rho = np.where(design, 1.0 / max(1, n_design), 0.0)
     dv = prob.filt.backward(dv_rho)
@@ -186,22 +196,26 @@ def optimise(
             )
         if change < tol:
             break
-        if budget_s is not None and it < maxit and elapsed + (elapsed / it) > budget_s:
+        # the next iteration and the final analysis after the loop: two more solves at the mean rate
+        if budget_s is not None and it < maxit and elapsed + 2 * (elapsed / it) > budget_s:
             budget_stop = True
             break
     rho = prob.physical(x)
     final = prob.analyse(rho, timings)
+    volume = prob.volume(rho)
     return RunResult(
         volfrac=volfrac,
         iterations=it,
-        converged=change < tol,
+        converged=change < tol and abs(volume - volfrac) <= VOLUME_TOL,
         budget_stop=budget_stop,
         final_change=change,
         history=history,
         compliance=[float(c) for c in final.compliance],
         rho=rho,
         energy=final.energy,
-        design_volume_fraction=prob.volume(rho),
+        design_volume_fraction=volume,
+        min_volume=min_volume,
+        tol=tol,
         clipped=clipped,
         seconds=time.perf_counter() - t_start,
         timings=timings,
@@ -212,13 +226,25 @@ def _oc(prob: Problem, x: np.ndarray, dc: np.ndarray, dv: np.ndarray, volfrac: f
     design = prob.design
     lo, hi = np.maximum(0.0, x - move), np.minimum(1.0, x + move)
     ratio = np.where(design, -dc / np.maximum(dv, 1e-300), 0.0)
-    l1, l2 = 0.0, 1e12
-    x_new = x
+
+    def step(lam: float) -> np.ndarray:
+        return np.where(design, np.clip(x * (ratio / lam) ** eta, lo, hi), 1.0)
+
+    top = float(ratio[design].max()) if design.any() else 0.0
+    if top <= 0.0:
+        return step(1.0)
+    l1, l2 = 0.0, top
+    x_new = step(l2)
+    for _ in range(400):  # widen: 2^400 covers any float ratio; past it every cell sits at its lower move limit
+        if prob.volume(prob.physical(x_new)) <= volfrac:
+            break
+        l1, l2 = l2, 2.0 * l2
+        x_new = step(l2)
     for _ in range(200):
         if (l2 - l1) / (l1 + l2) <= 1e-4:
             break
         lmid = 0.5 * (l1 + l2)
-        x_new = np.where(design, np.clip(x * (ratio / lmid) ** eta, lo, hi), 1.0)
+        x_new = step(lmid)
         if prob.volume(prob.physical(x_new)) > volfrac:
             l1 = lmid
         else:

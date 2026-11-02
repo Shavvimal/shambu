@@ -81,7 +81,9 @@ class VoxelFE:
         self.node_xyz_index = np.stack([uniq // ((ny + 1) * (nz + 1)), (uniq // (nz + 1)) % (ny + 1), uniq % (nz + 1)], axis=1)
         enode = inv.reshape(-1, 8)
         self.edof = (3 * enode[:, :, None] + np.arange(3)[None, None, :]).reshape(-1, 24)
-        self.set_fixed(np.zeros(0, dtype=int))
+        # the sparsity pattern (576 entries a cell) waits for set_fixed, so a caller can check the DOF count first
+        self.fixed = np.zeros(0, dtype=np.int64)
+        self.free = np.arange(self.n_dof)
 
     @property
     def n_elements(self) -> int:

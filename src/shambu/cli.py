@@ -1031,8 +1031,8 @@ TOPO_ACTIONS = ("check", "voxelise", "solve", "validate", "trace")
 # Each action's flags (argparse dests); a flag given to another action is a usage error (exit 2).
 _TOPO_FLAGS: dict[str, set[str]] = {
     "check": set(),
-    "voxelise": {"pitch"},
-    "solve": {"out", "volfrac", "pitch", "maxit", "tol", "budget_min", "full_only", "mesh"},
+    "voxelise": {"pitch", "max_cells"},
+    "solve": {"out", "volfrac", "pitch", "maxit", "tol", "budget_min", "full_only", "mesh", "max_cells"},
     "validate": {"size"},
     "trace": {"faces", "rules", "volfrac"},
 }
@@ -1058,6 +1058,13 @@ class Topo(Command):
         p.add_argument("--tol", type=float, metavar="T", help="solve: stop when no density changes by more than T")
         p.add_argument("--budget-min", type=float, metavar="MIN", help="solve: stop a run that would pass this many minutes")
         p.add_argument("--full-only", action="store_true", help="solve: the full-density check only, no optimisation")
+        p.add_argument(
+            "--max-cells",
+            type=int,
+            metavar="N",
+            help="voxelise/solve: refuse a domain over N cells (default 30000, about 5.5 GB at the measured 0.18 MB a cell); "
+            "the grid, DOF and filter caps scale with it",
+        )
         p.add_argument(
             "--mesh",
             choices=("auto", "cubes", "smooth", "none"),
@@ -1091,9 +1098,15 @@ class Topo(Command):
             return usage(out, f"topo {a.action} does not take " + ", ".join("--" + s.replace("_", "-") for s in stray))
         if a.action == "trace" and len(a.volfrac) > 1:
             return usage(out, "topo trace takes one --volfrac")
+        from .topo.spec import MAX_CELLS, override_errors
+
+        bad = override_errors(a.pitch, a.maxit, a.tol, a.budget_min, a.volfrac, a.max_cells)
+        if bad:
+            return usage(out, "; ".join(bad))
+        cap = a.max_cells or MAX_CELLS
         kw: dict = {
             "check": lambda: {"spec_path": a.file},
-            "voxelise": lambda: {"spec_path": a.file, "pitch": a.pitch},
+            "voxelise": lambda: {"spec_path": a.file, "pitch": a.pitch, "max_cells": cap},
             "solve": lambda: {
                 "spec_path": a.file,
                 "out_dir": a.out,
@@ -1104,6 +1117,7 @@ class Topo(Command):
                 "budget_min": a.budget_min,
                 "full_only": a.full_only,
                 "mesh": a.mesh,
+                "max_cells": cap,
             },
             "validate": lambda: {"size": a.size},
             "trace": lambda: {"run_path": a.file, "faces_path": a.faces, "rules": a.rules, "volfrac": a.volfrac[0] if a.volfrac else None},
@@ -1115,9 +1129,9 @@ class Topo(Command):
         try:
             rep = app.topo(a.action, listener=listen, **kw)
         except TopoSpecError as e:
-            out.emit({"error": f"TopoSpecError: {len(e.errors)} error(s)", "errors": e.errors}, e.errors)
+            out.emit({"error": f"TopoSpecError: {len(e.errors)} error(s)", "errors": e.errors}, e.errors, strict=True)
             return 1
-        out.emit(rep.to_json(), rep.lines())
+        out.emit(rep.to_json(), rep.lines(), strict=True)
         return rep.exit_code
 
 

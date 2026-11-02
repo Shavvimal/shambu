@@ -4,7 +4,10 @@ What it handles: `voxelise(facets, pitch, sub)` turns a closed STL (facets as `s
 a cell mask. Rays run along +z through an `sub x sub` lattice of sample columns per cell; the sorted hits of a
 column pair into inside intervals by parity, and a cell is kept when at least half of its `sub^3` samples lie
 inside. Ray origins carry a small fixed offset so they miss mesh edges and vertices. A column with an odd hit count
-(an open mesh there) drops its last hit and is counted, for the `topo.odd_parity` finding. `largest_piece` keeps
+(an open mesh there) drops its last hit and is counted, for the `topo.odd_parity` finding. A hole whose facets lie
+edge-on to +z (an open side wall) leaves every column even, so the welded mesh's open and non-manifold edges are
+counted too (`topo.open_mesh`). The fill ignores facet winding; a mesh wound inward has a negative signed volume,
+which is reported (`topo.inverted_mesh`) and compared by its size. `largest_piece` keeps
 the largest face-connected piece. `box_domain` makes a solid block for a spec without an STL.
 
 Cell (i, j, k) has its centre at `origin + pitch * (index + 0.5)`; arrays are indexed x, y, z.
@@ -15,12 +18,13 @@ numpy and scipy (the `topo` extra).
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 from scipy import ndimage
+
+from .spec import grid_shape
 
 # Ray-origin offsets in units of the sample spacing: small, irrational-looking fractions that keep a sample column off
 # the edges and vertices of meshes drawn on round numbers.
@@ -32,8 +36,10 @@ class VoxelDomain:
     mask: np.ndarray  # bool, shape (nx, ny, nz)
     origin: np.ndarray  # (3,) the min corner of cell (0, 0, 0)
     pitch: float
-    mesh_volume_mm3: float | None = None
+    mesh_volume_mm3: float | None = None  # the size of the signed volume; `inverted` says when the sign was negative
     odd_columns: int = 0
+    open_edges: int = 0  # welded edges used by one facet or by more than two
+    inverted: bool = False
     pieces: int = 1
     dropped: int = 0
 
@@ -64,6 +70,8 @@ class VoxelDomain:
             "pieces": self.pieces,
             "dropped": self.dropped,
             "odd_columns": self.odd_columns,
+            "open_edges": self.open_edges,
+            "inverted": self.inverted,
         }
         if self.mesh_volume_mm3:
             d["volume_ratio"] = round(self.voxel_volume_mm3 / self.mesh_volume_mm3, 4)
@@ -80,15 +88,11 @@ class VoxelDomain:
         }
 
 
-def _shape(span: np.ndarray, pitch: float) -> tuple[int, int, int]:
-    n = [max(1, math.ceil(s / pitch - 1e-9)) for s in span]
-    return n[0], n[1], n[2]
-
-
 def box_domain(lo: Sequence[float], hi: Sequence[float], pitch: float) -> VoxelDomain:
     """A solid block from `lo`; the far faces round up to whole cells."""
     lo_a = np.asarray(lo, dtype=float)
-    shape = _shape(np.asarray(hi, dtype=float) - lo_a, pitch)
+    span = np.asarray(hi, dtype=float) - lo_a
+    shape = grid_shape((float(span[0]), float(span[1]), float(span[2])), pitch)
     return VoxelDomain(np.ones(shape, dtype=bool), lo_a, pitch)
 
 
@@ -98,7 +102,7 @@ def voxelise(facets: Sequence, pitch: float, sub: int = 3) -> VoxelDomain:
     if len(tri) == 0:
         raise ValueError("the mesh has no facets")
     lo, hi = tri.reshape(-1, 3).min(axis=0), tri.reshape(-1, 3).max(axis=0)
-    shape = _shape(hi - lo, pitch)
+    shape = grid_shape((float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2])), pitch)
     nx, ny, nz = shape
     ds = pitch / sub
     # Sample column positions (x, y) and sample heights z.
@@ -156,8 +160,12 @@ def voxelise(facets: Sequence, pitch: float, sub: int = 3) -> VoxelDomain:
     sub3 = inside_count.reshape(nx, sub, ny, sub, nz, sub).sum(axis=(1, 3, 5))
     mask = sub3 * 2 >= sub**3
     from ..mesh import volume as mesh_volume
+    from ..meshgeom import weld
 
-    dom = VoxelDomain(mask, lo.copy(), pitch, float(mesh_volume(facets)), odd)
+    welded = weld(facets)
+    bad_edges = len(welded.open_edges()) + len(welded.nonmanifold_edges())
+    signed = float(mesh_volume(facets))
+    dom = VoxelDomain(mask, lo.copy(), pitch, abs(signed), odd, open_edges=bad_edges, inverted=signed < 0)
     return largest_piece(dom)
 
 

@@ -15,6 +15,12 @@ A selection is one primitive or a combination:
 - `{"half": {"p": [x, y, z], "n": [nx, ny, nz]}}`: the side the normal points to.
 - `{"union": [s, ...]}`, `{"intersect": [s, ...]}`, `{"minus": [a, b]}`.
 
+Size limits: a solve's memory grows faster than its cell count (SuperLU fill on a 3D grid: about 0.12 MB a cell at
+8000 cells and 0.18 MB at 50000, measured on a solid block). `MAX_CELLS` caps the domain cells (the elements) by
+default; the bounding grid of an STL, the degrees of freedom and the filter weights have caps derived from it
+(`limits`). `size_errors` refuses a grid over a cap before anything allocates it and states the memory estimate;
+`--max-cells` raises the cap for a machine that has the memory.
+
 What it does not do: no numpy, no geometry, no file other than the one JSON it is asked to read, no printing.
 """
 
@@ -40,6 +46,13 @@ EDGES = ("u_lo", "u_hi", "v_lo", "v_hi")
 DEFAULT_E_MPA = 2100.0
 DEFAULT_NU = 0.38
 DEFAULT_DENSITY_G_CM3 = 1.27
+
+MAX_CELLS = 30_000  # default cap on domain cells: about 5.5 GB of peak memory at the measured rate
+GRID_FACTOR = 50  # an STL's bounding grid may hold this many times the cell cap (the voxeliser's sample grid is subsamples^3 bytes a cell)
+DOF_FACTOR = 12  # a solid block has about 3 DOF a cell, a one-cell plate about 7, a one-cell bar about 12
+FILTER_FACTOR = 500  # filter weights a cell, on average, at the cell cap
+MB_BASE, MB_PER_CELL = 100.0, 0.18  # the memory estimate: a base plus the measured rate at 50000 cells
+MAX_RASTER = 4_000_000  # trace raster cells on one face (2000 x 2000)
 
 
 # ---------------------------------------------------------------------------- dataclasses
@@ -186,6 +199,71 @@ class Faces:
     keepouts: tuple[dict, ...] = ()
 
 
+def volfrac_tag(vf: float) -> str:
+    """The run tag of a volume fraction: `v` and its decimal digits, at least two (0.5 -> v50, 0.05 -> v05,
+    0.401 -> v401). Distinct fractions give distinct tags, so two runs never share a file name."""
+    from decimal import Decimal
+
+    text = format(Decimal(repr(float(vf))), "f")
+    digits = text.split(".", 1)[1] if "." in text else "0"
+    return "v" + digits.ljust(2, "0")
+
+
+def grid_shape(span: tuple[float, float, float], pitch: float) -> tuple[int, int, int]:
+    """Cells along each axis of a grid that covers `span` at `pitch` (the far faces round up to whole cells)."""
+    n = [max(1, math.ceil(s / pitch - 1e-9)) for s in span]
+    return n[0], n[1], n[2]
+
+
+def memory_mb(cells: int) -> int:
+    return round(MB_BASE + MB_PER_CELL * cells)
+
+
+def limits(max_cells: int) -> dict[str, int]:
+    return {
+        "cells": max_cells,
+        "grid_cells": GRID_FACTOR * max_cells,
+        "dof": DOF_FACTOR * max_cells,
+        "filter_weights": FILTER_FACTOR * max_cells,
+    }
+
+
+def size_errors(what: str, count: float, cap_key: str, max_cells: int, cells_for_memory: float) -> list[str]:
+    """One error line when `count` is over its cap, with the memory estimate; [] otherwise."""
+    cap = limits(max_cells)[cap_key]
+    if count <= cap:
+        return []
+    return [
+        f"{what}: {count:.0f} is over the cap of {cap} (max cells {max_cells}); a solve this size needs about "
+        f"{memory_mb(int(cells_for_memory))} MB. Use a coarser pitch, or raise --max-cells when the machine has the memory"
+    ]
+
+
+def override_errors(
+    pitch: Any = None,
+    maxit: Any = None,
+    tol: Any = None,
+    budget_min: Any = None,
+    volfrac: Any = (),
+    max_cells: Any = None,
+) -> list[str]:
+    """Range checks of the command-line overrides, the same ranges as the spec's own keys."""
+    v = _V()
+    if pitch is not None:
+        v.num(pitch, "--pitch", 0.0, lo_open=True)
+    if tol is not None:
+        v.num(tol, "--tol", 0.0, lo_open=True)
+    if budget_min is not None:
+        v.num(budget_min, "--budget-min", 0.0, lo_open=True)
+    for flag, n in (("--maxit", maxit), ("--max-cells", max_cells)):
+        if n is not None and (not isinstance(n, int) or isinstance(n, bool) or n < 1):
+            v.err(flag, f"must be a positive integer, got {n!r}")
+    fr = [v.num(x, "--volfrac", 0.0, 1.0, lo_open=True, hi_open=True) for x in volfrac or ()]
+    for x in sorted({x for x in fr if fr.count(x) > 1}):
+        v.err("--volfrac", f"{x:g} is given twice")
+    return v.errors
+
+
 def plane_axes(axis: str) -> tuple[int, int]:
     """The two in-plane axis indexes of a face with this normal, in x, y, z order."""
     n = AXES.index(axis)
@@ -314,6 +392,11 @@ class _V:
     def ok_num(v: Any) -> bool:
         return isinstance(v, (int, float)) and not isinstance(v, bool)
 
+    def unique(self, names: list[str], where: str, what: str) -> None:
+        """A name used twice would let one entry replace the other where entries are looked up by name."""
+        for n in sorted({n for n in names if names.count(n) > 1}):
+            self.err(where, f"{what} name {n!r} is used twice")
+
 
 def _sha256(data: bytes) -> str:
     import hashlib
@@ -385,6 +468,8 @@ def parse_spec(doc: Any, path: str = "spec.json", raw: bytes = b"") -> tuple[Top
         v.err("spec.simp.volfrac", f"must be a number or a non-empty list of numbers, got {vf!r}")
         vf = [0.5]
     volfrac = tuple(v.num(x, f"spec.simp.volfrac[{i}]", 0.0, 1.0, lo_open=True, hi_open=True) for i, x in enumerate(vf))
+    for x in sorted({x for x in volfrac if volfrac.count(x) > 1}):
+        v.err("spec.simp.volfrac", f"{x:g} is given twice")
     maxit = s.get("maxit", 80)
     if not isinstance(maxit, int) or isinstance(maxit, bool) or maxit < 1:
         v.err("spec.simp.maxit", f"must be a positive integer, got {maxit!r}")
@@ -417,8 +502,11 @@ def parse_spec(doc: Any, path: str = "spec.json", raw: bytes = b"") -> tuple[Top
             dofs = "xyz"
         supports.append(Support(v.text(e.get("name", "?"), f"{w}.name"), v.selection(e.get("nodes", {}), f"{w}.nodes"), dofs))
 
+    v.unique([x.name for x in supports], "spec.supports", "support")
     passive = _regions(v, d.get("passive", []), "spec.passive")
     regions = _regions(v, d.get("regions", []), "spec.regions")
+    v.unique([x.name for x in passive], "spec.passive", "passive region")
+    v.unique([x.name for x in regions], "spec.regions", "region")
 
     weights = d.get("weights", "normalised")
     if weights not in ("normalised", "raw"):
@@ -431,9 +519,7 @@ def parse_spec(doc: Any, path: str = "spec.json", raw: bytes = b"") -> tuple[Top
         cs = []
     for i, x in enumerate(cs):
         cases.append(_case(v, x, f"spec.cases[{i}]", weights))
-    names = [c.name for c in cases]
-    for n in sorted({n for n in names if names.count(n) > 1}):
-        v.err("spec.cases", f"case name {n!r} is used twice")
+    v.unique([c.name for c in cases], "spec.cases", "case")
 
     if v.errors:
         return None, v.errors
@@ -522,7 +608,7 @@ def parse_faces(doc: Any, where: str = "faces") -> tuple[Faces | None, list[str]
     if d.get("schema", FACES_SCHEMA) != FACES_SCHEMA:
         v.err(f"{where}.schema", f"must be {FACES_SCHEMA!r}")
     build = v.axis(d.get("build_axis", "z"), f"{where}.build_axis")
-    keep = tuple(_ball(v, b, f"{where}.keepouts[{i}]") for i, b in enumerate(d.get("keepouts", []) or []))
+    keep = _balls(v, d.get("keepouts"), f"{where}.keepouts")
     faces = []
     fs = d.get("faces", [])
     if not isinstance(fs, list) or not fs:
@@ -543,12 +629,22 @@ def parse_faces(doc: Any, where: str = "faces") -> tuple[Faces | None, list[str]
                 v.interval(e.get("u", [0, 1]), f"{w}.u"),
                 v.interval(e.get("v", [0, 1]), f"{w}.v"),
                 tuple(oe),
-                tuple(_ball(v, b, f"{w}.keepouts[{j}]") for j, b in enumerate(e.get("keepouts", []) or [])),
+                _balls(v, e.get("keepouts"), f"{w}.keepouts"),
             )
         )
+    v.unique([f.name for f in faces], f"{where}.faces", "face")
     if v.errors:
         return None, v.errors
     return Faces(build, tuple(faces), keep), []
+
+
+def _balls(v: _V, xs: Any, where: str) -> tuple[dict, ...]:
+    if xs is None:
+        return ()
+    if not isinstance(xs, list):
+        v.err(where, f"must be a list of keep-out balls, got {xs!r}")
+        return ()
+    return tuple(_ball(v, b, f"{where}[{i}]") for i, b in enumerate(xs))
 
 
 def _ball(v: _V, b: Any, w: str) -> dict:
@@ -566,6 +662,17 @@ def load_faces(path: str | Path) -> Faces:
     if faces is None:
         raise TopoSpecError(errors)
     return faces
+
+
+# The range of each numeric rule (low, high, low open, high open); a key not listed takes [0, inf).
+_RULE_RANGES: dict[str, tuple[float, float | None, bool, bool]] = {
+    "keep_volfrac": (0.0, 1.0, True, True),
+    "threshold": (0.0, 1.0, True, True),
+    "raster_mm": (0.0, None, True, False),
+    "roof_deg": (0.0, 90.0, True, False),
+    "flat_report_deg": (0.0, 90.0, False, False),
+}
+_RULE_INTS = {"max_vertices": 3, "rib_passes": 1}  # a polygon keeps at least three vertices
 
 
 def rules_from(name_or_path: str) -> TraceRules:
@@ -588,14 +695,15 @@ def rules_from(name_or_path: str) -> TraceRules:
             if d[k] not in ("rib", "rim"):
                 v.err("rules.other_grow", "must be 'rib' or 'rim'")
             over[k] = d[k]
-        elif k in ("max_vertices", "rib_passes"):
-            if not isinstance(d[k], int) or isinstance(d[k], bool) or d[k] < 1:
-                v.err(f"rules.{k}", "must be a positive integer")
+        elif k in _RULE_INTS:
+            if not isinstance(d[k], int) or isinstance(d[k], bool) or d[k] < _RULE_INTS[k]:
+                v.err(f"rules.{k}", f"must be an integer of at least {_RULE_INTS[k]}, got {d[k]!r}")
             over[k] = d[k]
         elif d[k] is None and k in ("clip_r_mm", "keep_volfrac"):
             over[k] = None
         else:
-            over[k] = v.num(d[k], f"rules.{k}", 0.0)
+            lo, hi, lo_open, hi_open = _RULE_RANGES.get(k, (0.0, None, False, False))
+            over[k] = v.num(d[k], f"rules.{k}", lo, hi, lo_open, hi_open)
     if v.errors:
         raise TopoSpecError(v.errors)
     return replace(PRESETS[base], name=f"{base}+{Path(name_or_path).name}", **over)
@@ -605,6 +713,7 @@ def spec_summary(spec: TopoSpec) -> dict:
     """What `topo check` reports for a valid spec."""
     return {
         "domain": {"stl": spec.domain.stl, "box": spec.domain.box, "pitch": spec.domain.pitch, "subsamples": spec.domain.subsamples},
+        "volfrac_tags": [volfrac_tag(x) for x in spec.simp.volfrac],
         "cases": [{"name": c.name, "loads": len(c.loads), "body_force": c.body_force is not None, "weight": c.weight} for c in spec.cases],
         "supports": [s.name for s in spec.supports],
         "passive": [r.name for r in spec.passive],

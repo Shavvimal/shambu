@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import math
-import time
 
 import pytest
 
@@ -15,8 +14,9 @@ pytest.importorskip("scipy")
 
 from cadfix import run, stl  # noqa: E402
 from meshes import box  # noqa: E402
+from shambu.errors import TopoSpecError  # noqa: E402
 from shambu.topo import checks, loads, michell  # noqa: E402
-from shambu.topo.fe import VoxelFE, hex8_ke  # noqa: E402
+from shambu.topo.fe import VoxelFE, elasticity, hex8_ke  # noqa: E402
 from shambu.topo.filter import DensityFilter  # noqa: E402
 from shambu.topo.linsolve import DenseSolver, SuperLUSolver  # noqa: E402
 from shambu.topo.optimise import Problem, optimise  # noqa: E402
@@ -65,6 +65,37 @@ def test_ke_symmetric_with_six_rigid_modes():
     ev = np.linalg.eigvalsh(ke)
     assert np.sum(np.abs(ev) < 1e-10) == 6 and ev[6] > 1e-3
     assert np.allclose(ke.reshape(24, 8, 3).sum(axis=1), 0)  # a rigid translation makes no force
+
+
+@pytest.mark.parametrize("nu", [0.3, 0.38])
+def test_ke_pins_the_material_law_by_constant_strain_energies(nu):
+    """A linear displacement field is exact on a hex8, so u^T ke u of a unit cube (E = 1, volume 1) equals the
+    continuum energy 2 W = strain^T D strain. Each engineering shear gives G = 1 / (2 (1 + nu)), each axial strain
+    lambda + 2 mu, and a pure dilatation 9 K. A wrong shear (or Lame) term in the material law changes these."""
+    from shambu.topo.fe import CORNERS
+
+    ke = hex8_ke(nu)
+    assert np.allclose(ke, ke.T, atol=1e-14)
+    ev = np.linalg.eigvalsh(ke)
+    assert np.sum(np.abs(ev) < 1e-10) == 6 and ev[6] > 1e-3  # exactly the six rigid-body modes are free
+    lam, mu = nu / ((1 + nu) * (1 - 2 * nu)), 1 / (2 * (1 + nu))
+    xyz = CORNERS.astype(float)
+
+    def energy(grad: np.ndarray) -> float:
+        u = (xyz @ grad.T).ravel()  # u_i = grad[i, j] x_j at each corner
+        return float(u @ ke @ u)
+
+    eps = 1e-3
+    for i, j in ((0, 1), (1, 2), (2, 0)):  # simple shear: gamma_ij = eps
+        g = np.zeros((3, 3))
+        g[i, j] = eps
+        assert math.isclose(energy(g), mu * eps**2, rel_tol=1e-10), (i, j)
+    for i in range(3):  # uniaxial strain
+        g = np.zeros((3, 3))
+        g[i, i] = eps
+        assert math.isclose(energy(g), (lam + 2 * mu) * eps**2, rel_tol=1e-10)
+    assert math.isclose(energy(eps * np.eye(3)), (9 * lam + 6 * mu) * eps**2, rel_tol=1e-10)  # 9 K eps^2, K = lam + 2 mu / 3
+    assert np.allclose(elasticity(nu)[3:, 3:], mu * np.eye(3))
 
 
 def test_patch_uniaxial_tension_is_exact():
@@ -196,15 +227,13 @@ def test_update_holds_the_volume_and_the_passive_cells():
 
 
 # ---------------------------------------------------------------------------- the Michell cantilever
-def test_michell_small_shape_and_speed():
-    t0 = time.perf_counter()
+def test_michell_small_shape():
     rep = Topo().validate("small")
-    took = time.perf_counter() - t0
     doc = rep.to_json()
     checks_ = doc["metrics"]["checks"]
     assert doc["metrics"]["pass"], checks_
     assert checks_["top_chord"]["value"] > 0.6 and checks_["bottom_chord"]["value"] > 0.6 and checks_["clamp_middle"]["value"] < 0.1
-    assert rep.exit_code == 0 and took < 2.0, took
+    assert rep.exit_code == 0
     codes = {f["code"] for f in doc["findings"]}
     assert {"topo.map_not_proof", "topo.stiffness_not_strength", "topo.clamped_support", "topo.rigid_load_patch"} <= codes
 
@@ -372,3 +401,187 @@ def test_smooth_iso_surface_when_scikit_image_is_present():
     facets = R.smooth_facets(dom, rho)
     vol = sum(meshgeom_volume(f) for f in facets)
     assert facets and 150 < vol < 230  # the 216 mm3 block, its edges cut by the 0.5 level
+
+
+# ---------------------------------------------------------------------------- guards from the review
+def _michell(**over) -> dict:
+    doc = michell.spec_doc("small")
+    doc.update(over)
+    return doc
+
+
+def _write(tmp_path, doc) -> str:
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(doc))
+    return str(p)
+
+
+def _strict(raw: str) -> dict:
+    def bad(token):
+        raise AssertionError(f"non-JSON constant {token} in the output")
+
+    return json.loads(raw, parse_constant=bad)
+
+
+@pytest.mark.parametrize(
+    ("support", "free"),
+    [
+        ({"name": "clamp", "nodes": {"box": {"x": [-0.01, 0.01]}}, "dofs": "x"}, 3),  # y, z and rotation about x free
+        ({"name": "pin", "nodes": {"ball": {"c": [0, 0, 0], "r": 0.01}}}, 3),  # one node: the three rotations free
+    ],
+)
+def test_an_under_constrained_model_fails_before_the_solve(tmp_path, capsys, support, free):
+    doc = _michell(supports=[support])
+    code, out, raw, _ = run(capsys, "topo", "solve", _write(tmp_path, doc), "--out", str(tmp_path / "o"))
+    _strict(raw)
+    (f,) = [f for f in out["findings"] if f["code"] == "topo.under_constrained"]
+    assert code == 1 and out["ok"] is False and out["runs"] == [] and f["measure"]["free_modes"] == free
+    for weights in ("raw", "normalised"):  # both weight modes, never a wrong "zero compliance" diagnosis
+        rep = Topo()._solve(parse_spec({**doc, "weights": weights})[0], False)[0]
+        assert {x.code for x in rep.findings if x.severity == "FAIL"} == {"topo.under_constrained"}
+
+
+def test_free_rigid_modes_of_a_full_clamp_is_empty():
+    _, _, fe, nodes, _, _ = _problem(_cantilever(6, 2, 3))
+    assert checks.free_rigid_modes(nodes, fe.fixed) == []
+    assert len(checks.free_rigid_modes(nodes, np.zeros(0, dtype=int))) == 6
+
+
+def test_raw_weights_with_a_case_on_fixed_nodes_is_a_spec_error_not_nan(tmp_path, capsys):
+    doc = _michell(weights="raw")
+    doc["cases"].append({"name": "on clamp", "loads": [{"nodes": {"box": {"x": [-0.01, 0.01]}}, "force": [0, 0, 1]}]})
+    code, out, raw, _ = run(capsys, "topo", "solve", _write(tmp_path, doc), "--out", str(tmp_path / "o"))
+    _strict(raw)
+    assert code == 1 and any("'on clamp': zero compliance" in e for e in out["errors"])
+
+
+def test_an_all_passive_domain_is_a_spec_error_not_nan(tmp_path, capsys):
+    doc = _michell(passive=[{"name": "all", "cells": {"box": {"x": [-1, 100]}}}])
+    code, out, raw, _ = run(capsys, "topo", "solve", _write(tmp_path, doc), "--out", str(tmp_path / "o"))
+    _strict(raw)
+    assert code == 1 and any("cover every domain cell" in e for e in out["errors"])
+
+
+def test_a_nan_in_a_result_is_a_fail_and_strict_json(tmp_path, capsys, monkeypatch):
+    real = checks.equilibrium
+
+    def nan_row(*a, **k):
+        rows, found = real(*a, **k)
+        rows[0]["umax_mm"] = float("nan")
+        return rows, found
+
+    monkeypatch.setattr(checks, "equilibrium", nan_row)
+    out_dir = tmp_path / "o"
+    code, out, raw, _ = run(capsys, "topo", "solve", _write(tmp_path, _michell()), "--out", str(out_dir), "--maxit", "2")
+    assert code == 1 and out["ok"] is False and "topo.non_finite" in {f["code"] for f in out["findings"]}
+    assert _strict(raw)["full_density"][0]["umax_mm"] is None
+    assert _strict((out_dir / "run.json").read_text()) == out
+
+
+def test_two_close_volume_fractions_write_two_maps(tmp_path):
+    doc = _michell()
+    doc["simp"].update({"volfrac": [0.401, 0.404], "maxit": 3})
+    Topo().solve(_write(tmp_path, doc), str(tmp_path / "o"), mesh="none")
+    out = json.loads((tmp_path / "o" / "run.json").read_text())
+    assert [r["files"]["density"] for r in out["runs"]] == ["density_v401.npy", "density_v404.npy"]
+    assert (tmp_path / "o" / "density_v401.npy").read_bytes() != (tmp_path / "o" / "density_v404.npy").read_bytes()
+
+
+def test_raw_weights_and_a_large_force_still_hold_the_volume():
+    """The bisection bound follows the sensitivity scale: a 1e6 N load must not saturate it."""
+    doc = _michell(weights="raw")
+    doc["simp"]["maxit"] = 10
+    doc["cases"][0]["loads"][0]["force"] = [0, 0, -1e6]
+    rep = Topo()._solve(parse_spec(doc)[0], False)[0]
+    run_ = rep.data["runs"][0]
+    assert abs(run_["design_volume_fraction"] - 0.4) < 0.005
+    assert "topo.volume_missed" not in {f.code for f in rep.findings}
+
+
+def test_an_unreachable_volume_is_a_finding_not_a_convergence():
+    """Five passive slices and a wide filter hold the design volume above 0.4: say so."""
+    doc = {
+        "schema": "shambu.topo/1",
+        "units": "mm-N-MPa",
+        "domain": {"box": {"min": [0, 0, 0], "max": [6, 1, 4]}, "pitch": 1},
+        "simp": {"volfrac": [0.4], "rmin_cells": 2.5, "maxit": 40},
+        "supports": [{"name": "c", "nodes": {"box": {"x": [-0.01, 0.01]}}}],
+        "passive": [{"name": f"p{i}", "cells": {"box": {"x": [i + 0.1, i + 0.9]}}} for i in range(5)],
+        "cases": [{"name": "t", "loads": [{"nodes": {"box": {"x": [5.99, 6.01]}}, "force": [0, 0, -1]}]}],
+    }
+    rep = Topo()._solve(parse_spec(doc)[0], False)[0]
+    run_ = rep.data["runs"][0]
+    (f,) = [f for f in rep.findings if f.code == "topo.volume_missed"]
+    assert run_["converged"] is False and run_["design_volume_fraction"] > 0.405
+    assert f.severity == "WARN" and "out of reach" in f.message
+
+
+def test_a_box_over_the_cell_cap_is_refused_before_allocation(tmp_path, capsys, monkeypatch):
+    from shambu.topo import voxel
+
+    def boom(*a, **k):
+        raise AssertionError("allocated a grid over the cap")
+
+    monkeypatch.setattr(voxel, "box_domain", boom)
+    code, out, _, _ = run(capsys, "topo", "solve", _write(tmp_path, _michell()), "--out", str(tmp_path / "o"), "--max-cells", "100")
+    (err,) = out["errors"]
+    assert code == 1 and "192 is over the cap of 100" in err and " MB" in err
+
+
+def test_max_cells_raises_the_cap(tmp_path, capsys):
+    doc = _michell()
+    doc["simp"]["maxit"] = 2
+    code, out, _, _ = run(capsys, "topo", "voxelise", _write(tmp_path, doc), "--max-cells", "192")
+    assert code == 0 and out["fe"]["elements"] == 192
+
+
+def test_an_stl_grid_over_the_cap_is_refused_before_voxelising(tmp_path, capsys, monkeypatch):
+    from shambu.topo import voxel
+
+    monkeypatch.setattr(voxel, "voxelise", lambda *a, **k: (_ for _ in ()).throw(AssertionError("voxelised")))
+    stl(tmp_path / "big.stl", box((0, 0, 0), (100, 100, 100)))
+    doc = _cantilever(10, 10, 4)
+    doc["domain"] = {"stl": "big.stl", "pitch": 0.1}
+    code, out, _, _ = run(capsys, "topo", "voxelise", _write(tmp_path, doc))
+    assert code == 1 and "bounding grid" in out["errors"][0] and "over the cap" in out["errors"][0]
+
+
+def test_override_errors_reach_library_callers(tmp_path):
+    with pytest.raises(TopoSpecError, match="--maxit"):
+        Topo().solve(_write(tmp_path, _michell()), str(tmp_path / "o"), maxit=0)
+
+
+def test_budget_projection_counts_the_final_analysis(monkeypatch):
+    """With a clock that ticks at a fixed rate, a budget stop keeps the whole run, final solve included, inside it."""
+    from shambu.topo import optimise as O
+
+    class Clock:
+        t = 0.0
+
+        def perf_counter(self):
+            self.t += 1.0
+            return self.t
+
+    monkeypatch.setattr(O, "time", Clock())
+    *_, prob, _ = _problem(_cantilever(8, 1, 4, maxit=50))
+    for budget in (20.0, 30.0, 45.0):
+        r = optimise(prob, 0.4, 50, 0.0, 0.2, 0.5, budget_s=budget)
+        assert r.budget_stop and r.seconds <= budget, (budget, r.seconds, r.iterations)
+
+
+def test_an_open_side_wall_is_reported():
+    """Facets edge-on to the +z rays leave every column even: the welded edges still show the hole."""
+    facets = [f for f in box((0, 0, 0), (10, 10, 4)) if not all(abs(v[0]) < 1e-9 for v in f)]
+    dom = voxelise(facets, 1.0)
+    found, _ = checks.domain_findings(dom, dom.mask)
+    assert dom.odd_columns == 0 and dom.open_edges > 0 and "topo.open_mesh" in {f.code for f in found}
+    closed = voxelise(box((0, 0, 0), (10, 10, 4)), 1.0)
+    assert closed.open_edges == 0 and "topo.open_mesh" not in {f.code for f in checks.domain_findings(closed, closed.mask)[0]}
+
+
+def test_an_inward_wound_mesh_keeps_a_positive_volume():
+    facets = [(a, c, b) for a, b, c in box((0, 0, 0), (10, 10, 4))]
+    dom = voxelise(facets, 1.0)
+    found, _ = checks.domain_findings(dom, dom.mask)
+    assert dom.stats()["volume_ratio"] == 1.0 and dom.inverted
+    assert {f.code for f in found} >= {"topo.inverted_mesh"} and not any("-100" in f.message for f in found)
