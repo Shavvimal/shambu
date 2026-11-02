@@ -448,6 +448,7 @@ G-code computes the MD5 of the bytes and reads the markers. Each finding is WARN
 
 | Code | When | Severity | Evidence |
 |---|---|---|---|
+| `gcode.missing` | `slice_info.config` lists the plate, or its `gcode_file` is set, but `plate_N.gcode` is absent | WARN | observed |
 | `gcode.md5_missing` | a sliced plate without `.gcode.md5` | WARN | observed (this section) |
 | `gcode.md5_mismatch` | the MD5 of the G-code differs from the stored one (any case) | WARN | measured |
 | `gcode.md5_format` | it matches but is not 32 uppercase hex digits with no newline | INFO | observed for the case; external for the newline |
@@ -455,7 +456,7 @@ G-code computes the MD5 of the bytes and reads the markers. Each finding is WARN
 | `gcode.layer_markers` | the `M73 L` markers are not exactly 1..N | WARN | observed |
 | `gcode.no_layer_notice` | no `M991 S0 P` line | INFO | external |
 | `gcode.prediction_drift` | `slice_info` `prediction` and the first `M73 P R` (x 60) differ by more than max(120 s, 5 %) | WARN | heuristic |
-| `thumb.missing` / `thumb.unreadable` | no `plate_N.png` on a sliced plate / not a PNG | INFO | observed (section 2.10) / measured |
+| `thumb.missing` / `thumb.unreadable` | no `plate_N.png` on a sliced plate / not a PNG, or its IHDR chunk is not whole | INFO | observed (section 2.10) / measured |
 | `thumb.placeholder` / `thumb.not_rgba` | IHDR width or height <= 1 / colour type not 6 | INFO | external |
 | `bed.plate_vs_project` | `plate_N.json` `bed_type` against the plate's (or project's) bed type; an unknown id | INFO | external |
 | `slice.warning` | each `<warning>` of `slice_info.config`, with `msg`, `level`, `error_code` | WARN | observed |

@@ -89,8 +89,9 @@ def scan_gcode(lines: Iterable[bytes]) -> GcodeFacts:
 
 
 def png_header(data: bytes) -> tuple[int, int, int] | None:
-    """(width, height, colour type) from a PNG's IHDR chunk, or None when the bytes are not a PNG."""
-    if len(data) < 26 or not data.startswith(PNG_SIG) or data[12:16] != b"IHDR":
+    """(width, height, colour type) from a PNG's IHDR chunk, or None when the bytes are not a PNG or the IHDR chunk
+    is not whole (its length field is 13 and its 13 data bytes and CRC are present)."""
+    if len(data) < 33 or not data.startswith(PNG_SIG) or data[8:16] != b"\x00\x00\x00\x0dIHDR":
         return None
     w, h = struct.unpack(">II", data[16:24])
     return w, h, data[25]
@@ -135,6 +136,7 @@ def check(project: Project) -> IntegrityReport:
     findings: list[Finding] = []
     facts: list[dict] = []
     info = project.slice_info()
+    findings += missing_gcode_findings(project, info, plates)
     for p in plates:
         g = scan_gcode(io.BytesIO(project.read(f"Metadata/plate_{p}.gcode")))
         row: dict = {"plate": p, "gcode_bytes": g.size, "md5": g.md5}
@@ -147,8 +149,29 @@ def check(project: Project) -> IntegrityReport:
     findings += flush_findings(project)
     findings.sort(key=lambda f: (f.plate or 0, f.code, f.message))
     checked = list(CHECKS) if plates else [c for c in CHECKS if c not in GCODE_CHECKS]
-    not_applicable = [] if plates else list(GCODE_CHECKS)
+    not_applicable = [] if plates or any(f.code == "gcode.missing" for f in findings) else list(GCODE_CHECKS)
     return IntegrityReport(project.path, checked, not_applicable, facts, findings, time.monotonic() - start)
+
+
+def missing_gcode_findings(project: Project, info: dict[int, dict], plates: list[int]) -> list[Finding]:
+    """A plate that `slice_info.config` lists or whose `gcode_file` metadata is set, with no `plate_N.gcode` entry."""
+    declared = {p for p in info if p > 0}
+    for i, pl in enumerate(project.model_settings.findall("plate"), 1):
+        if any(m.get("key") == "gcode_file" and m.get("value") for m in pl.findall("metadata")):
+            declared.add(i)
+    return [
+        Finding(
+            "gcode.missing",
+            WARN,
+            "gcode",
+            f"plate {p} is marked sliced (slice_info.config or its gcode_file) but Metadata/plate_{p}.gcode is missing: "
+            "the G-code checks did not run on it",
+            OBSERVED,
+            plate=p,
+            fix=Fix("slice the project again in Studio or with `shambu slice`"),
+        )
+        for p in sorted(declared - set(plates))
+    ]
 
 
 def md5_findings(project: Project, plate: int, g: GcodeFacts, row: dict) -> list[Finding]:

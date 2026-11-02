@@ -217,3 +217,17 @@ def test_external_evidence_never_fails(tmp_path):
     external = [f for f in seen if f.evidence == EXTERNAL]
     assert external and all(f.severity in ("INFO", "WARN") for f in external)
     assert all(f.severity != "FAIL" for f in seen)
+
+
+# ---------------------------------------------------------------------------- review fixes
+def test_declared_sliced_plate_without_gcode_is_warn(sliced):
+    rewrite(sliced, {"Metadata/plate_1.gcode": None, "Metadata/plate_1.gcode.md5": None})
+    hit = only(run(sliced), "gcode.missing")
+    assert hit.severity == "WARN" and hit.plate == 1
+
+
+def test_truncated_ihdr_is_unreadable(tmp_path):
+    png = png_bytes(64, 64)
+    assert integrity.png_header(png) == (64, 64, 6)
+    assert integrity.png_header(png[:26]) is None
+    assert integrity.png_header(png[:8] + b"\x00\x00\x00\x0c" + png[12:]) is None
