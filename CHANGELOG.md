@@ -10,6 +10,9 @@ All notable changes to this project are documented here. The format follows
 - A post-mortem no longer names a Bambu account folder id or a session id, and `tests/test_public_hygiene.py` scans
   every tracked file for home paths, 192.168 addresses, preset folder ids, session and thread ids (full UUIDs, and
   short prefixes after "session" or "thread"), plus local private terms.
+- Docs, references and tests no longer name a printer serial, the owner, a private project, its parts or its notes
+  paths; the hygiene test adds printer serial, masked serial, private notes path and private-context word shapes, and
+  its private-term check skips with a stated reason when the local terms file is absent (always so in CI).
 - README opens with why the tool exists: agents can sweep orientations, print sequences and tower options in
   parallel and iterate on plates in a way a person in the Studio GUI cannot; Studio stays the final pass.
 
