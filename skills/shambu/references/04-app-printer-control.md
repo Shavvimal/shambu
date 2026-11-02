@@ -322,7 +322,7 @@ A user preset is `user/<uid>/<kind>/<name>.json` plus `<name>.info`:
 
 Known CLI pitfall (Bambu forum "CLI cannot apply external presets"): `--uptodate-settings` / `--uptodate-filaments` can be ignored. Projects with embedded presets slice correctly. That matches the approach of writing settings into the 3MF and resolving inheritance in the wrapper.
 
-Ideas to copy: user preflight gate (bambu-printer-mcp), access code from file/stdin/keychain only (bambu-cli), field decoders and CA handling (pybambu), embedded-G-code detection, per-job temp dirs and `--mstpp` cap (Printago). Ideas to reject: extracted signing keys, any print/upload path, Docker/xvfb (not needed on macOS, where the CLI runs without a window server dialog for slicing).
+Ideas to adopt (no code reused): user preflight gate (bambu-printer-mcp), access code from file/stdin/keychain only (bambu-cli), field decoders and CA handling (pybambu), embedded-G-code detection, per-job temp dirs and `--mstpp` cap (Printago). Ideas to reject: extracted signing keys, any print/upload path, Docker/xvfb (not needed on macOS, where the CLI runs without a window server dialog for slicing).
 
 ---
 

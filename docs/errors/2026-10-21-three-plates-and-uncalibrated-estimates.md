@@ -72,9 +72,9 @@ The time numbers are Studio's kinematic prediction (`prediction` in `slice_info.
 
 ## 8. Evidence
 
-- Post-mortem: `content/drafts/openarm/g2-redesign/55-shambu-post-mortem.md` in the owner's blog repo.
-- Trial specs and reports: `printing-tasks/plates/plate-14-housing-camera/` in the same repo (plate-14-B1, -B2, -C, plate-14b, plate-15, plate-14-all-on-one-E7a-pla-interface).
-- Timing: `printing-tasks/plates/plate-9-bracket/bambu/print-watch-D7.jsonl` and the M73 lines in the printed `.gcode.3mf`; the E7a watch of 2026-10-21.
+- Post-mortem: kept in the owner's private notes.
+- Trial specs and reports: `<repo>/plates/plate-14-housing-camera/` in the same notes (plate-14-B1, -B2, -C, plate-14b, plate-15, plate-14-all-on-one-E7a-pla-interface).
+- Timing: `<repo>/plates/plate-9-bracket/bambu/print-watch-D7.jsonl` and the M73 lines in the printed `.gcode.3mf`; the E7a watch of 2026-10-21.
 - Source, before the fix: `src/shambu/layout.py:97-104` (support margin), `:232-237` (pair test), `:130-180` (packer), `src/shambu/build.py:519-529` (give-up path), `:686-690` (`brim_margin`), `:695-696` (`at`), `:890-893` (the fixed tower).
 - References: `skills/shambu/references/00-findings.md` section 10 (every 0.4.0 rule with its Studio source line), 08 section 11 (layout), 06 sections 10 and 11 (tower, time), 03 section 8 and "Project edits", 04 Track 7 (watch log).
 

@@ -8,7 +8,7 @@ wait 9 hours to realise Shambu was wrong. I need it to work well with the GUI so
 the workflow". Sending the file to the printer without Studio is not a fix.
 
 Written from the post-mortem `docs/errors/2026-10-29-gui-open-drops-process.md`, a read of the Bambu Studio source at
-the installed tag `v02.08.02.61` (commit `926a7192`), the three evidence files in the openarm plates folder, and the
+the installed tag `v02.08.02.61` (commit `926a7192`), the three evidence files in the private project's plates folder, and the
 shambu tree at `5efeabd`. Studio paths below are relative to `src/` of that tag. Every Studio rule the code will
 encode cites its line here so the reference files can carry it.
 
@@ -76,7 +76,7 @@ encode cites its line here so the reference files can carry it.
 - The export check (`build.py:1615-1616`) requires `print_settings_id` == the composed name and the report claims
   "verified: process name and every override" (`report.py:247`). Both describe the file, not what the GUI will do.
 
-Evidence (openarm `plates/`): the untouched 19:22 export has `print_settings_id "PETG sweeper 4 walls 25 pc gyroid"`,
+Evidence (`<repo>/plates/`): the untouched 19:22 export has `print_settings_id "PETG custom 4 walls 25 pc gyroid"`,
 `inherits_group ["0.20mm Standard @BBL X2D","","",""]`, `different_settings_to_system ["","","",""]`, `wall_loops 4`;
 Studio's 20:50 save has `0.20mm Standard @BBL X2D`, no list, `wall_loops 2`; Studio's 21:07 save after the owner's
 manual edit has the list `bottom_shell_layers;skeleton_infill_density;skin_infill_density;sparse_infill_density;sparse_infill_pattern;wall_loops`
@@ -272,9 +272,9 @@ entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density
 1. `exp1-base-plus-diff.gcode.3mf`: expect the process combo `0.20mm Standard @BBL X2D (modified)`, wall loops 4,
    25 % gyroid, 5 bottom shells, brim none, plate unsliced, and a GUI slice near 6 h 30 min / 212 g. Save, then
    `shambu inspect` must show the same id and list.
-2. `exp2-embedded-named-preset.gcode.3mf`: expect the combo to read `PETG sweeper 4 walls 25 pc gyroid` with the same
+2. `exp2-embedded-named-preset.gcode.3mf`: expect the combo to read `PETG custom 4 walls 25 pc gyroid` with the same
    values. Save, reopen once more: the name must not grow a `(…3mf)` suffix.
-3. After the implementation: `shambu build plate-pla-interface.json --slice` on the sweeper, open, no grouping
+3. After the implementation: `shambu build plate-pla-interface.json --slice` on the same plate, open, no grouping
    dialog action, confirm PLA on the auxiliary nozzle and 4 walls, save, `shambu verify <save> --against plate-pla-interface.json`
    exits 0, GUI slice within 1 min / 1 g of the report.
 
@@ -298,7 +298,7 @@ entry). Diff list computed: `bottom_shell_layers;brim_type;sparse_infill_density
 `skills/shambu/SKILL.md` `--expect-version`, `skills/setup/SKILL.md`, `README.md`; CHANGELOG entry under 0.6.0 with
 the one-line summary from the post-mortem section 9 and the include-order fix.
 
-## 9. Design review (Codex gpt-6-astra high, thread 01a189a0, 2026-10-29) and the decisions
+## 9. Design review (Codex gpt-6-astra high, 2026-10-29) and the decisions
 
 Verdict was "reject" on three blockers. Each finding, and what changed:
 

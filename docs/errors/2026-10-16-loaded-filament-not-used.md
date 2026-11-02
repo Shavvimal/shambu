@@ -62,7 +62,7 @@ Run `shambu doctor` before every build. Confirm the GUI filament presets match t
 - `BambuStudio.conf` read by `doctor` on 2026-10-13: `presets.filaments = ["Bambu PETG Basic @BBL X2D 0.4 nozzle"]`, `filament_colors = "#00AE42"`; on 2026-10-16 after the owner's swap in the GUI: `["Generic PETG @BBL X2D 0.4 nozzle"]`, colour still `#00AE42`.
 - Studio's filament dropdown on 2026-10-16 (owner's screenshot): Left filaments "Ext Generic PETG" (white swatch), Right filaments "Ext Bambu PETG Basic" (blue swatch).
 - Headless slice of the project: 6 h 34 min, 175.7 g. GUI slice after the swap: 5 h 08 min, 115.80 g, process reverted to `0.20mm Standard @BBL X2D`.
-- Plate files: `content/drafts/openarm/g2-redesign/printing-tasks/plates/plate-9-bracket/` in the blog repo (plate-D7.json, the three build logs `bambu/shambu-build-D7b.log`, `-D7c.log`, `-D7d.log`).
+- Plate files: `<repo>/plates/plate-9-bracket/` in the owner's private notes (plate-D7.json, the three build logs `bambu/shambu-build-D7b.log`, `-D7c.log`, `-D7d.log`).
 
 ## 9. Resolution (2026-10-16, shambu 0.3.0)
 

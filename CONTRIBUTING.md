@@ -40,7 +40,7 @@ CLI on actual STLs of several kinds, not one favourite part:
 
 - functional robot parts exported in an assembly frame (gripper links, brackets, motor mounts, gears): off-origin
   STLs, copies, holes in every direction, tree supports;
-- URDF or simulation meshes in metres (SO-101, OpenArm): the metres warning and `rotate --scale 1000`;
+- URDF or simulation meshes in metres (SO-101, or any robot-arm URDF): the metres warning and `rotate --scale 1000`;
 - Gridfinity bins, baseplates and labels: 45-degree feet and lips, thin two-colour plates, many small objects on
   one plate (print-by-object should lose there);
 - organic forms (a character lamp, a logo duck, a funnel): dense meshes, no flat faces, supports everywhere,
@@ -60,6 +60,14 @@ leaves in the variant folder say which nozzle printed what, where. A tool that o
 - Add a line under `## [Unreleased]` in `CHANGELOG.md`.
 - Never commit a printer serial, access code, IP address or personal path. Run
   `rg -n '192\.168|access_code|/Users/'` before pushing.
+- `tests/test_public_hygiene.py` fails on a home path, a 192.168 address, a Bambu preset folder id, a full session UUID,
+  a short id after "session" or "thread", a printer serial (full or masked), a path into a personal notes or site
+  repository, or a private-context phrase (`GENERIC_TERMS` in the test) in any tracked file. Fixture serials are
+  invented and hold a word (`00X0TEST0000999`).
+- Employer, client and private project names, part names and account names go in the untracked file
+  `~/.config/shambu/private-terms` (or `$XDG_CONFIG_HOME/shambu/private-terms`), one per line, never in a tracked
+  file. Only a local run reads it: CI has no such file, and the private-term test skips with a reason that says the
+  names were not checked. Run `make check` locally with the file in place before every push.
 
 ## Printer safety
 

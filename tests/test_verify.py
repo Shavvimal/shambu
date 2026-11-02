@@ -34,7 +34,7 @@ def spec_file(tmp_path, *, body=None, label=None, filaments=None, **over):
         "name": "v",
         "outdir": str(tmp_path / "out"),
         "printer": MACHINE,
-        "process": {"base": PROCESS, "name": "Sweeper", "set": {"wall_loops": "4", "sparse_infill_density": "25%"}},
+        "process": {"base": PROCESS, "name": "Strong PETG", "set": {"wall_loops": "4", "sparse_infill_density": "25%"}},
         "filaments": filaments or [{"preset": "Test PLA", "colour": "#00AE42"}, {"preset": "Test PLA", "colour": "#FFFFFF"}],
         "bed_type": "Cool Plate",
         "plates": [
@@ -104,9 +104,9 @@ def test_stock_process_without_a_list_names_every_reset_key(capsys, tmp_path):
 
 
 def test_user_preset_id_is_a_fail(capsys, tmp_path):
-    code, lines = verify(capsys, project(tmp_path, print_settings_id="Sweeper"), spec_file(tmp_path))
+    code, lines = verify(capsys, project(tmp_path, print_settings_id="Strong PETG"), spec_file(tmp_path))
     assert code == 1
-    assert "FAIL process preset id: expected 0.20mm Test, got Sweeper (Studio selects the preset by this name)" in lines
+    assert "FAIL process preset id: expected 0.20mm Test, got Strong PETG (Studio selects the preset by this name)" in lines
 
 
 def test_right_value_missing_from_the_list_fails_because_the_next_open_resets_it(capsys, tmp_path):

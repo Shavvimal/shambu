@@ -351,7 +351,7 @@ def test_printer_error_text_never_carries_the_ip_into_the_report(tmp_path, stls,
     r = Bambu(studio=FakeStudio(), resolver=resolver).build(Spec.from_json(spec_json(tmp_path, stls, [{"preset": GENERIC}])), export=False)
     blob = r.report + json.dumps(r.to_json())
     assert "10.11.12.13" not in blob and "cannot connect to <ip>:8883" in blob
-    assert redact_ip("x 192.168.0.40 y 1.2.3.4") == "x <ip> y <ip>"
+    assert redact_ip("x 172.16.0.40 y 1.2.3.4") == "x <ip> y <ip>"
 
 
 def test_filament_map_decides_which_nozzle_is_compared(tmp_path, stls, resolver, with_printer):

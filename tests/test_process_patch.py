@@ -155,13 +155,13 @@ def test_slice_settings_from_refuses_an_export_with_another_process(capsys, tmp_
     fixture = two(tmp_path / "studio.gcode.3mf", sliced=True, print_settings_id="Other", printer_settings_id=MACHINE, wall_loops="4")
     doc = _fail_slice(capsys, tmp_path, monkeypatch, resolver, FakeStudio(fixture=fixture))
     text = json.dumps(doc)
-    assert "the export's process is 'Other', the slice asked for 'Sweeper' (print_settings_id)" in text
+    assert "the export's process is 'Other', the slice asked for 'Strong PETG' (print_settings_id)" in text
     kept = next(tmp_path.glob("o.slice-*/o.gcode.3mf"))
     assert ps_of(kept)["print_settings_id"] == "Other"  # no bookkeeping written over a wrong export
 
 
 def test_slice_settings_from_refuses_an_export_with_another_override_value(capsys, tmp_path, monkeypatch, resolver):
-    fixture = two(tmp_path / "studio.gcode.3mf", sliced=True, print_settings_id="Sweeper", printer_settings_id=MACHINE, wall_loops="2")
+    fixture = two(tmp_path / "studio.gcode.3mf", sliced=True, print_settings_id="Strong PETG", printer_settings_id=MACHINE, wall_loops="2")
     doc = _fail_slice(capsys, tmp_path, monkeypatch, resolver, FakeStudio(fixture=fixture))
     assert "the export's process setting wall_loops is '2', the slice asked for '4'" in json.dumps(doc)
     assert "the export's process is" not in json.dumps(doc)
@@ -183,7 +183,7 @@ def test_process_set_measures_against_the_inherits_parent_of_an_installed_user_p
 
 
 def test_process_set_on_a_project_only_name_appends_the_key(capsys, tmp_path):
-    f = two(tmp_path / "f.3mf", print_settings_id="Sweeper", wall_loops="4", brim_type="auto_brim")
+    f = two(tmp_path / "f.3mf", print_settings_id="Strong PETG", wall_loops="4", brim_type="auto_brim")
     code, _, _ = run(capsys, "patch", str(f), "--process-set", "brim_type=no_brim")
     assert code == 0 and ps_of(f)["different_settings_to_system"][0] == "brim_type"
 
@@ -218,7 +218,7 @@ def _slice_spec(tmp_path, process_set):
                 "name": "s",
                 "outdir": str(tmp_path),
                 "printer": MACHINE,
-                "process": {"base": PROCESS, "name": "Sweeper", "set": process_set},
+                "process": {"base": PROCESS, "name": "Strong PETG", "set": process_set},
                 "filaments": [{"preset": "Test PLA"}],
                 "plates": [{"parts": []}],
             }

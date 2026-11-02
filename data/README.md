@@ -1,7 +1,7 @@
 # data/: real CAD parts for testing (gitignored)
 
 Synthetic boxes pass the unit tests; real parts find the bugs. Everything in this folder except this README is
-ignored by git. Copy STLs here from your CAD exports (the gripper parts from the openarm build, a funnel, a URDF
+ignored by git. Copy STLs here from your CAD exports (the parts of a robot-gripper build, a funnel, a URDF
 mesh in metres) and run the manual loop below before a release. Nothing here is committed, so sizes and
 licences do not matter.
 
@@ -24,7 +24,7 @@ different assumption. Suggested contents (what found the 0.2.0 bugs, see
   only the last object;
 - organic forms (a lamp with no flat base, a duck, two funnels): found the slenderness gap (a 6 mm rod ranked
   standing), the empty orientation sweep, and the by-object win (1 h 13 against 2 h 40, 273 swaps);
-- an assembly with several bodies (an OpenArm gripper with motors, 88 bodies): found the missing multi-body note
+- an assembly with several bodies (a robot-arm gripper with motors, 88 bodies): found the missing multi-body note
   and the `split` count that disagrees with Studio's parts.
 
 The loop (each command takes up to about 1.6 s per part, a 520k-facet `orient` about 13 s, a sweep 1 to 7 s per

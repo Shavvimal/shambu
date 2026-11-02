@@ -280,7 +280,7 @@ summed two neighbours' margins.
 | the same plate with the tag bridge laid flat (its designer's bed face) | **2 h 27, 62.0 g, 14 changes, 1.6 g tower** | (by object not re-run) |
 | 4 x 10x10x15 mm cubes, 2 per filament, merged into 2 groups (notes-research A) | 42 m 16 s, 75 changes | **21 m 04 s merged**; 29 m 05 s as 4 separate objects; 1 change each |
 | 2 boxes (20x20x10, 15x25x12) on filament 1 + 2 x 18x18x8 on filament 2 (`group_by_filament`, live) | not run | **23 m 30 s grouped** (1410 s); 26 m 32 s separate (1592 s); 1 change each |
-| OpenArm: J7_joint_B + camera_mount (PLA, f1), shaft_A (PETG, f2) | 1 h 24, 20.6 g, 70 changes, 7.2 g tower | **59 m, 13.3 g, 1 change** |
+| robot arm: a joint part + a camera mount (PLA, f1), a shaft (PETG, f2) | 1 h 24, 20.6 g, 70 changes, 7.2 g tower | **59 m, 13.3 g, 1 change** |
 | SO-101 wrist: wrist_roll_follower, wrist_roll_pitch, moving_jaw (PLA, one filament, 20 to 65 mm tall, tree supports) | **3 h 23, 84.5 g** | 3 h 24, 84.4 g (1 min slower) |
 | SO-101: 3 x motor_holder_wrist (28 mm, one filament) | 1 h 20 | **1 h 19** |
 | Gridfinity: 6 labels, text part on filament 2 | **38 m (2299 s), 8.5 g, 3 changes, 0.3 g tower** | 40 m (2404 s, +105 s), 8.1 g, 23 changes, no tower |
@@ -301,7 +301,7 @@ the minimum layer time (outer wall 278 s merged vs 421 s separate on the four cu
 measured). Each group was timed once.
 
 The real-part rows (one slice each) agree: by object won by about 1 h 27 min on the duck and funnels and by 25 min on
-the OpenArm plate, where each filament holds whole objects; it lost 1 min to 105 s on single-filament or tiny
+the robot-arm plate, where each filament holds whole objects; it lost 1 min to 105 s on single-filament or tiny
 two-colour plates (SO-101 wrist, Gridfinity bins and labels). On six Gridfinity bins a recipe beat both: `fast-infill`
 4 h 39 against 5 h 21 for the baseline (`wide-line-two-loop-walls` 4 h 44, `coarse-fast` 4 h 58); by object did not
 fit one plate.
@@ -455,9 +455,9 @@ Not verified: whether a native `classcad-cli` worker build imports STL as a soli
 - Support spread: tree support reached 15.6 mm past a gripper bracket's box, on one side, below z 10 (Studio -101
   at gap 15, sliced at 20). The layout then kept 0.25 x height, 5..25 mm, on every side of a supported part (3.6);
   that over-reserved and refused the 2026-10-20 housing plate. Section 11 holds the rule now.
-- Metres: `check` passed an OpenArm J7_joint_B scaled to metres (0.0 x 0.0 x 0.0 mm, OK) and Studio failed with -100.
+- Metres: `check` passed a robot-arm joint part scaled to metres (0.0 x 0.0 x 0.0 mm, OK) and Studio failed with -100.
   A mesh under 1 mm now fails `check`; the SO-101 URDF meshes are the real case.
-- Export failure: on the gripper p5-bracket plate (-101), OpenArm G3 (-63) and SO-101 plate-arms the report said
+- Export failure: on a gripper bracket plate (-101), a robot-arm plate (-63) and SO-101 plate-arms the report said
   "already sliced" and pointed at a missing `.gcode.3mf`. It now says "export failed" with Studio's error.
 - T lines: Gridfinity labels with a height range on filament 2 reported 0 filament changes; the start G-code's
   indented `T1 H-1` was skipped. The first T line now sets the loaded filament.

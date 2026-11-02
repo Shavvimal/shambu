@@ -36,7 +36,7 @@ def spec_json(tmp_path: Path) -> dict:
         "printer": MACHINE,
         "process": {
             "base": PROCESS,
-            "name": "Sweeper",
+            "name": "Strong PETG",
             "recipes": ["two-filament-plate"],
             "set": {"wall_loops": "4", "sparse_infill_density": "25%"},
         },
