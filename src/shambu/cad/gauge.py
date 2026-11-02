@@ -61,7 +61,7 @@ class Bore:
     wall_mm: float | None
     floor_mm: float | None
     ends: str  # "through", "blind" or "step" (a narrower bore continues)
-    residual_mm: float
+    residual_mm: float | None  # None when the walled band does not fit a circle
     vertices: int
     diameter_min_mm: float | None = None  # the narrowest and widest across the band vertices (None: not measured)
     diameter_max_mm: float | None = None
@@ -76,7 +76,7 @@ class Bore:
             "wall_mm": round(self.wall_mm, 3) if self.wall_mm is not None else None,
             "floor_mm": round(self.floor_mm, 3) if self.floor_mm is not None else None,
             "ends": self.ends,
-            "residual_mm": round(self.residual_mm, 5),
+            "residual_mm": round(self.residual_mm, 5) if self.residual_mm is not None else None,
             "vertices": self.vertices,
             "diameter_min_mm": round(self.diameter_min_mm, 4) if self.diameter_min_mm is not None else None,
             "diameter_max_mm": round(self.diameter_max_mm, 4) if self.diameter_max_mm is not None else None,
@@ -194,12 +194,13 @@ class Gauge:
         ]
         d_min: float | None
         d_max: float | None
+        rms: float | None
         try:
             cu2, cv2, r2, rms = L.fit_circle([(L.dot(p, u), L.dot(p, v)) for p in band])
             radii = [math.hypot(L.dot(p, u) - cu2, L.dot(p, v) - cv2) for p in band]
             d_min, d_max = 2 * min(radii), 2 * max(radii)
         except ValueError:
-            cu2, cv2, r2, rms = cu, cv, r_rays, math.nan
+            cu2, cv2, r2, rms = cu, cv, r_rays, None
             d_min = d_max = None
         centre = L.add(L.add(L.mul(u, cu2), L.mul(v, cv2)), L.mul(a, mouth_t))
         offset = math.hypot(cu2 - L.dot(mouth, u), cv2 - L.dot(mouth, v))

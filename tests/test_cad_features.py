@@ -174,3 +174,24 @@ def test_an_unmeasured_wall_is_incomplete_not_a_pass():
     fit = F.Fit("wall-test", "clearance", 4.0, wall_min_mm=2.0, basis="test")
     (f,) = [f for f in GA.judge("p", "h1", fit, b, (0, 0, -1), (10, 10, 5), None, None, {}) if f.severity == "FAIL"]
     assert f.code.startswith("cad.incomplete.")
+
+
+def test_a_failed_band_fit_reports_no_residual_and_still_prints(tmp_path, capsys, monkeypatch):
+    """A failed refit of the walled band once set the residual to NaN, and the strict JSON writer crashed on it."""
+    import sys
+
+    from shambu.cad import linalg as L
+
+    real = L.fit_circle
+
+    def fit(points):
+        if sys._getframe(1).f_code.co_name == "bore":
+            raise ValueError("degenerate band")
+        return real(points)
+
+    monkeypatch.setattr(L, "fit_circle", fit)
+    part = stl(tmp_path / "p.stl", plate_with_holes((20, 20, 5), [{"x": 10, "y": 10, "stages": [(2.25, 0)]}]))
+    _, doc, _, _ = run(capsys, "cad", "fit", str(part), "--hole", "h1:M4-clearance-medium:10,10,5:0,0,-1")
+    assert doc is not None and "error" not in doc
+    (row,) = doc["rules"][0]["parts"]["p"]["holes"]
+    assert row["bore"]["residual_mm"] is None
