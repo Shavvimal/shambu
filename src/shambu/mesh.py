@@ -161,8 +161,21 @@ def parse_stl(data: bytes, name: str = "STL") -> list[Facet]:
             return _read_binary(data, n)
     text = data.decode("utf-8", errors="replace")
     if "facet" in text or text.lstrip().lower().startswith("solid"):
-        return _read_ascii(text)
-    raise BuildError(f"{p}: neither a binary nor an ASCII STL")
+        try:
+            facets = _read_ascii(text)
+        except BuildError as e:
+            raise BuildError(f"{p}: {e}") from e
+        if facets or len(data) < 84 or "vertex" in text:
+            return facets
+    raise BuildError(f"{p}: neither a binary STL nor an ASCII STL with facets{_binary_mismatch(data)}")
+
+
+def _binary_mismatch(data: bytes) -> str:
+    """Why the bytes are not a binary STL, when they are long enough to have a binary header."""
+    if len(data) < 84:
+        return ""
+    (n,) = struct.unpack_from("<I", data, 80)
+    return f" (as binary, the header says {n} facets, {84 + 50 * n} bytes, but the file has {len(data)} bytes)"
 
 
 def _read_binary(data: bytes, n: int) -> list[Facet]:
@@ -181,7 +194,11 @@ def _read_ascii(text: str) -> list[Facet]:
             parts = s.split()
             if len(parts) != 4:
                 raise BuildError(f"bad STL vertex line: {line!r}")
-            verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            try:
+                v = (float(parts[1]), float(parts[2]), float(parts[3]))
+            except ValueError as e:
+                raise BuildError(f"bad STL vertex line: {line!r} (a coordinate is not a number)") from e
+            verts.append(v)
             if len(verts) == 3:
                 out.append((verts[0], verts[1], verts[2]))
                 verts = []

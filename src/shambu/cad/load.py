@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import math
 from pathlib import Path
 
 from ..errors import BambuError, CadError, CadSpecError, MeshMissing
@@ -35,6 +36,7 @@ def load_subject(path: str | Path, name: str | None = None, obj: str | None = No
             facets = parse_stl(raw, str(path))
             if not facets:
                 raise CadError(f"{path}: the STL has no facets")
+            _finite(facets, path)
             return Subject(name or p.stem, str(path), facets, sha, "stl", raw=raw)
         if low.endswith(".3mf"):
             from ..edits import object_meshes
@@ -56,6 +58,7 @@ def load_subject(path: str | Path, name: str | None = None, obj: str | None = No
                 chosen = found[0]
             if not chosen.facets:
                 raise CadError(f"{path}: object {chosen.name!r} has no mesh")
+            _finite(chosen.facets, path)
             return Subject(name or chosen.name, str(path), list(chosen.facets), sha, "3mf", chosen.name, raw)
     except OSError as e:
         raise CadError(f"cannot read {path}: {e}") from e
@@ -64,6 +67,14 @@ def load_subject(path: str | Path, name: str | None = None, obj: str | None = No
     except BambuError as e:  # BuildError from read_stl, ProjectError and EditError from the 3MF reader
         raise CadError(f"{path}: {e}") from e
     raise CadError(f"{path}: shambu cad reads .stl and .3mf files")
+
+
+def _finite(facets, path: str | Path) -> None:
+    """Raises CadError at the first vertex coordinate that is NaN or infinite: no gate can measure it."""
+    for k, f in enumerate(facets):
+        for v in f:
+            if not all(math.isfinite(x) for x in v):
+                raise CadError(f"{path}: facet {k} has a vertex that is not finite: {list(v)}")
 
 
 def load_spec(path: str | Path) -> S.CadSpec:

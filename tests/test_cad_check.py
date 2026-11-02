@@ -116,3 +116,39 @@ def test_an_inward_shell_outside_every_body_is_not_a_void():
     areas = SO.check("b", box((0, 0, 0), (10, 10, 10)) + _inward_box((20, 20, 20), (25, 25, 25)), None, SO.Expect())
     codes_ = {f.code: f.severity for f in areas["solid"].findings}
     assert codes_.get("solid.inverted") == "FAIL" and "solid.void" not in codes_
+
+
+def _ascii_stl(path, first_vertex):
+    path.write_text(
+        "solid b\nfacet normal 0 0 0\nouter loop\n"
+        f"vertex {first_vertex}\nvertex 1 0 0\nvertex 0 1 0\n"
+        "endloop\nendfacet\nendsolid b\n"
+    )
+    return path
+
+
+def test_a_bad_stl_coordinate_is_a_named_error(tmp_path, capsys, vertex):
+    """A non-numeric or non-finite vertex once crashed every cad verb with a traceback."""
+    p = _ascii_stl(tmp_path / "bad.stl", vertex)
+    code, doc, _, _ = run(capsys, "cad", "check", str(p))
+    assert code == 3 and "bad.stl" in doc["error"] and "vertex" in doc["error"]
+
+
+def test_a_non_finite_binary_stl_coordinate_is_a_named_error(tmp_path, capsys):
+    import struct
+
+    tri = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, math.nan, 0.0)]
+    data = b"\0" * 80 + struct.pack("<I", 1) + struct.pack("<12f", 0, 0, 0, *[x for v in tri for x in v]) + b"\0\0"
+    p = tmp_path / "nan.stl"
+    p.write_bytes(data)
+    code, doc, _, _ = run(capsys, "cad", "check", str(p))
+    assert code == 3 and "nan.stl" in doc["error"] and "finite" in doc["error"]
+
+
+def test_a_truncated_binary_stl_names_the_size_mismatch(tmp_path, capsys):
+    """A binary STL whose header starts with `solid` and lost its tail once read as an empty ASCII STL."""
+    full = stl(tmp_path / "full.stl", box((0, 0, 0), (10, 10, 10))).read_bytes()
+    p = tmp_path / "cut.stl"
+    p.write_bytes(b"solid cube" + full[10:-30])
+    code, doc, _, _ = run(capsys, "cad", "check", str(p))
+    assert code == 3 and "12 facets" in doc["error"] and str(len(full) - 30) in doc["error"]
