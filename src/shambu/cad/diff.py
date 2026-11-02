@@ -10,12 +10,15 @@
 4. Impact, with a shambu plate spec: the plates that hold the changed STL (reslice them), whether
    `shambu patch --replace-mesh` applies (a size change needs `--allow-size-change`; a changed bed face needs a new
    orientation), and which changed features carry a fit in the CAD spec (`diff.coupon`: print a coupon first).
-5. Intent, with an expectation file (`{"changes": [{"feature": "h1", "diameter_mm": 3.5, "coupon": true},
-   {"measure": "size_z", "delta_mm": 2}, {"measure": "volume_mm3", "delta_mm3": -1728}]}`): a change not listed is
-   `diff.unexpected` (FAIL), a listed change that did not happen is `diff.expected_missing` (FAIL), and a changed fit
-   whose entry makes no coupon decision is `diff.coupon_undecided` (FAIL). A volume or section change counts as
-   explained only by a `volume_mm3` entry or by a listed size or feature change that happened; otherwise it is
-   `diff.unexpected` (an internal cavity changes neither the outside size nor a cylindrical feature).
+5. Intent, with an expectation file (`{"changes": [{"feature": "h1", "change": "resized", "diameter_mm": 3.5,
+   "coupon": true}, {"measure": "size_z", "delta_mm": 2}, {"measure": "volume_mm3", "delta_mm3": -1728}]}`; an
+   unknown key, a missing `change` or delta is a CadSpecError): a change not listed is `diff.unexpected` (FAIL), a
+   listed change that did not happen is `diff.expected_missing` (FAIL), and a changed fit whose entry makes no coupon
+   decision is `diff.coupon_undecided` (FAIL). Each entry excuses only the change it names: a volume change needs a
+   `volume_mm3` entry or listed feature changes whose cylinders account for it (a size change always needs the
+   entry), and a section band needs a `volume_mm3` entry, a listed size change or a listed feature change inside the
+   band; otherwise it is `diff.unexpected` (an internal cavity changes neither the outside size nor a cylindrical
+   feature).
    Spec holes name features in both inventories, so a new hole keeps its spec name. A hole that goes from through to
    blind (or back) is a change even when its diameter, centre and depth match.
 
@@ -26,6 +29,7 @@ moved part, no change below the section spacing, nothing a STEP B-rep carries th
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -358,6 +362,83 @@ def impact(
 
 
 MEASURES = (*SIZE_AXES, "volume_mm3")
+CHANGE_KINDS = ("resized", "moved", "gone", "new")
+ENDS = ("through", "blind", "closed")
+FEATURE_KEYS = ("feature", "change", "diameter_mm", "ends", "coupon")
+FEATURE_VOLUME_SHARE = 0.05  # a listed feature change accounts for its cylinder's volume to within 5 % (faceting)
+
+
+def _is_num(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def parse_expectation(expect: Mapping) -> tuple[dict[str, Mapping], dict[str, Mapping]]:
+    """(measure entries by measure, feature entries by feature) of an expectation file. Raises CadSpecError for an
+    unknown key, a missing delta or change, a wrong type or a duplicate: an entry that does not parse would otherwise
+    excuse changes it does not name."""
+    items = expect.get("changes")
+    if not isinstance(items, list) or set(expect) - {"changes"}:
+        raise CadSpecError('the expectation file is {"changes": [{"feature": ...} | {"measure": ...}]}')
+    measures: dict[str, Mapping] = {}
+    feats: dict[str, Mapping] = {}
+    for k, it in enumerate(items):
+        w = f"changes[{k}]"
+        if not isinstance(it, Mapping) or ("feature" in it) == ("measure" in it):
+            raise CadSpecError(f"{w}: one of 'feature' or 'measure'")
+        if "measure" in it:
+            m = it["measure"]
+            if m not in MEASURES:
+                raise CadSpecError(f"{w}.measure: one of {MEASURES}")
+            key = "delta_mm3" if m == "volume_mm3" else "delta_mm"
+            unknown = sorted(set(it) - {"measure", key})
+            if unknown:
+                raise CadSpecError(f"{w}: unknown keys {unknown}; a {m} entry is {{'measure': {m!r}, {key!r}: number}}")
+            if not _is_num(it.get(key)):
+                raise CadSpecError(f"{w}.{key}: the expected change, a number; got {it.get(key)!r}")
+            if m in measures:
+                raise CadSpecError(f"{w}: {m} is listed twice")
+            measures[m] = it
+            continue
+        unknown = sorted(set(it) - set(FEATURE_KEYS))
+        if unknown:
+            raise CadSpecError(f"{w}: unknown keys {unknown}; a feature entry takes {list(FEATURE_KEYS)}")
+        name = it["feature"]
+        if not isinstance(name, str) or not name:
+            raise CadSpecError(f"{w}.feature: a spec hole name or the id cad diff prints")
+        if it.get("change") not in CHANGE_KINDS:
+            raise CadSpecError(f"{w}.change: one of {CHANGE_KINDS}; got {it.get('change')!r}")
+        if it.get("diameter_mm") is not None and not _is_num(it["diameter_mm"]):
+            raise CadSpecError(f"{w}.diameter_mm: a number")
+        if it.get("ends") is not None and it["ends"] not in ENDS:
+            raise CadSpecError(f"{w}.ends: one of {ENDS}")
+        if "coupon" in it and not isinstance(it["coupon"], bool):
+            raise CadSpecError(f"{w}.coupon: true or false")
+        if name in feats:
+            raise CadSpecError(f"{w}: {name} is listed twice")
+        feats[name] = it
+    return measures, feats
+
+
+def _cylinder_mm3(f: FT.Feature | None) -> float:
+    """The material a feature adds (a boss) or removes (a hole), as a cylinder of its diameter and depth."""
+    if f is None:
+        return 0.0
+    v = math.pi * f.diameter_mm**2 / 4 * f.depth_mm
+    return v if f.kind == "boss" else -v
+
+
+def _span(f: FT.Feature | None, axis: int) -> tuple[float, float] | None:
+    """The extent of a feature's cylinder along one coordinate axis."""
+    if f is None:
+        return None
+    a = abs(f.axis[axis])
+    half = a * f.depth_mm / 2 + math.sqrt(max(0.0, 1 - a * a)) * f.diameter_mm / 2
+    return f.centre[axis] - half, f.centre[axis] + half
+
+
+def _covers(c: Change, axis: int, lo: float, hi: float) -> bool:
+    spans = [sp for sp in (_span(c.old, axis), _span(c.new, axis)) if sp is not None]
+    return any(a <= hi and lo <= b for a, b in spans)
 
 
 def expect_findings(
@@ -370,26 +451,13 @@ def expect_findings(
     shape_findings: Sequence[Finding] = (),
 ) -> list[Finding]:
     """Changes the expectation file does not list, listed changes that did not happen, and changed fits with no
-    coupon decision. `shape_findings` are the `diff.volume` and `diff.section` findings: each needs a `volume_mm3`
-    entry or a listed size or feature change that happened. Raises CadSpecError when the file breaks its shape."""
-    items = expect.get("changes")
-    if not isinstance(items, list):
-        raise CadSpecError('the expectation file is {"changes": [{"feature": ...} | {"measure": ...}]}')
+    coupon decision. `shape_findings` are the `diff.volume` and `diff.section` findings. Each entry excuses only the
+    change it names: a `diff.volume` needs a `volume_mm3` entry, or listed feature changes whose cylinders account for
+    the volume change (and no size change); a `diff.section` band needs a `volume_mm3` entry, a listed size change
+    that happened, or a listed feature change that happened within the band. Raises CadSpecError when the file breaks
+    its shape."""
+    listed_measures, listed_features = parse_expectation(expect)
     fs: list[Finding] = []
-    listed_measures: dict[str, Mapping] = {}
-    listed_features: dict[str, Mapping] = {}
-    for k, it in enumerate(items):
-        if not isinstance(it, Mapping) or ("feature" in it) == ("measure" in it):
-            raise CadSpecError(f"changes[{k}]: one of 'feature' or 'measure'")
-        if "measure" in it:
-            if it["measure"] not in MEASURES:
-                raise CadSpecError(f"changes[{k}].measure: one of {MEASURES}")
-            key = "delta_mm3" if it["measure"] == "volume_mm3" else "delta_mm"
-            if it.get(key) is not None and (isinstance(it[key], bool) or not isinstance(it[key], (int, float))):
-                raise CadSpecError(f"changes[{k}].{key}: a number")
-            listed_measures[str(it["measure"])] = it
-        else:
-            listed_features[str(it["feature"])] = it
     for ax in SIZE_AXES:
         d = deltas[ax]["delta"]
         want = listed_measures.get(ax)
@@ -406,52 +474,58 @@ def expect_findings(
                 )
             )
         elif want is not None:
-            target = want.get("delta_mm")
-            if target is not None and abs(d - float(target)) > size_tol_mm:
+            target = float(want["delta_mm"])
+            if abs(d - target) > size_tol_mm:
                 fs.append(
                     Finding(
                         "diff.unexpected" if moved else "diff.expected_missing",
                         FAIL,
                         "diff",
-                        f"{ax} changed by {d:+.3f} mm, the expectation says {float(target):+g}",
+                        f"{ax} changed by {d:+.3f} mm, the expectation says {target:+g}",
                         MEASURED,
-                        measure={"measure": ax, "delta_mm": d, "expected_delta_mm": float(target), "expected_from": "expect"},
+                        measure={"measure": ax, "delta_mm": d, "expected_delta_mm": target, "expected_from": "expect"},
                     )
                 )
-    explained = False  # a listed size or feature change that happened accounts for a volume or section change
     vol = listed_measures.get("volume_mm3")
     dv = deltas["volume_mm3"]["delta"]
     if vol is not None:
-        explained = True
-        target = vol.get("delta_mm3")
-        if target is not None and abs(dv - float(target)) > volume_tol_mm3:
+        target = float(vol["delta_mm3"])
+        if abs(dv - target) > volume_tol_mm3:
             fs.append(
                 Finding(
                     "diff.unexpected" if abs(dv) > volume_tol_mm3 else "diff.expected_missing",
                     FAIL,
                     "diff",
-                    f"volume changed by {dv:+.1f} mm3, the expectation says {float(target):+g}",
+                    f"volume changed by {dv:+.1f} mm3, the expectation says {target:+g}",
                     MEASURED,
-                    measure={
-                        "measure": "volume_mm3",
-                        "delta_mm3": dv,
-                        "expected_delta_mm3": float(target),
-                        "tolerance_mm3": volume_tol_mm3,
-                    },
+                    measure={"measure": "volume_mm3", "delta_mm3": dv, "expected_delta_mm3": target, "tolerance_mm3": volume_tol_mm3},
                 )
             )
-    explained = explained or any(ax in listed_measures and abs(deltas[ax]["delta"]) > size_tol_mm for ax in SIZE_AXES)
-    explained = explained or any(c.kind != "same" and c.id in listed_features for c in changes)
-    if shape_findings and not explained:
-        what = sorted({f.code for f in shape_findings})
+    happened = [c for c in changes if c.kind != "same" and c.id in listed_features]
+    sized = any(ax in listed_measures and abs(deltas[ax]["delta"]) > size_tol_mm for ax in SIZE_AXES)
+    loose: list[str] = []
+    if vol is None and any(f.code == "diff.volume" for f in shape_findings):
+        est = sum(_cylinder_mm3(c.new) - _cylinder_mm3(c.old) for c in happened)
+        if sized:
+            loose.append(f"volume {dv:+.1f} mm3 (a size change does not say how much: list volume_mm3)")
+        elif abs(dv - est) > volume_tol_mm3 + FEATURE_VOLUME_SHARE * abs(est):
+            loose.append(f"volume {dv:+.1f} mm3" + (f" (the listed feature changes account for {est:+.1f})" if happened else ""))
+    if vol is None and not sized:
+        for f in shape_findings:
+            if f.code != "diff.section" or not f.measure:
+                continue
+            ax, lo, hi = str(f.measure["axis"]), float(f.measure["from_mm"]), float(f.measure["to_mm"])
+            if not any(_covers(c, "xyz".index(ax), lo, hi) for c in happened):
+                loose.append(f"section {ax} {lo:.1f} to {hi:.1f}")
+    if loose:
         fs.append(
             Finding(
                 "diff.unexpected",
                 FAIL,
                 "diff",
-                f"the volume or a section changed ({', '.join(what)}) and no listed change accounts for it",
+                f"no listed change accounts for: {'; '.join(loose)}",
                 MEASURED,
-                measure={"findings": what, "volume_delta_mm3": dv, "expected_from": "expect"},
+                measure={"unexplained": loose, "volume_delta_mm3": dv, "expected_from": "expect"},
                 fix=Fix('revert the change, or list it: {"measure": "volume_mm3", "delta_mm3": ...} or the feature that changed'),
             )
         )
@@ -473,7 +547,7 @@ def expect_findings(
                 )
             )
             continue
-        if want.get("change") is not None and want["change"] != c.kind:
+        if want["change"] != c.kind:
             fs.append(
                 Finding(
                     "diff.unexpected",
@@ -492,6 +566,17 @@ def expect_findings(
                     FAIL,
                     "diff",
                     f"{c.id}: d {got} mm, the expectation says {want['diameter_mm']}",
+                    MEASURED,
+                    measure={"feature": c.id},
+                )
+            )
+        if want.get("ends") is not None and (c.new is None or c.new.ends != want["ends"]):
+            fs.append(
+                Finding(
+                    "diff.unexpected",
+                    FAIL,
+                    "diff",
+                    f"{c.id}: ends {c.new.ends if c.new else 'none'}, the expectation says {want['ends']}",
                     MEASURED,
                     measure={"feature": c.id},
                 )

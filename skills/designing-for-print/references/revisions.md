@@ -13,17 +13,24 @@ of it:
 
 ```json
 {"changes": [
-  {"feature": "h2", "diameter_mm": 4.2, "coupon": true},
-  {"measure": "size_z", "delta_mm": 2}
+  {"feature": "h2", "change": "resized", "diameter_mm": 4.2, "coupon": true},
+  {"measure": "size_z", "delta_mm": 2},
+  {"measure": "volume_mm3", "delta_mm3": 1550}
 ]}
 ```
 
 - `feature`: a spec hole name (the hole whose mouth lies on that feature's axis), or the id `cad diff` prints for a
-  feature with no name (`hole d4.00 at (30.0, 12.0, 2.5)`). Optional `change` (`resized`, `moved`, `gone`, `new`),
-  `diameter_mm` (the new diameter) and `coupon` (true or false; required when the feature carries a fit).
-- `measure`: `size_x`, `size_y` or `size_z` with `delta_mm`, or `volume_mm3` with `delta_mm3`.
-- A volume or section change must be accounted for: by a `volume_mm3` entry, or by a listed size or feature change
-  that happened. An internal change (a cavity, a rib) with neither is `diff.unexpected`.
+  feature with no name (`hole d4.00 at (30.0, 12.0, 2.5)`). `change` is required: `resized`, `moved`, `gone` or
+  `new`. Optional: `diameter_mm` (the new diameter), `ends` (`through`, `blind` or `closed`) and `coupon` (true or
+  false; required when the feature carries a fit).
+- `measure`: `size_x`, `size_y` or `size_z` with `delta_mm`, or `volume_mm3` with `delta_mm3`. The delta is
+  required.
+- Any other key, a missing `change` or delta, or a feature listed twice is an expectation error (exit 1): an entry
+  that does not parse would excuse changes it does not name.
+- Each entry excuses only the change it names. A volume change needs a `volume_mm3` entry, or listed feature changes
+  whose cylinders (diameter x depth) account for it; a size change always needs a `volume_mm3` entry as well. A
+  section band needs a `volume_mm3` entry, a listed size change, or a listed feature change inside the band. An
+  internal change (a cavity, a rib) that nothing lists is `diff.unexpected`.
 
 ## Run and read the diff
 

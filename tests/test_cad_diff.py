@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from cadfix import codes, fails, run, spec, stl
 from meshes import box, plate_with_holes
 from shambu import meshgeom as G
@@ -74,7 +76,7 @@ def test_a_changed_fit_needs_a_coupon(tmp_path, capsys):
 def test_expect_names_the_intended_changes(tmp_path, capsys):
     a, b = _pair(tmp_path, _plate(5), _plate(7, holes=((12, 8, 2.0), (30, 12, 2.0))))
     exp = tmp_path / "expect.json"
-    exp.write_text(json.dumps({"changes": [{"measure": "size_z", "delta_mm": 2}]}))
+    exp.write_text(json.dumps({"changes": [{"measure": "size_z", "delta_mm": 2}, {"measure": "volume_mm3", "delta_mm3": 1549.7}]}))
     code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--expect", str(exp))
     assert code == 1 and fails(doc) == {"diff.unexpected"}
     (u,) = [f for f in doc["findings"] if f["code"] == "diff.unexpected"]
@@ -84,10 +86,12 @@ def test_expect_names_the_intended_changes(tmp_path, capsys):
 def test_expected_change_that_did_not_happen_and_coupon_decision(tmp_path, capsys):
     a, b = _pair(tmp_path, _plate(), _plate(holes=((10, 8, 2.0), (30, 12, 2.1))))
     exp = tmp_path / "expect.json"
-    exp.write_text(json.dumps({"changes": [{"feature": "h2", "diameter_mm": 4.2}, {"measure": "size_z", "delta_mm": 1}]}))
+    exp.write_text(
+        json.dumps({"changes": [{"feature": "h2", "change": "resized", "diameter_mm": 4.2}, {"measure": "size_z", "delta_mm": 1}]})
+    )
     code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--spec", str(_spec(tmp_path)), "--expect", str(exp))
     assert code == 1 and fails(doc) == {"diff.coupon_undecided", "diff.expected_missing"}
-    exp.write_text(json.dumps({"changes": [{"feature": "h2", "diameter_mm": 4.2, "coupon": True}]}))
+    exp.write_text(json.dumps({"changes": [{"feature": "h2", "change": "resized", "diameter_mm": 4.2, "coupon": True}]}))
     code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--spec", str(_spec(tmp_path)), "--expect", str(exp))
     assert code == 0 and fails(doc) == set()
 
@@ -168,7 +172,7 @@ def test_a_new_spec_hole_keeps_its_name(tmp_path, capsys):
         },
     )
     exp = tmp_path / "expect.json"
-    exp.write_text(json.dumps({"changes": [{"feature": "h1", "diameter_mm": 4.3, "coupon": True}]}))
+    exp.write_text(json.dumps({"changes": [{"feature": "h1", "change": "new", "diameter_mm": 4.3, "coupon": True}]}))
     code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--spec", str(sp), "--part", "bracket", "--expect", str(exp))
     assert code == 0 and fails(doc) == set() and doc["features"]["new"][0]["id"] == "h1"
     assert "diff.coupon" in codes(doc)
@@ -182,6 +186,61 @@ def test_through_to_blind_is_a_change():
     new = Feature("hole", 4.0, (0.0, 0.0, 1.0), (0.0, 0.0, 5.0), 10.0, "blind", 0.0, 64)
     (c,) = D.match_features([old], [new])
     assert c.kind == "resized" and D.match_features([old], [old])[0].kind == "same"
+
+
+@pytest.mark.parametrize(
+    ("item", "words"),
+    [
+        ({"measure": "volume_mm3", "delta_mm": -1728}, "changes[0]"),  # the wrong delta key once excused any change
+        ({"measure": "size_z"}, "changes[0].delta_mm"),  # no delta once excused any size_z change
+        ({"feature": "h2", "change": "resized", "colour": "red"}, "changes[0]"),
+        ({"feature": "h2", "diameter_mm": 4.2}, "changes[0].change"),
+        ({"feature": "h2", "change": "bigger"}, "changes[0].change"),
+        ({"feature": "h2", "change": "resized", "coupon": "yes"}, "changes[0].coupon"),
+    ],
+)
+def test_the_expectation_file_is_strict(tmp_path, capsys, item, words):
+    a, b = _pair(tmp_path, _plate(), _plate(holes=((10, 8, 2.0), (30, 12, 2.1))))
+    exp = tmp_path / "expect.json"
+    exp.write_text(json.dumps({"changes": [item]}))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--expect", str(exp))
+    assert code == 1 and "CadSpecError" in doc["error"] and words in doc["error"]
+
+
+def test_a_listed_resize_does_not_excuse_a_move(tmp_path, capsys):
+    a, b = _pair(tmp_path, _plate(), _plate(holes=((10, 8, 2.0), (33, 12, 2.0))))
+    exp = tmp_path / "expect.json"
+    exp.write_text(json.dumps({"changes": [{"feature": "h2", "change": "resized", "diameter_mm": 4.0, "coupon": False}]}))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--spec", str(_spec(tmp_path)), "--expect", str(exp))
+    assert code == 1 and "diff.unexpected" in fails(doc)
+
+
+def test_a_listed_size_change_does_not_excuse_the_volume(tmp_path, capsys):
+    a, b = _pair(tmp_path, _plate(5), _plate(7))
+    exp = tmp_path / "expect.json"
+    exp.write_text(json.dumps({"changes": [{"measure": "size_z", "delta_mm": 2}]}))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--expect", str(exp))
+    (u,) = [f for f in doc["findings"] if f["code"] == "diff.unexpected"]
+    assert code == 1 and "volume" in u["message"]
+    exp.write_text(json.dumps({"changes": [{"measure": "size_z", "delta_mm": 2}, {"measure": "volume_mm3", "delta_mm3": 1549.7}]}))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--expect", str(exp))
+    assert code == 0 and fails(doc) == set()
+
+
+def test_a_listed_feature_change_excuses_only_its_own_volume(tmp_path, capsys):
+    """One listed hole resize once excused every volume and section change, an internal cavity included."""
+    old = _plate(20)
+    new = _plate(20, holes=((10, 8, 2.0), (30, 12, 2.1)))
+    exp = tmp_path / "expect.json"
+    exp.write_text(json.dumps({"changes": [{"feature": "h2", "change": "resized", "diameter_mm": 4.2, "coupon": True}]}))
+    a, b = _pair(tmp_path, old, new)
+    code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--spec", str(_spec(tmp_path)), "--expect", str(exp))
+    assert code == 0 and fails(doc) == set()
+    a, b = _pair(tmp_path, old, new + _inward_box((14, 2, 5), (26, 18, 15)))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(a), str(b), "--spec", str(_spec(tmp_path)), "--expect", str(exp))
+    assert code == 1 and fails(doc) == {"diff.unexpected"}
+    (u,) = [f for f in doc["findings"] if f["code"] == "diff.unexpected"]
+    assert "volume" in u["message"]
 
 
 def test_a_missing_print_section_is_not_a_bed_face_change(tmp_path, capsys):
