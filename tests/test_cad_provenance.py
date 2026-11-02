@@ -195,3 +195,18 @@ def test_stamp_never_writes_over_its_stl_or_another_file(tmp_path, capsys):
     code, _, _, _ = run(capsys, "cad", "stamp", str(part), "--part", "bracket")
     code2, _, _, _ = run(capsys, "cad", "stamp", str(part), "--part", "bracket")
     assert code == code2 == 0  # a re-stamp still replaces its own earlier record
+
+
+def test_a_provenance_glob_that_matches_a_folder_hashes_only_files(tmp_path, capsys):
+    """`inputs/*` once matched a sub-folder and crashed the gate with IsADirectoryError."""
+    from cadfix import spec
+
+    (tmp_path / "inputs" / "sub").mkdir(parents=True)
+    (tmp_path / "inputs" / "a.js").write_text("// a\n")
+    stl(tmp_path / "p.stl", box((0, 0, 0), (10, 10, 10)))
+    doc = {"provenance": {"inputs": ["inputs/*"]}, "parts": [{"name": "p", "mesh": "p.stl"}], "rules": [{"id": "c", "type": "check"}]}
+    code, out, _, _ = run(capsys, "cad", "gate", str(spec(tmp_path / "cad.json", doc)))
+    assert code == 0 and out["build_id"].startswith("-@")
+    doc["provenance"]["inputs"] = ["inputs/sub"]  # a folder named outright is an input that does not read
+    code, out, _, _ = run(capsys, "cad", "gate", str(spec(tmp_path / "cad.json", doc)))
+    assert code == 3 and "inputs/sub" in out["error"]

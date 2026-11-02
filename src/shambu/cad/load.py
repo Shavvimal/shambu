@@ -133,12 +133,13 @@ class Scene:
         return P.load_record(rp)
 
     def build_id(self) -> str | None:
-        """The build id of the spec's `provenance.inputs` (globs expanded, sorted), or None without inputs."""
+        """The build id of the spec's `provenance.inputs` (globs expanded to regular files, sorted), or None without
+        inputs. Raises CadError when an input named outright does not read (a folder)."""
         if not self.spec.provenance_inputs:
             return None
         files: list[tuple[str, Path]] = []
         for pat in self.spec.provenance_inputs:
-            hits = sorted(glob.glob(str(self.base / pat)))
+            hits = sorted(h for h in glob.glob(str(self.base / pat)) if Path(h).is_file() or not any(c in pat for c in "*?["))
             if not hits:
                 files.append((pat, self.base / pat))
             for h in hits:

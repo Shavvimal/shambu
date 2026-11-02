@@ -49,7 +49,8 @@ def _framed(data: bytes) -> bytes:
 
 def build_id(inputs: Iterable[tuple[str, Path]], rev: str | None) -> str:
     """`rev@` + 12 hex of SHA-256 over (label, file) pairs in sorted label order: each label length-prefixed, then
-    `F` and the length-prefixed content, or `M` for a missing file."""
+    `F` and the length-prefixed content, or `M` for a missing file. Raises CadError for an input that is there and
+    does not read (a folder)."""
     h = hashlib.sha256()
     for label, path in sorted(inputs, key=lambda x: x[0]):
         h.update(_framed(label.encode()))
@@ -57,6 +58,8 @@ def build_id(inputs: Iterable[tuple[str, Path]], rev: str | None) -> str:
             h.update(b"F" + _framed(path.read_bytes()))
         except FileNotFoundError:
             h.update(b"M")
+        except OSError as e:  # a folder, a file with no read permission
+            raise CadError(f"input {label}: cannot read {path}: {e.strerror or e}") from e
     return f"{rev or '-'}@{h.hexdigest()[:12]}"
 
 
