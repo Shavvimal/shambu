@@ -7,9 +7,9 @@
 > No Bambu Studio code is included in shambu, and shambu is not affiliated with or endorsed by Bambu Lab.
 > See `DISCLAIMER.md` at the repository root.
 
-Source: https://github.com/davglass/bambu-cli, shallow clone at `bambu-cli-re/repo`, HEAD `d02dc27` (2025-01-28), v1.0.17, archived, 94 stars. About 2,300 lines of Node.js in `bin/cli.js` + 16 files in `lib/`. I read every source file. I did not run `npm install` or execute any of its code. No code is reused here, only ideas.
+Source: https://github.com/davglass/bambu-cli, v1.0.17 (archived), about 2,300 lines of Node.js in `bin/cli.js` + 16 files in `lib/`. No code is reused here, only ideas.
 
-Verdict in one line: the parts worth copying are the HMS decoder, the `slice_info.config` / `plate_N.json` / gcode-header 3MF reader, the fuzzy machine selector, the `mqtt --path` JSONPath debugger and the "which printer has the right filament" check. Its status model is X1C-only and pre-2025, so it is stale for the X2D.
+Verdict in one line: the ideas worth adopting are the HMS decoder, the `slice_info.config` / `plate_N.json` / gcode-header 3MF reader, the fuzzy machine selector, the `mqtt --path` JSONPath debugger and the "which printer has the right filament" check. Its status model is X1C-only and pre-2025, so it is stale for the X2D.
 
 ---
 
