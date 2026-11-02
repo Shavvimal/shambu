@@ -68,17 +68,17 @@ As a Claude Code plugin:
 To update later: `/plugin marketplace update shambu` (it updates the installed plugin and reloads when the panel
 closes), then `/shambu:setup update`.
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.0"`) and runs
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.1"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.0"
-shambu doctor --expect-version 0.9.0
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.1"
+shambu doctor --expect-version 0.9.1
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.0" shambu doctor --expect-version 0.9.0
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.1" shambu doctor --expect-version 0.9.1
 ```
 
 ## Usage
@@ -124,7 +124,7 @@ Design in ClassCAD with `/shambu:designing-for-print`; `shambu cad gate cad.json
 `fit` read holes, bosses and insert pockets from the mesh, `clearance` and `sweep` find clashes and first contact,
 and `diff` names what changed between revisions and which plates to reslice. `clearance`, `sweep` and
 `diff --surface` need the optional geom extra (numpy, scipy, manifold3d):
-`uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.0'`.
+`uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.1'`.
 
 `shambu topo` maps where a part's material carries the load cases you give and where it works little: a SIMP
 density optimisation on a voxel grid of the STL, with supports, passive regions, weighted cases and self-weight from
@@ -141,7 +141,7 @@ shambu topo solve topo.json --out topo/bracket@B --volfrac 0.5   # run.json, den
 shambu topo trace topo/bracket@B/run.json --faces faces.json --rules conservative
 ```
 
-`uv tool install 'shambu[topo] @ git+https://github.com/Shavvimal/shambu@v0.9.0'` (add `topo-trace` or
+`uv tool install 'shambu[topo] @ git+https://github.com/Shavvimal/shambu@v0.9.1'` (add `topo-trace` or
 `topo-mesh` inside the brackets for tracing or a smooth iso-surface).
 
 A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`

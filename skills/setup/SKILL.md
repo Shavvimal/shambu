@@ -27,18 +27,18 @@ ls /Applications/BambuStudio.app/Contents/MacOS/BambuStudio && defaults read /Ap
 ## 2. Install or update the CLI
 
 ```
-uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.0"
-shambu --version        # must print: shambu 0.9.0
+uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.1"
+shambu --version        # must print: shambu 0.9.1
 ```
 
 With the CAD gates' geom extra (`shambu cad clearance`, `sweep`, `diff --surface`), install
-`"shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.0"` instead; the rest of shambu runs without it.
+`"shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.1"` instead; the rest of shambu runs without it.
 For the topology map (`shambu topo solve`, `validate`), install `shambu[topo]`; `shambu[topo-trace]` adds window
 tracing and `shambu[topo-mesh]` the smooth iso-surface. Extras combine: `"shambu[geom,topo] @ ..."`.
 
 The tag matches this setup text, and the `/shambu` skill text expects the same version. If `shambu` is not found
 afterwards, run `uv tool update-shell` and open a new shell (the uv tool bin dir must be on PATH). Alternative
-without a persistent install: `uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.0" shambu doctor --expect-version 0.9.0`.
+without a persistent install: `uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.1" shambu doctor --expect-version 0.9.1`.
 
 Install from the tag above, not from a local checkout: `uv tool install .` copies the code once and does not follow
 the plugin (that is how a 0.2.1 CLI ran under a 0.3.0 plugin). A checkout is for development only.
@@ -46,13 +46,13 @@ the plugin (that is how a 0.2.1 CLI ran under a 0.3.0 plugin). A checkout is for
 ## 3. Check the machine
 
 ```
-shambu --version                        # must print: shambu 0.9.0
-shambu doctor --expect-version 0.9.0
+shambu --version                        # must print: shambu 0.9.1
+shambu doctor --expect-version 0.9.1
 ```
 
 Run `shambu --version` first: every release prints it. If it shows another number, step 2 did not take: run it
 again and open a new shell. A usage error on `--expect-version` (`unrecognized arguments`) means the installed CLI
-predates 0.4.0: run step 2. Exit 3 with `skill expects 0.9.0: MISMATCH` means the same. Expected: the shambu version
+predates 0.4.0: run step 2. Exit 3 with `skill expects 0.9.1: MISMATCH` means the same. Expected: the shambu version
 and how it was installed, the Bambu Studio version and binary, the profile sources (Application Support copy first,
 then the app bundle), the GUI's current presets and bed type, whether a printer is selected and its access code is
 stored (the code itself is never printed), with a profile the line `printer profile <name> (default): serial
@@ -115,7 +115,7 @@ check; a `login --printer NAME` refresh without `--insecure` clears it.
 2. Run `/shambu:setup install` again: the new setup text pins the matching tag in step 2. Not `uv tool upgrade
    shambu`: it keeps the old source (a tag or a local folder). The line it runs is
    `uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@vX.Y.Z"` with the new version.
-3. `shambu doctor --expect-version 0.9.0` exits 0.
+3. `shambu doctor --expect-version 0.9.1` exits 0.
 
 ## Troubleshooting
 
