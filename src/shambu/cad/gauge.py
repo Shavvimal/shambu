@@ -9,14 +9,19 @@ The gauge, for a hole declared by its mouth point, its axis (pointing into the m
    from there the reference is that ring's diameter and the band 5 %. The 5 % band is what stops the depth at a step
    into a smaller relief bore (a 4.5 mm relief under a 5.8 mm pocket is 22 % smaller); a wider band once let the
    relief count as pocket depth.
-2. The first non-walled depth after the walled run is refined by bisection to 0.01 mm.
+2. The first non-walled depth after the walled run is refined by bisection to 0.01 mm, and so is the entry (the
+   first walled depth): a mouth point declared in the air above the surface adds no depth. The depth is from the
+   entry to the end.
 3. The diameter is refitted on the mesh vertices of the walled band (they lie on the CAD surface; ray hits on facet
-   chords read small). The fitted centre against the declared axis gives the offset.
+   chords read small). The fitted centre against the declared axis gives the offset, and the nearest and farthest
+   band vertex from that centre give the narrowest and widest diameters (an oval bore).
 4. A ray along the axis from the last walled depth finds the floor (none: a through hole). Rays continued outward
    from the wall hits give the thinnest wall.
 
-The judgement, from the fit (fits.py): diameter within the band, full-diameter depth at least `depth_min_mm`, wall at
-least `wall_min_mm`, offset at most `offset_max_mm`. `fit.coupon` (INFO) for an insert, press or slip fit: the first
+The judgement, from the fit (fits.py): the narrowest and the widest diameter within the band (a 3.9 x 4.1 mm bore
+does not pass a 4.00 mm fit on its 4.0 mm average), full-diameter depth at least `depth_min_mm`, wall at least
+`wall_min_mm` (a wall the rays could not measure is `cad.incomplete.wall_unmeasured`, never a pass), offset at most
+`offset_max_mm`. `fit.coupon` (INFO) for an insert, press or slip fit: the first
 print of a new fit is a coupon in the feature's own orientation. `fit.horizontal` (INFO, observed) for a bore that
 prints horizontal, with the allowance from the spec's intent.
 
@@ -58,6 +63,8 @@ class Bore:
     ends: str  # "through", "blind" or "step" (a narrower bore continues)
     residual_mm: float
     vertices: int
+    diameter_min_mm: float | None = None  # the narrowest and widest across the band vertices (None: not measured)
+    diameter_max_mm: float | None = None
 
     def to_json(self) -> dict:
         return {
@@ -71,6 +78,8 @@ class Bore:
             "ends": self.ends,
             "residual_mm": round(self.residual_mm, 5),
             "vertices": self.vertices,
+            "diameter_min_mm": round(self.diameter_min_mm, 4) if self.diameter_min_mm is not None else None,
+            "diameter_max_mm": round(self.diameter_max_mm, 4) if self.diameter_max_mm is not None else None,
         }
 
 
@@ -137,6 +146,17 @@ class Gauge:
             t += STEP_MM
         if start is None:
             return None
+        lo_t, hi_t = start - STEP_MM, start
+        if self._walled(at(lo_t), u, v, d_ref)[0]:
+            entry = 0.0  # walled before the first sample too: the mouth point sits inside the bore
+        else:
+            while hi_t - lo_t > RESOLUTION_MM:
+                mid = (lo_t + hi_t) / 2
+                if self._walled(at(mid), u, v, d_ref)[0]:
+                    hi_t = mid
+                else:
+                    lo_t = mid
+            entry = hi_t
         last = start
         t_max = self.diagonal + START_SEARCH_MM
         walls: list[float] = []
@@ -169,20 +189,23 @@ class Gauge:
         band = [
             p
             for p in self.verts
-            if start - STEP_MM - 1e-6 <= L.dot(p, a) - mouth_t <= end + RESOLUTION_MM
+            if entry - RESOLUTION_MM - 1e-6 <= L.dot(p, a) - mouth_t <= end + RESOLUTION_MM
             and abs(math.hypot(L.dot(p, u) - cu, L.dot(p, v) - cv) - r_rays) <= RADIUS_BAND * r_rays
         ]
         try:
             cu2, cv2, r2, rms = L.fit_circle([(L.dot(p, u), L.dot(p, v)) for p in band])
+            radii = [math.hypot(L.dot(p, u) - cu2, L.dot(p, v) - cv2) for p in band]
+            d_min, d_max = 2 * min(radii), 2 * max(radii)
         except ValueError:
             cu2, cv2, r2, rms = cu, cv, r_rays, math.nan
+            d_min = d_max = None
         centre = L.add(L.add(L.mul(u, cu2), L.mul(v, cv2)), L.mul(a, mouth_t))
         offset = math.hypot(cu2 - L.dot(mouth, u), cv2 - L.dot(mouth, v))
         probe = max(start, end - STEP_MM / 2)  # a point inside the walled band, clear of a floor at `end`
         floor_hit = self.grid.first_hit(at(probe), a, t_min=1e-6)
         floor = probe + floor_hit[0] if floor_hit is not None else None
         ends = "through" if floor is None else ("blind" if floor - end <= 2 * RESOLUTION_MM else "step")
-        return Bore(start, end, 2 * r2, centre, offset, min(walls) if walls else None, floor, ends, rms, len(band))
+        return Bore(entry, end - entry, 2 * r2, centre, offset, min(walls) if walls else None, floor, ends, rms, len(band), d_min, d_max)
 
     def _walls(self, hits: Sequence[tuple[Vec, Vec, float, int]]) -> list[float]:
         out = []
@@ -224,17 +247,20 @@ def judge(
     fs: list[Finding] = []
     lo, hi = fit.hole_mm + fit.band_mm[0], fit.hole_mm + fit.band_mm[1]
     m = {"fit": fit.name, "diameter_mm": bore.diameter_mm, "expected_from": expected}
-    if not lo <= bore.diameter_mm <= hi:
+    d_min = bore.diameter_min_mm if bore.diameter_min_mm is not None else bore.diameter_mm
+    d_max = bore.diameter_max_mm if bore.diameter_max_mm is not None else bore.diameter_mm
+    if not lo <= bore.diameter_mm <= hi or d_min < lo or d_max > hi:
+        oval = f" (narrowest {d_min:.3f}, widest {d_max:.3f})" if d_max - d_min > 1e-3 else ""
         fs.append(
             Finding(
                 "fit.diameter",
                 FAIL,
                 "fit",
-                f"{hole}: d {bore.diameter_mm:.3f} mm, {fit.name} wants {lo:.3f} to {hi:.3f}",
+                f"{hole}: d {bore.diameter_mm:.3f} mm{oval}, {fit.name} wants {lo:.3f} to {hi:.3f}",
                 MEASURED,
                 part,
                 where,
-                {**m, "band_mm": [lo, hi]},
+                {**m, "diameter_min_mm": d_min, "diameter_max_mm": d_max, "band_mm": [lo, hi]},
                 Fix(f"set the hole to {fit.hole_mm:g} mm in the parameter table"),
             )
         )
@@ -250,6 +276,20 @@ def judge(
                 where,
                 {**m, "depth_mm": bore.depth_mm, "depth_min_mm": fit.depth_min_mm},
                 Fix("deepen the pocket, or move the relief bore below it"),
+            )
+        )
+    if fit.wall_min_mm is not None and bore.wall_mm is None:
+        fs.append(
+            Finding(
+                "cad.incomplete.wall_unmeasured",
+                FAIL,
+                "fit",
+                f"{hole}: {fit.name} needs a {fit.wall_min_mm:g} mm wall and no ray found the outside surface, so the wall is unknown",
+                MEASURED,
+                part,
+                where,
+                {**m, "wall_min_mm": fit.wall_min_mm},
+                Fix("check that the part is a closed solid around the hole; a wall is never assumed"),
             )
         )
     if fit.wall_min_mm is not None and bore.wall_mm is not None and bore.wall_mm < fit.wall_min_mm:
