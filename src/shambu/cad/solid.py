@@ -4,7 +4,8 @@ session reported (the record), the STEP re-import and the spec.
 Areas (each with PR 1's status: attention, no-finding, not-checked plus a reason):
 
 - `solid`: open and non-manifold edges (`solid.open` FAIL), more than one outer shell (`solid.bodies` FAIL),
-  facets wound the wrong way (`solid.flipped` WARN), an inward shell, which is an enclosed void (`solid.void` INFO),
+  facets wound the wrong way (`solid.flipped` WARN), an inward shell inside a body, which is an enclosed void
+  (`solid.void` INFO), an inward shell outside every body, which is an inside-out body (`solid.inverted` FAIL),
   a mesh in metres (`mesh.metres` FAIL, the printability rule);
 - `volume`: the STL against the CAD volume, the STEP re-import against the CAD volume, and the spec's expectation;
 - `size`: the bounding box against the spec's expected size;
@@ -36,6 +37,7 @@ from .. import meshgeom as G
 from ..findings import FAIL, INFO, MEASURED, WARN, Finding, Fix
 from ..mesh import bbox, looks_like_metres
 from ..printability import ATTENTION, NO_FINDING, NOT_CHECKED_STATUS, AreaResult
+from . import linalg as L
 from .linalg import Facet, Vec
 
 KERNEL_REL_TOL = 5e-4  # ClassCAD verification recipe: mass-property integration band (see the module docstring)
@@ -63,27 +65,46 @@ def surface_area(facets: Sequence[Facet]) -> float:
 @dataclass(frozen=True)
 class Shells:
     outer: int
-    inward: int
+    inward: int  # enclosed voids: inward shells inside an outward shell
     open_edges: int
     nonmanifold_edges: int
     flipped_edges: int
+    inverted: int = 0  # inward shells outside every outward shell: an inside-out body, not a void
 
     @property
     def closed(self) -> bool:
         return self.open_edges == 0 and self.nonmanifold_edges == 0
 
 
+def _winding(p: Vec, facets: Sequence[Facet]) -> float:
+    """The winding number of the closed shell `facets` about `p` (Van Oosterom and Strackee solid angles over 4 pi):
+    about 1 inside an outward shell, 0 outside it."""
+    total = 0.0
+    for a, b, c in facets:
+        ra, rb, rc = L.sub(a, p), L.sub(b, p), L.sub(c, p)
+        la, lb, lc = L.norm(ra), L.norm(rb), L.norm(rc)
+        num = L.dot(ra, L.cross(rb, rc))
+        den = la * lb * lc + L.dot(ra, rb) * lc + L.dot(rb, rc) * la + L.dot(rc, ra) * lb
+        total += 2 * math.atan2(num, den)
+    return total / (4 * math.pi)
+
+
 def shells(facets: Sequence[Facet]) -> Shells:
-    """Connected shells by welded edges; a shell with a negative signed volume faces inwards (a void)."""
+    """Connected shells by welded edges. A shell with a negative signed volume faces inwards: a void when it lies
+    inside an outward shell (the winding number of that shell about one of its vertices is about 1), an inverted
+    body when it lies outside every outward shell."""
     w = G.weld(facets)
-    outer = inward = 0
+    outward: list[list[Facet]] = []
+    inward: list[list[Facet]] = []
     for reg in G.regions(range(len(facets)), w):
-        v, _ = G.moments([facets[i] for i in reg])
+        shell = [facets[i] for i in reg]
+        v, _ = G.moments(shell)
         if v > 0:
-            outer += 1
+            outward.append(shell)
         elif v < 0:
-            inward += 1
-    return Shells(outer, inward, len(w.open_edges()), len(w.nonmanifold_edges()), w.flipped_edges())
+            inward.append(shell)
+    voids = sum(1 for sh in inward if any(_winding(sh[0][0], o) > 0.5 for o in outward))
+    return Shells(len(outward), voids, len(w.open_edges()), len(w.nonmanifold_edges()), w.flipped_edges(), len(inward) - voids)
 
 
 def facts(facets: Sequence[Facet]) -> dict:
@@ -159,6 +180,19 @@ def check(name: str, facets: Sequence[Facet], record: dict | None, expect: Expec
                 fix=Fix("re-export from CAD"),
             )
         )
+    if sh.inverted:
+        fs.append(
+            Finding(
+                "solid.inverted",
+                FAIL,
+                "solid",
+                f"{sh.inverted} inward-facing shell(s) outside every body: an inside-out body, not an enclosed void",
+                MEASURED,
+                name,
+                measure={"inverted_shells": sh.inverted},
+                fix=Fix("re-export from CAD; an inward shell is legal only as a void inside a body"),
+            )
+        )
     if sh.inward:
         fs.append(
             Finding(
@@ -191,7 +225,8 @@ def check(name: str, facets: Sequence[Facet], record: dict | None, expect: Expec
             "nonmanifold_edges": sh.nonmanifold_edges,
             "flipped_edges": sh.flipped_edges,
             "inward_shells": sh.inward,
-            "watertight": sh.closed and not sh.flipped_edges,
+            "inverted_shells": sh.inverted,
+            "watertight": sh.closed and not sh.flipped_edges and not sh.inverted,
             "volume_mm3": round(vol, 3),
         },
         fs,
