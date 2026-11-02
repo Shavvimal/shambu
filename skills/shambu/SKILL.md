@@ -1,6 +1,6 @@
 ---
 name: shambu
-description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It uses the printer's loaded spools as filaments, places parts on their outlines or at a given corner, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament. It compares orientation and print-sequence variants, pre-flights a part's printability (overhangs, bridges, thin walls), inspects, patches and edits .3mf or .gcode.3mf files (settings, meshes, positions), and reads a Bambu Lab printer over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part or whether it will print, wants a time or filament estimate, wants to change a 3MF, asks how far the print is, or has a login or access code problem, even if Bambu Studio is not named. Not for designing or editing CAD parts (use a CAD skill), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
+description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It uses the printer's loaded spools as filaments, places parts on their outlines or at a given corner, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament. It compares orientation and print-sequence variants, pre-flights a part's printability (overhangs, bridges, thin walls), inspects, patches and edits .3mf or .gcode.3mf files (settings, meshes, positions), and reads a Bambu Lab printer over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part or whether it will print, wants a time or filament estimate, wants to change a 3MF, asks how far the print is, or has a login or access code problem, even if Bambu Studio is not named. Not for modelling CAD parts (designing-for-print), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
 argument-hint: "[stl files or project.3mf] [print notes]"
 allowed-tools: Bash(shambu *), Read
 ---
@@ -13,7 +13,7 @@ send a job. Request: $ARGUMENTS
 ## Before you start (standing rules)
 
 1. Before the first shambu command of a task (before the spec is written): `shambu --version` (it must print:
-   shambu 0.7.0), then `shambu doctor --json --expect-version 0.7.0`. Exit 3 with `"shambu": {"match": false}`
+   shambu 0.8.0), then `shambu doctor --json --expect-version 0.8.0`. Exit 3 with `"shambu": {"match": false}`
    (`MISMATCH` and a `Fix:` line) means another version is on PATH. A usage error on `--expect-version` means one
    older than 0.4.0. Either way: stop, give both versions and the fix (`/shambu:setup update`). Never use
    `uv run --project`, a checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`.
@@ -193,6 +193,8 @@ shambu printer discover | printer filaments | printer status | printer watch [--
 shambu printer list | printer login ... (the user runs it: it prompts for the code) | printer forget --printer NAME   # every read takes [--printer NAME]
 shambu calibrate --log FILE --add | calibrate --show                    # store a watched print; show the fit
 ```
+
+CAD gates (`shambu cad ...` on exported STLs): see the designing-for-print skill.
 
 `--json` gives one JSON document (`printer watch --json`: one per poll). Exit codes: 0 ok, 1 a check, export or
 verification failed or a patch was refused, 2 usage, 3 environment.

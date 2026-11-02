@@ -24,7 +24,7 @@ def test_marketplace_entries_have_no_version():
 
 
 def test_skills_exist():
-    for name in ("shambu", "setup"):
+    for name in ("shambu", "setup", "designing-for-print"):
         assert (ROOT / "skills" / name / "SKILL.md").is_file()
 
 
@@ -41,9 +41,11 @@ def test_skill_version_literals_match_package():
     skill = (ROOT / "skills" / "shambu" / "SKILL.md").read_text()
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     readme = (ROOT / "README.md").read_text()
+    cad = (ROOT / "skills" / "designing-for-print" / "SKILL.md").read_text()
+    assert VERSION_LITERALS[2].findall(cad), "the designing-for-print skill must name the CLI version"
     assert VERSION_LITERALS[0].findall(skill), "the shambu skill must run doctor with --expect-version"
     assert VERSION_LITERALS[1].findall(setup), "the setup skill must install a tagged version"
     assert VERSION_LITERALS[1].findall(readme), "the README must install a tagged version"
     assert 'shambu"' not in readme and 'shambu" shambu' not in readme, "an untagged git install line in the README"
-    found = {v for text in (skill, setup, readme) for rx in VERSION_LITERALS for v in rx.findall(text)}
+    found = {v for text in (skill, setup, readme, cad) for rx in VERSION_LITERALS for v in rx.findall(text)}
     assert found == {shambu.__version__}

@@ -68,17 +68,17 @@ As a Claude Code plugin:
 To update later: `/plugin marketplace update shambu` (it updates the installed plugin and reloads when the panel
 closes), then `/shambu:setup update`.
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.7.0"`) and runs
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.8.0"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.7.0"
-shambu doctor --expect-version 0.7.0
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.8.0"
+shambu doctor --expect-version 0.8.0
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu@v0.7.0" shambu doctor --expect-version 0.7.0
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.8.0" shambu doctor --expect-version 0.8.0
 ```
 
 ## Usage
@@ -117,6 +117,14 @@ bridges and their span, sampled wall and slab thickness, tip-over, brim need and
 severity, its evidence (measured, observed, external or heuristic) and a fix; there is no overall score, and every run
 lists what it did not check. `shambu inspect` and `shambu verify` also check a file's integrity (G-code MD5, layer
 markers, time prediction, thumbnails, bed id, slice warnings, flush matrix shape) as WARN or INFO lines.
+
+Design in ClassCAD with `/shambu:designing-for-print`; `shambu cad gate cad.json` judges the exported STL before
+`shambu build`. The gates read files only (they never drive a CAD program): `stamp` writes a provenance record,
+`check` proves one closed solid and its volume and size against the CAD and refuses a stale export, `features` and
+`fit` read holes, bosses and insert pockets from the mesh, `clearance` and `sweep` find clashes and first contact,
+and `diff` names what changed between revisions and which plates to reslice. `clearance`, `sweep` and
+`diff --surface` need the optional geom extra (numpy, scipy, manifold3d):
+`uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.8.0'`.
 
 A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`
 (one object after another: on a two-filament plate that drops the prime tower and the per-layer nozzle changes,

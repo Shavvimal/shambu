@@ -1,0 +1,80 @@
+{
+ "skill_name": "designing-for-print",
+ "evals": [
+  {
+   "id": 1,
+   "prompt": "Design a wall bracket for a 25 mm pipe, two M4 clearance holes 40 mm apart, PETG, print it flat.",
+   "expected_output": "Writes a parameter table and a cad.json intent block before the first run_script, uses the M4-clearance-medium fit (4.5 mm) for both holes, exports to out/.candidate, stamps, runs shambu cad gate, promotes only after exit 0, and reports with the template including the not-checked list and the bore orientation from the bed face.",
+   "files": [],
+   "expectations": [
+    "cad.json with intent and a fits or hole entry exists before the first run_script",
+    "Both holes use M4-clearance-medium (4.5 mm) or a fit with a stated basis",
+    "Runs shambu cad stamp and shambu cad gate on the exported STL",
+    "Uses --promote only after a gate exit 0",
+    "The reply uses the report template and lists Not checked"
+   ]
+  },
+  {
+   "id": 2,
+   "prompt": "Add two M3 heat-set insert pockets to this lid",
+   "expected_output": "Asks for the insert's pocket diameter and length (or declares the assumption), adds an insert fit row with its basis and a fit rule per pocket, names fit.coupon in the report, and runs cad diff with an expect.json listing only the two new pockets.",
+   "files": [
+    "cad.json",
+    "out/lid@A.cad.json",
+    "out/lid@A.stl"
+   ],
+   "expectations": [
+    "Asks for or declares the insert pocket size and length",
+    "The fits row has kind insert and a basis",
+    "expect.json lists exactly the two new pockets, written before the change",
+    "Runs shambu cad diff with --expect",
+    "Mentions printing a coupon of the insert fit"
+   ]
+  },
+  {
+   "id": 3,
+   "prompt": "Does this hinge open to 110 degrees without hitting the base?",
+   "expected_output": "Runs shambu cad sweep (or quotes the GeomMissing install line and exit 3 instead of guessing), quotes the first-contact angle with its resolution and partner, and claims nothing beyond the sweep's not-checked list.",
+   "files": [
+    "cad.json",
+    "out/lid@B.stl",
+    "out/base@B.stl"
+   ],
+   "expectations": [
+    "Runs shambu cad sweep --spec cad.json or shambu cad gate with the sweep rule",
+    "Quotes at_deg and the resolution, or the GeomMissing line with exit 3",
+    "Does not estimate the angle by reasoning about the geometry"
+   ]
+  },
+  {
+   "id": 4,
+   "prompt": "I changed the boss diameter; what do I need to reprint?",
+   "expected_output": "Runs shambu cad diff on the two revisions with --plate, quotes the reslice list and coupon list, and gives the replace-mesh advice from impact.",
+   "files": [
+    "cad.json",
+    "plate.json",
+    "out/arm@B.cad.json",
+    "out/arm@C.cad.json"
+   ],
+   "expectations": [
+    "Runs shambu cad diff with --plate",
+    "Quotes the plates to reslice from impact",
+    "Quotes replace_mesh advice"
+   ]
+  },
+  {
+   "id": 5,
+   "prompt": "I re-exported the bracket STL after stamping it, is it still good to print?",
+   "expected_output": "Runs shambu cad check with the record, quotes cad.stale.stl_sha, then stamps and gates again; never says it passed earlier.",
+   "files": [
+    "out/.candidate/bracket.stl",
+    "out/.candidate/bracket.cad.json"
+   ],
+   "expectations": [
+    "Quotes cad.stale.stl_sha (or gate stale)",
+    "Stamps again and re-runs the gate",
+    "Does not rely on an earlier pass"
+   ]
+  }
+ ]
+}
