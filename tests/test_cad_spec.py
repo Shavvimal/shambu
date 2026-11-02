@@ -300,3 +300,15 @@ def test_pairs_skip_self_and_same_group():
         }
     )
     assert {(p.name, q.name) for p, q in J.pairs_of(sp.rules[0], sp.parts)} == {("a", "c"), ("b", "c")}
+
+
+def test_a_fit_rule_with_no_holes_reads_its_inputs_and_is_incomplete(tmp_path, capsys):
+    """A fit rule on a part with no holes once passed without reading the mesh or the record, both missing."""
+    part = {"name": "bracket", "mesh": "bracket.stl", "record": "bracket.cad.json"}
+    sp = spec(tmp_path / "fit.json", {"parts": [part], "rules": [{"id": "holes", "type": "fit", "parts": "part:bracket"}]})
+    code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
+    assert code == 1 and doc["gate"] == "incomplete"
+    assert fails(doc) == {"cad.incomplete.mesh_missing", "cad.incomplete.no_record", "cad.incomplete.no_holes"}
+    write_record(stl(tmp_path / "bracket.stl", box((0, 0, 0), (10, 10, 10))))
+    code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
+    assert code == 1 and doc["gate"] == "incomplete" and fails(doc) == {"cad.incomplete.no_holes"}

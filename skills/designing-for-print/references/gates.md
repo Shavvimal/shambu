@@ -120,6 +120,7 @@ The gate word is derived from the findings: `stale` if any `cad.stale.*`; else `
 | `cad.incomplete.mesh_missing` | FAIL | a part's mesh is not there | export it, or fix the path |
 | `cad.incomplete.unreadable` | FAIL | a mesh or record does not read | export again |
 | `cad.incomplete.no_record` | FAIL | the spec declares a record that is missing | `shambu cad stamp` |
+| `cad.incomplete.no_holes` | FAIL | a `fit` rule selects only parts that declare no hole | declare the holes, or select the parts that have them |
 | `cad.incomplete.no_volume` | FAIL | a capped pair is not closed, so it has no overlap volume | re-export closed solids |
 | `cad.spec.unknown_key` | WARN | a key the spec does not know (a typo?) | fix the key |
 | `cad.default_role` | INFO | a part with no role is treated as rigid | name the role |

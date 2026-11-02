@@ -4,7 +4,7 @@
 Every rule reads its parts through a `SceneLike` (load.Scene in use, a fake in tests) and turns a part it cannot
 evaluate into a finding, never a pass: a selector with no match is `cad.incomplete.selector_empty`, a missing mesh
 `cad.incomplete.mesh_missing`, an unreadable one `cad.incomplete.unreadable`, a declared record that is missing
-`cad.incomplete.no_record`. Each of these is FAIL with area `inputs`; the gate word is `incomplete` when nothing else
+`cad.incomplete.no_record`, a fit rule whose parts declare no hole `cad.incomplete.no_holes`. Each of these is FAIL with area `inputs`; the gate word is `incomplete` when nothing else
 fails.
 
 What it does not do: no file reading of its own (the scene does it), no printing.
@@ -180,12 +180,21 @@ class FitRule:
         for note in ctx.spec.fit_notes:
             fs.append(Finding("fit.shadowed", WARN, "fit", note, MEASURED))
         parts = select(ctx, self.spec, self.spec.parts, fs, drop_reference=True)
+        if parts and not any(p.holes for p in parts):
+            fs.append(
+                _incomplete(
+                    "no_holes",
+                    self.spec.id,
+                    f"no selected part declares a hole ({', '.join(p.name for p in parts)}), so the rule measures nothing",
+                    fix="declare the part's holes in the spec, or point the rule at the parts that have them",
+                )
+            )
         for part in parts:
+            subject = load(ctx, self.spec, part, fs)
+            ok, record = _record(ctx, self.spec, part, fs)
             if not part.holes:
                 out[part.name] = {"holes": [], "note": "the part declares no holes"}
                 continue
-            subject = load(ctx, self.spec, part, fs)
-            ok, record = _record(ctx, self.spec, part, fs)
             if subject is None or not ok:
                 continue
             gauge = GA.Gauge(subject.facets)
