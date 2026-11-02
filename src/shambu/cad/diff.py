@@ -11,9 +11,13 @@
    `shambu patch --replace-mesh` applies (a size change needs `--allow-size-change`; a changed bed face needs a new
    orientation), and which changed features carry a fit in the CAD spec (`diff.coupon`: print a coupon first).
 5. Intent, with an expectation file (`{"changes": [{"feature": "h1", "diameter_mm": 3.5, "coupon": true},
-   {"measure": "size_z", "delta_mm": 2}]}`): a change not listed is `diff.unexpected` (FAIL), a listed change that did
-   not happen is `diff.expected_missing` (FAIL), and a changed fit whose entry makes no coupon decision is
-   `diff.coupon_undecided` (FAIL).
+   {"measure": "size_z", "delta_mm": 2}, {"measure": "volume_mm3", "delta_mm3": -1728}]}`): a change not listed is
+   `diff.unexpected` (FAIL), a listed change that did not happen is `diff.expected_missing` (FAIL), and a changed fit
+   whose entry makes no coupon decision is `diff.coupon_undecided` (FAIL). A volume or section change counts as
+   explained only by a `volume_mm3` entry or by a listed size or feature change that happened; otherwise it is
+   `diff.unexpected` (an internal cavity changes neither the outside size nor a cylindrical feature).
+   Spec holes name features in both inventories, so a new hole keeps its spec name. A hole that goes from through to
+   blind (or back) is a change even when its diameter, centre and depth match.
 
 The frame is assumed shared (the exports come from one CAD frame). What it does not do: no alignment of a rotated or
 moved part, no change below the section spacing, nothing a STEP B-rep carries that a mesh does not, no file reading
@@ -191,9 +195,24 @@ def _off_axis(f: FT.Feature, p: Sequence[float]) -> float:
     return L.norm(L.sub(d, L.mul(f.axis, L.dot(d, f.axis))))
 
 
-def match_features(old: Sequence[FT.Feature], new: Sequence[FT.Feature], names: Mapping[int, str] | None = None) -> list[Change]:
-    """Changes between two inventories. `names` maps an old feature index to a name (a spec hole)."""
+def match_features(
+    old: Sequence[FT.Feature],
+    new: Sequence[FT.Feature],
+    names: Mapping[int, str] | None = None,
+    new_names: Mapping[int, str] | None = None,
+) -> list[Change]:
+    """Changes between two inventories. `names` and `new_names` map an old or new feature index to a name (a spec
+    hole); the old name wins when both name a matched pair."""
     names = names or {}
+    new_names = new_names or {}
+
+    def name(i: int | None, j: int | None, f: FT.Feature) -> str:
+        if i is not None and i in names:
+            return names[i]
+        if j is not None and j in new_names:
+            return new_names[j]
+        return _fid(f)
+
     left_new = list(range(len(new)))
     out: list[Change] = []
     left_old = []
@@ -212,9 +231,10 @@ def match_features(old: Sequence[FT.Feature], new: Sequence[FT.Feature], names: 
         same = (
             abs(g.diameter_mm - f.diameter_mm) <= SAME_MM
             and L.norm(shift(f, g)) <= SAME_MM
+            and f.ends == g.ends
             and (abs(g.depth_mm - f.depth_mm) <= SAME_MM or f.ends == g.ends == "through")
         )
-        out.append(Change("same" if same else "resized", f.kind, f, g, names.get(i, _fid(f))))
+        out.append(Change("same" if same else "resized", f.kind, f, g, name(i, j, f)))
     for i in list(left_old):
         f = old[i]
         cands = [
@@ -225,14 +245,14 @@ def match_features(old: Sequence[FT.Feature], new: Sequence[FT.Feature], names: 
         j = min(cands, key=lambda k: (L.norm(shift(f, new[k])), k))
         left_new.remove(j)
         left_old.remove(i)
-        out.append(Change("moved", f.kind, f, new[j], names.get(i, _fid(f))))
-    out += [Change("gone", old[i].kind, old[i], None, names.get(i, _fid(old[i]))) for i in left_old]
-    out += [Change("new", new[j].kind, None, new[j], _fid(new[j])) for j in left_new]
+        out.append(Change("moved", f.kind, f, new[j], name(i, j, f)))
+    out += [Change("gone", old[i].kind, old[i], None, name(i, None, old[i])) for i in left_old]
+    out += [Change("new", new[j].kind, None, new[j], name(None, j, new[j])) for j in left_new]
     return out
 
 
 def hole_names(part: PartSpec | None, inv: Sequence[FT.Feature]) -> dict[int, str]:
-    """Old feature index -> the spec hole whose mouth lies on that hole's axis (within its radius)."""
+    """Feature index -> the spec hole whose mouth lies on that hole's axis (within its radius)."""
     out: dict[int, str] = {}
     if part is None:
         return out
@@ -337,9 +357,21 @@ def impact(
     return block, fs
 
 
-def expect_findings(expect: Mapping, deltas: dict, changes: Sequence[Change], size_tol_mm: float, fit_names: set[str]) -> list[Finding]:
+MEASURES = (*SIZE_AXES, "volume_mm3")
+
+
+def expect_findings(
+    expect: Mapping,
+    deltas: dict,
+    changes: Sequence[Change],
+    size_tol_mm: float,
+    fit_names: set[str],
+    volume_tol_mm3: float = 0.0,
+    shape_findings: Sequence[Finding] = (),
+) -> list[Finding]:
     """Changes the expectation file does not list, listed changes that did not happen, and changed fits with no
-    coupon decision. Raises CadSpecError when the file breaks its shape."""
+    coupon decision. `shape_findings` are the `diff.volume` and `diff.section` findings: each needs a `volume_mm3`
+    entry or a listed size or feature change that happened. Raises CadSpecError when the file breaks its shape."""
     items = expect.get("changes")
     if not isinstance(items, list):
         raise CadSpecError('the expectation file is {"changes": [{"feature": ...} | {"measure": ...}]}')
@@ -350,8 +382,11 @@ def expect_findings(expect: Mapping, deltas: dict, changes: Sequence[Change], si
         if not isinstance(it, Mapping) or ("feature" in it) == ("measure" in it):
             raise CadSpecError(f"changes[{k}]: one of 'feature' or 'measure'")
         if "measure" in it:
-            if it["measure"] not in SIZE_AXES:
-                raise CadSpecError(f"changes[{k}].measure: one of {SIZE_AXES}")
+            if it["measure"] not in MEASURES:
+                raise CadSpecError(f"changes[{k}].measure: one of {MEASURES}")
+            key = "delta_mm3" if it["measure"] == "volume_mm3" else "delta_mm"
+            if it.get(key) is not None and (isinstance(it[key], bool) or not isinstance(it[key], (int, float))):
+                raise CadSpecError(f"changes[{k}].{key}: a number")
             listed_measures[str(it["measure"])] = it
         else:
             listed_features[str(it["feature"])] = it
@@ -383,6 +418,43 @@ def expect_findings(expect: Mapping, deltas: dict, changes: Sequence[Change], si
                         measure={"measure": ax, "delta_mm": d, "expected_delta_mm": float(target), "expected_from": "expect"},
                     )
                 )
+    explained = False  # a listed size or feature change that happened accounts for a volume or section change
+    vol = listed_measures.get("volume_mm3")
+    dv = deltas["volume_mm3"]["delta"]
+    if vol is not None:
+        explained = True
+        target = vol.get("delta_mm3")
+        if target is not None and abs(dv - float(target)) > volume_tol_mm3:
+            fs.append(
+                Finding(
+                    "diff.unexpected" if abs(dv) > volume_tol_mm3 else "diff.expected_missing",
+                    FAIL,
+                    "diff",
+                    f"volume changed by {dv:+.1f} mm3, the expectation says {float(target):+g}",
+                    MEASURED,
+                    measure={
+                        "measure": "volume_mm3",
+                        "delta_mm3": dv,
+                        "expected_delta_mm3": float(target),
+                        "tolerance_mm3": volume_tol_mm3,
+                    },
+                )
+            )
+    explained = explained or any(ax in listed_measures and abs(deltas[ax]["delta"]) > size_tol_mm for ax in SIZE_AXES)
+    explained = explained or any(c.kind != "same" and c.id in listed_features for c in changes)
+    if shape_findings and not explained:
+        what = sorted({f.code for f in shape_findings})
+        fs.append(
+            Finding(
+                "diff.unexpected",
+                FAIL,
+                "diff",
+                f"the volume or a section changed ({', '.join(what)}) and no listed change accounts for it",
+                MEASURED,
+                measure={"findings": what, "volume_delta_mm3": dv, "expected_from": "expect"},
+                fix=Fix('revert the change, or list it: {"measure": "volume_mm3", "delta_mm3": ...} or the feature that changed'),
+            )
+        )
     seen = set()
     for c in changes:
         if c.kind == "same":

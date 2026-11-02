@@ -368,13 +368,16 @@ class DiffArgs:
 
 
 def _side(path: str, obj: str | None) -> tuple[Subject, dict | None, list[Finding]]:
-    """A diff input: an STL, a 3MF object, or a record (its STL, refused when stale)."""
+    """A diff input: an STL, a 3MF object, or a record (its STL, refused when the STL is not the one stamped). A record
+    is history: the revision workflow edits the script and parameters in place and re-exports the STEP, so the build id
+    and the STEP hash of an old record no longer recompute. Only "this artifact matches its record" is judged here;
+    "the current build is fresh" is `shambu cad check`'s question."""
     if path.endswith(".cad.json"):
         rec = P.load_record(path)
         stl = rec.resolve(str(rec.section("stl").get("path")))
         s = load_subject(stl, str(rec.data.get("part")))
         _, fs = P.freshness(rec, stl, s.sha256)
-        return s, rec.data, [f for f in fs if f.code.startswith("cad.stale.")]
+        return s, rec.data, [f for f in fs if f.code == "cad.stale.stl_sha"]
     return load_subject(path, None, obj), None, []
 
 
@@ -428,7 +431,9 @@ def diff(a: DiffArgs) -> CadReport:
     fs += sfs
     inv_old = FT.detect(old.facets)
     inv_new = FT.detect(new.facets)
-    changes = D.match_features(inv_old.features, inv_new.features, D.hole_names(part, inv_old.features))
+    changes = D.match_features(
+        inv_old.features, inv_new.features, D.hole_names(part, inv_old.features), D.hole_names(part, inv_new.features)
+    )
     fs += D.feature_findings(changes, spec, part)
     extra: dict = {
         "measures": deltas,
@@ -452,7 +457,8 @@ def diff(a: DiffArgs) -> CadReport:
         if not isinstance(exp, dict):
             raise CadSpecError(f"{a.expect}: an object with 'changes'")
         fit_names: set[str] = {h.name for h in part.holes} if part is not None else set()
-        fs += D.expect_findings(exp, deltas, changes, tol, fit_names)
+        shape = [f for f in fs if f.code in ("diff.volume", "diff.section")]
+        fs += D.expect_findings(exp, deltas, changes, tol, fit_names, vol_tol, shape)
     text = [f"{ax}: {deltas[ax]['old']:.3f} -> {deltas[ax]['new']:.3f} ({deltas[ax]['delta']:+.3f})" for ax in ("volume_mm3", *D.SIZE_AXES)]
     text += [f"feature {c.kind}: {c.id}" for c in changes if c.kind != "same"]
     if "impact" in extra:

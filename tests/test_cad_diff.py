@@ -164,6 +164,7 @@ def test_a_new_spec_hole_keeps_its_name(tmp_path, capsys):
                     "holes": [{"name": "h1", "fit": "pocket", "mouth": [10, 8, 5], "axis": [0, 0, -1]}],
                 }
             ],
+            "rules": [{"id": "holes", "type": "fit"}],
         },
     )
     exp = tmp_path / "expect.json"
