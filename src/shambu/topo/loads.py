@@ -40,7 +40,7 @@ def rigid_distribute(xyz: np.ndarray, force: np.ndarray, moment: np.ndarray, whe
     w = np.linalg.lstsq(a, m, rcond=None)[0] if np.any(m) else np.zeros(3)
     f = np.asarray(force, dtype=float)[None, :] / n + np.cross(w[None, :], r)
     carried = np.cross(r, f).sum(axis=0)
-    if np.linalg.norm(carried - m) > 1e-9 * max(1.0, np.linalg.norm(m)):
+    if float(np.linalg.norm(carried - m)) > 1e-9 * max(1.0, float(np.linalg.norm(m))):
         raise TopoSpecError([f"{where}: the moment {m.tolist()} N mm cannot be carried by {n} node(s) that lie on a point or a line"])
     return f
 
