@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from ..errors import CadError, MeshMissing
+from ..errors import CadError, GeomError, MeshMissing
 from ..findings import FAIL, INFO, MEASURED, WARN, Finding, Fix
 from ..printability import NOT_CHECKED_STATUS
 from . import features as FT
@@ -274,13 +274,36 @@ class SweepRule:
 
         fs: list[Finding] = []
         moving = select(ctx, self.spec, self.spec.moving, fs)
-        fixed = [p for p in select(ctx, self.spec, self.spec.fixed, fs) if p not in moving]
+        named = select(ctx, self.spec, self.spec.fixed, fs)
+        fixed = [p for p in named if p not in moving]
+        if named and not fixed:
+            fs.append(
+                _incomplete(
+                    "selector_empty",
+                    self.spec.id,
+                    f"selector {self.spec.fixed.text()} matches only moving parts, so no fixed part is left to sweep against",
+                    fix="name the fixed parts apart from the moving ones",
+                )
+            )
         pm = _placed(ctx, self.spec, moving, None, fs)
         pf = _placed(ctx, self.spec, fixed, None, fs)
         if any(f.code.startswith("cad.incomplete.") for f in fs) or not pm or not pf:
             return RuleResult(self.spec.id, self.spec.type, status_of(fs), findings=fs)
         runner = SweepRunner(self.spec, pm, pf, ctx.spec.zones, ctx.cull)
-        run = runner.run()
+        try:
+            run = runner.run()
+        except GeomError as e:
+            fs.append(
+                Finding(
+                    "sweep.boolean_failed",
+                    FAIL,
+                    self.spec.id,
+                    f"the sweep could not be evaluated: {e}",
+                    MEASURED,
+                    fix=Fix("re-export the parts as closed solids and re-run; a failed Boolean is never a pass"),
+                )
+            )
+            return RuleResult(self.spec.id, self.spec.type, status_of(fs), findings=fs)
         block, jf = judge(self.spec, run, runner.motion)
         fs += jf
         return RuleResult(self.spec.id, self.spec.type, status_of(fs), data=block, findings=fs)

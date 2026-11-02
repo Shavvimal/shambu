@@ -73,9 +73,12 @@ def clearance_verdict(
     distance: tuple[float, Vec3, Vec3] | None = None,
     sampling_mm: float | None = None,
     beyond_mm: float | None = None,
+    outside: Callable[[Zone], tuple[float, Vec3, Vec3, float] | None] | None = None,
 ) -> tuple[dict, list[Finding]]:
     """The JSON row and findings of one pair from its measurements: a Boolean error, or an overlap, or (with no overlap)
-    the closest pair of points at `distance` (None: beyond `beyond_mm`)."""
+    the closest pair of points at `distance` (None: beyond `beyond_mm`). A zone exemption covers a distance under the
+    margin only when `outside(zone)` (the closest pair under the margin whose midpoint lies outside the zone, and the
+    sample spacing it was found at) finds none: one exempt closest point must not exempt the rest of the pair."""
     an, bn = a.name, b.name
     row: dict = {"a": an, "b": bn, "overlap": None, "distance_mm": None}
     fs: list[Finding] = []
@@ -183,6 +186,15 @@ def clearance_verdict(
         mid = ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2)
         hit = next((e for e in exempt if e.zone is None or zones[e.zone].contains(mid)), None)
         where = Location("shared", mid)
+        if hit is not None and hit.zone is not None and outside is not None:
+            out = outside(zones[hit.zone])
+            if out is not None:
+                d, p, q, spacing = out
+                mid = ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2)
+                where = Location("shared", mid)
+                row["outside_zone"] = {"zone": hit.zone, "distance_mm": d, "closest": [list(p), list(q)], "sampling_mm": spacing}
+                hit = None
+                sampling_mm = spacing
         if hit is not None:
             row["exemption"] = {"reason": hit.reason, "cap_mm3": hit.max_overlap_mm3, "zone": hit.zone}
             fs.append(
@@ -203,7 +215,8 @@ def clearance_verdict(
                     "clash.margin",
                     FAIL,
                     rule.id,
-                    f"{an} and {bn} are {d:.3f} mm apart, under the {rule.margin_mm:g} mm margin",
+                    f"{an} and {bn} are {d:.3f} mm apart, under the {rule.margin_mm:g} mm margin"
+                    + (f" (outside exempt zone {row['outside_zone']['zone']})" if "outside_zone" in row else ""),
                     MEASURED,
                     an,
                     where,
@@ -218,7 +231,7 @@ def clearance_verdict(
 @dataclass
 class Contact:
     tau: float  # travel from the start (mm or deg)
-    kind: str  # "distance", "overlap" or "crossing"
+    kind: str  # "distance", "overlap", "crossing" or "bound" (an interval the gap bound cannot prove clear)
     partner: str
     part: str
     point: Vec3
@@ -235,6 +248,7 @@ class SweepRun:
     zone_contact: Contact | None = None
     end_overlap: Contact | None = None
     sampling_mm: float = 0.0  # how far high a distance can read; 0 with the exact edge pass
+    speed: float = 0.0  # the most the gap changes per unit of travel (mm per mm or per degree): the proof's bound
 
 
 def sweep_verdict(rule: SweepRuleSpec, run: SweepRun, total: float, angle_of: Callable[[float], float]) -> tuple[dict, list[Finding]]:
@@ -271,6 +285,7 @@ def sweep_verdict(rule: SweepRuleSpec, run: SweepRun, total: float, angle_of: Ca
         "resolution_" + unit: rule.resolution,
         "margin_mm": rule.margin_mm,
         "sampling_mm": run.sampling_mm,
+        "gap_speed_mm_per_" + unit: round(run.speed, 6),
     }
     fs: list[Finding] = []
     if run.first is not None:
@@ -331,6 +346,11 @@ def sweep_verdict(rule: SweepRuleSpec, run: SweepRun, total: float, angle_of: Ca
                 what = f"overlaps {c.partner} by {c.volume_mm3 or 0:.3f} mm3"
             elif c.kind == "distance":
                 what = f"comes within {c.distance_mm or 0:.3f} mm of {c.partner} (margin {rule.margin_mm:g})"
+            elif c.kind == "bound":
+                what = (
+                    f"cannot be proven clear of {c.partner} between two poses: the gap may fall to {c.distance_mm or 0:.4f} mm"
+                    f" (margin {rule.margin_mm:g})"
+                )
             else:
                 what = f"passes through {c.partner} between two steps"
             fs.append(
@@ -368,6 +388,18 @@ def sweep_verdict(rule: SweepRuleSpec, run: SweepRun, total: float, angle_of: Ca
                 z.part,
                 Location("shared", z.point),
                 {"zone": rule.contact_zone},
+            )
+        )
+    if rule.contact_zone is not None:
+        fs.append(
+            Finding(
+                "sweep.zone_sampled",
+                INFO,
+                rule.id,
+                f"zone {rule.contact_zone} exempts geometry by where it sits at the poses evaluated; between two poses the "
+                "clearance proof trusts those exemptions",
+                MEASURED,
+                measure={"zone": rule.contact_zone, "resolution_" + unit: rule.resolution},
             )
         )
     e = run.end_overlap

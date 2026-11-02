@@ -355,6 +355,25 @@ def edge_samples(mesh: GMesh, spacing: float) -> np.ndarray:
     return np.concatenate(pts)
 
 
+def edge_pieces(mesh: GMesh, piece_mm: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """(start points, end points) of the mesh's unique edges, each split into equal pieces at most `piece_mm` long
+    (None: whole edges)."""
+    e = edges(mesh)
+    a, b = mesh.V[e[:, 0]], mesh.V[e[:, 1]]
+    if piece_mm is None:
+        return a, b
+    n = np.maximum(1, np.ceil(np.linalg.norm(b - a, axis=1) / piece_mm)).astype(np.int64)
+    ps, qs = [], []
+    for k in np.unique(n):
+        sel = n == k
+        t0 = (np.arange(k) / k)[None, :, None]
+        t1 = (np.arange(1, k + 1) / k)[None, :, None]
+        d = (b[sel] - a[sel])[:, None, :]
+        ps.append((a[sel][:, None, :] + d * t0).reshape(-1, 3))
+        qs.append((a[sel][:, None, :] + d * t1).reshape(-1, 3))
+    return np.concatenate(ps), np.concatenate(qs)
+
+
 def _segment_pairs(p1: np.ndarray, q1: np.ndarray, p2: np.ndarray, q2: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(distance, point on 1, point on 2) for aligned rows of segments (the clamped closest-point solution)."""
     d1, d2, r = q1 - p1, q2 - p2, p1 - p2
@@ -384,10 +403,27 @@ class EdgeSet:
     tree: cKDTree
 
     @classmethod
-    def build(cls, mesh: GMesh) -> EdgeSet:
-        e = edges(mesh)
-        p, q = mesh.V[e[:, 0]], mesh.V[e[:, 1]]
+    def build(cls, mesh: GMesh, piece_mm: float | None = None) -> EdgeSet:
+        """The mesh's edges; with `piece_mm`, each edge split into pieces at most that long (the same points, so the
+        same distances), which keeps the ball queries local when a mesh has long edges."""
+        p, q = edge_pieces(mesh, piece_mm)
         return cls(p, q, np.linalg.norm(q - p, axis=1) / 2, cKDTree((p + q) / 2))
+
+    def within(self, p2: np.ndarray, q2: np.ndarray, bound: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Every segment pair within `bound`: (distances, points on this set, points on the other)."""
+        empty = (np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3)))
+        if not len(self.p) or not len(p2):
+            return empty
+        h2 = np.linalg.norm(q2 - p2, axis=1) / 2
+        lists = self.tree.query_ball_point((p2 + q2) / 2, bound + h2 + self.half.max() + 1e-9)
+        sizes = np.fromiter((len(x) for x in lists), dtype=np.int64, count=len(lists))
+        if not sizes.sum():
+            return empty
+        i2 = np.repeat(np.arange(len(p2)), sizes)
+        i1 = np.fromiter((j for x in lists for j in x), dtype=np.int64, count=int(sizes.sum()))
+        d, c1, c2 = _segment_pairs(self.p[i1], self.q[i1], p2[i2], q2[i2])
+        keep = d <= bound
+        return d[keep], c1[keep], c2[keep]
 
     def closest(self, p2: np.ndarray, q2: np.ndarray, bound: float) -> tuple[float, np.ndarray, np.ndarray] | None:
         """(distance, point on this set, point on the other) of the closest edge pair within `bound`, else None. Two

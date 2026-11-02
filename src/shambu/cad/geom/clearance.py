@@ -4,7 +4,11 @@ are in `cad/judge.py`.
 For each pair from the rule's two selectors (pairs inside one group skipped when the rule says so): a box cull with
 the report bound, then the overlap from the intersection engine (`ManifoldBoolean` for two closed meshes,
 `SampledContainment` otherwise), then, with no overlap, the exact minimum distance between the meshes
-(`engines.mesh_distance`: every vertex against the other's triangles, then the near edge pairs). A distance beyond max(2 x margin, 1 mm) is `null` with
+(`engines.mesh_distance`: every vertex against the other's triangles, then the near edge pairs). When an exemption
+zone holds that closest pair, the rest of the pair still counts: surface samples of each mesh (`sample_spacing` of
+the margin apart, triangle corners included) are measured exactly against the other, and the closest pair under the
+margin whose midpoint lies outside the zone fails the margin. A gap under the margin narrower than the sample spacing
+and wholly between samples is the limit of that pass; the row names the spacing. A distance beyond max(2 x margin, 1 mm) is `null` with
 `beyond_mm`, never `inf`. A `GeomError` from the engine is passed to the verdict as a failed Boolean.
 
 What it does not do: no file reading, no selector parsing (spec.py), no verdicts (judge.py), no printing.
@@ -19,9 +23,9 @@ import numpy as np
 
 from ...errors import GeomError
 from ...findings import Finding
-from ..judge import clearance_verdict, overlap_floor, report_bound, sample_spacing
+from ..judge import Vec3, clearance_verdict, overlap_floor, report_bound, sample_spacing
 from ..spec import ClearanceRuleSpec, PartSpec, Zone
-from .engines import GMesh, IntersectionEngine, ManifoldBoolean, PrunedDistance, SampledContainment, mesh_distance
+from .engines import GMesh, IntersectionEngine, ManifoldBoolean, PrunedDistance, SampledContainment, mesh_distance, surface_samples
 
 
 @dataclass
@@ -64,4 +68,24 @@ def check_pair(
     if found is not None:
         d, p, q = found
         best = (d, (float(p[0]), float(p[1]), float(p[2])), (float(q[0]), float(q[1]), float(q[2])))
-    return clearance_verdict(rule, pa.part, pb.part, zones, ov, floor, distance=best, sampling_mm=0.0, beyond_mm=bound)
+
+    def outside(zone: Zone) -> tuple[float, Vec3, Vec3, float] | None:
+        spacing = sample_spacing(rule.margin_mm)
+        found: tuple[float, Vec3, Vec3, float] | None = None
+        for src, dst in ((a, b), (b, a)):
+            pts, _, _ = surface_samples(src, spacing)
+            res = distance(dst).distances(pts, rule.margin_mm)
+            idx = np.nonzero(np.isfinite(res.d) & (res.d < rule.margin_mm))[0]
+            for i in idx[np.argsort(res.d[idx], kind="stable")]:
+                p, q = pts[i], res.q[i]
+                if not zone.contains((p + q) / 2):
+                    if found is None or res.d[i] < found[0]:
+                        found = (float(res.d[i]), _v(p), _v(q), spacing)
+                    break
+        return found
+
+    return clearance_verdict(rule, pa.part, pb.part, zones, ov, floor, distance=best, sampling_mm=0.0, beyond_mm=bound, outside=outside)
+
+
+def _v(p: np.ndarray) -> tuple[float, float, float]:
+    return (float(p[0]), float(p[1]), float(p[2]))

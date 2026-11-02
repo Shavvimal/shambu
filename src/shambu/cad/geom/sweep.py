@@ -18,9 +18,21 @@ crossing test runs on the evaluated points only and misses nothing the full test
 every point at every step: the slow reference path, which gives the same first contact, partner and step count (a
 property test checks it).
 
-The crossing test follows each evaluated point along the straight segment between two steps. A rotating point moves
-on an arc, which bulges past that segment by rho (1 - cos(step / 2)); a fixed part thinner than that bulge, met only
-by the arc, can be missed. Bisection runs every point without culling.
+The crossing test follows each evaluated point along the straight segment between two steps. Neither it nor the
+per-step distance sees two parts that cross between two poses where no sampled point passes through a surface (two
+thin bars that cross like a plus sign half a step in). So every interval between two clear poses must also be
+proven clear (`_first_contact`): the exact gap g between the moving and the fixed meshes (every vertex against the
+other's triangles, every edge piece against every edge piece; outside the contact zone) changes by at most
+`speed` x travel, with speed 1 for a translation and rho_max x pi / 180 mm per degree for a rotation (rho_max: the
+moving vertex farthest from the axis). So over [a, b] the gap is at least (g(a) + g(b) - speed (b - a)) / 2; an
+interval whose bound is above the margin is clear, and any other is split in two, earliest half first. An interval
+no wider than the resolution that cannot be proven clear is evaluated at its end (every point, no culling); a contact
+there is the first contact, to the resolution. With none, the split goes on to 1/64 of the resolution, and an
+interval still unproven there is reported as a `bound` contact: its lower bound is under the margin. This makes the
+first contact sound (never late by more than the resolution, a crossing between poses included) for a translation
+and a rotation alike. The limit: a contact zone exempts geometry by where it sits at the poses evaluated, so a
+part that touches outside the zone only between two poses, and inside it at both, is judged by those poses
+(`sweep.zone_sampled` INFO says so whenever a rule has a zone).
 
 What it does not do: no two-axis motions, no per-step scripts, no file reading, no printing.
 """
@@ -38,10 +50,12 @@ from ...findings import Finding
 from ..judge import Contact, SweepRun, overlap_floor, sweep_verdict
 from ..spec import SweepRuleSpec, Zone
 from .clearance import Placed
-from .engines import EdgeSet, ManifoldBoolean, PrunedDistance, edge_samples, edges
+from .engines import EdgeSet, ManifoldBoolean, PrunedDistance, edge_pieces, edge_samples, edges
 
 LOOKAHEAD_STEPS = 3  # each exact distance is kept up to margin + 3 chords, so a far point is re-checked every few steps
 CROSS_SPACING_MM = 1.0  # query points along each edge for the crossing test (the distance itself is exact)
+EDGE_PIECE_MM = 1.0  # edge pieces for the exact gap: short pieces keep the edge-against-edge queries local
+PROOF_FLOOR = 64  # an unproven interval is split down to resolution / 64 before it is reported as a `bound` contact
 
 
 def _p(v) -> tuple[float, float, float]:
@@ -132,11 +146,21 @@ class SweepRunner:
         self.engine = ManifoldBoolean()
         self.channels: list[Channel] = []
         self.edge_sets: dict[str, EdgeSet] = {}
+        self.dist: dict[str, PrunedDistance] = {}
+        self.pieces: dict[str, EdgeSet] = {}
+        self.moving_pieces: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.gaps: dict[float, tuple[float, Contact | None]] = {}
+        rho = max((float(self.motion.radius(m.mesh.V).max(initial=0.0)) for m in self.moving), default=0.0)
+        self.speed = 1.0 if rule.motion == "translate" else rho * math.pi / 180  # mm of gap per unit of travel, at most
+        self.cap = rule.margin_mm + self.speed * rule.step  # a gap beyond this proves any one step clear
 
     def _build(self) -> None:
         dist = {p.part.name: PrunedDistance.build(p.mesh) for p in [*self.moving, *self.fixed]}
+        self.dist = dist
         pts = {p.part.name: edge_samples(p.mesh, self.spacing) for p in [*self.moving, *self.fixed]}
         self.edge_sets = {f.part.name: EdgeSet.build(f.mesh) for f in self.fixed}
+        self.pieces = {f.part.name: EdgeSet.build(f.mesh, EDGE_PIECE_MM) for f in self.fixed}
+        self.moving_pieces = {m.part.name: edge_pieces(m.mesh, EDGE_PIECE_MM) for m in self.moving}
         for m in self.moving:
             for f in self.fixed:
                 pts_m = pts[m.part.name]
@@ -153,7 +177,9 @@ class SweepRunner:
             return np.zeros(len(world), dtype=bool)
         return np.array([self.zone.contains(p) for p in world], dtype=bool)
 
-    def _overlap(self, tau: float) -> Contact | None:
+    def _overlap(self, tau: float, zone: bool = True) -> Contact | None:
+        """The largest overlap above the floor at `tau`. With `zone`, an overlap whose bounds lie in the contact zone
+        does not count (a seat); without it (the end-of-travel cap) every overlap counts."""
         r, t = self.motion.pose(tau)
         best: Contact | None = None
         for m in self.moving:
@@ -167,7 +193,7 @@ class SweepRunner:
                     raise GeomError(f"at {tau:.3f} {self.rule.unit}: {e}") from e
                 if ov.volume_mm3 is None or ov.volume_mm3 <= overlap_floor(m.mesh.volume(), f.mesh.volume()) or ov.bounds is None:
                     continue
-                if self.zone is not None and self.zone.contains_box(ov.bounds[0], ov.bounds[1]):
+                if zone and self.zone is not None and self.zone.contains_box(ov.bounds[0], ov.bounds[1]):
                     continue
                 c = _p([(ov.bounds[0][i] + ov.bounds[1][i]) / 2 for i in range(3)])
                 if best is None or ov.volume_mm3 > (best.volume_mm3 or 0):
@@ -235,38 +261,97 @@ class SweepRunner:
         d = self._distance(tau, prev, run, full)
         return d if d is not None else self._overlap(tau)
 
+    def _gap(self, tau: float) -> tuple[float, Contact | None]:
+        """(gap, where): the exact minimum distance at `tau` between the moving and the fixed meshes, outside the
+        contact zone, capped at `self.cap` (a capped value is a lower bound, which keeps the proof sound)."""
+        if tau in self.gaps:
+            return self.gaps[tau]
+        r, t = self.motion.pose(tau)
+        best, where = self.cap, None
+        for m in self.moving:
+            vm = m.mesh.V @ r.T + t
+            pm, qm = self.moving_pieces[m.part.name]
+            pw, qw = pm @ r.T + t, qm @ r.T + t
+            for f in self.fixed:
+                res = self.dist[f.part.name].distances(vm, best)
+                res2 = self.dist[m.part.name].distances((f.mesh.V - t) @ r, best)
+                d3, c1, c2 = self.pieces[f.part.name].within(pw, qw, best)
+                rows = [
+                    (res.d, vm, vm),
+                    (res2.d, f.mesh.V, f.mesh.V),
+                    (d3, c1, c2),
+                ]
+                for d, a, b in rows:
+                    ok = np.isfinite(d) & (d < best)
+                    if not ok.any():
+                        continue
+                    mid = (a + b) / 2
+                    if self.zone is not None:
+                        ok &= ~self._in_zone(mid)
+                    if ok.any():
+                        i = int(np.argmin(np.where(ok, d, np.inf)))
+                        best = float(d[i])
+                        where = Contact(tau, "bound", f.part.name, m.part.name, _p(mid[i]), best)
+        self.gaps[tau] = (best, where)
+        return best, where
+
+    def _first_contact(self, lo: float, hi: float, run: SweepRun) -> Contact | None:
+        """The first contact in (lo, hi], `lo` clear: the earliest interval that cannot be proven clear (the
+        module notes), evaluated at its end."""
+        margin, res = self.rule.margin_mm, self.rule.resolution
+        stack = [(lo, hi)]
+        while stack:
+            a, b = stack.pop()
+            ga, _ = self._gap(a)
+            gb, where = self._gap(b)
+            if (ga + gb - self.speed * (b - a)) / 2 > margin:
+                continue
+            if b - a <= res:
+                for ch in self.channels:
+                    ch.known = np.zeros(len(ch.points))
+                c = self._hit(b, a, run, True)
+                if c is not None:
+                    c.tau = b
+                    return c
+                if b - a <= res / PROOF_FLOOR:
+                    bound = max(0.0, (ga + gb - self.speed * (b - a)) / 2)
+                    if where is None:
+                        where = self._gap(a)[1]
+                    if where is None:
+                        m, f = self.moving[0].part.name, self.fixed[0].part.name
+                        where = Contact(b, "bound", f, m, (0.0, 0.0, 0.0))
+                    return Contact(b, "bound", where.partner, where.part, where.point, bound)
+            mid = (a + b) / 2
+            stack.append((mid, b))
+            stack.append((a, mid))
+        return None
+
     def run(self) -> SweepRun:
         self._build()
         run = SweepRun()
+        run.speed = self.speed
         total = self.motion.total
         n = max(1, math.ceil(total / self.rule.step - 1e-9))
         taus = [min(total, k * self.rule.step) for k in range(n + 1)]
         prev: float | None = None
-        hit_at: Contact | None = None
         for tau in taus:
             run.steps += 1
             hit_at = self._hit(tau, prev, run, False)
-            if hit_at is not None:
-                break
+            if prev is None:
+                if hit_at is not None:
+                    hit_at.tau = tau
+                    run.first = hit_at
+                    break
+            else:
+                first = self._first_contact(prev, tau, run)
+                if first is None and hit_at is not None:
+                    hit_at.tau = tau  # a hit the proof does not see between the poses (a crossing): at this pose
+                    first = hit_at
+                if first is not None:
+                    run.first = first
+                    break
             prev = tau
-        if hit_at is not None:
-            lo = prev if prev is not None else 0.0
-            hi = hit_at.tau
-            best = hit_at
-            if prev is not None:
-                while hi - lo > self.rule.resolution:
-                    mid = (lo + hi) / 2
-                    for ch in self.channels:
-                        ch.known = np.zeros(len(ch.points))
-                    c = self._hit(mid, lo, run, True)
-                    if c is not None:
-                        hi, best = mid, c
-                    else:
-                        lo = mid
-            best.tau = hi
-            run.first = best
-        end_ov = self._overlap(total)
-        run.end_overlap = end_ov
+        run.end_overlap = self._overlap(total, zone=False)
         return run
 
 
