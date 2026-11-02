@@ -261,3 +261,79 @@ def test_step_chord_bounds_every_point():
         moved = np.linalg.norm((pts @ r1.T + t1) - (pts @ r0.T + t0), axis=1)
         bound = m.chord(m.radius(pts @ r0.T + t0), step)
         assert np.all(moved <= bound + 1e-9) and np.allclose(moved, bound, atol=1e-9)
+
+
+def _slide_rule(**kw):
+    rule = {"id": "slide", "type": "sweep", "moving": "part:bar", "fixed": "part:post", "motion": "translate", "axis": [0, 0, 1]}
+    return {**rule, "from_mm": 1, "step_mm": 1, "resolution_mm": 0.01, "margin_mm": 0.01, **kw}
+
+
+@pytest.mark.parametrize("cull", [True, False])
+def test_a_crossing_between_two_poses_is_found(tmp_path, capsys, cull):
+    """Two thin bars cross like a plus sign half a step in; no sampled point or pose sees it. The gap at both poses
+    is 0.2 mm, so the 1 mm step cannot be proven clear and is subdivided."""
+    meshes = {"bar": box((-5, 0.1, 0.35), (5, 0.4, 0.65)), "post": box((0.1, -5, -0.15), (0.4, 5, 0.15))}
+    sp = _scene(tmp_path, meshes, [_slide_rule()], {"bar": "moving"})
+    code, doc, _, _ = run(capsys, "cad", "sweep", "--spec", str(sp), *([] if cull else ["--no-cull"]))
+    got = doc["rules"][1]["first_contact"]
+    assert code == 1 and fails(doc) & {"sweep.margin", "sweep.overlap"}
+    assert got is not None and abs(got["travel_mm"] - 0.19) <= 0.02  # the gap of 0.2 mm closes to the 0.01 mm margin
+
+
+def test_same_part_on_both_sides_is_incomplete(tmp_path, capsys):
+    sp = _scene(tmp_path, {"bar": box((0, 0, 0), (1, 1, 1))}, [_slide_rule(fixed="part:bar")], {"bar": "moving"})
+    code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
+    assert code == 1 and doc["gate"] == "incomplete" and "cad.incomplete.selector_empty" in fails(doc)
+
+
+def test_a_contact_zone_does_not_lift_the_end_overlap_cap(tmp_path, capsys):
+    meshes = {"bar": box((0, 0, 0), (2, 2, 2)), "post": box((0, 0, 0), (2, 2, 2))}
+    rule = _slide_rule(from_mm=5, step_mm=1, contact_zone="seat", max_overlap_mm3=0.1)
+    sp = _scene(tmp_path, meshes, [rule], {"bar": "moving"}, zones={"seat": {"x": [-1, 3], "y": [-1, 3], "z": [-1, 3]}})
+    code, doc, _, _ = run(capsys, "cad", "sweep", "--spec", str(sp))
+    assert code == 1 and "sweep.overlap" in fails(doc) and doc["rules"][1]["end_overlap"]["volume_mm3"] > 7.9
+
+
+def test_a_sweep_boolean_failure_is_a_finding_and_the_gate_goes_on(tmp_path, capsys, monkeypatch):
+    def broken(self, a, b):
+        raise GeomError(f"{a.name} x {b.name}: the Boolean failed (test)")
+
+    monkeypatch.setattr(ManifoldBoolean, "overlap", broken)
+    meshes = {"bar": box((0, 0, 0), (2, 2, 2)), "post": box((0, 0, 0), (2, 2, 2))}
+    rules = [_slide_rule(from_mm=5), {"id": "solid", "type": "check"}]
+    sp = _scene(tmp_path, meshes, rules, {"bar": "moving"})
+    code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
+    assert code == 1 and "sweep.boolean_failed" in fails(doc) and [r["id"] for r in doc["rules"][1:]] == ["slide", "solid"]
+
+
+def test_one_exempt_closest_point_does_not_exempt_the_rest(tmp_path, capsys):
+    """The faces are 0.1 mm apart over their whole area; the zone covers one corner, where the closest pair sits."""
+    ex = [{"a": "part:a", "b": "part:b", "reason": "seat", "zone": "corner"}]
+    sp = _scene(
+        tmp_path,
+        {"a": box((0, 0, 0), (10, 10, 10)), "b": box((10.1, 0, 0), (20, 10, 10))},
+        [_clash(margin_mm=0.3, exempt=ex)],
+        zones={"corner": {"y": [9.9, 10.1], "z": [-0.1, 0.1]}},
+    )
+    code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
+    assert code == 1 and "clash.margin" in fails(doc)
+
+
+def test_a_contact_inside_the_zone_alone_stays_exempt(tmp_path, capsys):
+    ex = [{"a": "part:a", "b": "part:b", "reason": "seat", "zone": "face"}]
+    sp = _scene(
+        tmp_path,
+        {"a": box((0, 0, 0), (10, 10, 10)), "b": box((10.1, 0, 0), (20, 10, 10))},
+        [_clash(margin_mm=0.3, exempt=ex)],
+        zones={"face": {"x": [9.9, 10.2]}},
+    )
+    code, doc, _, _ = run(capsys, "cad", "gate", str(sp))
+    assert code == 0 and "clash.exempt" in codes(doc)
+
+
+def test_diff_surface_reads_a_known_offset(tmp_path, capsys):
+    old = stl(tmp_path / "old.stl", box((0, 0, 0), (10, 10, 10)))
+    new = stl(tmp_path / "new.stl", box((0, 0, 0), (10, 10, 10.5)))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(old), str(new), "--surface")
+    surf = doc["surface"]
+    assert code == 0 and abs(surf["hausdorff_mm"] - 0.5) <= 1e-6 and 0 < surf["mean_mm"] < 0.5

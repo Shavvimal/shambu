@@ -134,3 +134,64 @@ def test_promote_never_overwrites(tmp_path, capsys):
     code, doc, _, _ = run(capsys, "cad", "check", str(part), "--promote", str(dest))
     assert code == 3 and "new file" in doc["error"]
     assert dest.read_bytes() == b"last good export"
+
+
+def test_build_id_tells_a_missing_input_from_one_that_reads_missing(tmp_path):
+    """A file whose bytes are `MISSING` and a missing file hashed the same; a deleted input then kept the id fresh."""
+    looks_missing = tmp_path / "params.json"
+    looks_missing.write_bytes(b"MISSING")
+    assert P.build_id([("params.json", looks_missing)], "B") != P.build_id([("params.json", tmp_path / "gone.json")], "B")
+
+
+def test_promote_publishes_the_bytes_that_were_checked(tmp_path, capsys, monkeypatch):
+    """A writer replaces the candidate between the check and the copy: the promoted file holds the checked bytes."""
+    from shambu.cad import verbs
+
+    part = stl(tmp_path / "bracket.stl", box((0, 0, 0), (20, 10, 5)))
+    checked = part.read_bytes()
+    real = verbs.check_subject
+
+    def racing(subject, record, expect):
+        out = real(subject, record, expect)
+        part.write_bytes(b"replacement that is not an STL")
+        return out
+
+    monkeypatch.setattr(verbs, "check_subject", racing)
+    dest = tmp_path / "bracket@A.stl"
+    code, doc, _, _ = run(capsys, "cad", "check", str(part), "--promote", str(dest))
+    assert code == 0 and doc["promote"]["done"] and dest.read_bytes() == checked
+
+
+def test_load_subject_hashes_the_bytes_it_parses(tmp_path, monkeypatch):
+    """The hash and the facets come from one read: a file swapped between two reads cannot pair one hash with
+    another file's mesh."""
+    import hashlib
+
+    from shambu import mesh as M
+    from shambu.cad import load
+
+    part = stl(tmp_path / "bracket.stl", box((0, 0, 0), (20, 10, 5)))
+    first = part.read_bytes()
+    real = M.read_stl
+
+    def swapped(path):
+        stl(tmp_path / "bracket.stl", box((0, 0, 0), (20, 10, 5)) + box((30, 0, 0), (40, 10, 5)))
+        return real(path)
+
+    monkeypatch.setattr(M, "read_stl", swapped)
+    s = load.load_subject(part)
+    assert s.sha256 == hashlib.sha256(first).hexdigest() and len(s.facets) == 12
+
+
+def test_stamp_never_writes_over_its_stl_or_another_file(tmp_path, capsys):
+    part = stl(tmp_path / "bracket.stl", box((0, 0, 0), (20, 10, 5)))
+    mesh = part.read_bytes()
+    code, doc, _, _ = run(capsys, "cad", "stamp", str(part), "--part", "bracket", "-o", str(part))
+    assert code == 3 and part.read_bytes() == mesh and "bracket.stl" in doc["error"]
+    notes = tmp_path / "notes.txt"
+    notes.write_text("keep me")
+    code, doc, _, _ = run(capsys, "cad", "stamp", str(part), "--part", "bracket", "-o", str(notes))
+    assert code == 3 and notes.read_text() == "keep me"
+    code, _, _, _ = run(capsys, "cad", "stamp", str(part), "--part", "bracket")
+    code2, _, _, _ = run(capsys, "cad", "stamp", str(part), "--part", "bracket")
+    assert code == code2 == 0  # a re-stamp still replaces its own earlier record

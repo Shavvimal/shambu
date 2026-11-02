@@ -13,6 +13,7 @@ allowance a printed horizontal bore needs is the user's design decision, recorde
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -57,11 +58,19 @@ class Fit:
             hole = float(d["hole_mm"])
         except (TypeError, ValueError, IndexError) as e:
             raise CadSpecError(f"{where}: fit {d['name']!r}: {e}") from e
-        if lo > hi or hole <= 0:
+        if not all(math.isfinite(x) for x in (lo, hi, hole)) or lo > hi or hole <= 0:
             raise CadSpecError(f"{where}: fit {d['name']!r}: hole_mm must be positive and band_mm [low, high]")
 
         def opt(k: str) -> float | None:
-            return float(d[k]) if d.get(k) is not None else None
+            if d.get(k) is None:
+                return None
+            try:
+                v = float(d[k])
+            except (TypeError, ValueError) as e:
+                raise CadSpecError(f"{where}: fit {d['name']!r}: {k}: {e}") from e
+            if not math.isfinite(v) or v < 0:
+                raise CadSpecError(f"{where}: fit {d['name']!r}: {k} must be a finite number, 0 or more")
+            return v
 
         return cls(
             str(d["name"]), str(d["kind"]), hole, (lo, hi), opt("depth_min_mm"), opt("wall_min_mm"), opt("offset_max_mm"), str(d["basis"])

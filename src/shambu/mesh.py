@@ -147,6 +147,12 @@ def read_stl(path: str | Path) -> list[Facet]:
         data = p.read_bytes()
     except OSError as e:
         raise BuildError(f"{p}: cannot read: {e}") from e
+    return parse_stl(data, str(p))
+
+
+def parse_stl(data: bytes, name: str = "STL") -> list[Facet]:
+    """Binary or ASCII STL bytes to facets (`name` labels the errors). Raises BuildError on anything it cannot parse."""
+    p = name
     if len(data) < 84 and not data.lstrip().lower().startswith(b"solid"):
         raise BuildError(f"{p}: not an STL file ({len(data)} bytes)")
     if len(data) >= 84:

@@ -109,3 +109,10 @@ def test_metres_mesh_fails(tmp_path, capsys):
     part = stl(tmp_path / "b.stl", box((0, 0, 0), (0.02, 0.01, 0.005)))
     code, doc, _, _ = run(capsys, "cad", "check", str(part))
     assert code == 1 and "mesh.metres" in fails(doc)
+
+
+def test_an_inward_shell_outside_every_body_is_not_a_void():
+    """An inside-out box beside a box is not a cavity: it once read as one body, watertight, 875 mm3."""
+    areas = SO.check("b", box((0, 0, 0), (10, 10, 10)) + _inward_box((20, 20, 20), (25, 25, 25)), None, SO.Expect())
+    codes_ = {f.code: f.severity for f in areas["solid"].findings}
+    assert codes_.get("solid.inverted") == "FAIL" and "solid.void" not in codes_

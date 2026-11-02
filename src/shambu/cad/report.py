@@ -177,3 +177,4 @@ class Subject:
     sha256: str
     kind: str = "stl"  # "stl" or "3mf"
     object: str | None = None
+    raw: bytes = field(default=b"", repr=False, compare=False)  # the bytes hashed and parsed (what --promote publishes)

@@ -89,11 +89,12 @@ class Output:
     def __init__(self, as_json: bool):
         self.as_json = as_json
 
-    def emit(self, data, text_lines: list[str] | None = None) -> None:
+    def emit(self, data, text_lines: list[str] | None = None, strict: bool = False) -> None:
+        """`strict`: a NaN or infinity in the document raises ValueError instead of printing invalid JSON."""
         values = _scrub_values()
         doc = _scrub_tree(_jsonable(data), values)
         if self.as_json:
-            print(json.dumps(doc, indent=1, default=str))
+            print(json.dumps(doc, indent=1, default=str, allow_nan=not strict))
         else:
             for line in [conf.scrub_text(x, values) for x in text_lines] if text_lines is not None else _default_lines(doc):
                 print(line)
@@ -896,6 +897,22 @@ class Cad(Command):
             "extra missing)."
         )
 
+    # Every numeric flag is checked before a verb runs: NaN or infinity would pass every comparison (`nan < x` is
+    # False) and switch a check off, and would print as NaN, which is not JSON.
+    _RANGES = (
+        ("--cad-volume", "cad_volume", lambda x: x > 0, "over 0 mm3"),
+        ("--cad-area", "cad_area", lambda x: x > 0, "over 0 mm2"),
+        ("--step-volume", "step_volume", lambda x: x > 0, "over 0 mm3"),
+        ("--faceting-tol", "faceting_tol", lambda x: x > 0, "over 0 mm"),
+        ("--angle-tol", "angle_tol", lambda x: 0 < x < 180, "between 0 and 180 degrees"),
+        ("--expect-volume", "expect_volume", lambda x: x > 0, "over 0 mm3"),
+        ("--volume-tol", "volume_tol", lambda x: x >= 0, "0 mm3 or more"),
+        ("--size-tol", "size_tol", lambda x: x >= 0, "0 mm or more"),
+        ("--density", "density", lambda x: x > 0, "over 0 g/cm3"),
+        ("--axis-tol", "axis_tol", lambda x: 0 < x < 90, "between 0 and 90 degrees"),
+        ("--min-diameter", "min_diameter", lambda x: x >= 0, "0 mm or more"),
+    )
+
     def run(self, a, app, out):
         from .cad import verbs
         from .errors import CadSpecError
@@ -921,6 +938,12 @@ class Cad(Command):
             return usage(out, f"cad {a.action} does not take " + ", ".join("--" + s.replace("_", "-") for s in stray))
         if a.action in ("clearance", "sweep") and not a.spec:
             return usage(out, f"cad {a.action} needs --spec cad.json")
+        for flag, v, ok, want in self._RANGES:
+            v = getattr(a, v)
+            if v is not None and not (math.isfinite(v) and ok(v)):
+                return usage(out, f"{flag} must be a finite number {want}, not {v}")
+        if a.sections < 2:
+            return usage(out, f"--sections must be at least 2, not {a.sections}")
         try:
             kw = self._args(a, verbs)
         except ValueError as e:
@@ -931,7 +954,7 @@ class Cad(Command):
             msg = f"CadSpecError: {e}"
             out.emit({"error": msg}, [msg])
             return 1
-        out.emit(rep.to_json(), rep.lines())
+        out.emit(rep.to_json(), rep.lines(), strict=True)
         return rep.exit_code
 
     @staticmethod

@@ -2,8 +2,9 @@
 `shambu.cad.record/1`), the build id, and the stale-export refusal `shambu cad check` applies.
 
 The build id is SHA-256 over the declared inputs (the saved CAD script and its parameter file) in sorted path order,
-each hashed as `path NUL bytes NUL`; a missing input hashes as `path NUL MISSING NUL`, so it differs from an empty
-file. The id is `rev@` and the first 12 hex digits. Paths in a record are relative to the record's own folder, so a
+each hashed as the label's length and bytes, then a presence tag: `F` with the content's length and bytes, or `M` for
+a missing file. The tag and the lengths keep a missing file apart from an empty one and from one whose bytes read
+`MISSING`, and no two (label, content) lists run together into one byte stream. The id is `rev@` and the first 12 hex digits. Paths in a record are relative to the record's own folder, so a
 project moved as a whole keeps its ids; each input also keeps the label it was hashed under, so a promoted record in
 another folder recomputes the same id.
 
@@ -29,6 +30,7 @@ from pathlib import Path
 
 from ..errors import CadError
 from ..findings import FAIL, MEASURED, WARN, Finding, Fix
+from .jsonin import loads
 
 SCHEMA = "shambu.cad.record/1"
 
@@ -41,16 +43,20 @@ def sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def _framed(data: bytes) -> bytes:
+    return len(data).to_bytes(8, "big") + data
+
+
 def build_id(inputs: Iterable[tuple[str, Path]], rev: str | None) -> str:
-    """`rev@` + 12 hex of SHA-256 over (label, file) pairs in sorted label order. A missing file hashes as MISSING."""
+    """`rev@` + 12 hex of SHA-256 over (label, file) pairs in sorted label order: each label length-prefixed, then
+    `F` and the length-prefixed content, or `M` for a missing file."""
     h = hashlib.sha256()
     for label, path in sorted(inputs, key=lambda x: x[0]):
-        h.update(label.encode() + b"\0")
+        h.update(_framed(label.encode()))
         try:
-            h.update(path.read_bytes())
+            h.update(b"F" + _framed(path.read_bytes()))
         except FileNotFoundError:
-            h.update(b"MISSING")
-        h.update(b"\0")
+            h.update(b"M")
     return f"{rev or '-'}@{h.hexdigest()[:12]}"
 
 
@@ -86,8 +92,8 @@ def load_record(path: str | Path) -> Record:
     """Raises CadError when the record does not read or is not a `shambu.cad.record/1` document."""
     p = Path(path)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+        data = loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:  # ValueError: not UTF-8, not JSON, or a non-finite number
         raise CadError(f"cannot read record {path}: {e}") from e
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         raise CadError(f"{path}: not a {SCHEMA} record (write one with `shambu cad stamp`)")
@@ -130,12 +136,13 @@ def stamp_record(
     angle_tol_deg: float | None,
     bed_face: list[float] | None,
     version: str,
+    stl_sha: str,
 ) -> dict:
-    """The record for `stl`, written to `out` by the caller. `inputs` are paths as the caller gives them; the record
-    keeps them relative to `out`'s folder. Raises CadError when the STL or the STEP does not read."""
+    """The record for `stl`, written to `out` by the caller. `stl_sha` is the hash of the bytes the mesh facts came
+    from. `inputs` are paths as the caller gives them; the record keeps them relative to `out`'s folder. Raises
+    CadError when the STEP does not read."""
     folder = out.parent
     try:
-        stl_sha = sha256_file(stl)
         step_sha = sha256_file(step) if step is not None else None
     except OSError as e:
         raise CadError(f"cannot read {e.filename}: {e.strerror}") from e
@@ -234,18 +241,21 @@ def freshness(record: Record, stl: Path, stl_sha: str) -> tuple[dict, list[Findi
     return measures, fs
 
 
-def promote(src: Path, dest: Path, record: Record | None) -> dict:
-    """Copy the checked `src` to the NEW file `dest` and, with a record, write a NEW record beside it
-    (`<dest stem>.cad.json`, with `stl.path` pointing at `dest`; the SHA stays). Refuses (CadError, exit 3) when either
-    destination exists. The copy goes through a temp file and a hard link, then its SHA-256 is compared with the
-    source's."""
+def promote(src: Path, data: bytes, checked_sha: str, dest: Path, record: Record | None) -> dict:
+    """Publish `data`, the bytes the check read from `src` and judged, as the NEW file `dest` and, with a record,
+    write a NEW record beside it (`<dest stem>.cad.json`, with `stl.path` pointing at `dest`; the SHA stays). The
+    source is never read again, so a writer that replaces it after the check cannot slip unchecked bytes through.
+    Refuses (CadError, exit 3) when the bytes do not hash to `checked_sha` or when either destination exists. The
+    copy goes through a temp file and a hard link (never over an existing file), then its SHA-256 is compared with
+    `checked_sha`."""
+    if hashlib.sha256(data).hexdigest() != checked_sha:
+        raise CadError(f"{src}: the bytes to promote are not the ones the check hashed; nothing was written")
     rec_dest = dest.with_name(dest.stem + ".cad.json") if record is not None else None
     if dest.exists() or (rec_dest is not None and rec_dest.exists()):
         raise CadError(f"{dest if dest.exists() else rec_dest} exists: --promote writes only a new file; give a new revision name")
     tmp = None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        data = src.read_bytes()
         with tempfile.NamedTemporaryFile("wb", dir=dest.parent, delete=False, suffix=".tmp") as fh:
             tmp = Path(fh.name)
             fh.write(data)
@@ -257,9 +267,9 @@ def promote(src: Path, dest: Path, record: Record | None) -> dict:
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
-    if sha256_file(dest) != hashlib.sha256(data).hexdigest():
-        raise CadError(f"{dest}: the copy does not match {src}")
-    out: dict = {"stl": str(dest), "sha256": hashlib.sha256(data).hexdigest(), "record": None}
+    if sha256_file(dest) != checked_sha:
+        raise CadError(f"{dest}: the copy does not match the checked bytes of {src}")
+    out: dict = {"stl": str(dest), "sha256": checked_sha, "record": None}
     if record is not None and rec_dest is not None:
         new = json.loads(json.dumps(record.data))
         old_folder = record.folder.resolve()
@@ -270,6 +280,6 @@ def promote(src: Path, dest: Path, record: Record | None) -> dict:
         if isinstance(new.get("step"), dict) and new["step"].get("path"):
             new["step"]["path"] = relative_to(old_folder / new["step"]["path"], new_folder)
         new["promoted_from"] = relative_to(src, new_folder)
-        write_new(rec_dest, json.dumps(new, indent=1) + "\n")
+        write_new(rec_dest, json.dumps(new, indent=1, allow_nan=False) + "\n")
         out["record"] = str(rec_dest)
     return out

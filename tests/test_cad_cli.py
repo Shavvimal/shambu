@@ -112,3 +112,41 @@ def test_cad_package_stays_off_cad_programs():
         if any(w in line for w in ("subprocess", "socket", "npx", "import mcp"))
     ]
     assert hits == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["check", "--expect-volume", "1000", "--volume-tol", "nan"],
+        ["check", "--expect-volume", "inf", "--volume-tol", "1"],
+        ["check", "--expect-volume", "1000", "--volume-tol=-1"],
+        ["check", "--density", "nan"],
+        ["check", "--expect-size", "10,10,10", "--size-tol", "inf"],
+        ["stamp", "--part", "b", "--cad-volume", "nan"],
+        ["stamp", "--part", "b", "--faceting-tol=-0.1"],
+        ["features", "--axis-tol", "nan"],
+        ["features", "--min-diameter=-inf"],
+        ["fit", "--hole", "h1:M3-clearance-medium:nan,5,10:0,0,-1"],
+        ["diff", "--sections", "1"],
+    ],
+)
+def test_non_finite_or_out_of_range_numbers_are_usage_errors(tmp_path, capsys, argv):
+    """`--volume-tol nan` once disabled the volume check (gate pass, exit 0) and printed NaN, which is not JSON."""
+    verb, *flags = argv
+    files = [str(_box(tmp_path))] * (2 if verb == "diff" else 1)
+    code, doc, out, _ = run(capsys, "cad", verb, *files, *flags)
+    assert code == 2 and doc is not None and "error" in doc
+    assert "NaN" not in out and "Infinity" not in out
+
+
+def test_non_finite_numbers_in_input_json_are_refused(tmp_path, capsys):
+    """JSON allows no NaN or Infinity, but Python's reader takes them (and 1e400 reads as inf): every input file is
+    read strictly."""
+    b = _box(tmp_path)
+    fits = tmp_path / "fits.json"
+    fits.write_text('{"fits": [{"name": "x", "kind": "slip", "hole_mm": 4, "depth_min_mm": NaN, "basis": "t"}]}')
+    code, doc, _, _ = run(capsys, "cad", "fit", str(b), "--fits", str(fits), "--hole", "h1:x:5,5,10:0,0,-1")
+    assert code == 1 and "CadSpecError" in doc["error"]
+    fits.write_text('{"fits": [{"name": "x", "kind": "slip", "hole_mm": 1e400, "basis": "t"}]}')
+    code, doc, _, _ = run(capsys, "cad", "fit", str(b), "--fits", str(fits), "--hole", "h1:x:5,5,10:0,0,-1")
+    assert code == 1 and "CadSpecError" in doc["error"]

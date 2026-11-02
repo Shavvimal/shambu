@@ -3,19 +3,20 @@
 
 What it handles: STL through `mesh.read_stl`, a 3MF object through `edits.object_meshes` (its normal parts in
 plate-local mm), SHA-256 of each file, spec paths relative to the spec file, and caching (one read per part per
-run). What it does not do: no checking and no printing. Every error is a `CadError`: `MeshMissing` for a file that is
+run). A subject's hash, its facets and the bytes `--promote` publishes all come from one read of the file. What it does not do: no checking and no printing. Every error is a `CadError`: `MeshMissing` for a file that is
 not there, `CadError` for one that does not read, `CadSpecError` for a spec that breaks its schema.
 """
 
 from __future__ import annotations
 
 import glob
-import json
+import hashlib
 from pathlib import Path
 
 from ..errors import BambuError, CadError, CadSpecError, MeshMissing
 from . import provenance as P
 from . import spec as S
+from .jsonin import loads
 from .report import Subject
 
 
@@ -26,19 +27,23 @@ def load_subject(path: str | Path, name: str | None = None, obj: str | None = No
         raise MeshMissing(f"{path}: no such file")
     low = p.name.lower()
     try:
-        sha = P.sha256_file(p)
+        raw = p.read_bytes()
+        sha = hashlib.sha256(raw).hexdigest()
         if low.endswith(".stl"):
-            from ..mesh import read_stl
+            from ..mesh import parse_stl
 
-            facets = read_stl(p)
+            facets = parse_stl(raw, str(path))
             if not facets:
                 raise CadError(f"{path}: the STL has no facets")
-            return Subject(name or p.stem, str(path), facets, sha, "stl")
+            return Subject(name or p.stem, str(path), facets, sha, "stl", raw=raw)
         if low.endswith(".3mf"):
             from ..edits import object_meshes
             from ..threemf import Project
 
-            meshes = object_meshes(Project(str(p)))
+            project = Project(str(p))
+            if P.sha256_file(p) != sha:
+                raise CadError(f"{path}: the file changed while it was read; read it again when the writer is done")
+            meshes = object_meshes(project)
             names = [m.name for m in meshes]
             if obj is None:
                 if len(meshes) != 1:
@@ -51,7 +56,7 @@ def load_subject(path: str | Path, name: str | None = None, obj: str | None = No
                 chosen = found[0]
             if not chosen.facets:
                 raise CadError(f"{path}: object {chosen.name!r} has no mesh")
-            return Subject(name or chosen.name, str(path), list(chosen.facets), sha, "3mf", chosen.name)
+            return Subject(name or chosen.name, str(path), list(chosen.facets), sha, "3mf", chosen.name, raw)
     except OSError as e:
         raise CadError(f"cannot read {path}: {e}") from e
     except CadError:
@@ -64,10 +69,10 @@ def load_subject(path: str | Path, name: str | None = None, obj: str | None = No
 def load_spec(path: str | Path) -> S.CadSpec:
     p = Path(path)
     try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
+        doc = loads(p.read_text(encoding="utf-8"))
     except OSError as e:
         raise CadError(f"cannot read spec {path}: {e}") from e
-    except json.JSONDecodeError as e:
+    except ValueError as e:  # not UTF-8, not JSON, or a non-finite number
         raise CadSpecError(f"{path}: not JSON: {e}") from e
     try:
         return S.parse(doc, str(path), str(p.parent))
@@ -79,10 +84,10 @@ def load_spec(path: str | Path) -> S.CadSpec:
 
 def load_json(path: str | Path, what: str) -> object:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return loads(Path(path).read_text(encoding="utf-8"))
     except OSError as e:
         raise CadError(f"cannot read {what} {path}: {e}") from e
-    except json.JSONDecodeError as e:
+    except ValueError as e:  # not UTF-8, not JSON, or a non-finite number
         raise CadSpecError(f"{path}: {what} is not JSON: {e}") from e
 
 

@@ -148,3 +148,29 @@ def test_features_cli_one_document(tmp_path, capsys):
     part = stl(tmp_path / "p.stl", _plate())
     code, doc, out, _ = run(capsys, "cad", "features", str(part))
     assert code == 0 and json.loads(out) == doc and len(doc["rules"][0]["parts"]["p"]["features"]) == 4
+
+
+def test_pocket_depth_counts_from_the_material_not_the_declared_mouth():
+    """A 6 mm pocket whose mouth is declared 0.8 mm above the surface once read 6.8 mm deep."""
+    plate = plate_with_holes((20, 20, 10), [{"x": 10, "y": 10, "stages": [(2.0, 6)]}])
+    b = GA.Gauge(plate).bore((10, 10, 10.8), (0, 0, -1), 4.0)
+    assert b is not None and abs(b.depth_mm - 6.0) <= 0.02
+    fit = F.Fit("insert-test", "insert", 4.0, (-0.1, 0.1), depth_min_mm=6.5, basis="test")
+    assert "fit.depth" in {f.code for f in GA.judge("p", "h1", fit, b, (0, 0, -1), (10, 10, 10.8), None, None, {})}
+
+
+def test_an_oval_bore_fails_a_round_fit():
+    """A 3.9 x 4.1 mm bore averages 4.0 mm; its narrow side is what a 4.00 mm pin meets."""
+    plate = plate_with_holes((20, 20, 5), [{"x": 10, "y": 10, "stages": [(2.0, 0)]}])
+    oval = [tuple((x * 1.025, y * 0.975, z) for x, y, z in f) for f in plate]
+    b = GA.Gauge(oval).bore((10.25, 9.75, 5), (0, 0, -1), 4.0)
+    assert b is not None
+    fit = F.Fit("slip-test", "slip", 4.0, basis="test")
+    assert "fit.diameter" in {f.code for f in GA.judge("p", "h1", fit, b, (0, 0, -1), (10.25, 9.75, 5), None, None, {})}
+
+
+def test_an_unmeasured_wall_is_incomplete_not_a_pass():
+    b = GA.Bore(0.05, 5.0, 4.0, (10.0, 10.0, 5.0), 0.0, None, None, "through", 0.0, 64)
+    fit = F.Fit("wall-test", "clearance", 4.0, wall_min_mm=2.0, basis="test")
+    (f,) = [f for f in GA.judge("p", "h1", fit, b, (0, 0, -1), (10, 10, 5), None, None, {}) if f.severity == "FAIL"]
+    assert f.code.startswith("cad.incomplete.")

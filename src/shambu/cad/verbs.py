@@ -10,6 +10,7 @@ program (the skill drives it).
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -64,6 +65,20 @@ def _replace_text(path: Path, text: str) -> None:
             tmp.unlink(missing_ok=True)
 
 
+def _refuse_overwrite(out: Path, protected: Sequence[str]) -> None:
+    """Stamp writes only its record: refuse an output that is the STL, the STEP or a declared input, or any existing
+    file that is not a shambu record (a re-stamp replaces its own earlier record). Raises CadError (exit 3)."""
+    target = out.resolve()
+    for p in protected:
+        if Path(p).resolve() == target:
+            raise CadError(f"{out} is {p}, an input of this stamp: the record goes to a file of its own (-o PART.cad.json)")
+    if out.exists():
+        try:
+            P.load_record(out)
+        except CadError as e:
+            raise CadError(f"{out} exists and is not a shambu record: stamp replaces only its own earlier record") from e
+
+
 @dataclass(frozen=True)
 class StampArgs:
     stl: str
@@ -87,6 +102,7 @@ def stamp(a: StampArgs) -> CadReport:
     t0 = time.monotonic()
     subject = load_subject(a.stl, a.part)
     out = Path(a.out) if a.out else Path(a.stl).with_name(Path(a.stl).stem + ".cad.json")
+    _refuse_overwrite(out, [a.stl, *([a.step] if a.step else []), *a.inputs])
     cad = None
     if a.cad_volume_mm3 is not None or a.cad_area_mm2 is not None or a.cad_cog is not None:
         cad = {
@@ -112,8 +128,9 @@ def stamp(a: StampArgs) -> CadReport:
         a.angle_tol_deg,
         list(a.bed_face) if a.bed_face else None,
         __version__,
+        subject.sha256,
     )
-    _replace_text(out, json.dumps(rec, indent=1) + "\n")
+    _replace_text(out, json.dumps(rec, indent=1, allow_nan=False) + "\n")
     r = RuleResult(
         "stamp",
         "stamp",
@@ -166,7 +183,7 @@ def check(a: CheckArgs) -> CadReport:
     rep = CadReport("check", [rule], a.spec, record.data.get("build_id") if record else None, [_input_row(subject)])
     if a.promote:
         if rep.gate == "pass":
-            done = P.promote(Path(a.stl), Path(a.promote), record)
+            done = P.promote(Path(a.stl), subject.raw, subject.sha256, Path(a.promote), record)
             rep.extra["promote"] = {"done": True, **done}
             rep.text.append(f"promoted to {done['stl']}" + (f" with record {done['record']}" if done["record"] else ""))
         else:
@@ -228,6 +245,8 @@ def parse_hole(text: str) -> HoleSpec:
     ax = tuple(float(x) for x in axis.split(","))
     if len(m) != 3 or len(ax) != 3 or not name or not fit:
         raise ValueError(f"--hole {text!r}: NAME:FIT:X,Y,Z:AX,AY,AZ")
+    if not all(math.isfinite(x) for x in (*m, *ax)):
+        raise ValueError(f"--hole {text!r}: the point and the axis must be finite numbers")
     n = sum(x * x for x in ax) ** 0.5
     if n == 0:
         raise ValueError(f"--hole {text!r}: a zero axis")
