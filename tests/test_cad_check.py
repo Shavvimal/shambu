@@ -153,3 +153,11 @@ def test_a_truncated_binary_stl_names_the_size_mismatch(tmp_path, capsys):
     p.write_bytes(b"solid cube" + full[10:-30])
     code, doc, _, _ = run(capsys, "cad", "check", str(p))
     assert code == 3 and "12 facets" in doc["error"] and str(len(full) - 30) in doc["error"]
+
+
+def test_an_inside_out_shell_inside_a_void_is_inverted_not_a_void():
+    """Net winding decides: inside the outer body (+1) and inside its void (-1) is empty space."""
+    facets = box((0, 0, 0), (30, 30, 30)) + _inward_box((5, 5, 5), (25, 25, 25)) + _inward_box((10, 10, 10), (20, 20, 20))
+    areas = SO.check("b", facets, None, SO.Expect())
+    codes_ = {f.code: f.severity for f in areas["solid"].findings}
+    assert codes_.get("solid.inverted") == "FAIL" and areas["solid"].measures["inward_shells"] == 1

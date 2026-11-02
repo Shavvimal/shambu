@@ -91,8 +91,9 @@ def _winding(p: Vec, facets: Sequence[Facet]) -> float:
 
 def shells(facets: Sequence[Facet]) -> Shells:
     """Connected shells by welded edges. A shell with a negative signed volume faces inwards: a void when it lies
-    inside an outward shell (the winding number of that shell about one of its vertices is about 1), an inverted
-    body when it lies outside every outward shell."""
+    in material, an inverted body when it lies in empty space. In material means the net winding number of all the
+    other shells about one of its vertices is about 1 (an outward shell adds 1 inside it, an inward shell adds -1), so
+    an inward shell inside a void, which is empty space, is inverted and not a second void."""
     w = G.weld(facets)
     outward: list[list[Facet]] = []
     inward: list[list[Facet]] = []
@@ -103,7 +104,11 @@ def shells(facets: Sequence[Facet]) -> Shells:
             outward.append(shell)
         elif v < 0:
             inward.append(shell)
-    voids = sum(1 for sh in inward if any(_winding(sh[0][0], o) > 0.5 for o in outward))
+    voids = 0
+    for k, sh in enumerate(inward):
+        p = sh[0][0]
+        net = sum(_winding(p, o) for o in outward) + sum(_winding(p, other) for j, other in enumerate(inward) if j != k)
+        voids += net > 0.5
     return Shells(len(outward), voids, len(w.open_edges()), len(w.nonmanifold_edges()), w.flipped_edges(), len(inward) - voids)
 
 
