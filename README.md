@@ -130,8 +130,9 @@ and `diff` names what changed between revisions and which plates to reslice. `cl
 density optimisation on a voxel grid of the STL, with supports, passive regions, weighted cases and self-weight from
 a spec (`shambu.topo/1`). `check` validates the spec on the base install; `voxelise`, `solve` and `validate` (the
 Michell cantilever) need the topo extra (numpy, scipy); `trace` turns a map into window polygons for plate-like
-walls with the topo-trace extra (shapely). It is a map, not a proof: every result carries `topo.map_not_proof` and
-a not-checked list (no stress, buckling, fatigue or layer strength). The reference is
+walls with the topo-trace extra (shapely). It is a map, not a proof: every `solve`, `validate` and `trace` result
+carries `topo.map_not_proof` and a not-checked list (no stress, buckling, fatigue or layer strength). A domain over
+30000 cells is refused with a memory estimate; `--max-cells` raises the cap. The reference is
 `skills/designing-for-print/references/topology.md`.
 
 ```

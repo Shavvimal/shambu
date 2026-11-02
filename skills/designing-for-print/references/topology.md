@@ -22,15 +22,22 @@ carries findings and a not-checked list that say so.
 
 | Verb | Needs | Does | Exit |
 | --- | --- | --- | --- |
-| `shambu topo check SPEC.json` | base install | Validates the spec: one error line per problem | 0 valid, 1 errors |
-| `shambu topo voxelise SPEC.json [--pitch MM]` | `topo` | Grid, cells, voxel against mesh volume, pieces, open-mesh columns, what each selection holds. No solve | 0, 1 a selection is empty with no fallback |
-| `shambu topo solve SPEC.json --out DIR [--volfrac F]... [--pitch MM] [--maxit N] [--tol T] [--budget-min M] [--full-only] [--mesh auto\|cubes\|smooth\|none]` | `topo` (`smooth`: `topo-mesh`) | Full-density check, then one optimisation per volume fraction; writes the run files | 0 (WARN allowed), 1 a FAIL finding |
+| `shambu topo check SPEC.json` | base install | Validates the spec: one error line per problem; the grid size against the cell cap | 0 valid, 1 errors |
+| `shambu topo voxelise SPEC.json [--pitch MM] [--max-cells N]` | `topo` | Grid, cells, voxel against mesh volume, pieces, open-mesh columns, what each selection holds. No solve | 0, 1 a selection is empty with no fallback |
+| `shambu topo solve SPEC.json --out DIR [--volfrac F]... [--pitch MM] [--maxit N] [--tol T] [--budget-min M] [--full-only] [--mesh auto\|cubes\|smooth\|none] [--max-cells N]` | `topo` (`smooth`: `topo-mesh`) | Full-density check, then one optimisation per volume fraction; writes the run files | 0 (WARN allowed), 1 a FAIL finding |
 | `shambu topo validate [--size small\|paper]` | `topo` | The Michell cantilever: shape bands and a monotone objective | 0 pass, 1 fail |
 | `shambu topo trace RUN.json --faces FACES.json [--rules conservative\|aggressive\|RULES.json] [--volfrac F]` | `topo-trace` | Window polygons per wall face, with clearances and stage areas | 0, 1 a window inside its keep-out |
 
-Exit 2 is a usage error and exit 3 an environment error: a missing extra (`TopoDependencyError`, with the install
-line), a file that does not read or write, or a singular model (a support set that leaves the part free to move).
-A spec, faces or rules file that breaks its schema is exit 1 with one line per error. `--json` prints one document.
+Exit 2 is a usage error, a flag out of its range included (`--pitch 0`, `--maxit 0`, `--tol nan`); exit 3 an
+environment error: a missing extra (`TopoDependencyError`, with the install line) or a file that does not read or
+write. A spec, faces or rules file that breaks its schema is exit 1 with one line per error, and so is a name used
+twice. `--json` prints one document, always strict JSON: a NaN or an infinity becomes null and a
+`topo.non_finite` FAIL.
+
+Size: a domain over 30000 cells is refused before anything is allocated (exit 1), with a memory estimate: a solve
+measured about 0.18 MB a cell at 50000 cells on a solid block, so the default cap is about 5.5 GB. An STL's bounding
+grid may hold 50 times the cap, the degrees of freedom 12 times and the filter weights 500 times. `--max-cells N`
+raises every cap with it on a machine that has the memory; a coarser pitch is the other way out.
 
 Install lines (quote them from the error; never run `pip install` for the user):
 
@@ -129,14 +136,21 @@ carries `topo.load_fallback`. Without it an empty load is a spec error (exit 1).
 - **Filter.** `rho_e = sum_j H_ej x_j / sum_j H_ej`, `H_ej = max(0, rmin - |x_e - x_j|)`; the gradient goes back
   through the same weights. Passive cells read 1.
 - **Update (optimality criteria).** `x_new = clip(x (-dJ/dx / (lambda dV/dx))^eta, x - move, x + move, 0, 1)`,
-  lambda by bisection so the mean physical density of the design cells equals the volume fraction. Stop when no
-  design variable changes by more than `tol`, at `maxit`, or when the next iteration would pass the budget.
+  lambda by bisection so the mean physical density of the design cells equals the volume fraction. The upper bound
+  starts at the largest sensitivity ratio and widens until the volume falls to the target, so the load scale does
+  not matter. Stop when no design variable changes by more than `tol`, at `maxit`, or when the next iteration and
+  the final analysis would pass the budget. A run is `converged` only when its volume is also within 0.005 of the
+  target; else `topo.volume_missed` says by how much, and whether the passive regions put the target out of reach.
 - **Loads.** A force and a moment spread over their nodes as a rigid insert would: `f_i = F/n + w x r_i` with
   `A w = M`, `A = sum(|r|^2 I - r r^T)`. A force acting at a point (`about`) moves to the centroid as a force and a
   couple. Supports clamp the selected directions of every selected node.
-- **Checks.** At full density, reactions must balance loads and moments to 1e-6 relative, and fixed displacements
-  must read 0 (`topo.equilibrium`, FAIL). After each run every passive region must read 1 (`topo.passive_not_one`,
-  FAIL). Both FAILs mean a bug, not a design result.
+- **Checks.** Before any factorisation the supports must hold all six rigid-body modes (three translations, three
+  rotations); a mode left free is `topo.under_constrained` (FAIL, no run), and so is a negative or non-finite
+  full-density compliance. At full density, reactions must balance loads and moments to 1e-6 relative, and fixed
+  displacements must read 0 (`topo.equilibrium`, FAIL). After each run every passive region must read 1
+  (`topo.passive_not_one`, FAIL). These two FAILs mean a bug, not a design result. A case whose loads all sit on
+  fixed nodes has zero compliance and is a spec error under either weighting, and so are passive regions that cover
+  the whole domain.
 
 ## 6. The run files and `run.json`
 
@@ -145,12 +159,16 @@ carries `topo.load_fallback`. Without it an empty load is a spec error (exit 1).
 | File | Content |
 | --- | --- |
 | `run.json` | the document `--json` prints (`shambu.topo.run/1`) |
-| `density_v<NN>.npy` | float32 densities, shape `grid.shape`, indexed x, y, z; NaN outside the domain; cell centre at `origin + pitch * (index + 0.5)` |
+| `density_<tag>.npy` | float32 densities, shape `grid.shape`, indexed x, y, z; NaN outside the domain; cell centre at `origin + pitch * (index + 0.5)` |
 | `passive.npy` | int16: 0 for a design or outside cell, i + 1 for the i-th entry of `passive` |
 | `regions.md` | the region table per volume fraction, and the passive means |
-| `iso_v<NN>.stl` | the 0.5 iso-surface: cell faces (`cubes`) or marching cubes (`smooth`, `topo-mesh`) |
+| `iso_<tag>.stl` | the 0.5 iso-surface: cell faces (`cubes`) or marching cubes (`smooth`, `topo-mesh`) |
 
-`run.json` keys: `grid`, `domain` (cells, voxel and mesh volume, ratio, pieces, dropped, odd columns, surface share),
+The tag is `v` and the volume fraction's decimal digits, at least two: `v50` for 0.5, `v05` for 0.05, `v401` for
+0.401. Two fractions never share a file; a fraction given twice is an error.
+
+`run.json` keys: `grid`, `domain` (cells, voxel and mesh volume, ratio, pieces, dropped, odd columns, open edges,
+inverted, surface share),
 `fe` (elements, nodes, DOF, free, fixed), `settings`, `cases`, `passive`, `full_density` (per case: compliance,
 load, reaction, residuals, `ok`), `runs` (per volume fraction: iterations, `converged`, `budget_stop`,
 `final_change`, `objective_drift_last20`, `objective` history, `compliance`, `ratio` to full density,
@@ -158,8 +176,10 @@ load, reaction, residuals, `ok`), `runs` (per volume fraction: iterations, `conv
 `skin_solid_next_to_passive`, `files`, `seconds`, `timings`, `peak_rss_mb`), `versions`, `findings`,
 `not_checked`, `counts`.
 
-Read it in this order: findings, `full_density[].ok`, `runs[].converged`, `ratio`, then the regions. A `ratio` of
-1.46 means 46 % more deflection under that case at that volume, not 46 % more stress.
+Read it in this order: findings, `full_density[].ok`, `runs[].converged`, `ratio`, then the regions. Under fixed
+loads a `ratio` of 1.46 means 46 % more deflection under that case at that volume, not 46 % more stress. With
+self-weight that scales with density the lighter part also carries less load, so the ratio is a compliance ratio
+only, not a deflection ratio.
 
 ## 7. Tracing windows (`topo trace`)
 
@@ -194,7 +214,14 @@ Rules (`--rules`):
 | `other_grow` | rib | rim |
 
 A rules file (`shambu.topo.rules/1`) names a `base` preset and overrides any key. Pick the map's run with
-`--volfrac` (or `keep_volfrac` in the file).
+`--volfrac` (or `keep_volfrac` in the file). Ranges: `threshold` and `keep_volfrac` in (0, 1), `raster_mm` above 0,
+`roof_deg` in (0, 90], `flat_report_deg` in [0, 90], `max_vertices` at least 3, `rib_passes` at least 1, every
+other length at least 0. A face raster over 4 million cells is an error: raise `raster_mm`.
+
+A window never holds an island: where low density rings solid material, a strip `rib_mm` wide through the island,
+along the build axis, splits the window and keeps the island joined to the wall. Passive cells up to the clearance
+reach past the face rectangle are kept clear too. When run.json lists passive regions, `passive.npy` must sit
+next to it (exit 3 otherwise).
 
 Per window the output gives `poly`, `area_mm2`, `removed_mm3`, `mean_density`, `roof_flat_mm`, `clearance` (mm
 and the nearest passive region or keep-out), `n_vertices` and `simplify_tol`; per face, `stage_areas_mm2` (after
@@ -203,7 +230,8 @@ each step) and the dropped windows with the reason. Writing the windows into a C
 ## 8. Findings
 
 Every solve, validate and trace result carries `topo.map_not_proof`, `topo.stiffness_not_strength` and
-`topo.pitch_dependent`. Only the three FAIL codes change the exit code.
+`topo.pitch_dependent`. `check` and `voxelise` produce no map, so they carry no standing findings and no
+not-checked list. Only the five FAIL codes change the exit code.
 
 | Code | Severity, evidence | When | What to do |
 | --- | --- | --- | --- |
@@ -214,8 +242,11 @@ Every solve, validate and trace result carries `topo.map_not_proof`, `topo.stiff
 | `topo.clamped_support` | INFO heuristic | a support fixes x, y and z | Results next to it are optimistic |
 | `topo.not_converged` | WARN measured | change still above `tol` at `maxit` | Read the drift; raise `--maxit` or accept a rough map |
 | `topo.budget_stop` | WARN measured | the time budget stopped the run | A partial run: coarser pitch or a larger budget |
+| `topo.volume_missed` | WARN measured | design volume more than 0.005 from the target | The map answers another volume; with passive regions, read `min_volume` |
 | `topo.voxel_volume` | WARN measured | voxel / mesh volume outside 0.98 to 1.02 | Finer pitch; thin walls are lost |
 | `topo.odd_parity` | WARN measured | ray columns with an odd hit count | The mesh is open: re-export it closed |
+| `topo.open_mesh` | WARN measured | welded edges used by one facet or by more than two | The mesh is open or non-manifold: re-export it closed |
+| `topo.inverted_mesh` | WARN measured | the signed mesh volume is negative | Facets wind inward: fix the export before other tools read it |
 | `topo.dropped_pieces` | WARN measured | cells outside the largest piece | A loose body or a gap thinner than a cell |
 | `topo.thin_walls` | WARN heuristic | over half the design cells within 3 cells of the surface | Finer pitch; the map has no room |
 | `topo.filter_small` | WARN heuristic | rmin under 1.5 x pitch, or under `min_member_mm` | Raise `rmin` |
@@ -226,6 +257,8 @@ Every solve, validate and trace result carries `topo.map_not_proof`, `topo.stiff
 | `topo.load_fallback` | WARN measured | a load selection grew | Check the load sits where you meant |
 | `topo.equilibrium` | FAIL measured | reactions do not balance loads at full density | A model or solver bug: stop, report |
 | `topo.passive_not_one` | FAIL measured | a passive region below density 1 | A solver bug: stop, report |
+| `topo.under_constrained` | FAIL measured | the supports leave a rigid-body mode free, or the stiffness is singular | Add supports that hold every direction and rotation |
+| `topo.non_finite` | FAIL measured | a NaN or an infinity in the result (now null) | No number to act on: report it with the spec |
 | `topo.trace_rules_dominate` | WARN heuristic | the rules removed over half the candidate area | The rules, not the map, set the windows |
 | `topo.roof_bridge` | WARN measured | a window roof flatter than 43 degrees beyond the apex | Check the bridge in the slicer |
 | `topo.clearance` | FAIL measured | a window at or under `clearance_mm` from a keep-out | The trace broke its own rule: report it |

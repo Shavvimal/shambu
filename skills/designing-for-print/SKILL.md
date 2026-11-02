@@ -1,6 +1,6 @@
 ---
 name: designing-for-print
-description: Builds, checks and revises 3D-printable parts in ClassCAD through its MCP, and gates each exported STL with the shambu cad commands before it reaches a plate. It plans from a parameter table and a print-intent block (material, inserts, hole allowance, bed face, tolerances), builds with parametric recipes, proves volume and features with numbers, and keeps an export only when its gates pass: one closed solid, volume and size, hole and insert fits, clearance, insertion and rotation sweeps, and a stale-export guard. Between revisions it names what changed, which plate to reslice and which fit needs a coupon. With shambu topo it maps where a part could lose material (a stiffness map, not a proof). Use when the user wants a part designed or changed for 3D printing in ClassCAD, asks whether a CAD export is fit to print, wants fit, clearance or clash checks, asks what changed between two revisions, or wants a part lighter or a topology map. Not for slicing or plates (the shambu skill) or machined parts.
+description: Builds, checks and revises 3D-printable parts in ClassCAD through its MCP, and gates each exported STL with the shambu cad commands before it reaches a plate. It plans from a parameter table and a print-intent block (material, inserts, tolerances), builds with parametric recipes, proves volume and features with numbers, and keeps an export only when its gates pass: one closed solid, volume and size, hole and insert fits, clearance, insertion and rotation sweeps, and a stale-export guard. Between revisions it names what changed and which plate to reslice. With shambu topo it maps where a part could lose material (a stiffness map, not a proof). Use when the user wants a part designed or changed for 3D printing in ClassCAD, asks whether a CAD export is fit to print, wants fit, clearance or clash checks, asks what changed between two revisions, or wants a part lighter or a topology map. Not for slicing or plates (the shambu skill) or machined parts.
 argument-hint: "[part description, drawing path or cad.json] [print notes]"
 allowed-tools: Bash(shambu *), Read, Write, mcp__plugin_classcad_classcad__*
 ---
@@ -15,7 +15,7 @@ verification). This skill adds the print intent, the gates and revisions.
 
 ## Standing rules
 
-1. Before the first `shambu cad` command of a task: `shambu --version` (it must print: shambu 0.9.0). Another
+1. Before the first `shambu cad` or `shambu topo` command of a task: `shambu --version` (it must print: shambu 0.9.0). Another
    version or "command not found": stop and give the fix (`/shambu:setup update`). `clearance`, `sweep` and
    `diff --surface` need the geom extra. On exit 3 with `GeomMissing`, quote the install line from the error and
    stop that check; never run `pip install` yourself.
@@ -100,8 +100,9 @@ with `TopoDependencyError`, quote the install line and stop that step.
 5. Change the part by hand in ClassCAD, then gate, `shambu printability` and a test print. `shambu topo trace`
    proposes window polygons for plate-like walls (`topo-trace` extra); they are data for the script, not edits.
 
-A `topo.equilibrium` or `topo.passive_not_one` FAIL means a bug: stop and report it. Never call a map a
-structural check.
+A `topo.equilibrium`, `topo.passive_not_one` or `topo.non_finite` FAIL means a bug: stop and report it. A
+`topo.under_constrained` FAIL means the supports leave the part free to move or turn: fix the supports in the spec.
+Never call a map a structural check.
 
 ## Gotchas
 
@@ -140,15 +141,16 @@ shambu cad sweep --spec cad.json [--rule ID]... [--no-cull]                # geo
 shambu cad diff OLD NEW [--spec cad.json] [--plate plate.json] [--expect expect.json] [--sections N] [--surface]
 shambu cad gate cad.json [--only ID]... [--skip ID]...
 shambu topo check|voxelise topo.json                                         # voxelise: topo extra
-shambu topo solve topo.json --out DIR [--volfrac F]... [--pitch MM] [--maxit N] [--mesh auto|cubes|smooth|none]
+shambu topo solve topo.json --out DIR [--volfrac F]... [--pitch MM] [--maxit N] [--mesh auto|cubes|smooth|none] [--max-cells N]
 shambu topo validate [--size small|paper]
 shambu topo trace DIR/run.json --faces faces.json [--rules conservative|aggressive|rules.json]   # topo-trace extra
 ```
 
 `--json` gives one JSON document. Exit 0 pass (WARN and INFO allowed), 1 fail, incomplete or stale (or an invalid
 spec), 2 usage, 3 environment (a file that does not read, a target that cannot be written, the geom extra missing).
-`shambu topo`: 0 ok (WARN and INFO allowed), 1 a spec error, a FAIL finding or a failed `validate`, 2 usage, 3 a
-missing extra, a file that does not read or write, or a singular model.
+`shambu topo`: 0 ok (WARN and INFO allowed), 1 a spec error (a name used twice, a grid over the cell cap), a FAIL
+finding or a failed `validate`, 2 usage (a flag out of its range), 3 a missing extra or a file that does not read
+or write.
 
 ## References (read when the row says so)
 

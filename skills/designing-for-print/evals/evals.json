@@ -103,6 +103,19 @@
     "Does not run pip install or uv tool install itself",
     "Does not invent a stiffness result without the run"
    ]
+  },
+  {
+   "id": 8,
+   "prompt": "Trace windows into the side wall of my bracket from topo/bracket@B/run.json. The wall is the y = 0 to 2 mm slab, x 5 to 75, z 0 to 30, printed with z up.",
+   "expected_output": "Writes a faces.json (shambu.topo.faces/1, build_axis z, one face with axis y, slab [0, 2], u [5, 75], v [0, 30]), runs shambu topo trace with --faces and a named rule preset, reports any topo.clearance FAIL and topo.roof_bridge WARN before the windows, quotes each window's area, removed volume and clearance as printed, and leaves the CAD change to the user's ClassCAD script followed by shambu cad gate.",
+   "files": [],
+   "expectations": [
+    "Writes faces.json with build_axis z and the face axis y, slab [0, 2], u [5, 75], v [0, 30]",
+    "Runs shambu topo trace with --faces and a --rules preset",
+    "Reports the findings (topo.map_not_proof, any topo.clearance or topo.roof_bridge) before the window list",
+    "Quotes window areas and clearances as printed, never rounded or paraphrased",
+    "Does not edit the CAD model itself and asks for a gate and a test print after the change"
+   ]
   }
  ]
 }

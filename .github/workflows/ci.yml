@@ -49,12 +49,16 @@ jobs:
   topo:
     # The optional topo extras (numpy, scipy, shapely, scikit-image): the stiffness map solver, the Michell check and
     # window tracing. The main job stays extra-free, so it proves `topo check`, `--help` and the missing-extra path.
+    # The same Python matrix as the check and geom jobs: numpy and scipy wheels differ per version.
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: uv sync --group dev --extra topo --extra topo-trace --extra topo-mesh
       - run: uv run mypy
       - run: uv run pytest -q tests/test_topo_cli.py tests/test_topo_solver.py tests/test_topo_trace.py
