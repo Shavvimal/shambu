@@ -78,5 +78,17 @@
  {
   "query": "move the prime tower in my 3mf to the back right corner",
   "should_trigger": false
+ },
+ {
+  "query": "can you run a topology optimisation on my bracket stl and tell me where to pocket it",
+  "should_trigger": true
+ },
+ {
+  "query": "make this printed arm lighter without losing much stiffness, loads are in loads.txt",
+  "should_trigger": true
+ },
+ {
+  "query": "run an FEA stress check on this aluminium part for certification",
+  "should_trigger": false
  }
 ]

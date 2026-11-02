@@ -1027,6 +1027,114 @@ class Cad(Command):
         return {"spec_path": a.files[0], "only": a.only, "skip": a.skip, "cull": not a.no_cull}
 
 
+TOPO_ACTIONS = ("check", "voxelise", "solve", "validate", "trace")
+# Each action's flags (argparse dests); a flag given to another action is a usage error (exit 2).
+_TOPO_FLAGS: dict[str, set[str]] = {
+    "check": set(),
+    "voxelise": {"pitch", "max_cells"},
+    "solve": {"out", "volfrac", "pitch", "maxit", "tol", "budget_min", "full_only", "mesh", "max_cells"},
+    "validate": {"size"},
+    "trace": {"faces", "rules", "volfrac"},
+}
+_TOPO_DEFAULTS = {"volfrac": [], "full_only": False, "mesh": "auto", "size": "small", "rules": "conservative"}
+
+
+@command("topo", "Stiffness map of a part: check | voxelise | solve | validate | trace (a map, not a proof; needs the topo extra)")
+class Topo(Command):
+    def configure(self, p):
+        p.add_argument("action", choices=TOPO_ACTIONS)
+        p.add_argument("file", nargs="?", help="check/voxelise/solve: SPEC.json (shambu.topo/1); trace: RUN.json from solve")
+        p.add_argument("--out", metavar="DIR", help="solve: write run.json, density maps, regions.md and iso STLs here")
+        p.add_argument(
+            "--volfrac",
+            type=float,
+            action="append",
+            default=[],
+            metavar="F",
+            help="solve: design volume fraction (repeat); trace: the run to trace",
+        )
+        p.add_argument("--pitch", type=float, metavar="MM", help="voxelise/solve: cell size instead of the spec's")
+        p.add_argument("--maxit", type=int, metavar="N", help="solve: iteration limit")
+        p.add_argument("--tol", type=float, metavar="T", help="solve: stop when no density changes by more than T")
+        p.add_argument("--budget-min", type=float, metavar="MIN", help="solve: stop a run that would pass this many minutes")
+        p.add_argument("--full-only", action="store_true", help="solve: the full-density check only, no optimisation")
+        p.add_argument(
+            "--max-cells",
+            type=int,
+            metavar="N",
+            help="voxelise/solve: refuse a domain over N cells (default 30000, about 5.5 GB at the measured 0.18 MB a cell); "
+            "the grid, DOF and filter caps scale with it",
+        )
+        p.add_argument(
+            "--mesh",
+            choices=("auto", "cubes", "smooth", "none"),
+            default="auto",
+            help="solve: iso-surface STL (smooth needs the topo-mesh extra; auto picks it when installed)",
+        )
+        p.add_argument("--size", choices=("small", "paper"), default="small", help="validate: the 24x1x8 grid (about 1 s) or 60x4x20")
+        p.add_argument("--faces", metavar="FACES.json", help="trace: the walls to trace (shambu.topo.faces/1)")
+        p.add_argument("--rules", default="conservative", metavar="NAME|RULES.json", help="trace: conservative, aggressive or a rules file")
+        p.epilog = (
+            "A linear, isotropic, static stiffness map: every result carries the topo.map_not_proof findings and a not-checked "
+            "list (no stress, buckling, fatigue or layer strength). check needs only the base install; voxelise, solve and "
+            "validate need the topo extra (numpy, scipy); trace needs topo-trace (shapely). Exit 0 ok (WARN and INFO allowed), "
+            "1 a spec error, a FAIL finding (equilibrium, passive density, window clearance) or a failed validation, 2 usage, "
+            "3 environment (a missing extra, a file that does not read or write, a singular model)."
+        )
+
+    def run(self, a, app, out):
+        from .errors import TopoSpecError
+
+        if a.action == "solve" and not a.out:
+            return usage(out, "topo solve needs --out DIR")
+        if a.action == "trace" and not a.faces:
+            return usage(out, "topo trace needs --faces FACES.json")
+        wants_file = a.action != "validate"
+        if wants_file != (a.file is not None):
+            return usage(out, f"topo {a.action} takes {'one file' if wants_file else 'no file'}")
+        given = {d for d in set().union(*_TOPO_FLAGS.values()) if getattr(a, d, None) not in (None, _TOPO_DEFAULTS.get(d))}
+        stray = sorted(given - _TOPO_FLAGS[a.action])
+        if stray:
+            return usage(out, f"topo {a.action} does not take " + ", ".join("--" + s.replace("_", "-") for s in stray))
+        if a.action == "trace" and len(a.volfrac) > 1:
+            return usage(out, "topo trace takes one --volfrac")
+        from .topo.spec import MAX_CELLS, override_errors
+
+        bad = override_errors(a.pitch, a.maxit, a.tol, a.budget_min, a.volfrac, a.max_cells)
+        if bad:
+            return usage(out, "; ".join(bad))
+        cap = a.max_cells or MAX_CELLS
+        kw: dict = {
+            "check": lambda: {"spec_path": a.file},
+            "voxelise": lambda: {"spec_path": a.file, "pitch": a.pitch, "max_cells": cap},
+            "solve": lambda: {
+                "spec_path": a.file,
+                "out_dir": a.out,
+                "volfrac": a.volfrac or None,
+                "pitch": a.pitch,
+                "maxit": a.maxit,
+                "tol": a.tol,
+                "budget_min": a.budget_min,
+                "full_only": a.full_only,
+                "mesh": a.mesh,
+                "max_cells": cap,
+            },
+            "validate": lambda: {"size": a.size},
+            "trace": lambda: {"run_path": a.file, "faces_path": a.faces, "rules": a.rules, "volfrac": a.volfrac[0] if a.volfrac else None},
+        }[a.action]()
+
+        def listen(ev: str, d: dict) -> None:
+            log.info("topo %s %s", ev, d)
+
+        try:
+            rep = app.topo(a.action, listener=listen, **kw)
+        except TopoSpecError as e:
+            out.emit({"error": f"TopoSpecError: {len(e.errors)} error(s)", "errors": e.errors}, e.errors, strict=True)
+            return 1
+        out.emit(rep.to_json(), rep.lines(), strict=True)
+        return rep.exit_code
+
+
 @command("split", "Split an STL with several bodies into one STL per body (Studio's 'Split to objects')")
 class Split(Command):
     def configure(self, p):

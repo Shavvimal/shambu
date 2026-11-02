@@ -433,6 +433,22 @@ class Bambu:
         }
         return table[action](**kw)
 
+    def topo(self, action: str, listener: Callable[[str, dict], None] | None = None, **kw):
+        """`shambu topo ACTION`: the density-based stiffness map (topo/service.py). Returns a `topo.result.TopoReport`.
+        Raises TopoSpecError (exit 1) for a spec, faces or rules file that breaks its schema, TopoDependencyError (exit 3)
+        when the verb's optional extra is missing, and TopoError (exit 3) when a file does not read or write."""
+        from .topo.service import Topo
+
+        svc = Topo(listener=listener)
+        table: dict[str, Callable] = {
+            "check": svc.check,
+            "voxelise": svc.voxelise,
+            "solve": svc.solve,
+            "validate": svc.validate,
+            "trace": svc.trace,
+        }
+        return table[action](**kw)
+
     def printability(
         self,
         path: str | Path,
