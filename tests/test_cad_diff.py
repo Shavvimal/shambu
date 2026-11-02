@@ -182,3 +182,17 @@ def test_through_to_blind_is_a_change():
     new = Feature("hole", 4.0, (0.0, 0.0, 1.0), (0.0, 0.0, 5.0), 10.0, "blind", 0.0, 64)
     (c,) = D.match_features([old], [new])
     assert c.kind == "resized" and D.match_features([old], [old])[0].kind == "same"
+
+
+def test_a_missing_print_section_is_not_a_bed_face_change(tmp_path, capsys):
+    from cadfix import write_record
+
+    a, b = _pair(tmp_path, _plate(), _plate())
+    ra, rb = write_record(a), write_record(b)
+    data = json.loads(ra.read_text())
+    del data["print"]
+    ra.write_text(json.dumps(data))
+    plate = tmp_path / "plate.json"
+    plate.write_text(json.dumps({"plates": [{"name": "one", "parts": [{"path": "new/bracket.stl"}]}]}))
+    code, doc, _, _ = run(capsys, "cad", "diff", str(ra), str(rb), "--plate", str(plate))
+    assert code == 0 and doc["impact"]["replace_mesh"] == "applies"

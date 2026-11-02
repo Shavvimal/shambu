@@ -381,6 +381,12 @@ def _side(path: str, obj: str | None) -> tuple[Subject, dict | None, list[Findin
     return load_subject(path, None, obj), None, []
 
 
+def _bed_face_of(record: dict | None) -> object:
+    """The record's `print.bed_face`, None when the record has no print section or no bed face."""
+    sec = (record or {}).get("print")
+    return sec.get("bed_face") if isinstance(sec, dict) else None
+
+
 def diff(a: DiffArgs) -> CadReport:
     t0 = time.monotonic()
     if a.sections < 2:
@@ -448,7 +454,7 @@ def diff(a: DiffArgs) -> CadReport:
         doc = load_json(a.plate, "plate spec")
         if not isinstance(doc, dict):
             raise CadSpecError(f"{a.plate}: not a plate spec")
-        bed_changed = (rec_old or {}).get("print", {}) != (rec_new or {}).get("print", {}) if rec_old and rec_new else False
+        bed_changed = _bed_face_of(rec_old) != _bed_face_of(rec_new) if rec_old and rec_new else False
         block, ifs = D.impact(doc, a.plate, old.path, new.path, size_moved, bool(bed_changed))
         extra["impact"] = block
         fs += ifs
