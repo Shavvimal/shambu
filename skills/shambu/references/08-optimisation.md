@@ -702,8 +702,9 @@ Every finding names one, in text as a tag:
 
 - **Mesh.** Vertices weld on a 1e-4 mm grid. An undirected edge used once is open, more than twice non-manifold
   (`mesh.open_edges`, FAIL); a directed edge used twice the same way is a flipped facet (`mesh.flipped`, WARN).
-  An open mesh has no inside: walls, layers and tip-over report `not-checked`. A mesh under 1 mm is in metres
-  (`mesh.metres`, FAIL); several bodies are INFO.
+  An open mesh, or one with flipped facets, has no reliable inside: walls, layers and tip-over report `not-checked`.
+  A mesh under 1 mm is in metres (`mesh.metres`, FAIL); several bodies are INFO. A 3MF object is read once per build
+  instance, on the plate of that instance; a mirrored transform reverses the winding so the normals still face out.
 - **Overhang.** A facet faces down beyond the threshold with the test of `mesh.metrics` (a facet exactly at the
   threshold is printable; facets on the bed plane are skipped). Facets join into regions by shared edges; each region
   reports area, shadow, steepest angle, centroid and z range, largest shadow first. Regions under 1 mm2 of shadow are
@@ -718,26 +719,32 @@ Every finding names one, in text as a tag:
   on large ceilings): the post-to-post length of a lintel, the short side of a ceiling held all round, the same at any
   rotation. Classes: span within `max_bridge_length` (the X2D preset sets 0) `bridge.free` INFO; to 10 mm
   `bridge.studio_supports` WARN with `bridge-short-spans`; 10 to 40 mm `bridge.long` INFO (rule 5, PLA, one plate);
-  over 40 mm `bridge.studio_supports` WARN (keep the support).
+  over 40 mm `bridge.studio_supports` WARN (keep the support). The texts say "with supports on": the check does not
+  read `enable_support`.
 - **Walls and slabs.** From each sampled facet a ray runs along the inward normal through a uniform grid (3D DDA) to
   the first facet hit, skipping facets that share a vertex with the source. A hit counts only when the hit facet faces
   the source within 30 deg of opposite (a wall pair); a chord across a sharp edge or a taper over 30 deg is dropped.
   Sources with |n.z| < 0.7 give wall thickness (XY), the others slab thickness (Z). The 200 largest facets are always
-  sampled, then every k-th by area so at most `--samples` (4000) rays run; the JSON gives the count. Thin samples and
+  sampled (fewer when `--samples` is smaller), then every k-th by area so at most `--samples` (4000) rays run; the JSON
+  gives the count. Thin samples and
   the facets they hit join into regions, one finding per region at its thinnest point: `wall.below_line` WARN under
   the outer line width, `wall.one_loop` INFO under outer + inner, `slab.below_layer` WARN under one layer,
-  `slab.off_grid` INFO when a slab under 10 layers is more than 0.02 mm off a whole number of layers.
+  `slab.off_grid` INFO when a slab under 10 layers has a face more than 0.02 mm from a layer boundary (the bed, the
+  first layer top, then one every layer height). Ties at the thinnest point break by position, not facet order.
 - **Stability.** Contact = facets flat on the bed (all corners within 0.05 mm, n.z < -0.999). Under max(25 mm2, 1 %
   of the footprint) is `contact.none` (FAIL, as `Metrics.stands`). On a closed mesh the centre of mass (signed
   tetrahedra, uniform density) is compared with the convex hull of the contact: outside is `tip.com_outside` (WARN);
-  a static tip angle `atan(margin / centre height)` under 10 deg is `tip.low_margin` (INFO, heuristic).
+  a static tip angle `atan(margin / centre height)` under 10 deg is `tip.low_margin` (INFO, heuristic). Separate bodies
+  are checked one by one (each outward shell with the cavities its box holds); the finding names the body.
 - **Adhesion.** Slenderness = height / sqrt(contact). Over 3 (the knee of the orientation score), or a contact at least
   100 mm long and under 15 mm wide (minimum width of the contact hull by rotating calipers), is `brim.suggest` (WARN,
-  heuristic) unless the file already sets an explicit brim. At least 400 mm2 of contact, slenderness at most 1 and
+  heuristic, per body) unless the file sets an outer brim (`outer_only`, `outer_and_inner`, `brim_ears`) or a painted
+  one; `inner_only` does not widen the base. At least 400 mm2 of contact, slenderness at most 1 and
   `auto_brim` is `brim.not_needed` (INFO). No published height-to-base ratio exists (rule 12).
 - **Fit.** The posed size against the bed box and `printable_height`, then against the reach of the extruder that
   prints it (`extruder_printable_area`, `extruder_printable_height`). `fit.bed` and `fit.extruder_reach` are FAIL; an
-  explicit brim that pushes the size past the reach is `fit.brim_edge` (INFO). This is "fits at all in this pose";
+  outer brim that pushes the size past the reach is `fit.brim_edge` (INFO). A malformed filament map leaves the
+  extruder unknown: the fit names the map and does not check the reach. This is "fits at all in this pose";
   placement on the plate stays with `shambu check`.
 
 ### 12.3 Thresholds and where they come from

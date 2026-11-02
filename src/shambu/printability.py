@@ -69,7 +69,8 @@ TIP_DEG = 10.0  # heuristic: a static tip angle under this is a low margin
 SLENDER = 3.0  # heuristic: the knee of `mesh.Metrics.score`; no published height-to-base ratio exists
 LONG_CONTACT_MM, NARROW_CONTACT_MM = 100.0, 15.0  # heuristic: long, narrow contact (216 mm rails, 112 mm jaws, reference 06 s3)
 BIG_CONTACT_MM2 = 400.0  # heuristic: contact this large and slenderness at most 1 needs no brim
-EXPLICIT_BRIMS = ("outer_only", "inner_only", "outer_and_inner", "brim_ears", "painted")
+OUTER_BRIMS = ("outer_only", "outer_and_inner", "brim_ears")  # brims that widen the outer footprint
+USER_BRIMS = (*OUTER_BRIMS, "painted")  # an outer brim the user chose (painted: where they painted it); inner_only is not
 
 
 class InputError(ValueError):
@@ -236,6 +237,7 @@ class Subject:
     skipped: tuple[str, ...] = ()  # subtypes of the volumes that are not geometry (modifiers, enforcers, ...)
     negative: bool = False  # the object has a negative part (not subtracted here)
     command: str | None = None  # the shambu command a fix can name, e.g. "shambu orient bracket.stl"
+    extruder_reason: str = ""  # set when the extruder is not known (a malformed filament map): reach is not checked
 
 
 class Geo:
@@ -262,6 +264,7 @@ class Geo:
         self.contact = [f for f in range(len(self.facets)) if self.on_bed(f) and self.normals[f][2] < -FLAT_DOWN]
         self._grid: G.RayGrid | None = None
         self._bridges: tuple[list[Bridge], set[int]] | None = None
+        self._bodies: list[list[int]] | None = None
 
     def on_bed(self, f: int) -> bool:
         return max(v[2] for v in self.facets[f]) <= self.bed + BED_TOL
@@ -290,11 +293,39 @@ class Geo:
         lo, hi = self.region_box(fids)
         return Location(self.frame, point or self.region_centroid(fids), (lo[2], hi[2]), (lo, hi))
 
+    def bodies(self) -> list[list[int]]:
+        """The facet ids of each separate body: every outward shell with the inward shells (cavities) whose box it
+        holds, ordered by position so the facet order does not change the order. One body: the whole mesh."""
+        if self._bodies is None:
+            self._bodies = _split_bodies(self)
+        return self._bodies
+
     def bridges(self) -> tuple[list[Bridge], set[int]]:
         """The flat ceilings that are bridges, and the facet ids they hold (left out of the overhang regions)."""
         if self._bridges is None:
             self._bridges = _find_bridges(self)
         return self._bridges
+
+
+def _split_bodies(geo: Geo) -> list[list[int]]:
+    shells = G.regions(range(len(geo.facets)), geo.welded)
+    if len(shells) < 2:
+        return [list(range(len(geo.facets)))]
+    vols = [G.moments(geo.facets[f] for f in sh)[0] for sh in shells]
+    outer = [(sh, v) for sh, v in zip(shells, vols, strict=True) if v > 0]
+    if len(outer) < 2:
+        return [list(range(len(geo.facets)))]
+    groups = [list(sh) for sh, _ in outer]
+    boxes = [geo.region_box(sh) for sh, _ in outer]
+    for sh, v in zip(shells, vols, strict=True):
+        if v > 0:
+            continue
+        lo, hi = geo.region_box(sh)
+        holders = [i for i, (blo, bhi) in enumerate(boxes) if all(blo[k] <= lo[k] + 1e-9 and hi[k] <= bhi[k] + 1e-9 for k in range(3))]
+        if holders:  # a cavity (or a degenerate sliver) inside the smallest body whose box holds it
+            groups[min(holders, key=lambda i: outer[i][1])] += sh
+    groups.sort(key=lambda g: tuple(round(x, 6) for corner in geo.region_box(g) for x in corner))
+    return [sorted(g) for g in groups]
 
 
 @dataclass(frozen=True)
@@ -562,7 +593,7 @@ class Bridges:
                         "bridge.free",
                         INFO,
                         "bridges",
-                        f"span {span:.1f} mm, within max_bridge_length {max_free:g}: Studio bridges it without support",
+                        f"span {span:.1f} mm, within max_bridge_length {max_free:g}: Studio bridges it without support even with supports on",
                         MEASURED,
                         subject.name,
                         loc,
@@ -577,7 +608,7 @@ class Bridges:
                         "bridge.studio_supports",
                         WARN,
                         "bridges",
-                        f"span {span:.1f} mm, max_bridge_length {max_free:g}: Studio puts support under it",
+                        f"span {span:.1f} mm, max_bridge_length {max_free:g}: with supports on, Studio puts support under it",
                         MEASURED,
                         subject.name,
                         loc,
@@ -591,7 +622,7 @@ class Bridges:
                         "bridge.long",
                         INFO,
                         "bridges",
-                        f"span {span:.1f} mm: Studio supports it; 10 to 40 mm bridged clean in PLA on one measured plate",
+                        f"span {span:.1f} mm: with supports on, Studio supports it; 10 to 40 mm bridged clean in PLA on one measured plate",
                         HEURISTIC,
                         subject.name,
                         loc,
@@ -605,7 +636,7 @@ class Bridges:
                         "bridge.studio_supports",
                         WARN,
                         "bridges",
-                        f"span {span:.1f} mm, over 40 mm: keep the support Studio puts under it",
+                        f"span {span:.1f} mm, over 40 mm: keep supports on so Studio puts support under it",
                         MEASURED,
                         subject.name,
                         loc,
@@ -649,13 +680,25 @@ class Thickness:
             (walls if abs(n[2]) < WALL_NZ else slabs)[f] = (t, g)
         outer, inner = float(limits.v("outer_line_mm")), float(limits.v("inner_line_mm"))
         lh = float(limits.v("layer_height_mm"))
+        layers = LayerGrid(geo.bed, float(limits.v("initial_layer_mm")), lh)
+
+        def faces(f: int) -> tuple[float, float]:  # the z of the slab's two faces: the source centroid and the ray's hit
+            z0 = geo.centroid(f)[2]
+            z1 = z0 - geo.normals[f][2] * slabs[f][0]
+            return min(z0, z1), max(z0, z1)
+
         wall_fs = self._group(
             subject,
             geo,
             walls,
             [
-                ("wall.below_line", WARN, lambda t: t < outer - 1e-9, "thinner than one {o:g} mm line: the wall may not print"),
-                ("wall.one_loop", INFO, lambda t: outer - 1e-9 <= t < outer + inner - 1e-9, "prints as one loop at {o:g} + {i:g} mm lines"),
+                ("wall.below_line", WARN, lambda f, t: t < outer - 1e-9, "thinner than one {o:g} mm line: the wall may not print"),
+                (
+                    "wall.one_loop",
+                    INFO,
+                    lambda f, t: outer - 1e-9 <= t < outer + inner - 1e-9,
+                    "prints as one loop at {o:g} + {i:g} mm lines",
+                ),
             ],
             {"o": outer, "i": inner},
         )
@@ -664,10 +707,16 @@ class Thickness:
             geo,
             slabs,
             [
-                ("slab.below_layer", WARN, lambda t: t < lh - 1e-9, "thinner than one {lh:g} mm layer"),
-                ("slab.off_grid", INFO, lambda t: lh - 1e-9 <= t < OFF_GRID_LAYERS * lh and _off_grid(t, lh), "{grid}"),
+                ("slab.below_layer", WARN, lambda f, t: t < lh - 1e-9, "thinner than one {lh:g} mm layer"),
+                (
+                    "slab.off_grid",
+                    INFO,
+                    lambda f, t: lh - 1e-9 <= t < OFF_GRID_LAYERS * lh and layers.off_grid(*faces(f)),
+                    "{grid}",
+                ),
             ],
             {"lh": lh},
+            lambda f: layers.text(*faces(f)),
         )
         wall_m = {
             "thinnest_wall_mm_sampled": min((t for t, _ in walls.values()), default=None),
@@ -679,8 +728,8 @@ class Thickness:
         return {"walls": _result(wall_m, wall_fs), "layers": _result(slab_m, slab_fs)}
 
     def _sources(self, geo: Geo) -> list[int]:
-        """Deterministic sample: the largest facets first (ties by position), the ALWAYS_SAMPLE largest always, then
-        every k-th so that at most `samples` rays are cast."""
+        """Deterministic sample: the largest facets first (ties by position), the ALWAYS_SAMPLE largest always (fewer
+        when `samples` is smaller), then every k-th so that at most `samples` rays are cast."""
 
         def key(f: int) -> tuple:
             c = geo.centroid(f)
@@ -689,22 +738,26 @@ class Thickness:
         order = sorted((f for f in range(len(geo.facets)) if geo.areas[f] > 0), key=key)
         if len(order) <= self.samples:
             return order
-        head, rest = order[:ALWAYS_SAMPLE], order[ALWAYS_SAMPLE:]
-        k = math.ceil(len(rest) / max(1, self.samples - ALWAYS_SAMPLE))
-        return head + rest[::k]
+        n_head = min(ALWAYS_SAMPLE, self.samples)
+        head, rest = order[:n_head], order[n_head:]
+        budget = self.samples - n_head
+        if budget <= 0 or not rest:
+            return head
+        return head + rest[:: math.ceil(len(rest) / budget)]
 
     @staticmethod
     def _group(
         subject: Subject,
         geo: Geo,
         hits: dict[int, tuple[float, int]],
-        classes: list[tuple[str, str, Callable[[float], bool], str]],
+        classes: list[tuple[str, str, Callable[[int, float], bool], str]],
         fmt: dict,
+        grid: Callable[[int], str] | None = None,
     ) -> list[Finding]:
         out: list[Finding] = []
         area = "walls" if classes[0][0].startswith("wall") else "layers"
         for code, sev, test, text in classes:
-            thin = {f: th for f, th in hits.items() if test(th[0])}
+            thin = {f: th for f, th in hits.items() if test(f, th[0])}
             if not thin:
                 continue
             nodes = set(thin) | {g for _, g in thin.values()}
@@ -713,9 +766,9 @@ class Thickness:
                 own = [f for f in reg if f in thin]
                 if not own:
                     continue
-                f_min = min(own, key=lambda f: (thin[f][0], f))
+                f_min = min(own, key=lambda f: (round(thin[f][0], 9), *(round(x, 6) for x in geo.centroid(f))))
                 t = thin[f_min][0]
-                msg = text.format(grid=_grid_text(t, fmt.get("lh", 0.2)), **fmt)
+                msg = text.format(grid=grid(f_min) if grid else "", **fmt)
                 if code.startswith("wall"):
                     fix = (
                         Fix("in CAD, thicken the wall; or set Arachne walls or `detect_thin_wall` on the object")
@@ -744,18 +797,48 @@ class Thickness:
         return out
 
 
-def _off_grid(t: float, lh: float) -> bool:
-    return abs(t - round(t / lh) * lh) > OFF_GRID_MM
+@dataclass(frozen=True)
+class LayerGrid:
+    """The layer boundaries Studio slices at: the bed, the first layer top, then one boundary every layer height."""
 
+    bed: float
+    first: float
+    layer: float
 
-def _grid_text(t: float, lh: float) -> str:
-    n = math.floor(t / lh + 1e-9)
-    return f"prints as {n} or {n + 1} layers ({n * lh:.2f} or {(n + 1) * lh:.2f} mm at {lh:g} mm layers)"
+    def around(self, z: float) -> tuple[float, float]:
+        """The boundaries at or below and at or above `z`."""
+        top = self.bed + self.first
+        if z <= top:
+            return (self.bed, top) if z > self.bed else (self.bed, self.bed)
+        n = (z - top) / self.layer
+        return top + math.floor(n + 1e-9) * self.layer, top + math.ceil(n - 1e-9) * self.layer
+
+    def off(self, z: float) -> bool:
+        lo, hi = self.around(z)
+        return min(z - lo, hi - z) > OFF_GRID_MM
+
+    def off_grid(self, z0: float, z1: float) -> bool:
+        return self.off(z0) or self.off(z1)
+
+    def text(self, z0: float, z1: float) -> str:
+        """Which faces fall between boundaries and the thinnest and thickest the slab can print."""
+        (b0, t0), (b1, t1) = self.around(z0), self.around(z1)
+        if not self.off(z0):
+            b0 = t0 = b0 if z0 - b0 <= t0 - z0 else t0
+        if not self.off(z1):
+            b1 = t1 = b1 if z1 - b1 <= t1 - z1 else t1
+        off = " and ".join(f"z {z:.2f}" for z in (z0, z1) if self.off(z))
+        return (
+            f"the face at {off} falls between layers ({self.first:g} mm first layer, then {self.layer:g} mm): "
+            f"prints as {max(b1 - t0, 0.0):.2f} or {t1 - b0:.2f} mm"
+        )
 
 
 def _no_inside(subject: Subject, geo: Geo) -> str:
     if not geo.closed:
         return "open mesh: no inside (mesh.open_edges)"
+    if geo.flipped:
+        return f"{geo.flipped} flipped edges: some facets face inwards (mesh.flipped)"
     if subject.negative:
         return "negative parts are not subtracted"
     return ""
@@ -784,46 +867,60 @@ class Stability:
         why = _no_inside(subject, geo)
         if why:
             return {"stability": AreaResult(NOT_CHECKED_STATUS, measures, f"tip-over not checked: {why}", [])}
-        vol, com = G.moments(geo.facets)
-        if vol <= 0:
+        bodies = geo.bodies()
+        on_bed = set(geo.contact)
+        tips: list[tuple[str, float, float, float, Vec]] = []  # (body label, margin, angle, height, centre of mass)
+        for k, fids in enumerate(bodies, 1):
+            con = [f for f in fids if f in on_bed]
+            if not con:
+                continue  # a body off the bed stands on support: its overhang region says so
+            vol, com = G.moments(geo.facets[f] for f in fids)
+            if vol <= 0:
+                continue
+            hull = G.hull_2d((v[0], v[1]) for f in con for v in geo.facets[f])
+            margin = G.convex_margin((com[0], com[1]), hull)
+            height = com[2] - geo.bed
+            angle = math.degrees(math.atan2(margin, height)) if height > 0 else 90.0
+            tips.append((f"body {k} of {len(bodies)}: " if len(bodies) > 1 else "", margin, angle, height, com))
+        if not tips:
             r = _result(measures, [])
             r.reason = "tip-over not checked: the mesh volume is not positive (inverted winding)"
             return {"stability": r}
-        hull = G.hull_2d((v[0], v[1]) for f in geo.contact for v in geo.facets[f])
-        margin = G.convex_margin((com[0], com[1]), hull)
-        height = com[2] - geo.bed
-        angle = math.degrees(math.atan2(margin, height)) if height > 0 else 90.0
-        measures.update({"com_margin_mm": margin, "tip_angle_deg": angle, "com_height_mm": height})
+        worst = min(tips, key=lambda t: (t[2], t[1]))
+        measures.update({"com_margin_mm": worst[1], "tip_angle_deg": worst[2], "com_height_mm": worst[3]})
+        if len(bodies) > 1:
+            measures["bodies_checked"] = len(tips)
         fs: list[Finding] = []
-        loc = Location(geo.frame, com)
-        if margin < 0:
-            fs.append(
-                Finding(
-                    "tip.com_outside",
-                    WARN,
-                    "stability",
-                    f"the centre of mass sits {-margin:.1f} mm outside the bed contact: the part can tip over as it grows",
-                    MEASURED,
-                    subject.name,
-                    loc,
-                    {"com_margin_mm": margin},
-                    Fix("choose another pose, or add a brim and tell the user", {"recipes": ["tall-outer-brim"]}, subject.command),
+        for label, margin, angle, height, com in tips:
+            loc = Location(geo.frame, com)
+            if margin < 0:
+                fs.append(
+                    Finding(
+                        "tip.com_outside",
+                        WARN,
+                        "stability",
+                        f"{label}the centre of mass sits {-margin:.1f} mm outside the bed contact: the part can tip over as it grows",
+                        MEASURED,
+                        subject.name,
+                        loc,
+                        {"com_margin_mm": margin},
+                        Fix("choose another pose, or add a brim and tell the user", {"recipes": ["tall-outer-brim"]}, subject.command),
+                    )
                 )
-            )
-        elif angle < TIP_DEG:
-            fs.append(
-                Finding(
-                    "tip.low_margin",
-                    INFO,
-                    "stability",
-                    f"tips over at {angle:.1f} deg: centre of mass {margin:.1f} mm inside the contact edge, {height:.1f} mm up",
-                    HEURISTIC,
-                    subject.name,
-                    loc,
-                    {"com_margin_mm": margin, "tip_angle_deg": angle},
-                    Fix("an outer brim widens the base", {"recipes": ["tall-outer-brim"]}),
+            elif angle < TIP_DEG:
+                fs.append(
+                    Finding(
+                        "tip.low_margin",
+                        INFO,
+                        "stability",
+                        f"{label}tips over at {angle:.1f} deg: centre of mass {margin:.1f} mm inside the contact edge, {height:.1f} mm up",
+                        HEURISTIC,
+                        subject.name,
+                        loc,
+                        {"com_margin_mm": margin, "tip_angle_deg": angle},
+                        Fix("an outer brim widens the base", {"recipes": ["tall-outer-brim"]}),
+                    )
                 )
-            )
         return {"stability": _result(measures, fs)}
 
 
@@ -834,37 +931,52 @@ class Adhesion:
         contact = sum(geo.areas[f] for f in geo.contact)
         if contact <= 0:
             return {"adhesion": _skip("no bed contact (stability: contact.none)")}
-        height = geo.hi[2] - geo.bed
-        slender = height / math.sqrt(max(contact, 1.0))
-        hull = G.hull_2d((v[0], v[1]) for f in geo.contact for v in geo.facets[f])
-        width, length, _ = G.min_width(hull)
+        bodies = geo.bodies()
+        on_bed = set(geo.contact)
+        rows: list[tuple[str, float, float, float, float]] = []  # (body label, contact, slenderness, width, length)
+        for k, fids in enumerate(bodies, 1):
+            con = [f for f in fids if f in on_bed]
+            area = sum(geo.areas[f] for f in con)
+            if area <= 0:
+                continue
+            height = max(v[2] for f in fids for v in geo.facets[f]) - geo.bed
+            hull = G.hull_2d((v[0], v[1]) for f in con for v in geo.facets[f])
+            width, length, _ = G.min_width(hull)
+            rows.append(
+                (f"body {k} of {len(bodies)}: " if len(bodies) > 1 else "", area, height / math.sqrt(max(area, 1.0)), width, length)
+            )
         brim = str(limits.v("brim_type"))
+        top = max(rows, key=lambda r: r[2])
         measures = {
-            "slenderness": slender,
-            "contact_width_mm": width,
-            "contact_length_mm": length,
+            "slenderness": top[2],
+            "contact_width_mm": top[3],
+            "contact_length_mm": top[4],
             "brim_type_in_file": brim,
         }
         fs: list[Finding] = []
-        reasons = []
-        if slender > SLENDER:
-            reasons.append(f"slenderness {slender:.1f} (height over the square root of the contact) is over {SLENDER:g}")
-        if length >= LONG_CONTACT_MM and width < NARROW_CONTACT_MM:
-            reasons.append(f"the contact is {length:.0f} mm long and {width:.1f} mm wide")
-        if reasons and brim not in EXPLICIT_BRIMS:
-            fs.append(
-                Finding(
-                    "brim.suggest",
-                    WARN,
-                    "adhesion",
-                    "; ".join(reasons) + f"; brim_type is {brim}",
-                    HEURISTIC,
-                    subject.name,
-                    measure={"slenderness": slender, "contact_width_mm": width, "contact_length_mm": length},
-                    fix=Fix("add an outer brim", {"recipes": ["tall-outer-brim"]}),
+        wanted = False
+        for label, _, slender, width, length in rows:
+            reasons = []
+            if slender > SLENDER:
+                reasons.append(f"slenderness {slender:.1f} (height over the square root of the contact) is over {SLENDER:g}")
+            if length >= LONG_CONTACT_MM and width < NARROW_CONTACT_MM:
+                reasons.append(f"the contact is {length:.0f} mm long and {width:.1f} mm wide")
+            wanted = wanted or bool(reasons)
+            if reasons and brim not in USER_BRIMS:
+                fs.append(
+                    Finding(
+                        "brim.suggest",
+                        WARN,
+                        "adhesion",
+                        label + "; ".join(reasons) + f"; brim_type is {brim}",
+                        HEURISTIC,
+                        subject.name,
+                        measure={"slenderness": slender, "contact_width_mm": width, "contact_length_mm": length},
+                        fix=Fix("add an outer brim", {"recipes": ["tall-outer-brim"]}),
+                    )
                 )
-            )
-        elif not reasons and contact >= BIG_CONTACT_MM2 and slender <= 1.0 and brim == "auto_brim":
+        slender = top[2]
+        if not wanted and contact >= BIG_CONTACT_MM2 and slender <= 1.0 and brim == "auto_brim":
             fs.append(
                 Finding(
                     "brim.not_needed",
@@ -909,6 +1021,10 @@ class BedFit:
             )
             measures["limit_mm"] = list(bed_lim)
             return {"fit": _result(measures, fs)}
+        if subject.extruder_reason:
+            r = _result(measures, fs)
+            r.reason = f"{subject.extruder_reason}: reach not checked"
+            return {"fit": r}
         if not 1 <= subject.extruder <= len(exts):
             r = _result(measures, fs)
             r.reason = f"extruder {subject.extruder} is not in the printer facts ({len(exts)} extruders): reach not checked"
@@ -931,7 +1047,7 @@ class BedFit:
             )
         brim = str(limits.v("brim_type"))
         bw = float(limits.v("brim_width_mm"))
-        if not fs and brim in EXPLICIT_BRIMS and bw > 0 and any(size[i] + 2 * bw > reach[i] + tol for i in range(2)):
+        if not fs and brim in OUTER_BRIMS and bw > 0 and any(size[i] + 2 * bw > reach[i] + tol for i in range(2)):
             fs.append(
                 Finding(
                     "fit.brim_edge",
@@ -1106,6 +1222,8 @@ def analyse(
     checks = tuple(checks) if checks is not None else default_checks(samples)
     objects: list[ObjectReport] = []
     for s in subjects:
+        if not all(math.isfinite(x) for t in s.facets for v in t for x in v):
+            raise InputError(f"{s.name}: a vertex coordinate is not finite (NaN or infinite): the mesh does not read")
         lim = s.limits or limits
         geo = Geo(s)
         areas: dict[str, AreaResult] = {}

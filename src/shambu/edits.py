@@ -605,8 +605,21 @@ def _world_facets(geo: _Geometry, obj: _Obj, comps: Sequence[_Comp], item: Seque
         m = geo.mesh(c)
         full = _compose(item, c.transform)
         w = [_apply(full, v) for v in m.vertices]
-        facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
+        if _det(full) < 0:  # a mirror turns every facet inside out: reverse the winding so the normals face out again
+            facets += [(w[i], w[k], w[j]) for i, j, k in m.triangles]
+        else:
+            facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
     return facets
+
+
+def _det(t: Sequence[float]) -> float:
+    """The determinant of a transform's 3 x 3 part: negative for a mirror."""
+    m = _lin(t)
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
 
 
 @dataclass(frozen=True)
@@ -615,17 +628,19 @@ class ObjectMesh:
     plate-local mm (the frame of `inspect`), its plate, filament and own settings, and the subtypes of the volumes left
     out (modifiers, enforcers, blockers, negative parts)."""
 
-    name: str
+    name: str  # the object's name, with "(instance k)" when the object has more than one build item
     plate: int
     filament: int
     facets: list[M.Facet]
     skipped: tuple[str, ...]
     settings: dict
+    object: str = ""  # the object's own name (what `--object` matches)
 
 
 def object_meshes(project: Project) -> list[ObjectMesh]:
-    """Every object of the project with its `normal_part` triangles in plate-local mm (first instance only). A volume
-    with no subtype is a normal part, as Studio reads it. Raises EditError when a mesh does not read."""
+    """Every build instance of every object with its `normal_part` triangles in plate-local mm, on the plate that holds
+    that instance (as `plate_objects` reads it). A volume with no subtype is a normal part, as Studio reads it. Raises
+    EditError when a mesh does not read."""
     geo = _Geometry(project)
     root = _root(project)
     out: list[ObjectMesh] = []
@@ -634,12 +649,14 @@ def object_meshes(project: Project) -> list[ObjectMesh]:
         subtype = {p.get("id"): p.get("subtype") or "normal_part" for p in o.findall("part")}
         keep = [c for c in obj.comps if subtype.get(c.sub_id, "normal_part") == "normal_part"]
         skipped = tuple(sorted({subtype.get(c.sub_id, "normal_part") for c in obj.comps} - {"normal_part"}))
-        plate = _plate_of(project, obj.oid)
-        ox, oy = _origin(project, plate)
-        facets = M.translate(_world_facets(geo, obj, keep, obj.item), (-ox, -oy, 0.0))
-        out.append(
-            ObjectMesh(obj.name, plate, _slot_parser(obj)(_meta(o, "extruder"), "extruder") or 1, facets, skipped, _object_settings(obj))
-        )
+        filament = _slot_parser(obj)(_meta(o, "extruder"), "extruder") or 1
+        where = _instance_plates(project, obj.oid)
+        for k, text in enumerate(obj.item_texts or [obj.item_text]):
+            plate = where.get(k, _plate_of(project, obj.oid))
+            ox, oy = _origin(project, plate)
+            facets = M.translate(_world_facets(geo, obj, keep, parse_transform(text)), (-ox, -oy, 0.0))
+            label = obj.name if obj.n_items <= 1 else f"{obj.name} (instance {k})"
+            out.append(ObjectMesh(label, plate, filament, facets, skipped, _object_settings(obj), obj.name))
     return out
 
 

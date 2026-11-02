@@ -754,6 +754,14 @@ class Printability(Command):
             return usage(out, "--lay-on-face, --rotate, --extruder, --printer and --process are for an STL; a 3MF carries its own")
         if a.samples < 1:
             return usage(out, "--samples must be at least 1")
+        for flag, v, ok, want in (
+            ("--threshold", a.threshold, lambda x: 0 < x < 90, "between 0 and 90 degrees from vertical"),
+            ("--max-bridge", a.max_bridge, lambda x: x >= 0, "0 mm or more"),
+            ("--layer-height", a.layer_height, lambda x: x > 0, "over 0 mm"),
+            ("--line-width", a.line_width, lambda x: x > 0, "over 0 mm"),
+        ):
+            if v is not None and not (math.isfinite(v) and ok(v)):
+                return usage(out, f"{flag} must be a finite number {want}, not {v}")
         orientation = None
         try:
             if a.lay_on_face or a.rotate:

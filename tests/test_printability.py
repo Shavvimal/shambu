@@ -185,7 +185,7 @@ def test_slab_below_one_layer():
 
 def test_slab_off_the_layer_grid():
     f = only(run(box((0, 0, 0), (20, 20, 0.5))), "slab.off_grid")
-    assert f.severity == "INFO" and "2 or 3 layers" in f.message
+    assert f.severity == "INFO" and "prints as 0.40 or 0.60 mm" in f.message
 
 
 def test_no_wall_from_a_chord_across_a_sharp_edge():
@@ -383,3 +383,147 @@ def test_cli_text_lists_what_it_did_not_check(tmp_path, capsys):
     cli.main(["printability", str(stl)])
     out = capsys.readouterr().out
     assert "not checked: support volume" in out and "pose as modelled" in out
+
+
+# ---------------------------------------------------------------------------- review fixes
+def rewrite(path, name: str, fn):
+    """Rewrite one entry of a fixture (a test set-up step, not a patch)."""
+    import zipfile
+
+    with zipfile.ZipFile(path) as z:
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    with zipfile.ZipFile(path, "w") as z:
+        for i, d in items:
+            z.writestr(i, fn(d.decode()).encode() if i.filename == name else d)
+    return path
+
+
+BODY_ITEM = 'objectid="2" p:UUID="00000002-b1ec-4553-aec9-835e5b724bb4" transform="1 0 0 0 1 0 0 0 1 55 60 5"'
+
+
+def test_every_build_instance_is_analysed_on_its_plate(tmp_path):
+    f = make_geo_3mf(tmp_path / "i.3mf", plates=2)
+    second = '<item objectid="2" p:UUID="00000009-b1ec-4553-aec9-835e5b724bb4" transform="1 0 0 0 1 0 0 0 1 55 160 5" printable="1"/>'
+    rewrite(f, "3D/3dmodel.model", lambda t: t.replace(" </build>", f"  {second}\n </build>"))
+    inst = '<model_instance>\n      <metadata key="object_id" value="2"/>\n      <metadata key="instance_id" value="1"/>\n    </model_instance>'
+    rewrite(f, "Metadata/model_settings.config", lambda t: t.replace("</plate>\n</config>", f"  {inst}\n  </plate>\n</config>"))
+    rep = Bambu().printability(f, plate=2)
+    assert sorted(o.name for o in rep.objects) == ["body (instance 1)", "label"]
+    assert [o.name for o in Bambu().printability(f, objects=["body"]).objects] == ["body (instance 0)", "body (instance 1)"]
+
+
+@pytest.mark.parametrize("where", ["item", "component"])
+def test_mirrored_transform_keeps_the_bed_contact(tmp_path, where):
+    f = make_geo_3mf(tmp_path / "m.3mf")
+    if where == "item":
+        rewrite(f, "3D/3dmodel.model", lambda t: t.replace(BODY_ITEM, BODY_ITEM.replace("1 0 0 0 1 0 0 0 1 55", "-1 0 0 0 1 0 0 0 1 55")))
+    else:
+        comp = 'objectid="1" p:UUID="00010000-b206-40ff-9872-83e8017abed1" transform="1 0 0 0 1 0 0 0 1 0 0 0"'
+        rewrite(f, "3D/3dmodel.model", lambda t: t.replace(comp, comp.replace('"1 0 0 0 1', '"1 0 0 0 -1')))
+    o = Bambu().printability(f, objects=["body"]).objects[0]
+    assert "contact.none" not in codes(o) and o.watertight
+    assert o.areas["stability"].measures["contact_mm2"] == pytest.approx(600)
+
+
+def test_unstable_body_beside_a_wide_body_is_found():
+    o = run(prism(GAMMA, 10) + box((200, 0, 0), (300, 100, 10)))
+    f = only(o, "tip.com_outside")
+    assert "body 1 of 2" in f.message and f.measure["com_margin_mm"] < 0
+
+
+def test_cube_with_a_cavity_is_one_body_for_tip_over():
+    inner = [tuple(reversed(t)) for t in box((5, 5, 5), (15, 15, 15))]
+    o = run(box((0, 0, 0), (20, 20, 20)) + inner)
+    assert o.areas["stability"].measures["com_margin_mm"] == pytest.approx(10)
+
+
+def test_slender_body_beside_a_wide_body_wants_a_brim():
+    o = run(box((0, 0, 0), (5, 5, 100)) + box((50, 0, 0), (150, 100, 10)))
+    assert "body 1 of 2" in only(o, "brim.suggest").message
+
+
+def test_flipped_facets_skip_the_inside_checks():
+    o = run(flipped(box((100, 0, 0), (120, 20, 20)), 2))
+    for a in ("walls", "layers", "stability"):
+        assert o.areas[a].status == "not-checked" and "mesh.flipped" in (o.areas[a].reason or "")
+    assert "tip.com_outside" not in codes(o)
+
+
+def test_slab_on_the_grid_of_first_and_regular_layers():
+    lim = pa.Limits.default().from_settings({"layer_height": "0.28", "initial_layer_print_height": "0.2"}, "file")
+    assert "slab.off_grid" not in codes(run(box((0, 0, 0), (20, 20, 0.48)), lim))
+    assert "slab.off_grid" in codes(run(box((0, 0, 0), (20, 20, 0.56)), lim))
+
+
+def test_bridge_support_text_is_conditional_on_supports():
+    f = only(run(lintel(8)), "bridge.studio_supports")
+    assert "with supports on" in f.message
+
+
+@pytest.mark.parametrize("samples", [1, 5, 12, 13, 300])
+def test_samples_below_the_facet_count_cap_the_rays(samples):
+    for facets in (box((0, 0, 0), (20, 20, 20)), cup((24, 16), (20, 12), 10, 2) * 20):
+        s = pa.Subject("p", facets, "posed")
+        n = len(pa.Thickness(samples)._sources(pa.Geo(s)))
+        assert 1 <= n <= samples
+    assert run(box((0, 0, 0), (20, 20, 20))).areas["walls"].status == "no-finding"
+    assert pa.analyse([pa.Subject("p", box((0, 0, 0), (20, 20, 20)), "posed")], pa.Limits.default(), samples=samples).objects
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--threshold", "inf"],
+        ["--threshold", "nan"],
+        ["--threshold", "90"],
+        ["--layer-height", "0"],
+        ["--max-bridge", "-1"],
+        ["--line-width", "nan"],
+    ],
+)
+def test_cli_bad_numeric_flags_are_usage(tmp_path, capsys, extra):
+    stl = M.write_stl(tmp_path / "c.stl", box((0, 0, 0), (5, 5, 5)))
+    assert cli.main(["--json", "printability", str(stl), *extra]) == 2
+    assert "error" in json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("ascii_stl", [False, True])
+def test_non_finite_coordinates_are_a_named_error(tmp_path, capsys, ascii_stl):
+    facets = box((0, 0, 0), (5, 5, 5))
+    facets[0] = ((float("nan"), 0.0, 0.0), facets[0][1], facets[0][2])
+    stl = tmp_path / "nan.stl"
+    if ascii_stl:
+        body = "".join(
+            "facet normal 0 0 0\nouter loop\n" + "".join(f"vertex {x} {y} {z}\n" for x, y, z in t) + "endloop\nendfacet\n" for t in facets
+        )
+        stl.write_text(f"solid nan\n{body}endsolid nan\n")
+    else:
+        M.write_stl(stl, facets)
+    assert cli.main(["--json", "printability", str(stl)]) == 2
+    assert "not finite" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_malformed_filament_map_is_not_silent(tmp_path, x2d):
+    f = make_geo_3mf(tmp_path / "f.3mf")
+    rewrite(f, "Metadata/model_settings.config", lambda t: t.replace('key="filament_maps" value="1 2"', 'key="filament_maps" value="a b"'))
+    o = Bambu().printability(f, objects=["label"]).objects[0]
+    assert "malformed" in (o.areas["fit"].reason or "") and "limit_mm" not in o.areas["fit"].measures
+
+
+def test_inner_brim_does_not_silence_the_suggestion_or_widen_the_fit(x2d):
+    lim = pa.Limits.default().from_settings({"brim_type": "inner_only"}, "file")
+    assert only(run(box((0, 0, 0), (5, 5, 100)), lim), "brim.suggest").severity == "WARN"
+    wide = x2d.from_settings({"brim_type": "inner_only", "brim_width": "5"}, "file")
+    assert "fit.brim_edge" not in codes(run(box((0, 0, 0), (250, 30, 10)), wide))
+
+
+def test_thin_feature_location_does_not_depend_on_facet_order():
+    f = box((0, 0, 0), (40, 30, 0.15)) + box((60, 0, 0), (80, 0.3, 10))
+    g = list(f)
+    random.Random(5).shuffle(g)  # noqa: S311 (a fixed test order, not a secret)
+
+    def points(facets):
+        o = run(facets)
+        return sorted((x.code, x.location.point) for x in o.findings if x.location and x.code.startswith(("slab.", "wall.")))
+
+    assert points(f) == points(g) == points(f[::-1])

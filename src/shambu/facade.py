@@ -470,11 +470,11 @@ class Bambu:
             base = base.with_machine(None, "none", "the file holds no printable_area")
         plate_maps = {pl["id"]: pl.get("filament_maps") for pl in pr.summary()["plates"]}
         meshes = edits.object_meshes(pr)
-        known = [m.name for m in meshes]
+        known = list(dict.fromkeys(m.object for m in meshes))
         missing = [n for n in objects if n not in known]
         if missing:
             raise pa.InputError(f"no object named {missing}; objects: {known}")
-        chosen = [m for m in meshes if (not objects or m.name in objects) and (plate is None or m.plate == plate)]
+        chosen = [m for m in meshes if (not objects or m.object in objects) and (plate is None or m.plate == plate)]
         if not chosen or not any(m.facets for m in chosen):
             raise pa.InputError(f"{path}: no mesh in the file" + (f" on plate {plate}" if plate is not None else ""))
         subjects = []
@@ -482,13 +482,24 @@ class Bambu:
             if not m.facets:
                 continue
             fmap = (plate_maps.get(m.plate) or "").split() or [str(x) for x in ps.get("filament_map") or []]
+            why = ""
             try:
                 ext = int(fmap[m.filament - 1]) if 0 < m.filament <= len(fmap) else 1
             except ValueError:
-                ext = 1  # a malformed map: extruder 1, as Studio's default map
+                ext, why = 1, f"the filament map {' '.join(fmap)!r} of plate {m.plate} is malformed"  # never silent (rubric 13)
             lim = base.from_settings(m.settings, "file object").with_flags(**flags)
             subjects.append(
-                pa.Subject(m.name, m.facets, "plate", ext, {"from": "file", "plate": m.plate}, lim, m.skipped, "negative_part" in m.skipped)
+                pa.Subject(
+                    m.name,
+                    m.facets,
+                    "plate",
+                    ext,
+                    {"from": "file", "plate": m.plate},
+                    lim,
+                    m.skipped,
+                    "negative_part" in m.skipped,
+                    extruder_reason=why,
+                )
             )
         return pa.analyse(subjects, base.with_flags(**flags), str(path), "3mf", samples=samples)
 
