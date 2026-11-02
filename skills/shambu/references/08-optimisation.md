@@ -24,6 +24,7 @@ right Bowden nozzle (x >= 20.5 mm, 256 mm tall), no AMS, Bambu Studio 02.08.02.6
 9. Corrections to older references
 10. Sources
 11. Layout checker: support spread, the pair rule, footprints, the packer and the support probe (the rules now)
+12. Printability pre-flight (`shambu printability`): algorithms, thresholds, evidence levels, limits, timings
 
 ---
 
@@ -81,7 +82,8 @@ height, centroid height and volume. Score = shadow - 0.25 x contact + 2 x height
 deg from vertical (Studio's own 30 from horizontal); a facet at exactly the threshold counts as printable. Bridges are
 counted as overhang (Studio's auto-orient has the same blind spot, and its wiki says bridges are its main error
 source), so a part with real bridges needs the sweep, not the score alone. Internal faces in a non-watertight STL
-count as overhang: fix the mesh first.
+count as overhang: fix the mesh first. `shambu printability` (section 12) separates bridges from overhangs, gives each
+region a location and checks the mesh is closed before it measures walls.
 
 Studio's auto-orient (`Orient.cpp`, a Tweaker-style method) for comparison: candidates are the current down
 direction, the 10 largest facet-normal clusters, the 14 largest convex-hull normal clusters and 18 fixed axis and
@@ -671,3 +673,147 @@ never rotated, so a part turned 45 degrees keeps its real outline (a 50 x 226 ba
   share a CLI name are named as "one of a, b".
 - Live on the plate-14 spec: without the probe, 3 WARN margin lines (the housing's 21.8 mm estimate), exit 0; with the
   probe, no WARN and no FAIL, exit 0, 14.4 s for five fresh probes.
+
+## 12. Printability pre-flight (`shambu printability`, 0.7.0)
+
+`shambu printability FILE` reads the triangle mesh of an STL (in the pose the flags give, dropped to z 0) or of every
+3MF object (its `normal_part` volumes in the placed pose, plate-local mm) and reports findings by area. It runs no
+slicer and has no overall score: each area is `attention` (a WARN or FAIL), `no-finding` (it ran and found nothing at
+these limits, which is not a promise that the part prints) or `not-checked` with the reason. Every run prints the list
+of what it did not check (support grams and time, load direction, finish, hole droop, mid-print stability, warping,
+painted supports and modifiers, placement, bridge quality by material, mesh accuracy). Exit 1 on a FAIL finding, as
+`shambu check`. The code is `src/shambu/printability.py` (checks), `meshgeom.py` (geometry, `math` only) and
+`findings.py` (the finding model shared with the integrity checks, reference 03 section 2.9).
+
+### 12.1 Evidence levels
+
+Every finding names one, in text as a tag:
+
+| Level | Means | Highest severity |
+|---|---|---|
+| `measured` | computed from the mesh or file in hand | FAIL |
+| `observed` | seen in a Studio 02.08.02.61 X2D export and recorded in a reference | WARN |
+| `external` | a third-party report on another printer or Studio version, not reproduced on the X2D | WARN (INFO in 0.7.0) |
+| `heuristic` | shambu's own rule or band | WARN |
+
+`findings.Finding` refuses a finding above its level's ceiling, so only a measured finding can fail a run.
+
+### 12.2 Algorithms
+
+- **Mesh.** Vertices weld on a 1e-4 mm grid. An undirected edge used once is open, more than twice non-manifold
+  (`mesh.open_edges`, FAIL); a directed edge used twice the same way is a flipped facet (`mesh.flipped`, WARN).
+  An open mesh, or one with flipped facets, has no reliable inside: walls, layers and tip-over report `not-checked`.
+  A closed shell with a negative volume that no body holds is inside out (`mesh.inverted`, WARN): its bottom reads
+  as a top, so support, bridges, walls, layers, stability and adhesion report `not-checked`. A mesh under 1 mm is in
+  metres (`mesh.metres`, FAIL): the same areas report `not-checked`, because the 0.05 mm bed tolerance and the line
+  widths mean nothing at that scale. Several bodies are INFO (`mesh.bodies`); a cavity inside a body and a degenerate
+  facet are not bodies. A 3MF object is read once per build instance, on the plate of that instance; a mirrored
+  transform reverses the winding so the normals still face out.
+- **Overhang.** A facet faces down beyond the threshold with the test of `mesh.metrics` (a facet exactly at the
+  threshold is printable; facets on the bed plane are skipped). Facets join into regions by shared edges; each region
+  reports area, shadow, steepest angle, centroid and z range, listed by location. Regions under 1 mm2 of shadow are
+  counted, not listed. A region within 1 mm of the bed that shares an edge with a contact facet is a bed fillet
+  (`overhang.bed_fillet`, INFO, rule 13): chamfer it in CAD; it is also a WARN region when it rises more than 1 mm.
+  The area between 45 deg and the threshold is measured (`overhang_mm2_45_to_threshold`, rule 3), never a finding.
+- **Bridge.** Candidates face down within 5 deg of flat, off the bed. For each boundary edge of a candidate region,
+  the facet across the edge is an anchor when its far corner lies more than 0.05 mm below the edge and it faces back
+  under the ceiling (a wall that holds it). Anchored edges join into chains. Two or more chains make a bridge, and so
+  does one chain with two anchors on opposite sides and the ceiling between them (a roof held all round, a slot held
+  on three sides). Any other single chain (one side, two adjacent sides, a ledge round a post) is a cantilever and
+  stays an overhang. Span = 2 x the largest
+  distance from a point of the ceiling to its nearest anchor, from a raster distance transform (0.25 mm cells, coarser
+  on large ceilings): the post-to-post length of a lintel, the short side of a ceiling held all round, the same at any
+  rotation. Classes: span within `max_bridge_length` (the X2D preset sets 0) `bridge.free` INFO; to 10 mm
+  `bridge.studio_supports` WARN with `bridge-short-spans`; 10 to 40 mm `bridge.long` INFO (rule 5, PLA, one plate);
+  over 40 mm `bridge.studio_supports` WARN (keep the support). The texts say "with supports on": the check does not
+  read `enable_support`.
+- **Walls and slabs.** From each sampled facet a ray runs along the inward normal through a uniform grid (3D DDA) to
+  the first facet hit, skipping facets that share a vertex with the source. A hit counts only when the hit facet faces
+  the source within 30 deg of opposite (a wall pair); a chord across a sharp edge or a taper over 30 deg is dropped.
+  Sources with |n.z| < 0.7 give wall thickness (XY), the others slab thickness (Z). The 200 largest facets are always
+  sampled (fewer when `--samples` is smaller), then the rest spread evenly by area so `--samples` (4000) rays run;
+  the JSON gives the count. Thin samples, the facets they hit and the samples on the same smooth face (neighbours
+  within 5 deg of one plane) join into regions, one finding per region at its thinnest point: `wall.below_line` WARN
+  under the outer line width, `wall.one_loop` INFO under outer + inner, `slab.below_layer` WARN under the layer that
+  starts at the slab's lower face (the first layer at the bed, the layer height above), `slab.off_grid` INFO when a
+  slab within 5 deg of flat and under 10 layers has a face more than 0.02 mm from a layer boundary (the bed, the
+  first layer top, then one every layer height); a sloped slab is not judged against the grid. Ties at the thinnest
+  point and between equal ray hits break by position, not facet order. Work is bounded: the ray grid holds at most
+  1,000,000 (cell, facet) entries (its cell grows past that), and after 3,000,000 ray-triangle tests walls and layers
+  stop and report `not-checked` with the count and "pass a lower --samples".
+- **Stability.** Contact = facets flat on the bed (all corners within 0.05 mm, n.z < -0.999). Under max(25 mm2, 1 %
+  of the footprint) is `contact.none` (FAIL, as `Metrics.stands`). On a closed mesh the centre of mass (signed
+  tetrahedra, uniform density) is compared with the convex hull of the contact: outside is `tip.com_outside` (WARN);
+  a static tip angle `atan(margin / centre height)` under 10 deg is `tip.low_margin` (INFO, heuristic). Separate bodies
+  are checked one by one (each outward shell with the cavities its box holds); the finding names the body. A body
+  that reaches the bed needs its own contact: one that stands on an edge beside a wide body is `contact.none` for that
+  body. A body whose lowest point is above the bed stands on support and is left to the overhang regions.
+- **Adhesion.** Slenderness = height / sqrt(contact). Over 3 (the knee of the orientation score), or a contact at least
+  100 mm long and under 15 mm wide (minimum width of the contact hull by rotating calipers), is `brim.suggest` (WARN,
+  heuristic, per body) unless the file sets an outer brim (`outer_only`, `outer_and_inner`, `brim_ears`) or a painted
+  one; `inner_only` does not widen the base. The area's measures describe the body that wants a brim. At least
+  400 mm2 of contact under every body, slenderness at most 1 and `auto_brim` is `brim.not_needed` (INFO). No published
+  height-to-base ratio exists (rule 12).
+- **Fit.** The posed size against the bed box and `printable_height`, then against the reach of the extruder that
+  prints it (`extruder_printable_area`, `extruder_printable_height`): every extruder the object's parts use, the
+  object's own and each part's. `fit.bed` and `fit.extruder_reach` are FAIL; the reach fix names an extruder whose
+  reach holds the part, or says that none does. An outer brim that pushes the size past the reach is `fit.brim_edge`
+  (INFO). A malformed filament map leaves the extruder unknown: the fit is `not-checked` for the reach and names the
+  map. This is "fits at all in this pose"; placement on the plate stays with `shambu check`. A 3MF whose zip entries
+  or metadata numbers do not read (damaged deflate data, an unknown compression method, a `plater_id` or
+  `prediction` that is not a number, a `printable_area` that does not parse) is a `ProjectError`, exit 3.
+
+### 12.3 Thresholds and where they come from
+
+Order per value: a flag, then the 3MF's object settings, then its project settings, then `--process` (STL), then
+the built-in default. The report names the source of each (`flag`, `file object`, `file`, `preset <name>`,
+`default`).
+
+| Value | Default | Source |
+|---|---|---|
+| Overhang | 60 deg from vertical (`support_threshold_angle` 30 from horizontal) | rule 4, section 3.3; `mesh.DEFAULT_THRESHOLD` |
+| Max bridge without support | `max_bridge_length` 0 | section 3.3; reference 06 section 4 |
+| Bridge recipe span, tested band | 10 mm; 10 to 40 mm | reference 06 section 4; rule 5 |
+| Flat for a bridge | within 5 deg | shambu's own (heuristic) |
+| Wall lines | outer 0.42, inner 0.45 (two loops 0.87) | reference 07; X2D `0.20mm Standard` |
+| Layers | `layer_height` 0.2, first layer 0.2, off-grid 0.02 mm | X2D `0.20mm Standard`; reference 07 |
+| Contact | max(25 mm2, 1 % of the footprint) | `mesh.MIN_CONTACT_MM2`, `Metrics.stands` |
+| Brim | slenderness 3; 100 mm long and 15 mm wide; 400 mm2 | rule 12; reference 06 section 3 (heuristic) |
+| Tip angle | 10 deg | shambu's own (heuristic) |
+| Bed and reach | the machine preset or the file's `printable_area`, `printable_height`, `extruder_printable_*` | reference 06 section 8 |
+
+A test compares the defaults with the installed `0.20mm Standard @BBL X2D` preset (skipped without the library).
+
+### 12.4 Honest limits
+
+- An STL is chords of the CAD surface: a facet angle on a curve can be off by half the tessellation step (a
+  64-segment bore: 2.8 deg), and regions on curves split or merge at that resolution.
+- The bridge anchor test reads one facet across each boundary edge. A ceiling anchored on a slope or a fillet, or on
+  two adjacent sides only, stays an overhang (the conservative side). A ceiling held by a wall that itself floats
+  still counts as anchored.
+- Wall and slab values are sampled, not a medial axis; the pair filter skips tapers over 30 deg.
+- Tip-over uses the finished part with uniform density and ignores adhesion, brims, supports and infill.
+- An STL takes its thresholds from `--process` and the flags only; a 3MF from its own settings. Negative parts are
+  not subtracted (walls, layers and tip-over report `not-checked`); modifiers, enforcers and blockers are not read.
+
+### 12.5 Real parts and timings (2026-11-02, Python 3.14.3, Apple silicon, 4000 samples)
+
+Each `data/` STL in the pose `shambu orient` ranks first:
+
+| Part | Facets | Seconds | Findings |
+|---|---|---|---|
+| bottle-funnel | 1076 | 0.03 | 3 bridge.studio_supports (1 mm spans held on three sides) |
+| bracket | 13542 | 0.41 | 44 overhang.region, 6 bridge.long, 5 bridge.studio_supports, wall.one_loop |
+| carrier | 19654 | 0.64 | 69 overhang.region, 10 bridge.long, 6 bridge.studio_supports, 3 wall.one_loop, 7 slab.off_grid, tip.com_outside, brim.suggest |
+| coupon_holes | 11668 | 0.39 | brim.not_needed |
+| jaw_posy | 2796 | 0.24 | 8 overhang.region, 3 bridge.long, 4 bridge.studio_supports, 3 slab.off_grid |
+| pinion_disc | 5662 | 0.16 | 2 overhang.region, 14 bridge.studio_supports, brim.not_needed |
+| so101 jaw (metres) | 28270 | 0.09 | mesh.metres, mesh.open_edges, mesh.flipped, mesh.bodies; the geometry areas `not-checked` (exit 1) |
+| tag_bridge | 2700 | 0.14 | slab.off_grid, brim.not_needed |
+
+A 19800-facet sphere took 0.24 s; a 199000-facet sphere 2.0 s and 384 MB peak. A 5 m tetrahedron (4 facets, one
+slanted face across the whole box) took 0.13 s and 290 MB: without the cap on grid entries, the 10 mm cell put that
+one face in 125 million cells (35 GB, 32 s). Many small overhang regions on the bracket and carrier are the crowns of
+horizontal bores (one region per bore). Not yet done: a side-by-side of the overhang regions with the support Studio
+prints in `shambu build --slice` on two parts; until then a region is "Studio would support this face", not "Studio
+will put N grams here".

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
+import struct
 import types
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,6 +69,46 @@ requires_studio = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------------------- 3MF fixture
+def png_bytes(w: int = 512, h: int = 512, colour_type: int = 6) -> bytes:
+    """A real PNG: signature, IHDR, one IDAT of blank rows, IEND (CRCs by zlib.crc32)."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colour_type]
+    raw = (b"\x00" + b"\x00" * (w * channels)) * h
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, colour_type, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+def gcode_text(layers: int = 2, m991: bool = True, r_min: int | None = 20, header: bool = True, markers: int | None = None) -> bytes:
+    """A small plate G-code in the shape of a Studio X2D export: header layer count, `M73 P R`, one `M73 L` marker
+    (and an `M991 S0 P` notice) per layer. `markers` writes fewer or more `M73 L` lines than `layers`."""
+    out = ["; HEADER_BLOCK_START"]
+    if header:
+        out.append(f"; total layer number: {layers}")
+    out.append("; HEADER_BLOCK_END")
+    if r_min is not None:
+        out.append(f"M73 P0 R{r_min}")
+    out.append("G28")
+    for i in range(1, (layers if markers is None else markers) + 1):
+        out.append(f"M73 L{i}")
+        if m991:
+            out.append(f"M991 S0 P{i - 1}")
+        out.append(f"G1 Z{0.2 * i:.1f}")
+    out.append("M73 P100 R0")
+    return ("\n".join(out) + "\n").encode()
+
+
+SLICED_GCODE = gcode_text()  # prediction 1234 s in the fixtures' slice_info: 20 min in the G-code, within the band
+SLICED_PNG = png_bytes()
+
+
+def md5_entry(gcode: bytes) -> bytes:
+    """The `.gcode.md5` entry Studio writes: 32 uppercase hex digits, no newline."""
+    return hashlib.md5(gcode).hexdigest().upper().encode()
+
+
 MODEL_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">
  <metadata name="Application">BambuStudio-02.08.02.61</metadata>
@@ -148,15 +191,23 @@ def project_settings(**over) -> dict:
 
 
 def make_3mf(
-    path: Path, *, sliced: bool = False, with_model_settings: bool = True, object_names: tuple[str, str] = ("body", "label"), **ps_over
+    path: Path,
+    *,
+    sliced: bool = False,
+    with_model_settings: bool = True,
+    object_names: tuple[str, str] = ("body", "label"),
+    gcode: bytes = SLICED_GCODE,
+    md5: bytes | None = None,
+    **ps_over,
 ) -> Path:
-    """A minimal Bambu project. Entry order and compression mimic a CLI export."""
+    """A minimal Bambu project. Entry order and compression mimic a CLI export. A sliced one carries `gcode` and its
+    `.md5` (`md5`, default the real one in Studio's form)."""
     gcode_meta = (
         '<metadata key="gcode_file" value="Metadata/plate_1.gcode"/>\n    <metadata key="prediction" value="1234"/>' if sliced else ""
     )
     entries: list[tuple[str, bytes, int]] = [
         ("[Content_Types].xml", b'<?xml version="1.0"?><Types/>', zipfile.ZIP_DEFLATED),
-        ("Metadata/plate_1.png", b"\x89PNG fake", zipfile.ZIP_STORED),
+        ("Metadata/plate_1.png", SLICED_PNG, zipfile.ZIP_STORED),
         ("3D/3dmodel.model", MODEL_XML.encode(), zipfile.ZIP_DEFLATED),
         ("3D/Objects/object_1.model", b"<model/>", zipfile.ZIP_DEFLATED),
         ("Metadata/project_settings.config", (json.dumps(project_settings(**ps_over), indent=4) + "\n").encode(), zipfile.ZIP_DEFLATED),
@@ -186,8 +237,8 @@ def make_3mf(
     ]
     if sliced:
         entries += [
-            ("Metadata/plate_1.gcode", b"G28\n", zipfile.ZIP_DEFLATED),
-            ("Metadata/plate_1.gcode.md5", b"abc", zipfile.ZIP_DEFLATED),
+            ("Metadata/plate_1.gcode", gcode, zipfile.ZIP_DEFLATED),
+            ("Metadata/plate_1.gcode.md5", md5_entry(gcode) if md5 is None else md5, zipfile.ZIP_DEFLATED),
         ]
     entries.append(("_rels/.rels", b"<Relationships/>", zipfile.ZIP_DEFLATED))
     with zipfile.ZipFile(path, "w") as z:
@@ -798,6 +849,11 @@ def make_geo_3mf(
     paint: bool = False,
     sliced: bool = False,
     ranges: list[tuple[float, float]] | None = None,
+    gcode: bytes = SLICED_GCODE,
+    md5: bytes | None = None,
+    png: bytes | None = SLICED_PNG,
+    plate_json: bytes = b'{"bbox_objects":[]}',
+    slice_extra: bytes = b"",
     **ps_over,
 ) -> Path:
     """Body (object id 2, sub-object 1, 30 x 20 x 10, filament 1, plate 1) and label (object id 4, sub-object 3,
@@ -905,8 +961,8 @@ def make_geo_3mf(
         ),
         ("3D/Objects/object_1.model", _mesh_model("1", GEO_BODY, paint).encode(), zipfile.ZIP_DEFLATED),
         ("3D/Objects/object_2.model", _mesh_model("3", GEO_LABEL).encode(), zipfile.ZIP_DEFLATED),
-        ("Metadata/plate_1.png", b"\x89PNG fake", zipfile.ZIP_STORED),
-        ("Metadata/plate_1.json", b'{"bbox_objects":[]}', zipfile.ZIP_DEFLATED),
+        *([("Metadata/plate_1.png", png, zipfile.ZIP_STORED)] if png is not None else []),
+        ("Metadata/plate_1.json", plate_json, zipfile.ZIP_DEFLATED),
         (
             "Metadata/project_settings.config",
             (json.dumps(geo_project_settings(filaments, **ps_over), indent=4) + "\n").encode(),
@@ -931,7 +987,7 @@ def make_geo_3mf(
             b'<?xml version="1.0"?>\n<config>\n  <header/>\n'
             + (
                 b'  <plate>\n    <metadata key="index" value="1"/>\n    <metadata key="prediction" value="1234"/>\n'
-                b'    <metadata key="weight" value="10.0"/>\n  </plate>\n'
+                b'    <metadata key="weight" value="10.0"/>\n' + slice_extra + b"  </plate>\n"
                 if sliced
                 else b""
             )
@@ -942,8 +998,8 @@ def make_geo_3mf(
     ]
     if sliced:
         entries += [
-            ("Metadata/plate_1.gcode", b"G28\n", zipfile.ZIP_DEFLATED),
-            ("Metadata/plate_1.gcode.md5", b"abc", zipfile.ZIP_DEFLATED),
+            ("Metadata/plate_1.gcode", gcode, zipfile.ZIP_DEFLATED),
+            ("Metadata/plate_1.gcode.md5", md5_entry(gcode) if md5 is None else md5, zipfile.ZIP_DEFLATED),
         ]
     with zipfile.ZipFile(path, "w") as z:
         for name, data, comp in entries:

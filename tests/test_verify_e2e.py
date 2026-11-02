@@ -135,3 +135,23 @@ def test_export_of_a_user_process_preset_verifies(capsys, tmp_path, resolver, pr
     code, lines = verify(capsys, r.project, spec_path)
     assert code == 0, lines
     assert not [x for x in lines if x.startswith(("FAIL", "WARN"))], lines
+
+
+def test_verify_integrity_lines_warn_but_keep_exit_0(capsys, tmp_path, resolver):
+    """A built project whose G-code no longer matches its .md5: verify adds a WARN `integrity` line with the evidence
+    tag, still exits 0 (integrity never fails), and `--no-integrity` drops the line."""
+    import zipfile
+
+    r, spec_path = build(tmp_path, resolver, sliced=True)
+    with zipfile.ZipFile(r.project) as z:
+        entries = [(i, z.read(i.filename)) for i in z.infolist()]
+    with zipfile.ZipFile(r.project, "w") as z:
+        for info, data in entries:
+            z.writestr(info, b"0" * 32 if info.filename == "Metadata/plate_1.gcode.md5" else data)
+    code = cli.main(["--json", "verify", str(r.project), "--against", str(spec_path)])
+    doc = json.loads(capsys.readouterr().out)
+    lines = [x for x in doc["lines"] if x["item"] == "integrity gcode.md5_mismatch"]
+    assert code == 0 and doc["ok"] and len(lines) == 1 and lines[0]["level"] == "WARN" and "[measured]" in lines[0]["note"]
+    code = cli.main(["--json", "verify", str(r.project), "--against", str(spec_path), "--no-integrity"])
+    doc = json.loads(capsys.readouterr().out)
+    assert code == 0 and not [x for x in doc["lines"] if x["item"].startswith("integrity ")]

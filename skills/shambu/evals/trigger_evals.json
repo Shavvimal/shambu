@@ -23,5 +23,10 @@
   {"query": "replace the mesh in my CAD model with the new bracket body and re-export the STEP", "should_trigger": false},
   {"query": "swap the housing mesh in all-on-one.3mf for housing_v2.stl, same spot on the plate", "should_trigger": true},
   {"query": "move the prime tower in my 3mf to the back right corner, it's sitting on top of a part", "should_trigger": true},
-  {"query": "the printer just finished, how accurate was Bambu Studio's time estimate for that print?", "should_trigger": true}
+  {"query": "the printer just finished, how accurate was Bambu Studio's time estimate for that print?", "should_trigger": true},
+  {"query": "is this bracket going to need supports and will the thin rib even print? bracket.stl", "should_trigger": true},
+  {"query": "check jaw.stl for overhangs and bridges before I slice it", "should_trigger": true},
+  {"query": "my tall rod print fell over halfway, would a brim have helped? rod.stl", "should_trigger": true},
+  {"query": "fix the holes in this broken STL mesh so it is watertight", "should_trigger": false},
+  {"query": "design a bracket with a 2 mm wall in CAD and export a STEP", "should_trigger": false}
 ]

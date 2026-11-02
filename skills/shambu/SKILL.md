@@ -1,6 +1,6 @@
 ---
 name: shambu
-description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It reads which spools the printer holds and uses them as the project's filaments, places parts on their outlines (never rotated) or at the corner the spec gives, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament estimates. It compares orientation and print-sequence variants, inspects, patches and edits .3mf or .gcode.3mf files (settings, mesh, filaments, object and tower positions), and reads a Bambu Lab printer over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part, wants a time or filament estimate, wants to change a 3MF, asks how far the print is, or has a login or access code problem, even if Bambu Studio is not named. Not for designing or editing CAD parts (use a CAD skill), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
+description: Builds Bambu Studio projects (.3mf) from STL files through the shambu CLI. It uses the printer's loaded spools as filaments, places parts on their outlines or at a given corner, sets the process, brims, supports, prime tower and bed type, picks a print orientation, prints by object when that is faster, and slices headless for time and filament. It compares orientation and print-sequence variants, pre-flights a part's printability (overhangs, bridges, thin walls), inspects, patches and edits .3mf or .gcode.3mf files (settings, meshes, positions), and reads a Bambu Lab printer over LAN (read-only). Use when the user wants a plate or project from STLs, asks how to orient or support a part or whether it will print, wants a time or filament estimate, wants to change a 3MF, asks how far the print is, or has a login or access code problem, even if Bambu Studio is not named. Not for designing or editing CAD parts (use a CAD skill), mesh repair, printer hardware calibration, or starting, pausing or sending prints.
 argument-hint: "[stl files or project.3mf] [print notes]"
 allowed-tools: Bash(shambu *), Read
 ---
@@ -13,7 +13,7 @@ send a job. Request: $ARGUMENTS
 ## Before you start (standing rules)
 
 1. Before the first shambu command of a task (before the spec is written): `shambu --version` (it must print:
-   shambu 0.6.1), then `shambu doctor --json --expect-version 0.6.1`. Exit 3 with `"shambu": {"match": false}`
+   shambu 0.7.0), then `shambu doctor --json --expect-version 0.7.0`. Exit 3 with `"shambu": {"match": false}`
    (`MISMATCH` and a `Fix:` line) means another version is on PATH. A usage error on `--expect-version` means one
    older than 0.4.0. Either way: stop, give both versions and the fix (`/shambu:setup update`). Never use
    `uv run --project`, a checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`.
@@ -40,6 +40,10 @@ send a job. Request: $ARGUMENTS
       bundles). `shambu spec plate.json` warns about each unknown key (a typo is dropped).
 - [ ] 2. Orient: `"orientation": "auto"` (Studio's auto-orient), or `shambu orient part.stl [--native]` and the
       chosen `lay_on_face`. A mesh under 1 mm is in metres: `shambu rotate part.stl -o DIR --convert-unit`.
+      Then `shambu printability part.stl --lay-on-face=NX,NY,NZ --printer PRESET` (the `=` form takes a negative
+      first value). Quote its findings by code with their evidence tag; apply a fix's recipe per object; FAIL
+      (open mesh, metres, no bed contact, does not fit) means another pose or a CAD fix. No finding is a verdict:
+      the slice decides, and the `not checked` line says what it did not look at.
 - [ ] 3. Pre-flight: `shambu check plate.json`. The report prints these prefixes. Fix every `FAIL body overlap`
       and every plain `FAIL:` line (a spool, preset, file, mesh, the bed, reach, height or the prime tower).
       `FAIL margin rule`: a measured (probe) or spec spread reaches the other part. The measurement is real, so
@@ -170,7 +174,8 @@ user sets one.
 
 ```
 shambu --version | doctor [--expect-version X.Y.Z] [--no-printer] [--printer NAME] [--ip IP] [--printer-timeout S]
-shambu info FILE... | inspect project.3mf | presets list filament --contains PETG | recipes | spec [plate.json]
+shambu info FILE... | inspect project.3mf [--no-integrity] | presets list filament --contains PETG | recipes | spec [plate.json]
+shambu printability PART.stl [--lay-on-face=NX,NY,NZ | --rotate X,Y,Z] [--printer PRESET] [--extruder 2] | printability project.3mf [--object NAME] [--plate N]
 shambu orient PART.stl [--native] [--write DIR] | rotate PART.stl -o DIR [--lay-on-face nx,ny,nz] | split PART.stl -o DIR
 shambu check plate.json | build plate.json [--slice] [--no-check] [--open] [--probe-supports | --no-probe]   # both read the spools first
        [--allow-filament-mismatch] [--no-printer] [--printer NAME] [--ip IP] [--keep-going: only with the user's yes]
@@ -217,6 +222,8 @@ and log path; its output is unverified until `shambu inspect` reads it.
 | Studio exit -101 | quote the two objects it names. Under a 1 mm gap neither a pass nor a -101 is proof (not repeatable). If the user accepts the GUI's warning: `--no-check`; the hand-back quotes `Checks skipped` |
 | Exit -100, -102, -104, -21 | -100: quote the stderr line ("No valid nozzle found": `patch --repair-nozzle-stats`); -102: right-nozzle work at x < 20.5; -104: off the bed; -21 (only from `shambu studio` or a GUI file with arrange on): Studio's arrange could not fit the parts (24 mm apart with trees): give `at` |
 | Exit -139 (crash) | run the same command once more; a second -139: report it with the log path, do not work round it |
+| `printability` finding | quote the line with its tag. `[measured]` is the mesh; `[heuristic]` is shambu's own band; neither replaces the slice. `bridge.studio_supports`: `bridge-short-spans`; `brim.suggest`: `tall-outer-brim`; `wall.below_line`: a CAD fix |
+| `inspect` or `verify` `integrity` WARN | `gcode.md5_mismatch`, `gcode.layer_markers`, `gcode.prediction_drift`: slice again (`shambu slice`) before the user prints; `flush.matrix_shape`: re-add the filament; `slice.warning`: quote Studio's text. `[external, not reproduced on X2D]` lines are INFO: mention, do not act |
 
 Reasons and numbers: `references/06-slicer-rules.md`, `references/08-optimisation.md`.
 
@@ -240,10 +247,10 @@ It never runs Studio's arrange and never rotates a part to pack it.
 |---|---|---|
 | [00-findings.md](references/00-findings.md) | Every rule the CLI encodes, one paragraph each, with the Studio source line | something fails (section 10: the 0.4.0 rules), or before changing the library |
 | [02-binary-crash.md](references/02-binary-crash.md) | Studio's exit codes and crashes | Studio exits non-zero |
-| [03-3mf-format.md](references/03-3mf-format.md) | The 3MF entries, re-slicing a CLI export, the edit verbs | patching or editing a project |
+| [03-3mf-format.md](references/03-3mf-format.md) | The 3MF entries, re-slicing a CLI export, the edit verbs, the integrity checks | patching or editing a project, an `integrity` line |
 | [04-app-printer-control.md](references/04-app-printer-control.md) | The printer report, the watch log | reading or logging a print |
 | [06-slicer-rules.md](references/06-slicer-rules.md) | Reasons behind the recipes; X2D limits; the prime tower; Studio's estimate against the printer | choosing a recipe, a tower, explaining a time |
-| [08-optimisation.md](references/08-optimisation.md) | Orientation, print by object, supports, the layout checker, headless metrics, the GUI workflow | optimising a plate, explaining a check line |
+| [08-optimisation.md](references/08-optimisation.md) | Orientation, print by object, supports, the layout checker, headless metrics, the GUI workflow, the printability pre-flight (section 12) | optimising a plate, explaining a check line or a printability finding |
 | [07-print-recipes.md](references/07-print-recipes.md) | Key scopes, defaults, the tip table | adding a recipe or a per-object key |
 | [09-user-notes.md](references/09-user-notes.md) | The user's own finish and fit notes | the hand-back for this user |
 | [01-source-cli.md](references/01-source-cli.md), [05-bambu-cli-ideas.md](references/05-bambu-cli-ideas.md) | CLI source, other tools | changing the code |

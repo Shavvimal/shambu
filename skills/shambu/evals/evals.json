@@ -7,7 +7,7 @@
       "expected_output": "A spec file with two filaments, print_sequence 'by object' and group_by_filament, built with `shambu build plate.json --slice` after `shambu check` passes its fact checks. The reply uses the hand-back template: project path, sliced status, per-plate 'Studio estimate' time and grams with the filament-change count, the Pre-flight and Slice lines, one line per object with its filament, and both standing warnings.",
       "files": [],
       "expectations": [
-        "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
+        "Runs `shambu --version` and `shambu doctor --json --expect-version X.Y.Z` with the version SKILL.md pins before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
         "Writes a plate.json spec with two entries in `filaments`, each `{\"preset\": \"loaded\"}` (the PETG spool on the left nozzle is filament 1, the PLA spool on the right is filament 2), or pins the presets the printer reports and no others",
         "Assigns jaw.stl to filament 1 with count 2, and label.stl to filament 2",
         "Sets `print_sequence` to \"by object\" on the plate, and sets `group_by_filament`",
@@ -82,10 +82,10 @@
     {
       "id": 6,
       "prompt": "make me a plate from parts/bracket.stl, PETG, slice it",
-      "expected_output": "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` first. Where the installed CLI is another version (doctor exit 3, match false, or a usage error on --expect-version), the reply stops, names both versions and gives the fix (`/shambu:setup update`). It does not switch to `uv run --project` or another copy, and it does not build.",
+      "expected_output": "Runs `shambu --version` and `shambu doctor --json --expect-version X.Y.Z` with the version SKILL.md pins first. Where the installed CLI is another version (doctor exit 3, match false, or a usage error on --expect-version), the reply stops, names both versions and gives the fix (`/shambu:setup update`). It does not switch to `uv run --project` or another copy, and it does not build.",
       "files": [],
       "expectations": [
-        "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` before writing a spec",
+        "Runs `shambu --version` and `shambu doctor --json --expect-version X.Y.Z` with the version SKILL.md pins before writing a spec",
         "When doctor reports a version mismatch, the reply states the installed version and the expected version",
         "Gives the fix: `/shambu:setup update` or the pinned `uv tool install --reinstall \"shambu @ git+https://github.com/Shavvimal/shambu@v...\"` line that doctor prints",
         "Does not run `uv run --project`, a checkout, or any other shambu copy to work round the mismatch",
@@ -183,6 +183,48 @@
         "Does not repeat the code back in the reply",
         "Tells the user to run `shambu printer login` themselves in a terminal (hidden prompt), or to pipe it with `--access-code-stdin` or pass `--access-code-file` from a file they create",
         "Reads the spools with `shambu printer filaments` only after the user's login succeeded"
+      ]
+    },
+    {
+      "id": 14,
+      "prompt": "will bracket.stl print ok lying on its back face (-z)? I don't want to waste a plate finding out",
+      "expected_output": "Runs `shambu printability bracket.stl --lay-on-face=0,0,-1` (with `--printer` from doctor when it wants the fit check), quotes the findings by code with their evidence tag (for example `WARN overhang.region ... [measured]`), names each fix's recipe per object, and says the slice decides: it does not call the part ready or give a score. It offers `shambu build --slice` for support grams and time, which printability does not measure.",
+      "files": [
+        "bracket.stl"
+      ],
+      "expectations": [
+        "Runs `shambu printability` on bracket.stl with the lay-on-face pose the user named",
+        "Quotes at least one finding line with its code and evidence tag, or quotes that every area reports no-finding",
+        "Does not say the part is ready, safe or guaranteed to print, and gives no overall score",
+        "Says support grams and time need the slice (`shambu build --slice` or `shambu sweep`)"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "the thin label plate in tags.stl keeps coming out with gaps. what's wrong with it before I print again?",
+      "expected_output": "Runs `shambu printability tags.stl` and reads the walls and layers areas. A `wall.below_line` or `slab.below_layer` WARN is quoted with its thickness and location, and the fix is a CAD change (thicken) or the recipe the finding names (`shim-0.1mm` alone, or Arachne / `detect_thin_wall` on the object). It does not edit the STL and does not invent a cause the finding does not state.",
+      "files": [
+        "tags.stl"
+      ],
+      "expectations": [
+        "Runs `shambu printability tags.stl`",
+        "Quotes the wall or slab finding with its measured thickness, or says the walls and layers areas report no-finding at the sampled facets",
+        "Offers the fix the finding names (CAD thickening or the named recipe), not an untested setting",
+        "Does not modify the STL file"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "inspect plate.gcode.3mf before I send it, someone edited the gcode by hand",
+      "expected_output": "Runs `shambu inspect plate.gcode.3mf` and reads the `integrity:` lines. A `gcode.md5_mismatch` or `gcode.layer_markers` WARN means the G-code changed after the slice: it advises `shambu slice` (or a slice in Studio) before printing and the GUI final pass. It reports `[external, not reproduced on X2D]` lines as INFO only and does not send or start the print.",
+      "files": [
+        "plate.gcode.3mf"
+      ],
+      "expectations": [
+        "Runs `shambu inspect` on the file",
+        "Quotes the integrity WARN or INFO lines with their evidence tag, or quotes the integrity count line with 0 WARN",
+        "On an MD5 or layer-marker WARN, advises slicing again before printing",
+        "Does not send, upload or start the print"
       ]
     }
   ]

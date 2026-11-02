@@ -453,7 +453,10 @@ def _plate_of(project: Project, oid: str) -> int:
 
 
 def _bed(project: Project) -> dict:
-    return machine_facts(project.project_settings)
+    try:
+        return machine_facts(project.project_settings)
+    except (ValueError, TypeError) as e:
+        raise EditError(f"{project.path}: the printable_area or extruder areas do not parse ({e})") from e
 
 
 def _origin(project: Project, plate: int) -> tuple[float, float]:
@@ -588,19 +591,82 @@ def _outline(geo: _Geometry, obj: _Obj, item: Sequence[float] | None = None) -> 
     """The object's XY outline (every part through component then item) by `layout.outline_of`, the rule `check`
     uses, against the object's world box; None and the reason when it does not rasterise (the box stands in)."""
     t_item = obj.item if item is None else list(item)
-    facets: list[M.Facet] = []
     try:
-        for c in obj.comps:
-            m = geo.mesh(c)
-            full = _compose(t_item, c.transform)
-            w = [_apply(full, v) for v in m.vertices]
-            facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
+        facets = _world_facets(geo, obj, obj.comps, t_item)
     except BambuError as e:
         return None, str(e)
     if not facets:
         return None, "the object has no triangles"
     lo, hi = geo.world_box(obj, t_item)
     return L.outline_of(facets, (lo[0], lo[1], hi[0], hi[1]))
+
+
+def _world_facets(geo: _Geometry, obj: _Obj, comps: Sequence[_Comp], item: Sequence[float]) -> list[M.Facet]:
+    """The triangles of `comps` (components of `obj`) in world mm: component transform, then the item transform."""
+    facets: list[M.Facet] = []
+    for c in comps:
+        m = geo.mesh(c)
+        full = _compose(item, c.transform)
+        w = [_apply(full, v) for v in m.vertices]
+        if _det(full) < 0:  # a mirror turns every facet inside out: reverse the winding so the normals face out again
+            facets += [(w[i], w[k], w[j]) for i, j, k in m.triangles]
+        else:
+            facets += [(w[i], w[j], w[k]) for i, j, k in m.triangles]
+    return facets
+
+
+def _det(t: Sequence[float]) -> float:
+    """The determinant of a transform's 3 x 3 part: negative for a mirror."""
+    m = _lin(t)
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+@dataclass(frozen=True)
+class ObjectMesh:
+    """One object's printing geometry for `shambu printability`: the triangles of its `normal_part` volumes in
+    plate-local mm (the frame of `inspect`), its plate, filament and own settings, and the subtypes of the volumes left
+    out (modifiers, enforcers, blockers, negative parts)."""
+
+    name: str  # the object's name, with "(instance k)" when the object has more than one build item
+    plate: int
+    filament: int
+    facets: list[M.Facet]
+    skipped: tuple[str, ...]
+    settings: dict
+    object: str = ""  # the object's own name (what `--object` matches)
+    filaments: tuple[int, ...] = ()  # every filament its normal parts print with: the object's and each part's own
+
+
+def object_meshes(project: Project) -> list[ObjectMesh]:
+    """Every build instance of every object with its `normal_part` triangles in plate-local mm, on the plate that holds
+    that instance (as `plate_objects` reads it). A volume with no subtype is a normal part, as Studio reads it. Raises
+    EditError when a mesh does not read."""
+    geo = _Geometry(project)
+    root = _root(project)
+    out: list[ObjectMesh] = []
+    for o in project.model_settings.findall("object"):
+        obj = _object(project, o, root)
+        subtype = {p.get("id"): p.get("subtype") or "normal_part" for p in o.findall("part")}
+        keep = [c for c in obj.comps if subtype.get(c.sub_id, "normal_part") == "normal_part"]
+        skipped = tuple(sorted({subtype.get(c.sub_id, "normal_part") for c in obj.comps} - {"normal_part"}))
+        slot = _slot_parser(obj)
+        filament = slot(_meta(o, "extruder"), "extruder") or 1
+        own = {
+            slot(_meta(p, "extruder"), f"part {p.get('id')} extruder") for p in o.findall("part") if p.get("id") in {c.sub_id for c in keep}
+        }
+        filaments = tuple(sorted({filament} | (own - {0})))  # 0 or absent: the part takes the object's filament
+        where = _instance_plates(project, obj.oid)
+        for k, text in enumerate(obj.item_texts or [obj.item_text]):
+            plate = where.get(k, _plate_of(project, obj.oid))
+            ox, oy = _origin(project, plate)
+            facets = M.translate(_world_facets(geo, obj, keep, parse_transform(text)), (-ox, -oy, 0.0))
+            label = obj.name if obj.n_items <= 1 else f"{obj.name} (instance {k})"
+            out.append(ObjectMesh(label, plate, filament, facets, skipped, _object_settings(obj), obj.name, filaments))
+    return out
 
 
 def _placed(

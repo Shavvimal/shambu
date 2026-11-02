@@ -68,17 +68,17 @@ As a Claude Code plugin:
 To update later: `/plugin marketplace update shambu` (it updates the installed plugin and reloads when the panel
 closes), then `/shambu:setup update`.
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.6.1"`) and runs
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.7.0"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.6.1"
-shambu doctor --expect-version 0.6.1
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.7.0"
+shambu doctor --expect-version 0.7.0
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu@v0.6.1" shambu doctor --expect-version 0.6.1
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.7.0" shambu doctor --expect-version 0.7.0
 ```
 
 ## Usage
@@ -106,10 +106,17 @@ places. `build --slice` is the final test: Studio's exit -101 names the two obje
 
 ```
 shambu orient bracket.stl                       # bed contact, support shadow, height per candidate face
+shambu printability bracket.stl --lay-on-face=0,0,-1 --printer "Bambu Lab X2D 0.4 nozzle"   # before shambu build
 shambu sweep plate.json --orientations bracket --by-object   # slices each variant: time, grams, support, waste, swaps
 shambu sweep plate.json --orientations bracket --write-spec plate-best.json   # writes the fastest variant as a spec
 shambu rotate part.stl -o out --lay-on-face 0,0,1          # write a turned copy; shambu split a.stl -o out
 ```
+
+`printability` is a pre-flight on the mesh in that pose, with no slicer: overhang regions with their location,
+bridges and their span, sampled wall and slab thickness, tip-over, brim need and bed fit. Each finding has a code, a
+severity, its evidence (measured, observed, external or heuristic) and a fix; there is no overall score, and every run
+lists what it did not check. `shambu inspect` and `shambu verify` also check a file's integrity (G-code MD5, layer
+markers, time prediction, thumbnails, bed id, slice warnings, flush matrix shape) as WARN or INFO lines.
 
 A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`
 (one object after another: on a two-filament plate that drops the prime tower and the per-layer nozzle changes,
