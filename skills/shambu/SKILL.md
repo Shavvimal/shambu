@@ -13,7 +13,7 @@ send a job. Request: $ARGUMENTS
 ## Before you start (standing rules)
 
 1. Before the first shambu command of a task (before the spec is written): `shambu --version` (it must print:
-   shambu 0.8.0), then `shambu doctor --json --expect-version 0.8.0`. Exit 3 with `"shambu": {"match": false}`
+   shambu 0.9.0), then `shambu doctor --json --expect-version 0.9.0`. Exit 3 with `"shambu": {"match": false}`
    (`MISMATCH` and a `Fix:` line) means another version is on PATH. A usage error on `--expect-version` means one
    older than 0.4.0. Either way: stop, give both versions and the fix (`/shambu:setup update`). Never use
    `uv run --project`, a checkout or another binary. No `timeout` wrapper (macOS has none), no `2>/dev/null`.
@@ -194,7 +194,7 @@ shambu printer list | printer login ... (the user runs it: it prompts for the co
 shambu calibrate --log FILE --add | calibrate --show                    # store a watched print; show the fit
 ```
 
-CAD gates (`shambu cad ...` on exported STLs): see the designing-for-print skill.
+CAD gates (`shambu cad ...` on exported STLs) and topology maps (`shambu topo ...`): see the designing-for-print skill.
 
 `--json` gives one JSON document (`printer watch --json`: one per poll). Exit codes: 0 ok, 1 a check, export or
 verification failed or a patch was refused, 2 usage, 3 environment.

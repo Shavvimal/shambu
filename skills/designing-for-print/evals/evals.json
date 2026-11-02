@@ -75,6 +75,34 @@
     "Stamps again and re-runs the gate",
     "Does not rely on an earlier pass"
    ]
+  },
+  {
+   "id": 6,
+   "prompt": "This bracket is too heavy. It hangs a 2 kg reel from the hook end and is screwed to the wall through the two bosses. Where can I take material out?",
+   "expected_output": "Checks the bracket's gate first, writes topo.json with the wall bosses as supports and passive regions and a 19.6 N hook load with its source, runs shambu topo check and voxelise before solve, reports the findings (topo.map_not_proof and the not-checked list) before the region table, quotes ratios as stiffness loss, proposes changes for the user to make in ClassCAD, and asks for a test print before any strength claim.",
+   "files": [
+    "cad.json",
+    "out/bracket@B.stl",
+    "out/bracket@B.cad.json"
+   ],
+   "expectations": [
+    "Writes a topo.json whose load cases come from the prompt (about 19.6 N at the hook) and asks for or declares any other case",
+    "Runs shambu topo check and shambu topo voxelise before shambu topo solve",
+    "Quotes topo.map_not_proof and the not-checked list in the reply",
+    "Never calls a low-density region safe to remove and never claims the part is strong enough",
+    "Leaves the CAD change to a ClassCAD edit followed by shambu cad gate and a test print"
+   ]
+  },
+  {
+   "id": 7,
+   "prompt": "shambu topo solve exited 3 with TopoDependencyError. What now?",
+   "expected_output": "Quotes the install line from the error (the topo extra), does not run pip install itself, and stops the topology step until the user installs it.",
+   "files": [],
+   "expectations": [
+    "Quotes the uv tool install line for shambu[topo] from the error",
+    "Does not run pip install or uv tool install itself",
+    "Does not invent a stiffness result without the run"
+   ]
   }
  ]
 }

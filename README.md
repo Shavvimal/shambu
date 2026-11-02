@@ -68,17 +68,17 @@ As a Claude Code plugin:
 To update later: `/plugin marketplace update shambu` (it updates the installed plugin and reloads when the panel
 closes), then `/shambu:setup update`.
 
-`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.8.0"`) and runs
+`/shambu:setup` installs the CLI (`uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.0"`) and runs
 `shambu doctor`. From then on, ask Claude to "make a plate from these STLs with PETG functional settings" and the
 `/shambu` skill does the rest.
 
 CLI only:
 
 ```
-uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.8.0"
-shambu doctor --expect-version 0.8.0
+uv tool install "shambu @ git+https://github.com/Shavvimal/shambu@v0.9.0"
+shambu doctor --expect-version 0.9.0
 # or without installing:
-uvx --from "git+https://github.com/Shavvimal/shambu@v0.8.0" shambu doctor --expect-version 0.8.0
+uvx --from "git+https://github.com/Shavvimal/shambu@v0.9.0" shambu doctor --expect-version 0.9.0
 ```
 
 ## Usage
@@ -124,7 +124,24 @@ Design in ClassCAD with `/shambu:designing-for-print`; `shambu cad gate cad.json
 `fit` read holes, bosses and insert pockets from the mesh, `clearance` and `sweep` find clashes and first contact,
 and `diff` names what changed between revisions and which plates to reslice. `clearance`, `sweep` and
 `diff --surface` need the optional geom extra (numpy, scipy, manifold3d):
-`uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.8.0'`.
+`uv tool install 'shambu[geom] @ git+https://github.com/Shavvimal/shambu@v0.9.0'`.
+
+`shambu topo` maps where a part's material carries the load cases you give and where it works little: a SIMP
+density optimisation on a voxel grid of the STL, with supports, passive regions, weighted cases and self-weight from
+a spec (`shambu.topo/1`). `check` validates the spec on the base install; `voxelise`, `solve` and `validate` (the
+Michell cantilever) need the topo extra (numpy, scipy); `trace` turns a map into window polygons for plate-like
+walls with the topo-trace extra (shapely). It is a map, not a proof: every result carries `topo.map_not_proof` and
+a not-checked list (no stress, buckling, fatigue or layer strength). The reference is
+`skills/designing-for-print/references/topology.md`.
+
+```
+shambu topo check topo.json
+shambu topo solve topo.json --out topo/bracket@B --volfrac 0.5   # run.json, density_v50.npy, regions.md, iso_v50.stl
+shambu topo trace topo/bracket@B/run.json --faces faces.json --rules conservative
+```
+
+`uv tool install 'shambu[topo] @ git+https://github.com/Shavvimal/shambu@v0.9.0'` (add `topo-trace` or
+`topo-mesh` inside the brackets for tracing or a smooth iso-surface).
 
 A part takes `"lay_on_face": [nx, ny, nz]` and `"rotate": [x, y, z]`; a plate takes `"print_sequence": "by object"`
 (one object after another: on a two-filament plate that drops the prime tower and the per-layer nozzle changes,

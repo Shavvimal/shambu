@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-02
+
+### Added
+- `shambu topo`: a density-based stiffness map of a part. A spec (`shambu.topo/1`) names the domain (a closed STL
+  or a box), material, supports, passive regions, weighted load cases with optional self-weight, and report
+  regions. `check` validates it on the base install. `voxelise` reports the grid, the voxel against mesh volume,
+  open-mesh columns and what each selection holds. `solve` checks equilibrium at full density, runs a SIMP
+  optimisation (hex8 elements, a density filter, an optimality-criteria update) per volume fraction, and writes
+  `run.json`, float32 density maps, a passive label grid, `regions.md` and an iso-surface STL. `validate` runs the
+  Michell cantilever. `trace` turns a map into window polygons on plate-like walls, with keep-outs, a minimum rib,
+  rounded corners, a 45-degree roof rule and clearances.
+- Every topology result carries the "a map, not a proof" findings (22 `topo.*` codes, each with severity and
+  evidence) and a not-checked list. Three codes fail the run: `topo.equilibrium`, `topo.passive_not_one` and
+  `topo.clearance`. There is no structural certification.
+- Optional extras `topo` (numpy, scipy), `topo-trace` (adds shapely) and `topo-mesh` (adds scikit-image), imported
+  only when a verb needs them; a missing extra exits 3 with the install line.
+- The designing-for-print skill gains a topology section, a reference (`references/topology.md`) and evals.
+- CI job `topo`: installs the topo extras and runs the solver and trace tests.
+
 ## [0.8.0] - 2026-11-02
 
 ### Added
