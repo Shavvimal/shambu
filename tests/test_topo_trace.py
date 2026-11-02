@@ -160,3 +160,75 @@ def test_unknown_volfrac_is_a_spec_error(tmp_path, capsys):
     run_json = _run_dir(tmp_path, _plate_with_disc())
     code, doc, _, _ = run(capsys, "topo", "trace", str(run_json), "--faces", str(_faces(tmp_path, [PLATE])), "--volfrac", "0.7")
     assert code == 1 and "no run at volfrac 0.7" in doc["errors"][0]
+
+
+# ---------------------------------------------------------------------------- guards from the review
+def _annulus() -> np.ndarray:
+    """Low density in a ring (r 4 to 11 mm) round a solid island at (20, 15)."""
+    nx, ny = 20, 15
+    dens = np.ones((nx, ny, 1))
+    x, y = np.meshgrid((np.arange(nx) + 0.5) * PITCH, (np.arange(ny) + 0.5) * PITCH, indexing="ij")
+    r = np.hypot(x - 20, y - 15)
+    dens[..., 0][(r > 4) & (r < 11)] = 0.0
+    return dens
+
+
+def test_a_window_never_swallows_an_island(tmp_path, capsys):
+    from shapely import geometry
+
+    run_json = _run_dir(tmp_path, _annulus())
+    code, doc, _, _ = run(capsys, "topo", "trace", str(run_json), "--faces", str(_faces(tmp_path, [PLATE])))
+    face = doc["faces"][0]
+    polys = [geometry.Polygon(w["poly"]) for w in face["windows"]]
+    assert code == 0 and polys
+    assert not any(p.contains(geometry.Point(20, 15)) for p in polys)  # the solid island stays
+    assert face["stage_areas_mm2"]["final"] <= face["stage_areas_mm2"]["after_print_rule"] + 1.0
+    assert all(w["mean_density"] < 0.3 for w in face["windows"])
+
+
+def test_a_missing_passive_file_is_an_error_when_the_run_has_passive_regions(tmp_path, capsys):
+    dens = _plate_with_disc()
+    passive = np.zeros(dens.shape)
+    passive[13, 7, 0] = 1
+    run_json = _run_dir(tmp_path, dens, passive, ["boss"])
+    (tmp_path / "passive.npy").unlink()
+    code, doc, _, _ = run(capsys, "topo", "trace", str(run_json), "--faces", str(_faces(tmp_path, [PLATE])))
+    assert code == 3 and "passive.npy" in doc["error"] and "boss" in doc["error"]
+
+
+def test_a_passive_cell_just_past_an_open_edge_is_kept_clear(tmp_path, capsys):
+    dens = _plate_with_disc()
+    x, y = np.meshgrid((np.arange(20) + 0.5) * PITCH, (np.arange(15) + 0.5) * PITCH, indexing="ij")
+    dens[..., 0][(x > 26) & (x < 37) & (np.abs(y - 15) < 6)] = 0.0  # low density up to the face edge at u = 37
+    passive = np.zeros(dens.shape)
+    passive[19, 7, 0] = 1  # a boss cell at u 38 to 40: outside the face rectangle, 1 mm past its open edge
+    run_json = _run_dir(tmp_path, dens, passive, ["boss"])
+    face = {"name": "plate", "axis": "z", "slab": [0, 2], "u": [0, 37], "v": [0, 30], "open_edges": ["u_hi"]}
+    code, doc, _, _ = run(capsys, "topo", "trace", str(run_json), "--faces", str(_faces(tmp_path, [face])))
+    assert code == 0, doc["findings"]
+    assert all(w["clearance"]["mm"] > PRESETS["conservative"].clearance_mm for w in doc["faces"][0]["windows"])
+
+
+@pytest.mark.parametrize(
+    ("rule", "needle"),
+    [
+        ({"max_vertices": 2}, "rules.max_vertices"),
+        ({"raster_mm": 0}, "rules.raster_mm"),
+        ({"roof_deg": 0}, "rules.roof_deg"),
+        ({"threshold": 1.5}, "rules.threshold"),
+    ],
+)
+def test_rules_that_would_hang_or_divide_by_zero_are_errors(tmp_path, capsys, rule, needle):
+    run_json = _run_dir(tmp_path, _plate_with_disc())
+    rules = tmp_path / "rules.json"
+    rules.write_text(json.dumps({"schema": "shambu.topo.rules/1", **rule}))
+    code, doc, _, _ = run(capsys, "topo", "trace", str(run_json), "--faces", str(_faces(tmp_path, [PLATE])), "--rules", str(rules))
+    assert code == 1 and any(needle in e for e in doc["errors"]), doc
+
+
+def test_a_raster_over_the_cap_is_refused(tmp_path, capsys):
+    run_json = _run_dir(tmp_path, _plate_with_disc())
+    rules = tmp_path / "rules.json"
+    rules.write_text(json.dumps({"schema": "shambu.topo.rules/1", "raster_mm": 0.001}))
+    code, doc, _, _ = run(capsys, "topo", "trace", str(run_json), "--faces", str(_faces(tmp_path, [PLATE])), "--rules", str(rules))
+    assert code == 1 and "over the cap" in doc["errors"][0]

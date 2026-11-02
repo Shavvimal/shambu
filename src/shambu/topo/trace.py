@@ -8,7 +8,8 @@ raster of `rules.raster_mm`:
 2. Average the density over the cells inside the wall (outside counts as 0) and sample it bilinearly. A candidate is
    PURE and below `threshold`.
 3. Keep-outs: every passive cell and every keep-out ball within `clearance + margin` of the wall, projected into the
-   face plane and grown by `sqrt(grow^2 - gap^2)`; a rim along each closed face edge; OTHER grown by the rib (or the
+   face plane and grown by `sqrt(grow^2 - gap^2)` (passive cells up to that reach outside the face rectangle count
+   too); a rim along each closed face edge; OTHER grown by the rib (or the
    rim) width. An optional opening of `clip_r_mm` rounds where a keep-out clips.
 4. Clean the raster: a closing of 0.6 mm, then an opening of 0.3 mm.
 5. Minimum rib: material thinner than `rib_mm` between two windows grows to the rib; material that thin between a
@@ -17,12 +18,17 @@ raster of `rules.raster_mm`:
 6. Print rule, when the build axis lies in the face plane: scanning down from the top, a window cell stays only when
    the layer above has window or air within one raster cell to either side, so roofs rise at 45 degrees. A run with
    nothing above keeps an `apex_mm` apex, so a square hole becomes a pointed arch.
-7. Polygons (shapely): simplify from 0.3 mm, raised until at most `max_vertices`; drop windows under `min_area_mm2`
-   or narrower than `min_width_mm`; round to 0.05 mm.
+7. Polygons (shapely): a window around an island of material is cut by a strip `rib_mm` wide through each island,
+   along the build axis, so no window holds an island and every island stays joined to the wall; simplify from 0.3 mm,
+   raised until at most `max_vertices` (a bounded search); drop windows under `min_area_mm2` or narrower than
+   `min_width_mm`; round to 0.05 mm. Area and mean density come from the emitted polygon.
 8. Report each window's 3D clearance to every passive region and keep-out ball (`topo.clearance` FAIL at or under
    `clearance_mm`), its removed volume, mean density and the roof length flatter than `flat_report_deg`
    (`topo.roof_bridge` WARN past the apex), and the area left after each stage (`topo.trace_rules_dominate` WARN when
    the rules removed more than half the candidate area).
+
+The run's `passive.npy` must be there when run.json lists passive regions (else TopoError, exit 3): without it the
+keep-outs would silently vanish. A face raster over `spec.MAX_RASTER` cells is a TopoSpecError before allocation.
 
 What it does not do: no CAD edit and no parameter file: the polygons are data for the user's own CAD script. No
 printing. Needs numpy, scipy and shapely (the `topo-trace` extra).
@@ -35,17 +41,19 @@ import math
 from pathlib import Path
 
 import numpy as np
+import shapely
 from scipy import ndimage
 from shapely import geometry, ops
 
 from ..errors import TopoError, TopoSpecError
 from ..findings import Finding
 from .result import finding
-from .spec import AXES, Face, Faces, TraceRules, plane_axes
+from .spec import AXES, MAX_RASTER, Face, Faces, TraceRules, plane_axes
 
 OPEN, PURE, OTHER = 0, 1, 2
 CLOSE_MM, OPEN_MM = 0.6, 0.3  # raster clean-up: fill hairline gaps, then drop slivers
 SIMPLIFY_MM = 0.3
+SIMPLIFY_STEPS = 40  # the tolerance grows 1.5 x a step: 0.3 mm to about 3e6 mm
 ROUND_MM = 0.05
 DOMINATE = 0.5
 
@@ -121,13 +129,20 @@ def trace(run_doc: dict, run_dir: Path, faces: Faces, rules: TraceRules) -> tupl
     entry = _run_entry(run_doc, rules.keep_volfrac)
     g = run_doc["grid"]
     origin, pitch = np.asarray(g["origin"], dtype=float), float(g["pitch"])
+    names = list(run_doc.get("passive", []))
     try:
         dens = np.load(run_dir / entry["files"]["density"])
         ppath = run_dir / "passive.npy"
-        passive = np.load(ppath) if ppath.exists() else np.zeros(dens.shape, dtype=np.int16)
+        if ppath.exists():
+            passive = np.load(ppath)
+        elif names:
+            raise TopoError(f"{ppath}: missing, and run.json lists passive regions ({', '.join(names)}): without it no keep-out holds")
+        else:
+            passive = np.zeros(dens.shape, dtype=np.int16)
     except (OSError, ValueError) as e:
         raise TopoError(f"{run_dir}: cannot read the density map: {e}") from e
-    names = list(run_doc.get("passive", []))
+    if passive.shape != dens.shape:
+        raise TopoError(f"{run_dir}: passive.npy has shape {passive.shape}, the density map {dens.shape}")
     grid = _Grid(dens, passive, origin, pitch, names)
     out_faces, findings, text = [], [], []
     for face in faces.faces:
@@ -181,15 +196,17 @@ def _face(grid: _Grid, face: Face, faces: Faces, rules: TraceRules) -> tuple[dic
 
     nu = max(1, math.ceil((face.u[1] - face.u[0]) / H - 1e-9))
     nv = max(1, math.ceil((face.v[1] - face.v[0]) / H - 1e-9))
+    reach = rules.clearance_mm + rules.margin_mm
+    pad = math.ceil(reach / H) + 1  # the keep-out raster reaches this far past the face rectangle
+    if (nu + 2 * pad) * (nv + 2 * pad) > MAX_RASTER:
+        raise TopoSpecError(
+            [f"face {face.name}: a {nu} x {nv} raster at raster_mm {H:g} is over the cap of {MAX_RASTER} cells; raise raster_mm"]
+        )
     uu = face.u[0] + H * (np.arange(nu) + 0.5)
     vv = face.v[0] + H * (np.arange(nv) + 0.5)
-    fa = (uu - grid.origin[a]) / h - 0.5
-    fb = (vv - grid.origin[b]) / h - 0.5
-    A, B = np.meshgrid(fa, fb, indexing="ij")
+    A, B = np.meshgrid((uu - grid.origin[a]) / h - 0.5, (vv - grid.origin[b]) / h - 0.5, indexing="ij")
     d2 = ndimage.map_coordinates(slab_mean, [A, B], order=1, mode="nearest")
-    ia = np.clip(np.floor(A + 0.5).astype(int), -1, cls.shape[0])
-    ib = np.clip(np.floor(B + 0.5).astype(int), -1, cls.shape[1])
-    inside = (ia >= 0) & (ia < cls.shape[0]) & (ib >= 0) & (ib < cls.shape[1])
+    ia, ib, inside = _cell_index(A, B, cls.shape)
     c2 = np.full((nu, nv), OPEN, dtype=np.int8)
     c2[inside] = cls[ia[inside], ib[inside]]
     air = c2 == OPEN
@@ -200,16 +217,19 @@ def _face(grid: _Grid, face: Face, faces: Faces, rules: TraceRules) -> tuple[dic
     stages["candidate"] = float(win.sum() * px_area)
 
     keep = np.zeros_like(win)
-    reach = rules.clearance_mm + rules.margin_mm
-    # passive cells near the wall, one gap level at a time
+    # passive cells near the wall, one gap level at a time, on a raster padded by the reach
+    up_ = face.u[0] + H * (np.arange(-pad, nu + pad) + 0.5)
+    vp_ = face.v[0] + H * (np.arange(-pad, nv + pad) + 0.5)
+    Ap, Bp = np.meshgrid((up_ - grid.origin[a]) / h - 0.5, (vp_ - grid.origin[b]) / h - 0.5, indexing="ij")
+    iap, ibp, inside_p = _cell_index(Ap, Bp, cls.shape)
     for k in range(dom.shape[2]):
         lo, hi = grid.origin[n] + h * k, grid.origin[n] + h * (k + 1)
         gap = max(0.0, s0 - hi, lo - s1)
         if gap >= reach or not (pas[:, :, k] > 0).any():
             continue
-        foot = np.zeros((nu, nv), dtype=bool)
-        foot[inside] = pas[:, :, k][ia[inside], ib[inside]] > 0
-        keep |= grow(foot, math.sqrt(reach**2 - gap**2), H)
+        foot = np.zeros(Ap.shape, dtype=bool)
+        foot[inside_p] = pas[:, :, k][iap[inside_p], ibp[inside_p]] > 0
+        keep |= grow(foot, math.sqrt(reach**2 - gap**2), H)[pad:-pad, pad:-pad]
     balls = list(faces.keepouts) + list(face.keepouts)
     U, V = np.meshgrid(uu, vv, indexing="ij")
     for ball in balls:
@@ -248,10 +268,14 @@ def _face(grid: _Grid, face: Face, faces: Faces, rules: TraceRules) -> tuple[dic
         win = print_rule(win, air, up, top_edge in face.open_edges, max(1, round(rules.apex_mm / H)), side)
     stages["after_print_rule"] = float(win.sum() * px_area)
 
-    windows, dropped = _polygons(win, uu, vv, H, face, rules)
+    windows, dropped = _polygons(win, uu, vv, H, face, rules, (0 if build == a else 1) if rule_applies else 1)
     findings: list[Finding] = []
     thick = s1 - s0
-    for i, (poly, cells, tol) in enumerate(windows):
+    for i, (poly, tol) in enumerate(windows):
+        cells = shapely.contains_xy(poly, U, V)
+        if not cells.any():  # a polygon thinner than the raster: the nearest raster cell
+            cells = np.zeros_like(win)
+            cells[np.unravel_index(int(np.argmin(np.hypot(U - poly.centroid.x, V - poly.centroid.y))), U.shape)] = True
         wname = f"{face.name}-w{i + 1}"
         clr, nearest = _clearance(poly, grid, face, n, balls)
         roof = _roof_flat(poly, build, a, b, rules.flat_report_deg) if rule_applies else 0.0
@@ -357,7 +381,36 @@ def _rib_rule(win: np.ndarray, air: np.ndarray, keep: np.ndarray, face: Face, ru
     return win
 
 
-def _polygons(win: np.ndarray, uu: np.ndarray, vv: np.ndarray, H: float, face: Face, rules: TraceRules):
+def _cell_index(A: np.ndarray, B: np.ndarray, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The grid cell under each raster point (fractional cell coordinates A, B) and whether it lies on the grid."""
+    ia = np.clip(np.floor(A + 0.5).astype(int), -1, shape[0])
+    ib = np.clip(np.floor(B + 0.5).astype(int), -1, shape[1])
+    return ia, ib, (ia >= 0) & (ia < shape[0]) & (ib >= 0) & (ib < shape[1])
+
+
+def _without_islands(poly, rib: float, up: int) -> list:
+    """Pieces of `poly` with no interior ring: a strip `rib` wide through each island, running along the raster axis
+    `up` across the whole polygon, joins the island to the wall on both sides. Cut edges run along the build axis."""
+    todo, out = [poly], []
+    for _ in range(10_000):  # each cut removes at least one ring; the bound only guards a shapely surprise
+        if not todo:
+            break
+        p = todo.pop()
+        if not p.interiors:
+            out.append(p)
+            continue
+        c = geometry.Polygon(p.interiors[0]).representative_point()
+        x0, y0, x1, y1 = p.bounds
+        if up == 0:
+            strip = geometry.box(x0 - 1, c.y - rib / 2, x1 + 1, c.y + rib / 2)
+        else:
+            strip = geometry.box(c.x - rib / 2, y0 - 1, c.x + rib / 2, y1 + 1)
+        rest = p.difference(strip)
+        todo += [g for g in getattr(rest, "geoms", [rest]) if isinstance(g, geometry.Polygon) and not g.is_empty]
+    return out
+
+
+def _polygons(win: np.ndarray, uu: np.ndarray, vv: np.ndarray, H: float, face: Face, rules: TraceRules, up: int = 1):
     labels, n = ndimage.label(win)
     found, dropped = [], []
     for k in range(1, n + 1):
@@ -371,11 +424,12 @@ def _polygons(win: np.ndarray, uu: np.ndarray, vv: np.ndarray, H: float, face: F
                 boxes.append(geometry.box(u0, v0, u0 + H, vv[js[e]] + H / 2))
         shape = ops.unary_union(boxes)
         polys = list(shape.geoms) if hasattr(shape, "geoms") else [shape]
-        for poly in polys:
-            poly = geometry.Polygon(poly.exterior)  # a window has no islands
+        for poly in (piece for whole in polys for piece in _without_islands(whole, rules.rib_mm, up)):
             tol = SIMPLIFY_MM
             simple = poly.simplify(tol, preserve_topology=True)
-            while len(simple.exterior.coords) - 1 > rules.max_vertices:
+            for _ in range(SIMPLIFY_STEPS):
+                if len(simple.exterior.coords) - 1 <= rules.max_vertices:
+                    break
                 tol *= 1.5
                 simple = poly.simplify(tol, preserve_topology=True)
             simple = geometry.polygon.orient(
@@ -388,7 +442,7 @@ def _polygons(win: np.ndarray, uu: np.ndarray, vv: np.ndarray, H: float, face: F
             elif simple.buffer(-rules.min_width_mm / 2).is_empty:
                 dropped.append({"reason": "width", "area_mm2": round(simple.area, 2), "at": [round(c.x, 2), round(c.y, 2)]})
             else:
-                found.append((simple, cells, tol))
+                found.append((simple, tol))
     found.sort(key=lambda t: (round(t[0].centroid.x, 3), round(t[0].centroid.y, 3)))
     return found, dropped
 
