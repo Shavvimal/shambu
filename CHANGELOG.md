@@ -6,7 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
+A docs and test release: no CLI behaviour changes. The skill texts move, so the version moves with them.
+
 ### Changed
+- Version 0.6.1 in `src/shambu/__init__.py`, `.claude-plugin/plugin.json`, both skills and the README install lines.
 - A post-mortem no longer names a Bambu account folder id or a session id, and `tests/test_public_hygiene.py` scans
   every tracked file for home paths, 192.168 addresses, preset folder ids, session and thread ids (full UUIDs, and
   short prefixes after "session" or "thread"), plus local private terms.
