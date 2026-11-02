@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from cadfix import codes, fails, run, stl, write_record
 from meshes import box
 from shambu.cad import provenance as P
@@ -210,3 +212,27 @@ def test_a_provenance_glob_that_matches_a_folder_hashes_only_files(tmp_path, cap
     doc["provenance"]["inputs"] = ["inputs/sub"]  # a folder named outright is an input that does not read
     code, out, _, _ = run(capsys, "cad", "gate", str(spec(tmp_path / "cad.json", doc)))
     assert code == 3 and "inputs/sub" in out["error"]
+
+
+@pytest.mark.parametrize(
+    ("over", "words"),
+    [
+        ({"inputs": ["a.js"]}, "inputs"),
+        ({"cad": {"volume_mm3": "big"}}, "cad.volume_mm3"),
+        ({"cad": {"cog": [0, "x", 0]}}, "cad.cog"),
+        ({"stl": {"faceting_tol_mm": -0.1}}, "stl.faceting_tol_mm"),
+        ({"stl": {"angle_tol_deg": True}}, "stl.angle_tol_deg"),
+        ({"stl": {"path": None}}, "stl.path"),
+        ({"step": {"path": None, "sha256": None, "reimport_volume_mm3": "x"}}, "step.reimport_volume_mm3"),
+        ({"print": {"bed_face": [0, 0]}}, "print.bed_face"),
+    ],
+)
+def test_a_malformed_record_is_a_named_error(tmp_path, capsys, over, words):
+    part = stl(tmp_path / "bracket.stl", box((0, 0, 0), (20, 10, 5)))
+    rec = write_record(part)
+    data = json.loads(rec.read_text())
+    for k, v in over.items():
+        data[k] = {**data[k], **v} if isinstance(v, dict) and isinstance(data.get(k), dict) else v
+    rec.write_text(json.dumps(data))
+    code, doc, _, _ = run(capsys, "cad", "check", str(part), "--record", str(rec))
+    assert code == 3 and words in doc["error"]

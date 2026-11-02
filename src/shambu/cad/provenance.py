@@ -103,7 +103,57 @@ def load_record(path: str | Path) -> Record:
     for key in ("part", "build_id", "stl"):
         if key not in data:
             raise CadError(f"{path}: the record has no {key!r}")
+    _check_record(data, str(path))
     return Record(p, data)
+
+
+def _is_num(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _check_record(data: dict, where: str) -> None:
+    """Raises CadError when a field a verb reads has the wrong type or range (the JSON reader already refuses NaN)."""
+
+    def bad(field: str, want: str, got: object) -> CadError:
+        return CadError(f"{where}: {field} must be {want}, got {got!r} (stamp the export again)")
+
+    def section(key: str, required: bool = False) -> dict:
+        v = data.get(key)
+        if v is None and not required:
+            return {}
+        if not isinstance(v, dict):
+            raise bad(key, "an object", v)
+        return v
+
+    def num(sec: dict, key: str, field: str, low: float | None = None, strict: bool = False) -> None:
+        v = sec.get(key)
+        if v is None:
+            return
+        if not _is_num(v) or (low is not None and (v <= low if strict else v < low)):
+            raise bad(field, "a number" + (f" {'above' if strict else 'at least'} {low:g}" if low is not None else ""), v)
+
+    def vec3(sec: dict, key: str, field: str) -> None:
+        v = sec.get(key)
+        if v is not None and not (isinstance(v, list) and len(v) == 3 and all(_is_num(x) for x in v)):
+            raise bad(field, "[x, y, z]", v)
+
+    inputs = data.get("inputs") or []
+    if not isinstance(inputs, list) or not all(isinstance(i, dict) and isinstance(i.get("path"), str) for i in inputs):
+        raise bad("inputs", 'a list of {"label", "path", "sha256"} objects', inputs)
+    stl = section("stl", required=True)
+    if not isinstance(stl.get("path"), str) or not stl["path"]:
+        raise bad("stl.path", "a path", stl.get("path"))
+    num(stl, "faceting_tol_mm", "stl.faceting_tol_mm", 0.0, strict=True)
+    num(stl, "angle_tol_deg", "stl.angle_tol_deg", 0.0)
+    cad = section("cad")
+    num(cad, "volume_mm3", "cad.volume_mm3")
+    num(cad, "area_mm2", "cad.area_mm2", 0.0)
+    vec3(cad, "cog", "cad.cog")
+    step = section("step")
+    if step.get("path") is not None and not isinstance(step["path"], str):
+        raise bad("step.path", "a path or null", step["path"])
+    num(step, "reimport_volume_mm3", "step.reimport_volume_mm3")
+    vec3(section("print"), "bed_face", "print.bed_face")
 
 
 def write_new(path: Path, text: str) -> None:
