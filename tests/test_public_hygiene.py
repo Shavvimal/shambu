@@ -21,9 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 #   it holds 7 or more hex digits with at least one letter, so "session 2" and a date such as "thread 20261029" pass.
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 SESSION_UUID = re.compile(rf'(?<![0-9a-z-])(?<!uuid=")(?<!UUID="){UUID}(?![0-9a-z-])', re.I)
-SESSION_PREFIX = re.compile(
-    r"\b(?:session|thread|conversation|transcript)\W{1,3}(?=[0-9]*[a-f])[0-9a-f]{7,}(?![0-9a-z])", re.I
-)
+SESSION_PREFIX = re.compile(r"\b(?:session|thread|conversation|transcript)\W{1,3}(?=[0-9]*[a-f])[0-9a-f]{7,}(?![0-9a-z])", re.I)
 
 # Each shape: (name, pattern, path prefix it applies to, or "" for every tracked file).
 SHAPES = [
