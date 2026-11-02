@@ -105,7 +105,7 @@ The gate word is derived from the findings: `stale` if any `cad.stale.*`; else `
 |---|---|
 | 0 | pass (WARN and INFO allowed) |
 | 1 | fail, incomplete or stale; or an invalid spec or expectation file |
-| 2 | usage: a flag for another verb, a malformed `--hole`, the wrong number of files |
+| 2 | usage: a flag for another verb, a malformed `--hole`, the wrong number of files, a numeric flag that is not finite or out of range (NaN, infinity, a negative tolerance) |
 | 3 | environment: a file that does not read, a record or `--promote` target that cannot be written or already exists, `GeomMissing` |
 
 ## 6. Finding codes and fixes
@@ -126,7 +126,8 @@ The gate word is derived from the findings: `stale` if any `cad.stale.*`; else `
 | `solid.open` | FAIL | open or non-manifold edges | fix the model (a failed Boolean, a surface body) |
 | `solid.bodies` | FAIL | more than one outer shell | unite the bodies, or export each part |
 | `solid.flipped` | WARN | facets wound inwards | export again |
-| `solid.void` | INFO | an enclosed void | legal; mention it |
+| `solid.void` | INFO | an enclosed void (an inward shell inside a body) | legal; mention it |
+| `solid.inverted` | FAIL | an inward shell outside every body: an inside-out body | export again from CAD |
 | `mesh.metres` | FAIL | the mesh is under 1 mm | export in millimetres |
 | `volume.vs_cad` | FAIL | STL volume outside the faceting band of the CAD volume | export again; stamp |
 | `volume.vs_step` | FAIL | STEP re-import volume outside 0.05 % of the CAD volume | export the STEP again |
@@ -141,6 +142,7 @@ The gate word is derived from the findings: `stale` if any `cad.stale.*`; else `
 | `fit.diameter` | FAIL | diameter outside the fit's band | set the hole size in the parameter table |
 | `fit.depth` | FAIL | full-diameter depth under `depth_min_mm` | deepen the pocket or move the relief below it |
 | `fit.wall` | FAIL | wall under `wall_min_mm` | thicken the boss or move the hole |
+| `cad.incomplete.wall_unmeasured` | FAIL | the fit needs a wall and no ray found the outside surface | check the part is a closed solid around the hole |
 | `fit.offset` | FAIL | axis further from the declared one than allowed | move the hole, or fix the spec |
 | `fit.shadowed` | WARN | a spec fit replaces a built-in name | rename it, or keep it on purpose |
 | `fit.coupon` | INFO | a new insert, press or slip fit | print a coupon first |
@@ -148,16 +150,18 @@ The gate word is derived from the findings: `stale` if any `cad.stale.*`; else `
 | `clash.overlap` | FAIL | overlap above the floor, no exemption | remove it, or exempt it with a reason and cap |
 | `clash.over_cap` | FAIL | exempt pair over its cap | reduce the interference |
 | `clash.exempt` | INFO | exempt pair within its cap (reason quoted) | none |
-| `clash.margin` | FAIL | closer than the margin | open the gap |
+| `clash.margin` | FAIL | closer than the margin (also outside an exempt zone that holds only the closest point) | open the gap, or widen the zone to the whole contact |
 | `clash.boolean_failed` | FAIL | the Boolean failed; never exempt | export closed solids |
 | `sweep.early_contact` | FAIL | contact before the allowed travel | add clearance or move the stop |
 | `sweep.margin`, `sweep.overlap` | FAIL | contact or overlap before the end of travel, or an end overlap over the cap | open the path |
 | `sweep.first_contact` | INFO | where and with what the parts first meet | quote it with the resolution |
 | `sweep.no_contact` | INFO | the moving parts met nothing | a seat with no stop is worth knowing |
+| `sweep.boolean_failed` | FAIL | a Boolean in the sweep failed; the gate goes on with the other rules | export closed solids |
+| `sweep.zone_sampled` | INFO | the contact zone is judged at the evaluated poses | none; keep the zone tight to the seat |
 | `diff.size`, `diff.volume`, `diff.section`, `diff.feature_*` | INFO | what changed | quote it |
 | `diff.coupon` | WARN | a fit feature changed | print a coupon |
 | `diff.coupon_undecided` | FAIL | a changed fit's expectation entry has no `coupon` decision | add `"coupon": true` or `false` |
-| `diff.unexpected` | FAIL | a change the expectation does not list | revert it or list it |
+| `diff.unexpected` | FAIL | a change the expectation does not list (a volume or section change needs a `volume_mm3` entry or a listed change that happened) | revert it or list it |
 | `diff.expected_missing` | FAIL | a listed change did not happen | make the change or remove the entry |
 | `diff.reslice` | INFO | a plate holds the changed STL | `shambu build plate.json --slice` |
 
@@ -171,5 +175,10 @@ The gate word is derived from the findings: `stale` if any `cad.stale.*`; else `
   rounding. The built-in fit band is +/- 0.02 mm.
 - Clearance distance: exact between the meshes (every vertex against the other's triangles, then edge against
   edge). Overlap floor: max(0.001 mm3, 1e-6 of the smaller part).
-- Sweep: the first contact is bisected to `resolution_mm` or `resolution_deg`. A fixed part thinner than the arc's
-  bulge between two straight step segments can be missed; use a smaller step for thin parts.
+- Sweep: every interval between two clear poses is proven clear by the exact gap at both ends and the most the gap
+  can change per unit of travel (1 for a translation, the farthest moving vertex's radius x pi / 180 per degree);
+  an interval that cannot be proven is split, so a crossing between poses is found to `resolution_mm` or
+  `resolution_deg`. A gap that stays within a sliver of the margin (1/128 of the resolution times that speed) reads as a `bound` contact. A contact
+  zone is judged at the poses evaluated (`sweep.zone_sampled`).
+- Fit: depth counts from the first full-diameter depth (a mouth point above the surface adds nothing); the
+  narrowest and widest diameter must both sit in the band.

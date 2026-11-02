@@ -50,7 +50,7 @@ verification). This skill adds the print intent, the gates and revisions.
 - [ ] 6. Export candidates to `out/.candidate/`: the STL (with the faceting you will stamp) and a STEP.
 - [ ] 7. Re-import the saved STEP in the session (checkpoint, import, measure, restore) and keep its volume.
 - [ ] 8. Stamp: `shambu cad stamp out/.candidate/<part>.stl --part <part> --rev <rev> --input parts/<part>.js
-      --input params.json --cad-volume V --cad-area A --cad-cog X,Y,Z --step out/.candidate/<part>.stp
+      --input params.json --cad-volume V --cad-cog X,Y,Z [--cad-area A] --step out/.candidate/<part>.stp
       --step-volume V2 --faceting-tol T --angle-tol D --bed-face NX,NY,NZ`.
 - [ ] 9. Gate: `shambu cad gate cad.json`. Exit 1: fix in ClassCAD (back to step 3), export, stamp and gate again.
       Exit 3: the environment; quote the error. Read `references/gates.md` for a code you do not know.
@@ -88,19 +88,21 @@ Standing warnings for every report with a fit:
 ## Gotchas
 
 - The MCP `save` tool takes only a format and a path. Finer STL faceting needs `run_script` with the
-  `common.save` STL options; that path is unverified on a remote worker. If it throws, use the MCP `save` (its
-  default faceting, 0.1 mm) and stamp `--faceting-tol 0.1`.
+  `common.save` STL options; that path is unverified on a remote worker. If it throws, use the MCP `save` and stamp
+  `--faceting-tol 0.1 --angle-tol 6` (the `common.save` defaults; that the MCP `save` uses them is unverified).
 - Analytic STEP options (`stp.version`, `stp.analytic`) are documented but unverified: one run threw on any `stp`
   option on a worker; untested on the local engine. Probe once per engine; on a throw, save plain STEP and say so
   in the report's Files line.
 - A STEP re-import of garbage reports success with no solid. Confirm the import has a solid child before you
   measure it. A file path must be reachable by the engine process (a remote worker cannot read your disk).
-- Mass properties reject feature ids and crash on an empty part: pass the part or solid id.
+- Mass properties reject feature ids and crash on an empty part: pass the part or solid id. The method doc lists
+  only `volume` and `cog` in the result: pass `--cad-area` only when a call you ran reported an area.
 - The engine reports success for a cut or a pattern that did nothing: assert the volume change after each one.
 - The graphic mesh is coarse (about 0.1 model units): probe the B-rep for small features, never the render.
 - `graphicBounds` is approximate and ignores instance transforms; `shambu cad check` reads the exact STL box.
-- In-session interference by `solid.intersection` destroys the target when the pair is disjoint: `checkpoint`
-  first and `restore` after. Prefer `shambu cad clearance` on the exports.
+- In-session interference: the `solid.intersection` doc says a disjoint pair destroys the target. This skill has
+  not run it in a part session (unverified), so `checkpoint` first and `restore` after. Prefer
+  `shambu cad clearance` on the exports.
 - A `pass` with a rule `not-checked` (skipped, or geom missing) proves nothing about that rule. Say which.
 - `cad.incomplete.*` is not a pass: a selector matched nothing, or a mesh or record is missing.
 

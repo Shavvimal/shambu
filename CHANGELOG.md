@@ -24,8 +24,19 @@ All notable changes to this project are documented here. The format follows
   Without it, `--help` and every stdlib verb work, and a check that needs it exits 3 with the install line.
 - New skill `designing-for-print`: builds and revises printable parts in ClassCAD through its MCP and keeps an
   export only when its gates pass.
-- CI job `geom`: installs the extra and runs the geom tests, including the proofs that the pruned distance equals
-  the exact one and that a culled sweep equals an unculled one.
+- CI job `geom`: installs the extra and runs the whole suite on Python 3.11 to 3.13, including the proofs that the
+  pruned distance equals the exact one and that a culled sweep equals an unculled one.
+- How the gates hold: `sweep` proves every interval between two poses clear from the exact gap at both ends and the
+  most it can change per unit of travel, so a crossing between poses is found; the end-of-travel overlap cap ignores
+  the contact zone; a Boolean failure is `sweep.boolean_failed` and the gate goes on; same-part selectors are
+  `cad.incomplete.selector_empty`. A clearance zone exemption no longer covers a gap under the margin outside the
+  zone. `--promote` publishes the exact bytes the check judged, and `stamp` never writes over its STL, STEP, an input
+  or a file that is not a record. A numeric flag that is not finite or out of range is a usage error (exit 2), input
+  JSON refuses NaN and Infinity, and no output holds them. `fit` measures depth from the material, fails an oval
+  bore on its narrow or wide side and reports an unmeasured required wall as `cad.incomplete.wall_unmeasured`.
+  `check` fails an inward shell outside every body (`solid.inverted`). `diff` needs a volume or section change to be
+  explained, keeps spec names on new holes, treats through-to-blind as a change and judges an old record by its STL
+  hash only.
 
 ### Changed
 - The shambu skill points CAD modelling at `designing-for-print`.

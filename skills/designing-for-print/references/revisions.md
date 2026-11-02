@@ -21,12 +21,15 @@ of it:
 - `feature`: a spec hole name (the hole whose mouth lies on that feature's axis), or the id `cad diff` prints for a
   feature with no name (`hole d4.00 at (30.0, 12.0, 2.5)`). Optional `change` (`resized`, `moved`, `gone`, `new`),
   `diameter_mm` (the new diameter) and `coupon` (true or false; required when the feature carries a fit).
-- `measure`: `size_x`, `size_y` or `size_z` with `delta_mm`.
+- `measure`: `size_x`, `size_y` or `size_z` with `delta_mm`, or `volume_mm3` with `delta_mm3`.
+- A volume or section change must be accounted for: by a `volume_mm3` entry, or by a listed size or feature change
+  that happened. An internal change (a cavity, a rib) with neither is `diff.unexpected`.
 
 ## Run and read the diff
 
 `shambu cad diff out/<part>@<old>.cad.json out/<part>@<new>.cad.json --spec cad.json --plate plate.json
---expect expect.json`. Records as inputs refuse a stale file (`cad.stale.*`).
+--expect expect.json`. A record as an input must still name its own STL (`cad.stale.stl_sha` when the file was
+replaced). Its build id and STEP are not rechecked: the script and parameters move on with each revision.
 
 - `measures`: old, new and delta for volume, area, box, centre of mass and inertia.
 - `sections`: where the section area changed, as bands ("changed between z 18.0 and 24.0").
