@@ -37,6 +37,14 @@ All notable changes to this project are documented here. The format follows
   `check` fails an inward shell outside every body (`solid.inverted`). `diff` needs a volume or section change to be
   explained, keeps spec names on new holes, treats through-to-blind as a change and judges an old record by its STL
   hash only.
+- Inputs that do not hold are named, never a pass or a traceback: a `fit` rule whose parts declare no hole is
+  `cad.incomplete.no_holes` and still reads each mesh and record; a non-numeric or non-finite STL or 3MF vertex, a
+  record field of the wrong type or range, and a provenance input that is a folder are errors that name the file and
+  field (exit 3), and a provenance glob keeps only files. The spec refuses a non-positive density, a zero bed face,
+  negative tolerances, margins and overlap caps, and booleans as numbers. The `diff` expectation file refuses unknown
+  keys and needs `change` on a feature entry and the delta on a measure entry; each entry excuses only the change it
+  names, so a listed hole no longer covers an unlisted cavity. `check` reads an inside-out shell inside a void as
+  `solid.inverted`.
 
 ### Changed
 - The shambu skill points CAD modelling at `designing-for-print`.
