@@ -15,7 +15,7 @@ verification). This skill adds the print intent, the gates and revisions.
 
 ## Standing rules
 
-1. Before the first `shambu cad` or `shambu topo` command of a task: `shambu --version` (it must print: shambu 0.9.0). Another
+1. Before the first `shambu cad` or `shambu topo` command of a task: `shambu --version` (it must print: shambu 0.9.1). Another
    version or "command not found": stop and give the fix (`/shambu:setup update`). `clearance`, `sweep` and
    `diff --surface` need the geom extra. On exit 3 with `GeomMissing`, quote the install line from the error and
    stop that check; never run `pip install` yourself.

@@ -261,7 +261,7 @@ Notes on the recipes:
   the base unless `different_settings_to_system` names them (reference 03, "Preset bookkeeping Studio honours"). The
   recipe is selected suggestion values plus explicit support-policy choices: the suggestion's interface keys
   (`support_interface_filament 2`, `support_top_z_distance 0`, `support_interface_spacing 0`, `rectilinear_interlaced`, `support_threshold_angle 35`, branch diameter 3 and angle
-  7 degrees, `raft_first_layer_expansion 5`, `tree_hybrid`, as seen on the owner's `cap_print` object on 2026-10-29)
+  7 degrees, `raft_first_layer_expansion 5`, `tree_hybrid`, as seen on a GUI-saved `cap_print` object, October 2026)
   plus shambu's own `tree(auto)`, `support_on_build_plate_only 0`, `support_filament 0`,
   `support_interface_not_for_body 1` and `thick_bridges 0`.
   `independent_support_layer_height` is a global key (`PrintConfig.hpp:1558`, moved from `PrintObjectConfig`): the

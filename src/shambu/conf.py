@@ -9,7 +9,7 @@ shambu's calibration file lives beside it: `~/Library/Application Support/shambu
 (`CALIBRATION`), the measured prints `shambu calibrate --add` stores. `load_calibration()` and
 `save_calibration()` read and write it (atomic: a temp file, then `os.replace`), and
 `update_calibration()` does load-change-save under a file lock. It holds a list of prints with the
-fixed fields of `calibrate.validate_print` (a session fingerprint, date, printer model, material, Studio total,
+fixed fields of `calibrate.validate_print` (a session digest, date, printer model, material, Studio total,
 rate, startup offset, poll times, speed levels, flags) and never a file name, an IP, a serial, an access code or a
 path.
 

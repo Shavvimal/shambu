@@ -475,8 +475,8 @@ class PrintFit:
     print_settings_id: str | None = None
 
     def to_print(self, session: str) -> dict:
-        """The calibration-file entry: the schema's fixed fields (see `validate_print`), `session` the fingerprint of
-        the log session (`session_fingerprint`). It stores no file name and no preset label: the grouping values
+        """The calibration-file entry: the schema's fixed fields (see `validate_print`), `session` the digest of
+        the log session (`session_digest`). It stores no file name and no preset label: the grouping values
         (printer model, material) are kept only when `storable_name` accepts them, else they are None."""
         return {
             "session": session,
@@ -625,7 +625,7 @@ _SCHEMA: dict[str, tuple] = {
 REFUSAL = "a calibration print must match the schema: fixed fields, numbers that are finite, no identifier"
 
 
-def session_fingerprint(header: dict | None, first_poll: dict, last_poll: dict) -> str:
+def session_digest(header: dict | None, first_poll: dict, last_poll: dict) -> str:
     """A stable id of one log session, from its content only (the header and the first and last poll), so the same
     session imported under several file names is one print."""
     blob = json.dumps([header, first_poll, last_poll], sort_keys=True, separators=(",", ":"), allow_nan=False)

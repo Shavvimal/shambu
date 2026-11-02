@@ -42,9 +42,9 @@ raises every cap with it on a machine that has the memory; a coarser pitch is th
 Install lines (quote them from the error; never run `pip install` for the user):
 
 ```
-uv tool install --force 'shambu[topo] @ git+https://github.com/Shavvimal/shambu@v0.9.0'
-uv tool install --force 'shambu[topo-trace] @ git+https://github.com/Shavvimal/shambu@v0.9.0'
-uv tool install --force 'shambu[topo-mesh] @ git+https://github.com/Shavvimal/shambu@v0.9.0'
+uv tool install --force 'shambu[topo] @ git+https://github.com/Shavvimal/shambu@v0.9.1'
+uv tool install --force 'shambu[topo-trace] @ git+https://github.com/Shavvimal/shambu@v0.9.1'
+uv tool install --force 'shambu[topo-mesh] @ git+https://github.com/Shavvimal/shambu@v0.9.1'
 ```
 
 ## 2. When to use it in the design loop

@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-02
+
+A docs and test release: no CLI behaviour changes. The skill texts move, so the version moves with them.
+
+### Changed
+- Version 0.9.1 in `src/shambu/__init__.py`, `.claude-plugin/plugin.json`, the three skills, the topology reference
+  and the README install lines.
+- The post-mortems and specs under `docs/` no longer narrate one person's working session. Clock times, the agent
+  session, quoted remarks, screenshots and private notes are gone. Each document keeps its numbers, error codes, log
+  shapes, settings, reproduction steps and acceptance tests. Evidence files carry labels (E1, S1, S2) and GUI
+  observations carry numbers (G1 to G9), with the order kept by step numbers.
+- `data/README.md`, `CONTRIBUTING.md`, the shambu evals and reference 08 describe parts by kind ("a bracket next to a
+  small holder", "an assembly of 88 bodies") instead of one build.
+- The 3MF format reference uses invented `p:UUID` and `uuid` values in its sample, and says that each kind of id is a
+  counter on a fixed suffix.
+- The README documents every `shambu cad` verb in one table with its exit codes and `--json`, change management
+  between revisions with `cad diff`, `shambu topo` as its own section, `shambu info` and `shambu presets`, a table of
+  the optional extras, the rules for findings, integrity lines and CAD gates, and the `cad/`, `topo/` and
+  `designing-for-print` rows of the repository layout. `CONTRIBUTING.md` counts three skills and states the Python
+  versions CI runs.
+- The calibration helper that hashes a log session is renamed `calibrate.session_digest`. The stored value and its
+  `session` key do not change.
+- `tests/test_public_hygiene.py` also fails on session narration in any tracked file (a quoted remark, verdict,
+  screenshot or note attributed to one person, or a named agent session), and on a clock-time range or a
+  "local time" clock under `docs/`.
+
 ## [0.9.0] - 2026-11-02
 
 ### Added
@@ -120,7 +146,7 @@ A docs and test release: no CLI behaviour changes. The skill texts move, so the 
 
 ## [0.6.0] - 2026-10-29
 
-A shambu project now opens in Bambu Studio with the process it was sliced with. On 2026-10-29 the owner opened a
+A shambu project now opens in Bambu Studio with the process it was sliced with. On 2026-10-29 a user opened a
 shambu project in Studio for the final pass, the process came back as the stock `0.20mm Standard @BBL X2D`, and the
 GUI re-sliced at 2 walls and 15 % grid instead of the spec's 4 walls and 25 % gyroid. shambu 0.5.1 exported the
 process as a user preset Studio did not know, with an empty `different_settings_to_system`, and Studio resets every
@@ -342,7 +368,7 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
   timestamped polls (`read_at` UTC, speed level and percent, stages, task id), 60 s polling at the start and the end,
   the final state recorded, errors as fixed-text categories. `shambu calibrate --log FILE... [--add] [--show]`: fits
   a layer-11-and-up rate and a startup offset per printer model and material, flags paused, failed, non-Standard,
-  disagreeing and unlogged prints, stores a fingerprinted print in `~/Library/Application Support/shambu/calibration.json`
+  disagreeing and unlogged prints, stores a print with its session digest in `~/Library/Application Support/shambu/calibration.json`
   under a file lock, and offers a point estimate only from three qualifying prints within 0.15.
 - `Status` fields `read_at`, `speed_level`, `speed_percent`, `stages`, `task_id`; `ends_at` is a dated UTC time.
 - `shambu inspect` prints each filament's extruder and nozzle stat and a "not re-sliceable" line when it applies.
@@ -377,11 +403,11 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
   presets from `BambuStudio.conf` stand in for `"loaded"` and pinned presets are kept and compared with the GUI.
 - `shambu doctor` gains a `loaded on the printer` section next to the GUI presets, with a `MISMATCH` line per slot
   that differs; `--no-printer` and `--ip` on doctor, check, build and sweep.
-- The skill runs `shambu doctor` before every build and writes filaments as `"loaded"` unless the owner names a
+- The skill runs `shambu doctor` before every build and writes filaments as `"loaded"` unless the user names a
   spool; the hand-back carries the `Filaments:` line.
 
 ### Fixed
-- A spec written for one spool passed every check after the owner changed spools, and the project opened in Studio
+- A spec written for one spool passed every check after the user changed spools, and the project opened in Studio
   with a filament that was not loaded; Studio's swap then reset the process preset without a word
   (`docs/errors/2026-10-16-loaded-filament-not-used.md`).
 
@@ -429,7 +455,7 @@ uncalibrated time estimate, no verb to edit a project, a two-filament slice that
 - On a plate with two filaments, a supported part's `support_filament` and `support_interface_filament` are
   pinned to the part's own filament when the spec leaves them at Studio's "default" (0): Studio otherwise prints
   the support base with whichever filament is loaded, and the right nozzle cannot reach x < 20.5 (exit -102,
-  found with a real gripper link next to a second-filament part).
+  found with a real arm link next to a second-filament part).
 - Orientations that leave (almost) nothing flat on the bed sort last and are marked "NO FLAT CONTACT"; the sweep
   skips them. `shambu orient` warns when a mesh is in metres; `shambu rotate --scale 1000` converts it.
 - The layout keeps a support margin round a part with supports: 0.25 x its height, clamped to 5..25 mm. The

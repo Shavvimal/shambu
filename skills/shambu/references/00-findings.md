@@ -305,4 +305,4 @@ build, two watched prints, and the Studio source at tag v02.08.02.61. Details: r
     saw its start, every poll was at Standard speed and 100 %, the printer's remaining time stayed within 5 % of
     M73 R, and it never paused. The hand-back shows "measured prints ran at A to B x Studio (n=N)", and
     "calibrated about H h M min (n=N)" only with 3 qualifying prints of one printer model and material whose rates
-    span less than 0.15. `--add` stores a fingerprint of the session, so one log imported twice is one print.
+    span less than 0.15. `--add` stores a digest of the session, so one log imported twice is one print.

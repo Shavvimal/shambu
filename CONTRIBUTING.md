@@ -1,6 +1,7 @@
 # Contributing
 
-Thanks for helping. shambu is small on purpose: one CLI, one Python package, two skills.
+Thanks for helping. shambu is small on purpose: one CLI, one Python package, three skills (`shambu`, `setup`,
+`designing-for-print`).
 
 ## Set up
 
@@ -10,7 +11,9 @@ make install          # uv sync --group dev
 make check            # ruff, mypy, pytest
 ```
 
-Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). The tests run offline and never call the Bambu Studio
+Python 3.11 or newer (CI runs 3.11, 3.12 and 3.13) and [uv](https://docs.astral.sh/uv/). `make install` installs
+no optional extra, so the tests that need numpy, scipy, manifold3d or shapely skip. Run
+`uv sync --group dev --all-extras` to run them too. The tests run offline and never call the Bambu Studio
 binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a Bambu Studio install is present.
 
 ## Where things live
@@ -44,7 +47,7 @@ a unit test, and none would have been invented for one.
 So before a release, and after any change to `mesh.py`, `layout.py`, `build.py`, `sweep.py` or a recipe, run the
 CLI on actual STLs of several kinds, not one favourite part:
 
-- functional robot parts exported in an assembly frame (gripper links, brackets, motor mounts, gears): off-origin
+- functional parts exported in an assembly frame (links, brackets, motor mounts, gears): off-origin
   STLs, copies, holes in every direction, tree supports;
 - URDF or simulation meshes in metres (SO-101, or any robot-arm URDF): the metres warning and `rotate --scale 1000`;
 - Gridfinity bins, baseplates and labels: 45-degree feet and lips, thin two-colour plates, many small objects on

@@ -15,7 +15,7 @@
         "Runs `shambu check plate.json` before it builds, fixes every FAIL that states a fact, and does not treat a margin-rule line (`WARN margin rule` or `FAIL margin rule`) as a reason to split the plate",
         "Runs `shambu build plate.json --slice` (not `BambuStudio` directly)",
         "Does not hand-assemble BambuStudio command-line flags",
-        "Hands back a `Filaments:` line that says the presets came from the printer at HH:MM (or that the printer was not read and the owner must confirm the spools by eye)",
+        "Hands back a `Filaments:` line that says the presets came from the printer at HH:MM (or that the printer was not read and the user must confirm the spools by eye)",
         "Hands back using the template: a Project line with sliced status, a Plate line that says 'Studio estimate' with time and grams and the filament-change count, a Pre-flight line, a Slice line with the Studio exit, and one line per object",
         "Includes both standing warnings: the first print of a new fit is a coupon in the same orientation, and holes print undersize (about 0.1 mm vertical, 0.2 to 0.3 mm horizontal)",
         "Quotes time and gram numbers from the report or the build output, and does not invent them"
@@ -37,8 +37,8 @@
     },
     {
       "id": 3,
-      "prompt": "change the bed type in projects/gripper.3mf to Textured PEI, everything else stays the same",
-      "expected_output": "Runs `shambu patch projects/gripper.3mf --bed-type \"Textured PEI Plate\"` (after an optional `shambu inspect`), and does not rebuild the project from STLs. If the file is a sliced .gcode.3mf, it warns that the patch drops the G-code and the user must re-slice.",
+      "prompt": "change the bed type in projects/assembly.3mf to Textured PEI, everything else stays the same",
+      "expected_output": "Runs `shambu patch projects/assembly.3mf --bed-type \"Textured PEI Plate\"` (after an optional `shambu inspect`), and does not rebuild the project from STLs. If the file is a sliced .gcode.3mf, it warns that the patch drops the G-code and the user must re-slice.",
       "files": [],
       "expectations": [
         "Uses `shambu patch` with `--bed-type \"Textured PEI Plate\"`",
@@ -147,14 +147,14 @@
     },
     {
       "id": 11,
-      "prompt": "Add parts/feeler.stl (50 x 226 x 64 mm, needs tree supports) and parts/cradle.stl (22 x 99 x 29, tree supports) to one plate and build it. PETG.",
-      "expected_output": "Runs `shambu check`. If the report says PLACEMENT NOT DONE, the reply quotes that line, says no position was computed, and offers `at` for the feeler (straight along the bed edge) or a `brim_margin`. Otherwise it builds with --slice. It never reports parts at the origin as overlaps and does not say the feeler needs the bed diagonal or its own plate.",
+      "prompt": "Add parts/long_bar.stl (50 x 226 x 64 mm, needs tree supports) and parts/cradle.stl (22 x 99 x 29, tree supports) to one plate and build it. PETG.",
+      "expected_output": "Runs `shambu check`. If the report says PLACEMENT NOT DONE, the reply quotes that line, says no position was computed, and offers `at` for the long bar (straight along the bed edge) or a `brim_margin`. Otherwise it builds with --slice. It never reports parts at the origin as overlaps and does not say the long bar needs the bed diagonal or its own plate.",
       "files": [],
       "expectations": [
         "If the check fails to place a part, quotes the `PLACEMENT NOT DONE` line as the reason and says no position exists",
-        "Does not report 'feeler and cradle overlap' or bed-edge FAILs at negative x/y as real clashes",
-        "Does not say the feeler needs the bed diagonal or its own plate",
-        "Offers an `at` placement for the feeler with its bbox inside the bed (y from about 15 to 241), or `brim_margin`, then slices to confirm",
+        "Does not report 'long_bar and cradle overlap' or bed-edge FAILs at negative x/y as real clashes",
+        "Does not say the long bar needs the bed diagonal or its own plate",
+        "Offers an `at` placement for the long bar with its bbox inside the bed (y from about 15 to 241), or `brim_margin`, then slices to confirm",
         "Does not pass `--keep-going` to export a plate with an unplaced part"
       ]
     },

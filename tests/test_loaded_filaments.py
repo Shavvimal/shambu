@@ -1,6 +1,6 @@
 """The loaded-filament reader and the spec reconciliation (docs/errors/2026-10-16-loaded-filament-not-used.md).
 
-Offline: the printer report is the redacted live capture from the owner's X2D with two external spools
+Offline: the printer report is the redacted live capture from a test printer (an X2D) with two external spools
 (tests/fixtures/x2d_pushall_two_external_spools.json), fed through a fake MQTT reader or straight into the decoder."""
 
 from __future__ import annotations

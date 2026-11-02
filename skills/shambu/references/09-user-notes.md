@@ -1,6 +1,6 @@
 # 09. The user's own finish and fit notes (personal tools and materials)
 
-These are the owner's notes, kept out of the decision layer because they name personal tools and one printer.
+These are one user's notes, kept out of the decision layer because they name specific tools and one printer.
 Use them in the hand-back for this user; for anyone else, the slicer-side version lives in `08-optimisation.md`
 section 5 and the recipes.
 
