@@ -63,3 +63,22 @@ class GeomMissing(CadError):
 class GeomError(CadError):
     """The geometry library refused an operation (a Boolean on a mesh it cannot use). Inside a gate it becomes a FAIL
     finding for the pair, never an exemption."""
+
+
+class TopoError(BambuError):
+    """A `shambu topo` run that cannot go on: a mesh or run file that does not read, an output folder that cannot be
+    written, a singular stiffness matrix. Exit 3 at the CLI."""
+
+
+class TopoSpecError(TopoError):
+    """A topology spec (`shambu.topo/1`), a faces file or a rules file that breaks its schema. The CLI reports it as a
+    failed check (exit 1), with one line per error."""
+
+    def __init__(self, errors: list[str]):
+        self.errors = list(errors)
+        super().__init__("; ".join(self.errors))
+
+
+class TopoDependencyError(TopoError):
+    """An optional extra a `shambu topo` verb needs (`topo`, `topo-trace` or `topo-mesh`) is not installed; the
+    message carries the install line."""

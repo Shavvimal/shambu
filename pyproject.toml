@@ -25,6 +25,12 @@ dependencies = ["paho-mqtt>=2.1"]
 [project.optional-dependencies]
 # `shambu cad clearance`, `sweep` and `diff --surface`: Booleans and exact distances. Imported lazily (cad/geom).
 geom = ["numpy>=2.0", "scipy>=1.13", "manifold3d>=3.0"]
+# `shambu topo voxelise`, `solve` and `validate`: the density-based stiffness map. Imported lazily (topo/__init__.py).
+topo = ["numpy>=2.0", "scipy>=1.13"]
+# `shambu topo trace`: window polygons from a density map.
+topo-trace = ["shambu[topo]", "shapely>=2.0"]
+# `shambu topo solve --mesh smooth`: a marching-cubes iso-surface STL instead of the cell-face one.
+topo-mesh = ["shambu[topo]", "scikit-image>=0.24"]
 
 [project.scripts]
 shambu = "shambu.cli:main"
