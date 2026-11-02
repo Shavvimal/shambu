@@ -313,6 +313,6 @@ slow-downs. D.7's 0.75 is an outlier, and a non-Standard speed level explains it
 1. Export the plate as a `.gcode.3mf`.
 2. Run `shambu printer watch --wait-for-start --log print.jsonl --gcode3mf plate.gcode.3mf` before or right after
    sending the print, and leave it until it logs FINISH.
-3. Run `shambu calibrate --log print.jsonl --add`. The calibration file stores a fingerprint of the session (its
+3. Run `shambu calibrate --log print.jsonl --add`. The calibration file stores a digest of the session (its
    header and first and last poll), not the file's name, so one session imported twice is one print.
 4. Run `shambu calibrate --show` to print the stored prints and the fit per printer model and material.

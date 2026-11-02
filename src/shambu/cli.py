@@ -2188,7 +2188,7 @@ class Calibrate(Command):
                     continue
                 found += 1
                 fits.append(fit)
-                prints.append(fit.to_print(C.session_fingerprint(s.header, s.polls[0][1], s.polls[-1][1])))
+                prints.append(fit.to_print(C.session_digest(s.header, s.polls[0][1], s.polls[-1][1])))
             if not found and not any(e.startswith(f"{name}: ") for e in errors):
                 errors.append(f"{name}: no session with a RUNNING poll: the log holds no print")
         added = 0

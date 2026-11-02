@@ -104,7 +104,7 @@ def stored(rate=0.8, **kw):
 
 
 def sid(tag) -> str:
-    """A session fingerprint for a test print: 16 hex digits."""
+    """A session digest for a test print: 16 hex digits."""
     return f"{abs(hash(str(tag))) % 16**16:016x}"
 
 
