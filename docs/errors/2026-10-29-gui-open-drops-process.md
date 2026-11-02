@@ -13,7 +13,7 @@ NOT an acceptable workaround; the assistant proposed it twice this session and S
 
 Evidence folder: `content/drafts/openarm/cad/sweeper-v1/plates/` (this file's parent), screenshots in
 `postmortem/screenshots/` (file names below are the session image numbers). Session transcript: Claude Code session
-`8d0c87de-7d07-454b-8e00-594d68ea9d24` (`cairn` export of this session when synced).
+`<session-id>` (`cairn` export of this session when synced).
 
 ## 0. Verdict
 
@@ -265,7 +265,7 @@ grams shown). Then a GUI save re-read by `shambu inspect` shows the same `print_
 
 F1b. **Alternative or belt-and-braces: install the preset.** Write the composed process as a real user preset JSON into
 `~/Library/Application Support/BambuStudio/user/<preset_folder>/process/<name>.json` (`doctor` already reads
-`preset_folder` 2379583394) with `inherits` and the diff, so the GUI finds the name. Risk: Studio rebuilds that folder from
+`preset_folder`, an account id) with `inherits` and the diff, so the GUI finds the name. Risk: Studio rebuilds that folder from
 its cloud account; test whether a local file survives a Studio restart and a sync. Prefer F1a if it passes alone.
 
 F2. **Make the interface recipe object-scoped.** Provide `dual-material-interface` (or a sibling `pla-interface`) as an
@@ -333,7 +333,7 @@ Paths relative to `content/drafts/openarm/cad/sweeper-v1/plates/` unless absolut
 | shambu source | `~/Code/shambu` at 5efeabd: `src/shambu/presets.py` 128 to 146, `build.py` 1463, 1509, 1597 to 1608, `threemf.py` 576 to 726, `edits.py` 84 to 91, 1692, 1803, `report.py` 284 to 303 |
 | shambu's prior record of the behaviour | `~/Code/shambu/docs/errors/2026-10-16-loaded-filament-not-used.md`; skill `references/00-findings.md` lines 128 to 136; `references/03-3mf-format.md` lines 295 to 340 (the vector table, `different_settings_to_system` "user-preset bookkeeping") and section 8 (re-slicing a CLI export) |
 | The earlier post-mortem (format and the "Shav places by hand, Studio's default process 2 walls 15 %" precedent at 20:57 on 20 Oct) | `content/drafts/openarm/g2-redesign/55-shambu-post-mortem.md` |
-| Session | Claude Code `8d0c87de-7d07-454b-8e00-594d68ea9d24`, 29 Oct 2026 |
+| Session | Claude Code `<session-id>`, 29 Oct 2026 |
 
 ## 9. One-line summary for the changelog
 
