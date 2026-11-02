@@ -110,7 +110,7 @@ check; a `login --printer NAME` refresh without `--insecure` clears it.
 2. Run `/shambu:setup install` again: the new setup text pins the matching tag in step 2. Not `uv tool upgrade
    shambu`: it keeps the old source (a tag or a local folder). The line it runs is
    `uv tool install --reinstall "shambu @ git+https://github.com/Shavvimal/shambu@vX.Y.Z"` with the new version.
-4. `shambu doctor --expect-version 0.7.0` exits 0.
+3. `shambu doctor --expect-version 0.7.0` exits 0.
 
 ## Troubleshooting
 

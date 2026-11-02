@@ -7,7 +7,7 @@
       "expected_output": "A spec file with two filaments, print_sequence 'by object' and group_by_filament, built with `shambu build plate.json --slice` after `shambu check` passes its fact checks. The reply uses the hand-back template: project path, sliced status, per-plate 'Studio estimate' time and grams with the filament-change count, the Pre-flight and Slice lines, one line per object with its filament, and both standing warnings.",
       "files": [],
       "expectations": [
-        "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
+        "Runs `shambu --version` and `shambu doctor --json --expect-version X.Y.Z` with the version SKILL.md pins before it writes the spec, and reads the spools loaded on the printer from its `printer` section (or `shambu printer filaments`)",
         "Writes a plate.json spec with two entries in `filaments`, each `{\"preset\": \"loaded\"}` (the PETG spool on the left nozzle is filament 1, the PLA spool on the right is filament 2), or pins the presets the printer reports and no others",
         "Assigns jaw.stl to filament 1 with count 2, and label.stl to filament 2",
         "Sets `print_sequence` to \"by object\" on the plate, and sets `group_by_filament`",
@@ -82,10 +82,10 @@
     {
       "id": 6,
       "prompt": "make me a plate from parts/bracket.stl, PETG, slice it",
-      "expected_output": "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` first. Where the installed CLI is another version (doctor exit 3, match false, or a usage error on --expect-version), the reply stops, names both versions and gives the fix (`/shambu:setup update`). It does not switch to `uv run --project` or another copy, and it does not build.",
+      "expected_output": "Runs `shambu --version` and `shambu doctor --json --expect-version X.Y.Z` with the version SKILL.md pins first. Where the installed CLI is another version (doctor exit 3, match false, or a usage error on --expect-version), the reply stops, names both versions and gives the fix (`/shambu:setup update`). It does not switch to `uv run --project` or another copy, and it does not build.",
       "files": [],
       "expectations": [
-        "Runs `shambu --version` and `shambu doctor --json --expect-version 0.4.0` before writing a spec",
+        "Runs `shambu --version` and `shambu doctor --json --expect-version X.Y.Z` with the version SKILL.md pins before writing a spec",
         "When doctor reports a version mismatch, the reply states the installed version and the expected version",
         "Gives the fix: `/shambu:setup update` or the pinned `uv tool install --reinstall \"shambu @ git+https://github.com/Shavvimal/shambu@v...\"` line that doctor prints",
         "Does not run `uv run --project`, a checkout, or any other shambu copy to work round the mismatch",

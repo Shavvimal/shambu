@@ -18,8 +18,12 @@ All notable changes to this project are documented here. The format follows
   a CAD step or a shambu command). There is no overall score, and every run lists what it did not check. Exit 1 on a
   FAIL finding (an open mesh, a mesh in metres, no bed contact, a part that does not fit), as `shambu check`. The
   thresholds are the X2D `0.20mm Standard` values, a 3MF's own settings, `--process` or a flag, each with its
-  source. A non-finite flag or vertex coordinate is a usage error (exit 2). Reference 08 section 12 has the
-  algorithms, the limits and the timings on real parts.
+  source. A non-finite flag or vertex coordinate is a usage error (exit 2). An inside-out shell is `mesh.inverted`
+  (WARN) and a mesh in metres skips the geometry areas (`not-checked`, with the reason), rather than reporting false
+  contact or overhang findings. The work is bounded: a metre-scale or 200000-facet mesh finishes in seconds, and past
+  3,000,000 ray tests the wall and slab areas say `not-checked`. A 3MF with damaged zip data or metadata numbers that
+  do not parse is a `ProjectError` (exit 3) in `printability`, `inspect` and `verify`. Reference 08 section 12 has
+  the algorithms, the limits and the timings on real parts.
 - File integrity in `shambu inspect` and `shambu verify`: a plate marked sliced with no G-code entry, the plate
   G-code against its `.md5` entry, the header
   layer count against the `M73 L` markers, the `M991` layer notices, the slice time against the G-code's own `M73 R`,
