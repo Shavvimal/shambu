@@ -23,9 +23,13 @@ binary or a printer; integration tests skip unless `SHAMBU_INTEGRATION=1` and a 
 | CLI flag handling | `src/shambu/studio.py` (`CliCommand`) | `references/01-source-cli.md` section 1 |
 | Printer fields | `src/shambu/printer.py` | `references/04-app-printer-control.md` |
 | Printer profiles and the credentials file | `src/shambu/profiles.py`, `conf.py`, `vault.py` | `docs/specs/2026-10-27-printer-profiles.md` |
+| A printability check | `src/shambu/printability.py` (a `PrintCheck`), `meshgeom.py`, `findings.py` | `references/08-optimisation.md` section 12 |
+| A file integrity check | `src/shambu/integrity.py` | `references/03-3mf-format.md` section 2.9 |
 | Skill text | `skills/shambu/SKILL.md`, `skills/setup/SKILL.md` | the plugin docs |
 
-Every rule the code encodes about Bambu Studio should cite the reference that proved it. The
+Every rule the code encodes about Bambu Studio should cite the reference that proved it. A finding names its
+evidence level (`measured`, `observed`, `external`, `heuristic`; reference 08 section 12.1): only a measured finding
+can FAIL, and an external one stays INFO until a reference records the X2D file it was seen in. The
 review rubric in `REVIEW-RUBRIC.md` is what a pull request is judged against.
 
 ## Test on real CAD before a release
@@ -48,7 +52,9 @@ CLI on actual STLs of several kinds, not one favourite part:
 - an assembly STL with several bodies (`shambu split`) and a non-manifold mesh.
 
 Keep such files in `data/` (gitignored; `data/README.md` says what to keep and why) and run the loop from that
-README: `shambu info`, `shambu orient`, `shambu build --slice`, `shambu sweep ... --orientations ... --by-object`.
+README: `shambu info`, `shambu orient`, `shambu printability` in the pose `orient` picks, `shambu build --slice`,
+`shambu sweep ... --orientations ... --by-object`. After a change to `printability.py` or `meshgeom.py`, update the
+timings and findings table in reference 08 section 12.5.
 Read the sweep table and the Studio log of any variant that fails; the failing exit code and the G-code Studio
 leaves in the variant folder say which nozzle printed what, where. A tool that only ever met cubes is not tested.
 

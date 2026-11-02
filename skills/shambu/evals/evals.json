@@ -184,6 +184,48 @@
         "Tells the user to run `shambu printer login` themselves in a terminal (hidden prompt), or to pipe it with `--access-code-stdin` or pass `--access-code-file` from a file they create",
         "Reads the spools with `shambu printer filaments` only after the user's login succeeded"
       ]
+    },
+    {
+      "id": 14,
+      "prompt": "will bracket.stl print ok lying on its back face (-z)? I don't want to waste a plate finding out",
+      "expected_output": "Runs `shambu printability bracket.stl --lay-on-face=0,0,-1` (with `--printer` from doctor when it wants the fit check), quotes the findings by code with their evidence tag (for example `WARN overhang.region ... [measured]`), names each fix's recipe per object, and says the slice decides: it does not call the part ready or give a score. It offers `shambu build --slice` for support grams and time, which printability does not measure.",
+      "files": [
+        "bracket.stl"
+      ],
+      "expectations": [
+        "Runs `shambu printability` on bracket.stl with the lay-on-face pose the user named",
+        "Quotes at least one finding line with its code and evidence tag, or quotes that every area reports no-finding",
+        "Does not say the part is ready, safe or guaranteed to print, and gives no overall score",
+        "Says support grams and time need the slice (`shambu build --slice` or `shambu sweep`)"
+      ]
+    },
+    {
+      "id": 15,
+      "prompt": "the thin label plate in tags.stl keeps coming out with gaps. what's wrong with it before I print again?",
+      "expected_output": "Runs `shambu printability tags.stl` and reads the walls and layers areas. A `wall.below_line` or `slab.below_layer` WARN is quoted with its thickness and location, and the fix is a CAD change (thicken) or the recipe the finding names (`shim-0.1mm` alone, or Arachne / `detect_thin_wall` on the object). It does not edit the STL and does not invent a cause the finding does not state.",
+      "files": [
+        "tags.stl"
+      ],
+      "expectations": [
+        "Runs `shambu printability tags.stl`",
+        "Quotes the wall or slab finding with its measured thickness, or says the walls and layers areas report no-finding at the sampled facets",
+        "Offers the fix the finding names (CAD thickening or the named recipe), not an untested setting",
+        "Does not modify the STL file"
+      ]
+    },
+    {
+      "id": 16,
+      "prompt": "inspect plate.gcode.3mf before I send it, someone edited the gcode by hand",
+      "expected_output": "Runs `shambu inspect plate.gcode.3mf` and reads the `integrity:` lines. A `gcode.md5_mismatch` or `gcode.layer_markers` WARN means the G-code changed after the slice: it advises `shambu slice` (or a slice in Studio) before printing and the GUI final pass. It reports `[external, not reproduced on X2D]` lines as INFO only and does not send or start the print.",
+      "files": [
+        "plate.gcode.3mf"
+      ],
+      "expectations": [
+        "Runs `shambu inspect` on the file",
+        "Quotes the integrity WARN or INFO lines with their evidence tag, or quotes the integrity count line with 0 WARN",
+        "On an MD5 or layer-marker WARN, advises slicing again before printing",
+        "Does not send, upload or start the print"
+      ]
     }
   ]
 }

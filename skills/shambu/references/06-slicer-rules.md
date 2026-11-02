@@ -47,6 +47,10 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
   video). Top-surface line width is a separate key (`top_surface_line_width`, 0.42 on the X2D).
 - `shim-0.1mm`: 0.5 and 1.0 mm spring shims alone at 0.1 mm layers (gripper build). Alone, because with a prime
   tower every object on a plate must share one layer height.
+- A slab prints as whole layers: a 0.5 mm plate at 0.2 mm layers comes out 0.4 or 0.6 mm, and one under a layer may
+  not print at all. A wall under one 0.42 mm line may vanish with classic walls; under 0.87 mm (0.42 + 0.45) it is
+  one loop. `shambu printability` reports these as `slab.below_layer`, `slab.off_grid`, `wall.below_line` and
+  `wall.one_loop` (reference 08 section 12).
 
 ## 3. First layer and adhesion
 
@@ -55,6 +59,9 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
 - `tall-outer-brim` (outer only, 5 mm) on anything tall, or long and narrow: blades on end, 216 mm rails, 112 mm
   jaws, carrier, bracket (gripper build). `flat-no-brim` on flat coupons and small parts; the default is
   `auto_brim`, so say it explicitly.
+- When a brim helps, as `shambu printability` judges it (heuristic, no published ratio exists): slenderness
+  (height / sqrt(bed contact)) over 3, or a contact at least 100 mm long and under 15 mm wide, is `brim.suggest`;
+  400 mm2 or more of contact with slenderness at most 1 is `brim.not_needed`.
 - A big flat plate (210 x 96 x 3): flat, no brim, unless a corner lifts. Then `dog-ears`: the user places the ear
   points with the Brim Ears gizmo in Studio (gripper build, 63-tip video).
 
@@ -70,6 +77,10 @@ summary is in `09-user-notes.md`); "research 08" = `08-optimisation.md`.
   with one sacrificial layer; `petg-supports` widens the gaps so PETG-on-PETG comes off; `more-support` raises
   Bambu's threshold (it counts from horizontal: default 30 = support only under faces within 30 deg of flat).
 - Thin bridged ceilings in the first layers are the weak spot: inspect them before fitting (notes).
+- Span classes in `shambu printability` (reference 08 section 12.2): a flat ceiling held by a wall on two sides, or
+  all round, is a bridge; held on one side only it is a cantilever and stays an overhang. Span within
+  `max_bridge_length` prints free; to 10 mm `bridge-short-spans` frees it; 10 to 40 mm is "test it" (PLA, one
+  plate); over 40 mm keep the support.
 
 ## 5. Different-material support interface (`dual-material-interface`, notes, research 08 section 3.2)
 
